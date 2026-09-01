@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tinyjobs"
+version = "0.1.0"
+description = "Background jobs and cron for Python, on SQLite, with zero dependencies"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Piergiuseppe D'Abbraccio", email = "piergiuseppedabbraccio@gmail.com" },
+]
+keywords = ["jobs", "queue", "cron", "background", "sqlite", "worker", "tasks"]
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/Piergiuseppe/tinyjobs"
+Repository = "https://github.com/Piergiuseppe/tinyjobs"
+Issues = "https://github.com/Piergiuseppe/tinyjobs/issues"
+
+[project.scripts]
+tinyjobs = "tinyjobs.cli:main"
+
+[project.entry-points."tinyjobs.backends"]
+sqlite = "tinyjobs.backends.sqlite:SQLiteBackend"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tinyjobs"]

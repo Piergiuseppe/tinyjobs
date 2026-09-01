@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import asyncio
+import unittest
+
+from tinyjobs import TinyJobs
+from tinyjobs.exceptions import TaskAlreadyRegisteredError, UnknownTaskError
+from tinyjobs.status import JobStatus
+from tests.support import BackendTestCase
+
+
+class TaskDeclarationTests(BackendTestCase):
+    def test_bare_decorator_registers_the_task(self):
+        @self.app.task
+        def handler(value):
+            return value
+
+        self.assertIn(handler.name, self.app.registry)
+        self.assertIs(self.app.registry.get(handler.name), handler)
+
+    def test_decorator_with_options_registers_the_task(self):
+        @self.app.task(queue="urgent", max_attempts=4, timeout=12.0)
+        def handler():
+            return None
+
+        self.assertEqual(handler.options.queue, "urgent")
+        self.assertEqual(handler.retry_policy.max_attempts, 4)
+        self.assertEqual(handler.timeout, 12.0)
+
+    def test_explicit_name_is_honoured(self):
+        @self.app.task(name="pdf.generate")
+        def handler():
+            return None
+
+        self.assertEqual(handler.name, "pdf.generate")
+
+    def test_two_tasks_cannot_share_a_name(self):
+        @self.app.task(name="clash")
+        def first():
+            return None
+
+        with self.assertRaises(TaskAlreadyRegisteredError):
+
+            @self.app.task(name="clash")
+            def second():
+                return None
+
+    def test_the_task_is_still_directly_callable(self):
+        @self.app.task
+        def double(value):
+            return value * 2
+
+        self.assertEqual(double(21), 42)
+
+    def test_unknown_task_lookup_explains_itself(self):
+        with self.assertRaises(UnknownTaskError) as caught:
+            self.app.registry.get("nope")
+        self.assertIn("--import", str(caught.exception))
+
+
+class EnqueueTests(BackendTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        @self.app.task(queue="default", max_attempts=3)
+        def handler(document_id, *, reason="none"):
+            return document_id
+
+        self.handler = handler
+
+    def test_enqueue_persists_a_queued_job(self):
+        job = self.handler.enqueue(7, reason="test")
+        stored = self.app.get(job.id)
+        self.assertIs(stored.status, JobStatus.QUEUED)
+        self.assertEqual(stored.task, self.handler.name)
+        self.assertEqual(stored.max_attempts, 3)
+
+    def test_arguments_round_trip_through_the_payload(self):
+        job = self.handler.enqueue(7, reason="test")
+        payload = self.app.decode(self.app.get(job.id))
+        self.assertEqual(payload.args, (7,))
+        self.assertEqual(payload.kwargs, {"reason": "test"})
+
+    def test_wrong_arguments_fail_at_enqueue_time(self):
+        with self.assertRaises(TypeError):
+            self.handler.enqueue()
+        with self.assertRaises(TypeError):
+            self.handler.enqueue(1, 2, 3)
+        with self.assertRaises(TypeError):
+            self.handler.enqueue(1, nonexistent=True)
+
+    def test_a_rejected_enqueue_writes_nothing(self):
+        with self.assertRaises(TypeError):
+            self.handler.enqueue()
+        self.assertEqual(self.app.jobs(limit=10).items, [])
+
+    def test_with_options_overrides_without_touching_the_task(self):
+        job = self.handler.with_options(queue="urgent", priority=5).enqueue(1)
+        stored = self.app.get(job.id)
+        self.assertEqual(stored.queue, "urgent")
+        self.assertEqual(stored.priority, 5)
+        self.assertEqual(self.handler.options.queue, "default")
+
+    def test_delay_pushes_run_at_into_the_future(self):
+        job = self.handler.with_options(delay=120).enqueue(1)
+        self.assertGreater(job.run_at, job.created_at + 119)
+
+    def test_deduplication_key_collapses_duplicates(self):
+        first = self.handler.with_options(key="doc:1").enqueue(1)
+        second = self.handler.with_options(key="doc:1").enqueue(1)
+        self.assertEqual(first.id, second.id)
+
+    def test_aenqueue_matches_enqueue(self):
+        job = asyncio.run(self.handler.aenqueue(3))
+        self.assertIs(self.app.get(job.id).status, JobStatus.QUEUED)
+
+
+class ConcurrentInitialisationTests(BackendTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fresh = TinyJobs(f"sqlite:///{self.database}")
+
+        @self.fresh.task
+        def handler(value):
+            return value
+
+        self.handler = handler
+
+    def tearDown(self) -> None:
+        self.fresh.close()
+        super().tearDown()
+
+    def test_many_threads_can_enqueue_against_an_uninitialised_app(self):
+        import threading
+
+        errors: list[BaseException] = []
+        jobs: list[str] = []
+        guard = threading.Lock()
+        start = threading.Barrier(12)
+
+        def enqueue(index: int) -> None:
+            start.wait()
+            try:
+                job = self.handler.enqueue(index)
+            except BaseException as error:
+                with guard:
+                    errors.append(error)
+                return
+            with guard:
+                jobs.append(job.id)
+
+        threads = [threading.Thread(target=enqueue, args=(i,)) for i in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(jobs)), 12)
+
+
+class SendByNameTests(BackendTestCase):
+    def test_send_does_not_require_the_task_to_be_registered(self):
+        job = self.app.send("ml.train", args=[1], kwargs={"epochs": 5})
+        stored = self.app.get(job.id)
+        self.assertEqual(stored.task, "ml.train")
+        payload = self.app.decode(stored)
+        self.assertEqual(payload.args, (1,))
+        self.assertEqual(payload.kwargs, {"epochs": 5})
+
+    def test_send_inherits_the_defaults_of_a_locally_registered_task(self):
+        @self.app.task(name="local.task", queue="slow", max_attempts=4)
+        def handler():
+            return None
+
+        stored = self.app.get(self.app.send("local.task").id)
+        self.assertEqual(stored.max_attempts, 4)
+        self.assertEqual(stored.queue, "slow")
+
+    def test_explicit_send_options_beat_the_task_declaration(self):
+        @self.app.task(name="local.task", queue="slow", max_attempts=4)
+        def handler():
+            return None
+
+        stored = self.app.get(self.app.send("local.task", queue="fast").id)
+        self.assertEqual(stored.queue, "fast")
+        self.assertEqual(stored.max_attempts, 4)
+
+    def test_send_to_an_unknown_task_uses_documented_defaults(self):
+        stored = self.app.get(self.app.send("not.registered").id)
+        self.assertEqual(stored.max_attempts, 1)
+        self.assertEqual(stored.queue, "default")
+
+    def test_send_accepts_enqueue_options(self):
+        job = self.app.send("ml.train", queue="gpu", priority=9, max_attempts=4)
+        stored = self.app.get(job.id)
+        self.assertEqual(stored.queue, "gpu")
+        self.assertEqual(stored.priority, 9)
+        self.assertEqual(stored.max_attempts, 4)
+
+
+class ControlTests(BackendTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        @self.app.task
+        def handler():
+            return None
+
+        self.handler = handler
+
+    def test_cancel_moves_a_queued_job_to_cancelled(self):
+        job = self.handler.enqueue()
+        self.assertTrue(self.app.cancel(job.id))
+        self.assertIs(self.app.get(job.id).status, JobStatus.CANCELLED)
+
+    def test_listing_returns_newest_first(self):
+        ids = [self.handler.enqueue().id for _ in range(3)]
+        listed = [job.id for job in self.app.jobs(limit=10).items]
+        self.assertEqual(listed, list(reversed(ids)))
+
+
+if __name__ == "__main__":
+    unittest.main()
