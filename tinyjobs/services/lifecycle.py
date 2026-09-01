@@ -25,14 +25,16 @@ class JobLifecycleService:
         self._serialization = serialization
         self._clock = clock
 
-    def succeed(self, job: Job, task: "Task", result: Any) -> bool:
+    async def succeed(self, job: Job, task: "Task", result: Any) -> bool:
         encoded = self._encode_result(job, task, result)
-        return self._backend.complete(job, encoded)
+        return await self._backend.complete(job, encoded)
 
-    def fail(self, job: Job, task: "Task", error: BaseException) -> tuple[bool, bool]:
+    async def fail(
+        self, job: Job, task: "Task", error: BaseException
+    ) -> tuple[bool, bool]:
         details = self._describe(error)
         retry_at = self._retry_at(job, task, error)
-        applied = self._backend.fail(
+        applied = await self._backend.fail(
             job, details, retry_at, self._execution_status(error)
         )
         return applied, retry_at is not None

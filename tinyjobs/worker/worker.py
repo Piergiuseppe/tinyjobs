@@ -63,6 +63,7 @@ class Worker:
         self._request_stop()
 
     async def start(self) -> None:
+        await self._app.ready()
         watcher = ShutdownWatcher(self._request_stop, self._request_force)
         watcher.install()
         logger.info(
@@ -103,8 +104,7 @@ class Worker:
 
     async def _claim(self, capacity: int) -> list[Job]:
         try:
-            return await asyncio.to_thread(
-                self._app.backend.claim,
+            return await self._app.backend.claim(
                 worker_id=self._id,
                 queues=self._queues,
                 limit=capacity,
@@ -145,11 +145,9 @@ class Worker:
         try:
             payload = self._app.serialization.decode_payload(job)
             result = await self._executors.resolve(task).execute(task, payload)
-            await asyncio.to_thread(self._app.lifecycle.succeed, job, task, result)
+            await self._app.lifecycle.succeed(job, task, result)
         except asyncio.CancelledError:
-            await asyncio.shield(
-                asyncio.to_thread(self._app.backend.release, job)
-            )
+            await asyncio.shield(self._app.backend.release(job))
             raise
         except BaseException as error:
             await self._record_failure(job, task, error)
@@ -157,9 +155,7 @@ class Worker:
         logger.info("job %s succeeded on attempt %d", job.id, job.attempts)
 
     async def _record_failure(self, job: Job, task, error: BaseException) -> None:
-        _, will_retry = await asyncio.to_thread(
-            self._app.lifecycle.fail, job, task, error
-        )
+        _, will_retry = await self._app.lifecycle.fail(job, task, error)
         logger.warning(
             "job %s failed on attempt %d/%d (%s)%s",
             job.id,
@@ -177,9 +173,7 @@ class Worker:
             job.id,
             self._unknown_task_delay,
         )
-        await asyncio.to_thread(
-            self._app.backend.release, job, self._unknown_task_delay
-        )
+        await self._app.backend.release(job, self._unknown_task_delay)
 
     async def _heartbeat_loop(self) -> None:
         interval = max(self._lease_seconds / 3.0, 1.0)
@@ -189,9 +183,7 @@ class Worker:
             if not job_ids:
                 continue
             try:
-                await asyncio.to_thread(
-                    self._app.backend.heartbeat, job_ids, self._lease_seconds
-                )
+                await self._app.backend.heartbeat(job_ids, self._lease_seconds)
             except Exception:
                 logger.exception("heartbeat failed for %d jobs", len(job_ids))
 
@@ -199,7 +191,7 @@ class Worker:
         while True:
             await asyncio.sleep(self._reap_interval)
             try:
-                reaped = await asyncio.to_thread(self._app.backend.reap_expired)
+                reaped = await self._app.backend.reap_expired()
             except Exception:
                 logger.exception("reaper pass failed")
                 continue

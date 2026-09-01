@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 from urllib.parse import urlsplit
@@ -62,6 +65,87 @@ class SQLiteBackend(BaseBackend):
             database, uri=uri, busy_timeout=busy_timeout
         )
         self._claim_strategy = build_claim_strategy()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tinyjobs-sqlite"
+        )
+
+
+    async def _call(self, function, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, partial(function, *args))
+
+    async def setup(self) -> None:
+        await self._call(self._setup_sync)
+
+    async def close(self) -> None:
+        await self._call(self._close_sync)
+        self._executor.shutdown(wait=True)
+
+    async def enqueue(self, job: Job) -> Job:
+        return await self._call(self._enqueue_sync, job)
+
+    async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
+        return await self._call(self._enqueue_many_sync, jobs)
+
+    async def claim(
+        self,
+        *,
+        worker_id: str,
+        queues: Sequence[str],
+        limit: int,
+        lease_seconds: float,
+    ) -> list[Job]:
+        return await self._call(
+            self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
+        )
+
+    async def heartbeat(self, job_ids: Sequence[str], lease_seconds: float) -> None:
+        await self._call(self._heartbeat_sync, tuple(job_ids), lease_seconds)
+
+    async def complete(self, job: Job, result: bytes | None) -> bool:
+        return await self._call(self._complete_sync, job, result)
+
+    async def fail(
+        self,
+        job: Job,
+        error: ExecutionError,
+        retry_at: float | None,
+        execution_status: ExecutionStatus = ExecutionStatus.FAILED,
+    ) -> bool:
+        return await self._call(
+            self._fail_sync, job, error, retry_at, execution_status
+        )
+
+    async def release(self, job: Job, delay: float = 0.0) -> bool:
+        return await self._call(self._release_sync, job, delay)
+
+    async def cancel(self, job_id: str) -> bool:
+        return await self._call(self._cancel_sync, job_id)
+
+    async def requeue(self, job_id: str) -> bool:
+        return await self._call(self._requeue_sync, job_id)
+
+    async def get(self, job_id: str) -> Job | None:
+        return await self._call(self._get_sync, job_id)
+
+    async def list(
+        self,
+        *,
+        status: JobStatus | None = None,
+        queue: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> Page:
+        return await self._call(self._list_sync, status, queue, limit, cursor)
+
+    async def executions(self, job_id: str) -> list[Execution]:
+        return await self._call(self._executions_sync, job_id)
+
+    async def reap_expired(self) -> int:
+        return await self._call(self._reap_expired_sync)
+
+    async def counts_by_status(self) -> dict[str, int]:
+        return await self._call(self._counts_by_status_sync)
 
     @property
     def database(self) -> str:
@@ -77,7 +161,7 @@ class SQLiteBackend(BaseBackend):
         path.parent.mkdir(parents=True, exist_ok=True)
         return cls(str(path), **options)
 
-    def setup(self) -> None:
+    def _setup_sync(self) -> None:
         with self._connections.write() as connection:
             for statement in DDL:
                 connection.execute(statement)
@@ -88,17 +172,17 @@ class SQLiteBackend(BaseBackend):
             )
         self._assert_schema_supported()
 
-    def close(self) -> None:
+    def _close_sync(self) -> None:
         self._connections.close()
 
     def transaction(self) -> AbstractContextManager[sqlite3.Connection]:
         return self._connections.write()
 
-    def enqueue(self, job: Job) -> Job:
+    def _enqueue_sync(self, job: Job) -> Job:
         with self._connections.write() as connection:
             return self._insert(connection, job)
 
-    def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
+    def _enqueue_many_sync(self, jobs: Sequence[Job]) -> list[Job]:
         with self._connections.write() as connection:
             if any(job.dedup_key is not None for job in jobs):
                 return [self._insert(connection, job) for job in jobs]
@@ -127,9 +211,8 @@ class SQLiteBackend(BaseBackend):
         row = connection.execute(SELECT_ACTIVE_BY_DEDUP, (dedup_key,)).fetchone()
         return job_from_row(row) if row else None
 
-    def claim(
+    def _claim_sync(
         self,
-        *,
         worker_id: str,
         queues: Sequence[str],
         limit: int,
@@ -153,7 +236,7 @@ class SQLiteBackend(BaseBackend):
                 )
         return jobs
 
-    def heartbeat(self, job_ids: Sequence[str], lease_seconds: float) -> None:
+    def _heartbeat_sync(self, job_ids: Sequence[str], lease_seconds: float) -> None:
         if not job_ids:
             return
         placeholders = ", ".join("?" for _ in job_ids)
@@ -163,7 +246,7 @@ class SQLiteBackend(BaseBackend):
                 HEARTBEAT.format(ids=placeholders), (expiry, *job_ids)
             )
 
-    def complete(self, job: Job, result: bytes | None) -> bool:
+    def _complete_sync(self, job: Job, result: bytes | None) -> bool:
         now = self._clock.now()
         with self._connections.write() as connection:
             cursor = connection.execute(
@@ -176,12 +259,12 @@ class SQLiteBackend(BaseBackend):
             )
         return True
 
-    def fail(
+    def _fail_sync(
         self,
         job: Job,
         error: ExecutionError,
         retry_at: float | None,
-        execution_status: ExecutionStatus = ExecutionStatus.FAILED,
+        execution_status: ExecutionStatus,
     ) -> bool:
         now = self._clock.now()
         with self._connections.write() as connection:
@@ -198,7 +281,7 @@ class SQLiteBackend(BaseBackend):
             self._finish_execution(connection, job, execution_status, error, now)
         return True
 
-    def release(self, job: Job, delay: float = 0.0) -> bool:
+    def _release_sync(self, job: Job, delay: float) -> bool:
         now = self._clock.now()
         with self._connections.write() as connection:
             cursor = connection.execute(
@@ -211,27 +294,26 @@ class SQLiteBackend(BaseBackend):
             )
         return True
 
-    def cancel(self, job_id: str) -> bool:
+    def _cancel_sync(self, job_id: str) -> bool:
         with self._connections.write() as connection:
             cursor = connection.execute(CANCEL_JOB, (self._clock.now(), job_id))
         return cursor.rowcount == 1
 
-    def requeue(self, job_id: str) -> bool:
+    def _requeue_sync(self, job_id: str) -> bool:
         with self._connections.write() as connection:
             cursor = connection.execute(REQUEUE_JOB, (self._clock.now(), job_id))
         return cursor.rowcount == 1
 
-    def get(self, job_id: str) -> Job | None:
+    def _get_sync(self, job_id: str) -> Job | None:
         row = self._connections.connection.execute(SELECT_JOB, (job_id,)).fetchone()
         return job_from_row(row) if row else None
 
-    def list(
+    def _list_sync(
         self,
-        *,
-        status: JobStatus | None = None,
-        queue: str | None = None,
-        limit: int = 100,
-        cursor: str | None = None,
+        status: JobStatus | None,
+        queue: str | None,
+        limit: int,
+        cursor: str | None,
     ) -> Page:
         conditions: list[str] = []
         parameters: list[Any] = []
@@ -255,13 +337,13 @@ class SQLiteBackend(BaseBackend):
         next_cursor = jobs[-1].id if len(rows) > limit and jobs else None
         return Page(items=jobs, cursor=next_cursor)
 
-    def executions(self, job_id: str) -> list[Execution]:
+    def _executions_sync(self, job_id: str) -> list[Execution]:
         rows = self._connections.connection.execute(
             SELECT_EXECUTIONS, (job_id,)
         ).fetchall()
         return [execution_from_row(row) for row in rows]
 
-    def reap_expired(self) -> int:
+    def _reap_expired_sync(self) -> int:
         now = self._clock.now()
         with self._connections.write() as connection:
             expired = self._select_expired(connection, now)
@@ -273,7 +355,7 @@ class SQLiteBackend(BaseBackend):
             )
         return len(expired)
 
-    def counts_by_status(self) -> dict[str, int]:
+    def _counts_by_status_sync(self) -> dict[str, int]:
         rows = self._connections.connection.execute(
             "SELECT status, count(*) AS total FROM jobs GROUP BY status"
         ).fetchall()

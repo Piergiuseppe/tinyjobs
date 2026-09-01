@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -33,6 +32,10 @@ class Task:
         self._store_result = store_result
         self._signature = inspect.signature(function)
         self._is_coroutine = inspect.iscoroutinefunction(function)
+
+    @property
+    def app(self) -> "TinyJobs":
+        return self._app
 
     @property
     def name(self) -> str:
@@ -69,18 +72,22 @@ class Task:
     def with_options(self, **overrides: Any) -> "BoundTask":
         return BoundTask(self, self._options.merged_with(**overrides))
 
-    def enqueue_with(
+    async def aenqueue_with(
         self, options: EnqueueOptions, args: tuple, kwargs: dict
     ) -> Job:
-        return self._app.dispatch.dispatch_by_name(
-            self._name, self.bind(args, kwargs), options
+        payload = self.bind(args, kwargs)
+        await self._app.ready()
+        return await self._app.dispatch.dispatch_by_name(
+            self._name, payload, options
         )
 
-    def enqueue(self, *args: Any, **kwargs: Any) -> Job:
-        return self.enqueue_with(self._options, args, kwargs)
-
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:
-        return await asyncio.to_thread(self.enqueue, *args, **kwargs)
+        return await self.aenqueue_with(self._options, args, kwargs)
+
+    def enqueue(self, *args: Any, **kwargs: Any) -> Job:
+        return self._app.run_sync(
+            self.aenqueue_with(self._options, args, kwargs), name="enqueue"
+        )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self._function(*args, **kwargs)
@@ -97,8 +104,10 @@ class BoundTask:
     def with_options(self, **overrides: Any) -> "BoundTask":
         return BoundTask(self._task, self._options.merged_with(**overrides))
 
-    def enqueue(self, *args: Any, **kwargs: Any) -> Job:
-        return self._task.enqueue_with(self._options, args, kwargs)
-
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:
-        return await asyncio.to_thread(self.enqueue, *args, **kwargs)
+        return await self._task.aenqueue_with(self._options, args, kwargs)
+
+    def enqueue(self, *args: Any, **kwargs: Any) -> Job:
+        return self._task.app.run_sync(
+            self._task.aenqueue_with(self._options, args, kwargs), name="enqueue"
+        )

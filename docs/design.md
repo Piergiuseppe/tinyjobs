@@ -815,29 +815,54 @@ means you did not need a background job.
 
 ## Public API
 
-### Sync core, async facade
+### Async core, sync facade
 
-The core and every backend are **synchronous**. The async API is a thin wrapper.
+The backend protocol is `async`. Every method a backend implements is a coroutine. On top of that
+sits a synchronous facade, so enqueuing still works from a script, a Django view or a `__main__`
+block with no event loop in sight.
 
-This is a deliberate reversal of the "async-first" idea in the original sketch, and the reason is that
-`sqlite3` is a blocking C library and the standard library ships no async driver for it. An
-`async def enqueue` sitting on top of a blocking `sqlite3` call is not asynchronous. It is a
-synchronous call that has taken your event loop hostage and stalled every other coroutine in the
-process. There are exactly two honest options: wrap it in `asyncio.to_thread`, or don't pretend.
+An earlier version of this document argued the opposite, and the argument was half right. The
+diagnosis was correct: `sqlite3` is a blocking C library, the standard library ships no async driver
+for it, and an `async def enqueue` sitting directly on a blocking `sqlite3` call is not asynchronous.
+It is a synchronous call that has taken your event loop hostage.
 
-So the shape is: backends implement sync methods; the async facade wraps them in `to_thread`; both are
-public and neither is second class.
+The conclusion drawn from it was wrong. The problem is not the `async` keyword, it is **where the
+thread hop lives**. Put it inside the SQLite backend and `async def claim` becomes honest, because it
+really does yield control:
 
 ```python
-job = generate_pdf.enqueue(123)             # from anywhere
-job = await generate_pdf.aenqueue(123)      # from a coroutine
+async def claim(self, ...):
+    return await self._call(self._claim_sync, ...)
 ```
 
-The payoff is that enqueuing works from a script, a Django view, a `__main__` block or a Flask handler
-with no event loop in sight, which is where a large share of real enqueues happen. An async-only API
-would force `asyncio.run()` into all of them. A native async backend (`tinyjobs-postgres` over
-asyncpg) can implement the async side directly and skip the thread hop; the facade is a default, not a
-ceiling.
+Put it in the architecture instead, and every future backend pays for a limitation that belongs to
+SQLite alone. A natively async backend would have to expose synchronous methods, which means running
+its own event loop on another thread and bridging back to it. Since the whole point of the backend
+seam is Redis, Postgres and whatever comes after, that is the wrong trade.
+
+The old shape also leaked in a way that is easy to measure. Because `asyncio.to_thread` spreads calls
+across the default executor's thread pool, and SQLite connections are thread-local, a worker doing
+nothing unusual ended up holding **ten connections instead of one**. Moving the hop into the backend,
+onto a dedicated single-worker executor, brings it back to one and serializes writes inside the
+process for free, which is exactly what SQLite's single-writer model wants anyway.
+
+```python
+job = generate_pdf.enqueue(123)             # sync facade, from anywhere
+job = await generate_pdf.aenqueue(123)      # native path
+```
+
+The facade drives a single background event loop, started lazily on the first synchronous call, and
+marshals coroutines onto it. The obvious alternative, one `asyncio.run()` per call, was rejected
+because connection pools in async network clients are bound to the loop that created them; a fresh
+loop per enqueue would break precisely the backends this design exists to support.
+
+Calling a synchronous method from inside a running loop raises `SynchronousCallInsideEventLoopError`
+and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's
+loop.
+
+Async does not make the queue faster on its own. On SQLite the limit is still `fsync`. It pays when
+there are many concurrent I/O waits in flight, which is the network-backend case, and it is why the
+protocol has to be async before those backends exist rather than after.
 
 **Task functions are unaffected by any of this.** `async def` runs on the loop, `def` runs in a pool,
 and you write whichever fits the work.

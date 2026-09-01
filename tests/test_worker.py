@@ -34,7 +34,8 @@ class WorkerTestCase(unittest.IsolatedAsyncioTestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             await asyncio.sleep(0.02)
-            if all(self.app.get(job.id).status.is_terminal for job in jobs):
+            statuses = [(await self.app.aget(job.id)).status for job in jobs]
+            if all(status.is_terminal for status in statuses):
                 break
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
@@ -45,8 +46,8 @@ class WorkerTestCase(unittest.IsolatedAsyncioTestCase):
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
 
-    def status_of(self, job) -> JobStatus:
-        return self.app.get(job.id).status
+    async def status_of(self, job) -> JobStatus:
+        return (await self.app.aget(job.id)).status
 
 
 class ExecutionTests(WorkerTestCase):
@@ -56,9 +57,9 @@ class ExecutionTests(WorkerTestCase):
             self.calls.append(f"async:{value}")
             return value * 2
 
-        job = handler.enqueue(21)
+        job = await handler.aenqueue(21)
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
         self.assertEqual(self.calls, ["async:21"])
 
     async def test_sync_task_runs_in_a_thread(self):
@@ -67,9 +68,9 @@ class ExecutionTests(WorkerTestCase):
             self.calls.append(f"sync:{value}")
             return value
 
-        job = handler.enqueue("x")
+        job = await handler.aenqueue("x")
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
         self.assertEqual(self.calls, ["sync:x"])
 
     async def test_async_and_sync_tasks_share_one_worker(self):
@@ -81,7 +82,7 @@ class ExecutionTests(WorkerTestCase):
         def second():
             self.calls.append("second")
 
-        jobs = [first.enqueue(), second.enqueue()]
+        jobs = [await first.aenqueue(), await second.aenqueue()]
         await self.settle(self.make_worker(), jobs)
         self.assertEqual(sorted(self.calls), ["first", "second"])
 
@@ -95,7 +96,7 @@ class ExecutionTests(WorkerTestCase):
         def handler(when, amount, tags):
             received.update(when=when, amount=amount, tags=tags)
 
-        job = handler.enqueue(
+        job = await handler.aenqueue(
             datetime(2026, 8, 31, 12, 0), Decimal("19.99"), {"a", "b"}
         )
         await self.settle(self.make_worker(), [job])
@@ -110,9 +111,9 @@ class FailureTests(WorkerTestCase):
         def handler():
             raise ValueError("boom")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        stored = self.app.get(job.id)
+        stored = await self.app.aget(job.id)
         self.assertIs(stored.status, JobStatus.FAILED)
         self.assertIn("boom", stored.last_error)
         self.assertEqual(stored.attempts, 1)
@@ -122,9 +123,9 @@ class FailureTests(WorkerTestCase):
         def handler():
             raise ValueError("boom")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        execution = self.app.backend.executions(job.id)[0]
+        execution = (await self.app.aexecutions(job.id))[0]
         self.assertIs(execution.status, ExecutionStatus.FAILED)
         self.assertEqual(execution.error_type, "ValueError")
         self.assertIn("ValueError: boom", execution.traceback)
@@ -139,11 +140,11 @@ class FailureTests(WorkerTestCase):
                 raise ConnectionError("flaky")
             return "ok"
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
-        self.assertEqual(self.app.get(job.id).attempts, 3)
-        self.assertEqual(len(self.app.backend.executions(job.id)), 3)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertEqual((await self.app.aget(job.id)).attempts, 3)
+        self.assertEqual(len(await self.app.aexecutions(job.id)), 3)
 
     async def test_retries_stop_when_the_budget_is_spent(self):
         @self.app.task(max_attempts=3, retry_base=0.01, retry_jitter=False)
@@ -151,9 +152,9 @@ class FailureTests(WorkerTestCase):
             self.calls.append("try")
             raise ConnectionError("always")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertEqual(len(self.calls), 3)
 
     async def test_unlisted_exceptions_are_not_retried(self):
@@ -162,9 +163,9 @@ class FailureTests(WorkerTestCase):
             self.calls.append("try")
             raise ValueError("permanent")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertEqual(len(self.calls), 1)
 
     async def test_abandon_skips_the_remaining_attempts(self):
@@ -173,9 +174,9 @@ class FailureTests(WorkerTestCase):
             self.calls.append("try")
             raise Abandon("nothing to do")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertEqual(len(self.calls), 1)
 
     async def test_explicit_retry_controls_its_own_delay(self):
@@ -186,9 +187,9 @@ class FailureTests(WorkerTestCase):
                 raise Retry(in_=0.01)
             return "ok"
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
         self.assertEqual(len(self.calls), 2)
 
 
@@ -199,11 +200,11 @@ class AttemptBudgetTests(WorkerTestCase):
             self.calls.append("try")
             raise ConnectionError("always")
 
-        job = handler.with_options(max_attempts=2).enqueue()
+        job = await handler.with_options(max_attempts=2).aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertEqual(len(self.calls), 2)
-        self.assertEqual(self.app.get(job.id).attempts, 2)
+        self.assertEqual((await self.app.aget(job.id)).attempts, 2)
 
     async def test_a_job_sent_by_name_retries_like_the_registered_task(self):
         @self.app.task(name="known.task", max_attempts=3, retry_base=0.01)
@@ -211,7 +212,7 @@ class AttemptBudgetTests(WorkerTestCase):
             self.calls.append("try")
             raise ConnectionError("always")
 
-        job = self.app.send("known.task")
+        job = await self.app.asend("known.task")
         await self.settle(self.make_worker(), [job])
         self.assertEqual(len(self.calls), 3)
 
@@ -222,11 +223,11 @@ class TimeoutTests(WorkerTestCase):
         async def handler():
             await asyncio.sleep(30)
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertIs(
-            self.app.backend.executions(job.id)[0].status, ExecutionStatus.TIMEOUT
+            (await self.app.aexecutions(job.id))[0].status, ExecutionStatus.TIMEOUT
         )
 
     async def test_sync_task_timeout_fails_the_job_without_killing_the_thread(self):
@@ -237,11 +238,11 @@ class TimeoutTests(WorkerTestCase):
             time.sleep(0.4)
             finished.append(True)
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
         self.assertIs(
-            self.app.backend.executions(job.id)[0].status, ExecutionStatus.TIMEOUT
+            (await self.app.aexecutions(job.id))[0].status, ExecutionStatus.TIMEOUT
         )
         await asyncio.sleep(0.5)
         self.assertEqual(finished, [True])
@@ -253,15 +254,18 @@ class UndecodableJobTests(WorkerTestCase):
         def handler(value):
             self.calls.append(value)
 
-        job = handler.enqueue(1)
-        with self.app.backend.transaction() as connection:
-            connection.execute(
-                "UPDATE jobs SET payload = ? WHERE id = ?",
-                (b'{"args":[{"$t":"gone","$v":1}],"kwargs":{}}', job.id),
-            )
+        job = await handler.aenqueue(1)
+        import sqlite3
+
+        outside = sqlite3.connect(self.app.backend.database, isolation_level=None)
+        outside.execute(
+            "UPDATE jobs SET payload = ? WHERE id = ?",
+            (b'{"args":[{"$t":"gone","$v":1}],"kwargs":{}}', job.id),
+        )
+        outside.close()
 
         await self.settle(self.make_worker(), [job])
-        stored = self.app.get(job.id)
+        stored = await self.app.aget(job.id)
         self.assertIs(stored.status, JobStatus.FAILED)
         self.assertIn("gone", stored.last_error)
         self.assertEqual(self.calls, [])
@@ -274,9 +278,9 @@ class UndecodableJobTests(WorkerTestCase):
         def handler():
             return Unserializable()
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.settle(self.make_worker(), [job])
-        self.assertIs(self.status_of(job), JobStatus.FAILED)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
 
 
 class RoutingTests(WorkerTestCase):
@@ -285,13 +289,13 @@ class RoutingTests(WorkerTestCase):
         def handler():
             self.calls.append("ran")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         await self.run_briefly(self.make_worker(queues=["default"]))
-        self.assertIs(self.status_of(job), JobStatus.QUEUED)
+        self.assertIs(await self.status_of(job), JobStatus.QUEUED)
         self.assertEqual(self.calls, [])
 
         await self.settle(self.make_worker(queues=["slow"]), [job])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
 
     async def test_higher_priority_jobs_run_first(self):
         order = []
@@ -300,8 +304,8 @@ class RoutingTests(WorkerTestCase):
         def handler(label):
             order.append(label)
 
-        low = handler.with_options(priority=0).enqueue("low")
-        high = handler.with_options(priority=10).enqueue("high")
+        low = await handler.with_options(priority=0).aenqueue("low")
+        high = await handler.with_options(priority=10).aenqueue("high")
         await self.settle(self.make_worker(concurrency=1), [low, high])
         self.assertEqual(order[0], "high")
 
@@ -310,16 +314,16 @@ class RoutingTests(WorkerTestCase):
         def handler():
             self.calls.append("ran")
 
-        job = handler.enqueue()
-        self.app.cancel(job.id)
+        job = await handler.aenqueue()
+        await self.app.acancel(job.id)
         await self.run_briefly(self.make_worker())
         self.assertEqual(self.calls, [])
-        self.assertIs(self.status_of(job), JobStatus.CANCELLED)
+        self.assertIs(await self.status_of(job), JobStatus.CANCELLED)
 
     async def test_an_unregistered_task_is_left_queued_not_failed(self):
-        job = self.app.send("nobody.knows.this", args=[1])
+        job = await self.app.asend("nobody.knows.this", args=[1])
         await self.run_briefly(self.make_worker(unknown_task_delay=30.0))
-        stored = self.app.get(job.id)
+        stored = await self.app.aget(job.id)
         self.assertIs(stored.status, JobStatus.QUEUED)
         self.assertGreater(stored.run_at, self.app.clock.now())
 
@@ -331,27 +335,27 @@ class ShutdownTests(WorkerTestCase):
             await asyncio.sleep(0.3)
             self.calls.append("finished")
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         worker = self.make_worker(shutdown_timeout=5.0)
         runner = asyncio.create_task(worker.start())
         await asyncio.sleep(0.1)
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
         self.assertEqual(self.calls, ["finished"])
-        self.assertIs(self.status_of(job), JobStatus.SUCCESS)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
 
     async def test_a_job_that_outlives_the_grace_period_returns_to_the_queue(self):
         @self.app.task
         async def handler():
             await asyncio.sleep(10)
 
-        job = handler.enqueue()
+        job = await handler.aenqueue()
         worker = self.make_worker(shutdown_timeout=0.2)
         runner = asyncio.create_task(worker.start())
         await asyncio.sleep(0.2)
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
-        self.assertIs(self.status_of(job), JobStatus.QUEUED)
+        self.assertIs(await self.status_of(job), JobStatus.QUEUED)
 
 
 if __name__ == "__main__":

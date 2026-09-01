@@ -22,8 +22,9 @@ PACING_SECONDS = 0.001
 
 
 def seed(database: str, count: int) -> None:
-    app = TinyJobs(f"sqlite:///{database}")
-    app.backend.enqueue_many(
+    app = TinyJobs(f"sqlite:///{database}").start()
+    app.run_sync(
+        app.backend.enqueue_many(
         [
             Job(
                 id=new_job_id(),
@@ -36,24 +37,33 @@ def seed(database: str, count: int) -> None:
                 created_at=0.0,
             )
             for _ in range(count)
-        ]
+            ]
+        ),
+        name="seed",
     )
     app.close()
 
 
+def claim_once(app, worker_id: str):
+    return app.run_sync(
+        app.backend.claim(
+            worker_id=worker_id,
+            queues=("default",),
+            limit=CLAIM_BATCH,
+            lease_seconds=300,
+        ),
+        name="claim",
+    )
+
+
 def drain(database: str, worker_id: str, sink, barrier=None) -> None:
-    app = TinyJobs(f"sqlite:///{database}")
+    app = TinyJobs(f"sqlite:///{database}").start()
     claimed: list[str] = []
     idle = 0
     if barrier is not None:
         barrier.wait(timeout=60)
     while idle < IDLE_ROUNDS_BEFORE_STOP:
-        jobs = app.backend.claim(
-            worker_id=worker_id,
-            queues=("default",),
-            limit=CLAIM_BATCH,
-            lease_seconds=300,
-        )
+        jobs = claim_once(app, worker_id)
         if not jobs:
             idle += 1
             time.sleep(0.005)
@@ -109,7 +119,7 @@ class ClaimExclusivityTests(unittest.TestCase):
         self.assert_contention_was_real(batches, PROCESS_COUNT)
 
     def test_competing_threads_never_claim_the_same_job(self):
-        app = TinyJobs(f"sqlite:///{self.database}")
+        app = TinyJobs(f"sqlite:///{self.database}").start()
         batches: list[list[str]] = []
         guard = threading.Lock()
         start = threading.Barrier(THREAD_COUNT)
@@ -119,12 +129,7 @@ class ClaimExclusivityTests(unittest.TestCase):
             idle = 0
             start.wait()
             while idle < IDLE_ROUNDS_BEFORE_STOP:
-                jobs = app.backend.claim(
-                    worker_id=f"thread-{index}",
-                    queues=("default",),
-                    limit=CLAIM_BATCH,
-                    lease_seconds=300,
-                )
+                jobs = claim_once(app, f"thread-{index}")
                 if not jobs:
                     idle += 1
                     time.sleep(0.005)
@@ -148,9 +153,15 @@ class ClaimExclusivityTests(unittest.TestCase):
         app.close()
 
     def test_every_job_ends_up_running_exactly_once(self):
-        app = TinyJobs(f"sqlite:///{self.database}")
-        drained = app.backend.claim(
-            worker_id="solo", queues=("default",), limit=JOB_COUNT, lease_seconds=300
+        app = TinyJobs(f"sqlite:///{self.database}").start()
+        drained = app.run_sync(
+            app.backend.claim(
+                worker_id="solo",
+                queues=("default",),
+                limit=JOB_COUNT,
+                lease_seconds=300,
+            ),
+            name="claim",
         )
         self.assertEqual(len(drained), JOB_COUNT)
         self.assertTrue(all(job.attempts == 1 for job in drained))

@@ -43,6 +43,12 @@ job = generate_pdf.enqueue(123)
 print(job.id, job.status)
 ```
 
+Or from async code, which is the native path:
+
+```python
+job = await generate_pdf.aenqueue(123)
+```
+
 Run a worker:
 
 ```bash
@@ -87,6 +93,7 @@ tinyjobs worker --app examples.demo:app --concurrency 4
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
 | Attempt history | every attempt is a row, with its traceback and timings |
 | Multi-worker | multiple processes and machines over one file or backend |
+| Async throughout | the backend protocol is `async`, with a sync facade for ordinary code |
 | Cancellation | before a job starts; cooperative after |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
@@ -162,6 +169,11 @@ redis = "tinyjobs_redis:RedisBackend"
 Backends declare what they support (`priority`, `delayed`, `dedup`, ...) and asking for something
 unsupported raises when you enqueue rather than failing quietly later. No Redis or Postgres backend
 exists yet.
+
+The protocol is `async`, so a backend built on a network client talks to it directly with no threads
+in the way. SQLite is the odd one out: `sqlite3` is a blocking C library, so that backend does its own
+thread hop internally, on a dedicated single-worker executor. `tests/test_async_backend.py` implements
+a working in-memory backend in about 120 lines if you want a template.
 
 ## Status
 

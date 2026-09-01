@@ -88,7 +88,7 @@ class JobsCommand(Command):
         if job.last_error:
             print(f"last error {job.last_error}")
         print("\nattempts")
-        for execution in app.backend.executions(job.id):
+        for execution in app.executions(job.id):
             print(
                 f"  {execution.attempt:>3}  {str(execution.status):<8} "
                 f"{format_duration(execution.duration):>8}  "

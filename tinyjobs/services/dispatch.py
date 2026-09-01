@@ -33,10 +33,10 @@ class DispatchService:
         self._default_queue = default_queue
         self._registry = registry
 
-    def dispatch_by_name(
+    async def dispatch_by_name(
         self, name: str, payload: JobPayload, options: EnqueueOptions
     ) -> Job:
-        return self._backend.enqueue(
+        return await self._backend.enqueue(
             self.build(name, payload, self._with_task_defaults(name, options))
         )
 
