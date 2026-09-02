@@ -1,15 +1,16 @@
 name: release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -39,10 +40,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check the release tag matches the packaged version
-        if: github.event_name == 'release'
+      - name: Check the tag matches the packaged version
+        if: github.event_name == 'push'
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.ref_name }}
         run: |
           python - <<'CHECK'
           import os
@@ -54,9 +55,9 @@ jobs:
           tag = os.environ["TAG"].removeprefix("v")
           if tag != version:
               sys.exit(
-                  f"release tag {tag!r} does not match the version in "
-                  f"pyproject.toml ({version!r}); PyPI version numbers cannot "
-                  f"be reused, so this run is stopping before it publishes"
+                  f"tag {tag!r} does not match the version in pyproject.toml "
+                  f"({version!r}); PyPI version numbers cannot be reused, so "
+                  f"this run is stopping before it publishes"
               )
           print(f"tag and pyproject agree on {version}")
           CHECK
