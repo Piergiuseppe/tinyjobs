@@ -88,12 +88,12 @@ def seed() -> None:
     print(f"  the two 'unique-work' calls share one job: {jobs[-3].id == jobs[-2].id}")
     print()
     print("now run the worker and watch:")
-    print("  python3.12 -m tinyjobs.cli worker --app examples.demo:app --concurrency 4")
+    print("  tinyjobs worker --app examples.demo:app --concurrency 4")
     print()
     print("then inspect:")
-    print("  python3.12 -m tinyjobs.cli jobs list --app examples.demo:app")
-    print("  python3.12 -m tinyjobs.cli jobs list --app examples.demo:app --status failed")
-    print("  python3.12 -m tinyjobs.cli jobs show <job-id> --app examples.demo:app")
+    print("  tinyjobs jobs list --app examples.demo:app")
+    print("  tinyjobs jobs list --app examples.demo:app --status failed")
+    print("  tinyjobs jobs show <job-id> --app examples.demo:app")
 
 
 if __name__ == "__main__":

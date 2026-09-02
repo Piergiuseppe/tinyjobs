@@ -1,3 +1,19 @@
+import sys
+
+MINIMUM_PYTHON = (3, 11)
+
+if sys.version_info < MINIMUM_PYTHON:
+    raise RuntimeError(
+        "tinyjobs needs Python {}.{} or newer, but this is Python {}.{} at {}. "
+        "Run it with a newer interpreter, for example: "
+        "python3.12 -m examples.demo".format(
+            *MINIMUM_PYTHON,
+            sys.version_info.major,
+            sys.version_info.minor,
+            sys.executable,
+        )
+    )
+
 from .app import TinyJobs
 from .exceptions import (
     Abandon,
