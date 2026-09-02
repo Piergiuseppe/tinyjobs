@@ -1,0 +1,96 @@
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run the test suite
+        run: python -m unittest discover -s tests -t . --verbose
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the release tag matches the packaged version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'CHECK'
+          import os
+          import sys
+          import tomllib
+
+          with open("pyproject.toml", "rb") as handle:
+              version = tomllib.load(handle)["project"]["version"]
+          tag = os.environ["TAG"].removeprefix("v")
+          if tag != version:
+              sys.exit(
+                  f"release tag {tag!r} does not match the version in "
+                  f"pyproject.toml ({version!r}); PyPI version numbers cannot "
+                  f"be reused, so this run is stopping before it publishes"
+              )
+          print(f"tag and pyproject agree on {version}")
+          CHECK
+
+      - name: Build the sdist and the wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check that the package installs and imports from the wheel
+        run: |
+          python -m venv /tmp/check
+          /tmp/check/bin/pip install --quiet dist/*.whl
+          /tmp/check/bin/python -c "import tinyjobs; print(tinyjobs.__version__)"
+          /tmp/check/bin/tinyjobs --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: tinyjobs
+      url: https://pypi.org/p/tinyjobs
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
