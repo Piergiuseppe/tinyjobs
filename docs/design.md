@@ -807,9 +807,12 @@ Results are serialized with the same codec as the arguments, capped at a configu
 64 KiB; a result larger than that belongs in object storage, with the job returning a key), and
 deleted when the TTL expires.
 
-`await job.result()` polls with the same adaptive backoff as the worker loop. It is a convenience for
-scripts and tests, not a synchronization primitive: blocking a request thread on a background job
-means you did not need a background job.
+`job.wait(timeout=...)` and `await job.awaited(timeout=...)` poll with the same adaptive backoff as
+the worker loop, and return the job rather than raising on failure: a job that failed still has a
+status, an attempt count and a last error worth reading. Only the timeout raises.
+
+They are a convenience for scripts, tests and glue code, not a synchronisation primitive. Blocking a
+request thread on a background job means you did not need a background job.
 
 ---
 

@@ -402,3 +402,103 @@ class RefreshAgainstAWorkerTests(WorkerTestCase):
         with self.assertRaises(SynchronousCallInsideEventLoopError) as caught:
             job.refresh()
         self.assertIn("arefresh", str(caught.exception))
+
+
+class WaitTests(WorkerTestCase):
+    async def test_awaited_blocks_until_the_job_is_done_and_yields_the_result(self):
+        @self.app.task(store_result=True)
+        async def handler(value):
+            await asyncio.sleep(0.2)
+            return value * 2
+
+        job = await handler.aenqueue(21)
+        worker = self.make_worker()
+        runner = asyncio.create_task(worker.start())
+
+        settled = await job.awaited(timeout=10)
+
+        self.assertIs(settled, job)
+        self.assertIs(job.status, JobStatus.SUCCESS)
+        self.assertEqual(job.result(), 42)
+
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+
+    async def test_awaited_returns_on_failure_rather_than_raising(self):
+        @self.app.task(max_attempts=1)
+        async def handler():
+            raise ValueError("boom")
+
+        job = await handler.aenqueue()
+        worker = self.make_worker()
+        runner = asyncio.create_task(worker.start())
+
+        await job.awaited(timeout=10)
+
+        self.assertIs(job.status, JobStatus.FAILED)
+        self.assertIn("boom", job.last_error)
+        self.assertIsNone(job.result())
+
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+
+    async def test_awaited_survives_retries_and_reports_the_attempts(self):
+        tries = []
+
+        @self.app.task(max_attempts=3, retry_base=0.05, retry_jitter=False,
+                       store_result=True)
+        async def handler():
+            tries.append(1)
+            if len(tries) < 3:
+                raise ConnectionError("nope")
+            return "recovered"
+
+        job = await handler.aenqueue()
+        worker = self.make_worker()
+        runner = asyncio.create_task(worker.start())
+
+        await job.awaited(timeout=10)
+
+        self.assertIs(job.status, JobStatus.SUCCESS)
+        self.assertEqual(job.attempts, 3)
+        self.assertEqual(job.result(), "recovered")
+
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+
+    async def test_awaited_times_out_when_nothing_is_consuming(self):
+        from tinyjobs.exceptions import WaitTimeout
+
+        @self.app.task
+        async def handler():
+            return None
+
+        job = await handler.aenqueue()
+        with self.assertRaises(WaitTimeout) as caught:
+            await job.awaited(timeout=0.3)
+        self.assertIn("queued", str(caught.exception))
+        self.assertIsInstance(caught.exception, TimeoutError)
+
+    async def test_awaited_returns_at_once_for_an_already_finished_job(self):
+        @self.app.task
+        async def handler():
+            return None
+
+        job = await handler.aenqueue()
+        await self.app.acancel(job.id)
+        started = time.monotonic()
+        await job.awaited(timeout=5)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIs(job.status, JobStatus.CANCELLED)
+
+    async def test_the_sync_wait_is_refused_inside_a_loop(self):
+        from tinyjobs.exceptions import SynchronousCallInsideEventLoopError
+
+        @self.app.task
+        async def handler():
+            return None
+
+        job = await handler.aenqueue()
+        with self.assertRaises(SynchronousCallInsideEventLoopError) as caught:
+            job.wait(timeout=1)
+        self.assertIn("awaited", str(caught.exception))

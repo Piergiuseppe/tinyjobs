@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field, fields
 from typing import Any, TYPE_CHECKING
 
-from .exceptions import JobNotFoundError, TinyJobsError
+from .exceptions import JobNotFoundError, TinyJobsError, WaitTimeout
+from .polling import AdaptiveInterval
 from .status import ExecutionStatus, JobStatus
 
 if TYPE_CHECKING:
@@ -61,6 +64,42 @@ class Job:
                 f"job {self.id} is no longer in the store; it may have been purged"
             )
         return self._absorb(fresh)
+
+    def wait(
+        self,
+        timeout: float | None = None,
+        *,
+        poll_minimum: float = 0.02,
+        poll_maximum: float = 1.0,
+    ) -> "Job":
+        return self._app_or_fail().run_sync(
+            self.awaited(
+                timeout, poll_minimum=poll_minimum, poll_maximum=poll_maximum
+            ),
+            name="wait",
+            async_name="awaited",
+        )
+
+    async def awaited(
+        self,
+        timeout: float | None = None,
+        *,
+        poll_minimum: float = 0.02,
+        poll_maximum: float = 1.0,
+    ) -> "Job":
+        interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            await self.arefresh()
+            if self.status.is_terminal:
+                return self
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise WaitTimeout(
+                    f"job {self.id} was still {self.status} after {timeout}s"
+                )
+            pause = interval.next()
+            await asyncio.sleep(pause if remaining is None else min(pause, remaining))
 
     def result(self) -> Any:
         if self.result_payload is None:

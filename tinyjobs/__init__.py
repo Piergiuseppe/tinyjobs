@@ -23,6 +23,7 @@ from .exceptions import (
     TinyJobsError,
     UnknownBackendError,
     UnknownTaskError,
+    WaitTimeout,
 )
 from .models import Execution, ExecutionError, Job, JobPayload
 from .retry import RetryPolicy
@@ -65,6 +66,7 @@ __all__ = [
     "TinyJobsError",
     "UnknownBackendError",
     "UnknownTaskError",
+    "WaitTimeout",
     "Worker",
     "__version__",
 ]

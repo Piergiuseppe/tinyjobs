@@ -28,11 +28,19 @@ class LoopRunner:
         self._thread: threading.Thread | None = None
         self._guard = threading.Lock()
 
-    def run(self, coroutine: Coroutine[Any, Any, T], *, name: str = "this call") -> T:
+    def run(
+        self,
+        coroutine: Coroutine[Any, Any, T],
+        *,
+        name: str = "this call",
+        async_name: str | None = None,
+    ) -> T:
         if inside_running_loop():
             coroutine.close()
             raise SynchronousCallInsideEventLoopError(
-                INSIDE_LOOP_MESSAGE.format(name=name, async_name=f"a{name}")
+                INSIDE_LOOP_MESSAGE.format(
+                    name=name, async_name=async_name or f"a{name}"
+                )
             )
         return asyncio.run_coroutine_threadsafe(coroutine, self._ensure_loop()).result()
 

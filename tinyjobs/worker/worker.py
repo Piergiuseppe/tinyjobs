@@ -8,7 +8,7 @@ from ..exceptions import UnknownTaskError
 from ..ids import new_worker_id
 from ..models import Job
 from ..executors import ExecutorResolver
-from .polling import AdaptiveInterval
+from ..polling import AdaptiveInterval
 from .signals import ShutdownWatcher
 
 if TYPE_CHECKING:

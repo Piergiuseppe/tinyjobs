@@ -74,6 +74,24 @@ job.refresh().result()     # '/tmp/123.pdf'
 Results are off by default because most jobs are run for their side effects, and storing return
 values nobody reads is write amplification on the hot path.
 
+If you want to block until a job is finished, `wait` polls for you:
+
+```python
+job = generate_pdf.enqueue(123)
+print(job.wait(timeout=30).result())     # '/tmp/123.pdf'
+
+await job.awaited(timeout=30)            # from async code
+```
+
+It returns the job whatever the outcome, rather than raising, so a failed job leaves you holding
+`job.status`, `job.attempts` and `job.last_error` to look at. Only the timeout raises, as
+`WaitTimeout`, which is also a `TimeoutError` if you would rather catch that.
+
+The async twin is called `awaited` and not `await` for the boring reason that `await` is a keyword.
+
+Waiting on a job from the request that created it means you did not need a background job. It is meant
+for scripts, tests and glue code.
+
 Or from async code, which is the native path:
 
 ```python

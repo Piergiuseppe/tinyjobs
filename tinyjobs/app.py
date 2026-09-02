@@ -90,8 +90,14 @@ class TinyJobs:
             raise BackendNotReadyError("the backend is not connected yet")
         return self._lifecycle
 
-    def run_sync(self, coroutine: Coroutine[Any, Any, T], *, name: str) -> T:
-        return self._runner.run(coroutine, name=name)
+    def run_sync(
+        self,
+        coroutine: Coroutine[Any, Any, T],
+        *,
+        name: str,
+        async_name: str | None = None,
+    ) -> T:
+        return self._runner.run(coroutine, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
         return job.bound_to(self) if job is not None else None
