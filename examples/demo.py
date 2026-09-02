@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+import shutil
+import sys
 import time
+from pathlib import Path
 
 from tinyjobs import Abandon, Retry, TinyJobs
 
@@ -59,6 +62,14 @@ def rich_arguments(when, amount, tags, path) -> str:
     return f"{when!r} {amount!r} {tags!r} {path!r}"
 
 
+def command_prefix() -> str:
+    name = Path(sys.executable).name
+    found = shutil.which(name)
+    if found and Path(found).resolve() == Path(sys.executable).resolve():
+        return f"{name} -m tinyjobs"
+    return f"{sys.executable} -m tinyjobs"
+
+
 def seed() -> None:
     from datetime import datetime
     from decimal import Decimal
@@ -87,13 +98,14 @@ def seed() -> None:
     print(f"enqueued {len(jobs)} calls into demo.db")
     print(f"  the two 'unique-work' calls share one job: {jobs[-3].id == jobs[-2].id}")
     print()
+    cli = command_prefix()
     print("now run the worker and watch:")
-    print("  tinyjobs worker --app examples.demo:app --concurrency 4")
+    print(f"  {cli} worker --app examples.demo:app --concurrency 4")
     print()
     print("then inspect:")
-    print("  tinyjobs jobs list --app examples.demo:app")
-    print("  tinyjobs jobs list --app examples.demo:app --status failed")
-    print("  tinyjobs jobs show <job-id> --app examples.demo:app")
+    print(f"  {cli} jobs list --app examples.demo:app")
+    print(f"  {cli} jobs list --app examples.demo:app --status failed")
+    print(f"  {cli} jobs show <job-id> --app examples.demo:app")
 
 
 if __name__ == "__main__":

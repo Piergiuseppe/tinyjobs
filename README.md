@@ -55,6 +55,13 @@ Run a worker:
 tinyjobs worker --app tasks:app --concurrency 8
 ```
 
+`tinyjobs` is installed as a command, but `python -m tinyjobs` does the same thing and is handy when
+you have not activated a virtualenv:
+
+```bash
+python3.13 -m tinyjobs worker --app tasks:app --concurrency 8
+```
+
 Look at what happened:
 
 ```bash
