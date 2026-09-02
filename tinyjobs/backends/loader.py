@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from importlib.metadata import entry_points
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -33,12 +32,18 @@ def load_backend(url: str, **options: Any) -> Any:
 
 
 def available_schemes() -> list[str]:
-    plugins = {ep.name for ep in entry_points(group=ENTRY_POINT_GROUP)}
+    plugins = {point.name for point in _plugin_entry_points()}
     return sorted(set(_BUILTIN_FACTORIES) | plugins)
 
 
+def _plugin_entry_points():
+    from importlib.metadata import entry_points
+
+    return entry_points(group=ENTRY_POINT_GROUP)
+
+
 def _load_plugin(scheme: str) -> Callable[..., Any] | None:
-    for entry_point in entry_points(group=ENTRY_POINT_GROUP):
+    for entry_point in _plugin_entry_points():
         if entry_point.name == scheme:
             return entry_point.load()
     return None

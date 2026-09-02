@@ -30,7 +30,23 @@ from .status import ExecutionStatus, JobStatus
 from .task import Task
 from .worker import Worker
 
-__version__ = "0.1.0"
+UNINSTALLED_VERSION = "0.0.0+unknown"
+
+_version: str | None = None
+
+
+def __getattr__(name: str) -> str:
+    if name != "__version__":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    global _version
+    if _version is None:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            _version = version("tinyjobs")
+        except PackageNotFoundError:
+            _version = UNINSTALLED_VERSION
+    return _version
 
 __all__ = [
     "Abandon",

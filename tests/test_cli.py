@@ -219,3 +219,30 @@ class ModuleEntryPointTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class VersionTests(unittest.TestCase):
+    def test_the_version_comes_from_the_package_metadata(self):
+        import tinyjobs
+
+        self.assertIsInstance(tinyjobs.__version__, str)
+        self.assertTrue(tinyjobs.__version__)
+
+    def test_it_is_not_duplicated_in_the_source(self):
+        from pathlib import Path
+
+        source = (Path(tinyjobs_dir()) / "__init__.py").read_text()
+        self.assertNotIn('__version__ = "0.', source)
+
+    def test_unknown_module_attributes_still_raise(self):
+        import tinyjobs
+
+        with self.assertRaises(AttributeError):
+            tinyjobs.__does_not_exist__
+
+
+def tinyjobs_dir() -> str:
+    import tinyjobs
+    from pathlib import Path
+
+    return str(Path(tinyjobs.__file__).parent)
