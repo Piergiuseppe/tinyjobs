@@ -360,3 +360,45 @@ class ShutdownTests(WorkerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshAgainstAWorkerTests(WorkerTestCase):
+    async def test_arefresh_follows_a_job_all_the_way_to_success(self):
+        @self.app.task(store_result=True)
+        async def handler(value):
+            return value * 2
+
+        job = await handler.aenqueue(21)
+        self.assertIs(job.status, JobStatus.QUEUED)
+
+        await self.settle(self.make_worker(), [job])
+
+        await job.arefresh()
+        self.assertIs(job.status, JobStatus.SUCCESS)
+        self.assertEqual(job.attempts, 1)
+        self.assertEqual(job.result(), 42)
+
+    async def test_arefresh_shows_the_attempts_climbing(self):
+        @self.app.task(max_attempts=3, retry_base=0.05, retry_jitter=False)
+        async def handler():
+            raise ConnectionError("nope")
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+
+        await job.arefresh()
+        self.assertIs(job.status, JobStatus.FAILED)
+        self.assertEqual(job.attempts, 3)
+        self.assertIn("nope", job.last_error)
+
+    async def test_the_sync_refresh_is_refused_inside_a_loop(self):
+        from tinyjobs.exceptions import SynchronousCallInsideEventLoopError
+
+        @self.app.task
+        async def handler():
+            return None
+
+        job = await handler.aenqueue()
+        with self.assertRaises(SynchronousCallInsideEventLoopError) as caught:
+            job.refresh()
+        self.assertIn("arefresh", str(caught.exception))

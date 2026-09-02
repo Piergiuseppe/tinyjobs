@@ -1,9 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, fields
+from typing import Any, TYPE_CHECKING
 
+from .exceptions import JobNotFoundError, TinyJobsError
 from .status import ExecutionStatus, JobStatus
+
+if TYPE_CHECKING:
+    from .app import TinyJobs
+
+UNBOUND_MESSAGE = (
+    "this Job was not handed out by a TinyJobs app, so it has nothing to talk "
+    "to; jobs returned by enqueue(), app.get() and app.jobs() are bound"
+)
+IMMUTABLE_FIELDS = frozenset({"id", "task", "payload", "codec", "created_at", "_app"})
 
 
 @dataclass(slots=True)
@@ -29,12 +39,45 @@ class Job:
     lease_expires_at: float | None = None
     worker_id: str | None = None
     dedup_key: str | None = None
-    result: bytes | None = None
+    result_payload: bytes | None = None
     last_error: str | None = None
+    _app: "TinyJobs | None" = field(default=None, compare=False, repr=False)
 
     @property
     def attempts_remaining(self) -> int:
         return max(self.max_attempts - self.attempts, 0)
+
+    def bound_to(self, app: "TinyJobs") -> "Job":
+        self._app = app
+        return self
+
+    def refresh(self) -> "Job":
+        return self._app_or_fail().run_sync(self.arefresh(), name="refresh")
+
+    async def arefresh(self) -> "Job":
+        fresh = await self._app_or_fail().aget(self.id)
+        if fresh is None:
+            raise JobNotFoundError(
+                f"job {self.id} is no longer in the store; it may have been purged"
+            )
+        return self._absorb(fresh)
+
+    def result(self) -> Any:
+        if self.result_payload is None:
+            return None
+        app = self._app_or_fail()
+        return app.serialization.decode_result(self.result_payload, self.codec)
+
+    def _absorb(self, other: "Job") -> "Job":
+        for entry in fields(self):
+            if entry.name not in IMMUTABLE_FIELDS:
+                setattr(self, entry.name, getattr(other, entry.name))
+        return self
+
+    def _app_or_fail(self) -> "TinyJobs":
+        if self._app is None:
+            raise TinyJobsError(UNBOUND_MESSAGE)
+        return self._app
 
 
 @dataclass(slots=True)

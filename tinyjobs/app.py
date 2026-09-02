@@ -93,6 +93,9 @@ class TinyJobs:
     def run_sync(self, coroutine: Coroutine[Any, Any, T], *, name: str) -> T:
         return self._runner.run(coroutine, name=name)
 
+    def bind(self, job: Job | None) -> Job | None:
+        return job.bound_to(self) if job is not None else None
+
     async def ready(self) -> None:
         if self._backend is not None:
             return
@@ -175,8 +178,10 @@ class TinyJobs:
     ) -> Job:
         await self.ready()
         payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
-        return await self.dispatch.dispatch_by_name(
-            name, payload, EnqueueOptions().merged_with(**options)
+        return self.bind(
+            await self.dispatch.dispatch_by_name(
+                name, payload, EnqueueOptions().merged_with(**options)
+            )
         )
 
     def send(self, name: str, *args: Any, **kwargs: Any) -> Job:
@@ -184,7 +189,7 @@ class TinyJobs:
 
     async def aget(self, job_id: str) -> Job | None:
         await self.ready()
-        return await self.backend.get(job_id)
+        return self.bind(await self.backend.get(job_id))
 
     def get(self, job_id: str) -> Job | None:
         return self.run_sync(self.aget(job_id), name="get")
@@ -198,9 +203,12 @@ class TinyJobs:
         cursor: str | None = None,
     ) -> Page:
         await self.ready()
-        return await self.backend.list(
+        page = await self.backend.list(
             status=status, queue=queue, limit=limit, cursor=cursor
         )
+        for job in page.items:
+            self.bind(job)
+        return page
 
     def jobs(self, **options: Any) -> Page:
         return self.run_sync(self.ajobs(**options), name="jobs")

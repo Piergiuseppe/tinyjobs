@@ -77,8 +77,8 @@ class Task:
     ) -> Job:
         payload = self.bind(args, kwargs)
         await self._app.ready()
-        return await self._app.dispatch.dispatch_by_name(
-            self._name, payload, options
+        return self._app.bind(
+            await self._app.dispatch.dispatch_by_name(self._name, payload, options)
         )
 
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:

@@ -228,3 +228,89 @@ class ControlTests(BackendTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshTests(BackendTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        @self.app.task(store_result=True)
+        def handler(value):
+            return {"doubled": value * 2}
+
+        self.handler = handler
+
+    def test_refresh_picks_up_a_status_written_elsewhere(self):
+        job = self.handler.enqueue(3)
+        self.assertIs(job.status, JobStatus.QUEUED)
+        self.app.cancel(job.id)
+
+        self.assertIs(job.refresh().status, JobStatus.CANCELLED)
+
+    def test_refresh_mutates_in_place_and_returns_self(self):
+        job = self.handler.enqueue(3)
+        self.app.cancel(job.id)
+        returned = job.refresh()
+        self.assertIs(returned, job)
+        self.assertIs(job.status, JobStatus.CANCELLED)
+
+    def test_refresh_leaves_the_identity_alone(self):
+        job = self.handler.enqueue(3)
+        original_id, original_task = job.id, job.task
+        self.app.cancel(job.id)
+        job.refresh()
+        self.assertEqual(job.id, original_id)
+        self.assertEqual(job.task, original_task)
+
+    def test_refresh_raises_once_the_job_is_gone(self):
+        from tinyjobs.exceptions import JobNotFoundError
+
+        job = self.handler.enqueue(3)
+        self.drive(
+            self.app.backend._call(
+                lambda: self.app.backend._connections.connection.execute(
+                    "DELETE FROM jobs WHERE id = ?", (job.id,)
+                )
+            )
+        )
+        with self.assertRaises(JobNotFoundError):
+            job.refresh()
+
+    def test_jobs_from_listings_are_refreshable_too(self):
+        self.handler.enqueue(3)
+        listed = self.app.jobs(limit=1).items[0]
+        self.app.cancel(listed.id)
+        self.assertIs(listed.refresh().status, JobStatus.CANCELLED)
+
+    def test_a_hand_built_job_says_it_is_unbound(self):
+        from tinyjobs.exceptions import TinyJobsError
+        from tinyjobs.models import Job
+
+        orphan = Job(
+            id="x",
+            task="t",
+            payload=b"{}",
+            codec="json",
+            queue="default",
+            status=JobStatus.QUEUED,
+        )
+        with self.assertRaises(TinyJobsError) as caught:
+            orphan.refresh()
+        self.assertIn("not handed out by a TinyJobs app", str(caught.exception))
+
+    def test_result_is_none_until_the_task_has_run(self):
+        self.assertIsNone(self.handler.enqueue(3).result())
+
+    def test_result_decodes_the_stored_return_value(self):
+        job = self.handler.enqueue(21)
+        claimed = self.drive(
+            self.app.backend.claim(
+                worker_id="w", queues=("default",), limit=1, lease_seconds=60
+            )
+        )[0]
+        self.drive(
+            self.app.lifecycle.succeed(
+                claimed, self.handler, {"doubled": 42}
+            )
+        )
+        self.assertEqual(job.refresh().result(), {"doubled": 42})

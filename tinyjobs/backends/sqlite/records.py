@@ -46,7 +46,7 @@ def job_to_row(job: Job) -> tuple:
         job.lease_expires_at,
         job.worker_id,
         job.dedup_key,
-        job.result,
+        job.result_payload,
         job.last_error,
     )
 
@@ -68,7 +68,7 @@ def job_from_row(row: sqlite3.Row) -> Job:
         lease_expires_at=row["lease_expires_at"],
         worker_id=row["worker_id"],
         dedup_key=row["dedup_key"],
-        result=row["result"],
+        result_payload=row["result"],
         last_error=row["last_error"],
     )
 

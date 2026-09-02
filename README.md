@@ -43,14 +43,36 @@ job = generate_pdf.enqueue(123)
 print(job.id)          # 01a061bf-c08a-738d-...
 ```
 
-`enqueue` gives you back a snapshot of the row it just wrote, not a live handle. The `Job` you are
-holding will say `queued` forever, however long you wait, because nothing updates it: the worker that
-runs your task is a different process writing to the database. To see where a job got to, read it
-back:
+`enqueue` gives you back a snapshot of the row it just wrote, not a live handle, so the `Job` you are
+holding keeps saying `queued`: the worker that runs your task is a different process writing to the
+database, and nothing reaches back into your object. Ask for the current state when you want it:
 
 ```python
-app.get(job.id).status     # queued -> running -> success
+job.refresh()          # updates this instance in place, and returns it
+job.status             # queued -> running -> success
+job.attempts           # 3, if it took three tries
+job.last_error         # 'ConnectionError: refused', when it failed
+
+app.get(job.id)        # or a fresh object, if you prefer not to mutate
 ```
+
+Attribute access never does I/O on its own. `refresh()` is the one place a round trip happens, which
+keeps `for job in jobs: print(job.status)` from quietly becoming a thousand queries.
+
+If the task returns something you want back, ask for it to be kept:
+
+```python
+@app.task(store_result=True)
+async def generate_pdf(document_id: int) -> str:
+    return f"/tmp/{document_id}.pdf"
+
+job = generate_pdf.enqueue(123)
+...
+job.refresh().result()     # '/tmp/123.pdf'
+```
+
+Results are off by default because most jobs are run for their side effects, and storing return
+values nobody reads is write amplification on the hot path.
 
 Or from async code, which is the native path:
 

@@ -96,7 +96,7 @@ class SQLiteBackendTests(AsyncBackendTestCase):
         self.assertTrue(await self.backend.complete(claimed, b'"done"'))
         stored = await self.backend.get(job.id)
         self.assertIs(stored.status, JobStatus.SUCCESS)
-        self.assertEqual(stored.result, b'"done"')
+        self.assertEqual(stored.result_payload, b'"done"')
         self.assertIsNone(stored.lease_expires_at)
         self.assertIs(
             (await self.backend.executions(job.id))[0].status, ExecutionStatus.SUCCESS

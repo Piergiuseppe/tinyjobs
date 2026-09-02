@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tinyjobs"
-version = "0.1.0"
+version = "0.1.1"
 description = "Background jobs and cron for Python, on SQLite, with zero dependencies"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Piergiuseppe D'Abbraccio", email = "piergiuseppedabbraccio@gmail.com" },
 ]
@@ -17,7 +18,6 @@ dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

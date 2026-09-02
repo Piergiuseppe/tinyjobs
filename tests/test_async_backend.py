@@ -64,7 +64,7 @@ class RamBackend(BaseBackend):
             if current is None or current.worker_id != job.worker_id:
                 return False
             self._jobs[job.id] = replace(
-                current, status=JobStatus.SUCCESS, result=result
+                current, status=JobStatus.SUCCESS, result_payload=result
             )
             self._attempts[job.id][-1] = "success"
             return True
