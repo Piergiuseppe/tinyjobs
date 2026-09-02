@@ -68,6 +68,12 @@ class EnqueueTests(BackendTestCase):
 
         self.handler = handler
 
+    def test_the_returned_job_is_a_snapshot_not_a_live_handle(self):
+        job = self.handler.enqueue(7)
+        self.assertTrue(self.app.cancel(job.id))
+        self.assertIs(job.status, JobStatus.QUEUED)
+        self.assertIs(self.app.get(job.id).status, JobStatus.CANCELLED)
+
     def test_enqueue_persists_a_queued_job(self):
         job = self.handler.enqueue(7, reason="test")
         stored = self.app.get(job.id)

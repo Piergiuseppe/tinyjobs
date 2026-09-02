@@ -40,7 +40,16 @@ Enqueue from anywhere, including plain sync code:
 from tasks import generate_pdf
 
 job = generate_pdf.enqueue(123)
-print(job.id, job.status)
+print(job.id)          # 01a061bf-c08a-738d-...
+```
+
+`enqueue` gives you back a snapshot of the row it just wrote, not a live handle. The `Job` you are
+holding will say `queued` forever, however long you wait, because nothing updates it: the worker that
+runs your task is a different process writing to the database. To see where a job got to, read it
+back:
+
+```python
+app.get(job.id).status     # queued -> running -> success
 ```
 
 Or from async code, which is the native path:
