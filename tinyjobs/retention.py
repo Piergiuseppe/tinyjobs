@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .duration import format_duration
 from .status import JobStatus
 
 DAY = 86400.0
@@ -36,7 +37,7 @@ class RetentionPolicy:
         if not self.enabled:
             return "retention disabled, nothing is pruned"
         parts = [
-            f"{name} {int(keep)}s"
+            f"{name} {format_duration(keep)}"
             for name, keep in (
                 ("success", self.success),
                 ("cancelled", self.cancelled),
@@ -44,7 +45,10 @@ class RetentionPolicy:
             )
             if keep > 0
         ]
-        return f"keeping {', '.join(parts)}, sweeping every {int(self.interval)}s"
+        return (
+            f"keeping {', '.join(parts)}, "
+            f"sweeping every {format_duration(self.interval)}"
+        )
 
 
 KEEP_EVERYTHING = RetentionPolicy(success=0, cancelled=0, failed=0)

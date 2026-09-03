@@ -13,7 +13,7 @@ from tinyjobs.status import ExecutionStatus, JobStatus
 
 
 class RamBackend(BaseBackend):
-    capabilities = Capabilities(dedup=True)
+    capabilities = Capabilities(dedup=True, retention=True)
 
     def __init__(self, url: str, **options) -> None:
         self._jobs: dict[str, Job] = {}
@@ -120,6 +120,27 @@ class RamBackend(BaseBackend):
     async def reap_expired(self) -> int:
         return 0
 
+    async def counts_by_status(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for job in self._jobs.values():
+            counts[str(job.status)] = counts.get(str(job.status), 0) + 1
+        return counts
+
+    async def purge(self, policy, now: float) -> int | None:
+        if not policy.enabled:
+            return None
+        horizons = policy.horizons(now)
+        async with self._lock:
+            doomed = [
+                job.id for job in self._jobs.values()
+                if job.status in horizons
+                and job.finished_at is not None
+                and job.finished_at < horizons[job.status]
+            ]
+            for job_id in doomed:
+                del self._jobs[job_id]
+        return len(doomed)
+
 
 register_builtin("ram", RamBackend.from_url)
 
@@ -214,3 +235,43 @@ class SyncOnlyUsageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThirdPartyRetentionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.app = TinyJobs("ram://")
+        await self.app.ready()
+
+    async def asyncTearDown(self) -> None:
+        await self.app.aclose()
+
+    async def test_a_plugin_can_implement_its_own_pruning(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        @self.app.task
+        async def handler(value):
+            return value
+
+        job = await handler.aenqueue(1)
+        claimed = await self.app.backend.claim(
+            worker_id="w", queues=("default",), limit=1, lease_seconds=60
+        )
+        await self.app.backend.complete(claimed[0], None)
+        self.app.backend._jobs[job.id] = replace(
+            self.app.backend._jobs[job.id], finished_at=100.0
+        )
+
+        removed = await self.app.apurge(
+            RetentionPolicy(success=10.0, cancelled=0, failed=0, interval=0.0)
+        )
+        self.assertEqual(removed, 1)
+        self.assertIsNone(await self.app.aget(job.id))
+
+    async def test_counts_come_from_the_plugin(self):
+        @self.app.task
+        async def handler(value):
+            return value
+
+        await handler.aenqueue(1)
+        await handler.aenqueue(2)
+        self.assertEqual(await self.app.acounts(), {"queued": 2})

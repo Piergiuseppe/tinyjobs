@@ -251,6 +251,20 @@ def tinyjobs_dir() -> str:
 
 
 class PurgeCommandTests(FixtureApp, unittest.TestCase):
+    def test_purge_works_as_the_very_first_command(self):
+        code, output = self.invoke(
+            "purge", "--app", "fixture_app:app", "--before", "1d"
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("removed 0", output)
+
+    def test_dry_run_as_the_very_first_command(self):
+        code, output = self.invoke(
+            "purge", "--app", "fixture_app:app", "--before", "1d", "--dry-run"
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("dry run", output)
+
     def test_dry_run_removes_nothing(self):
         self.invoke("send", "--app", "fixture_app:app", "fixture.echo",
                     "--args", '["hi"]')

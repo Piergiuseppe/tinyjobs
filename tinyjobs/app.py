@@ -249,6 +249,13 @@ class TinyJobs:
     def purge(self, policy: RetentionPolicy | None = None) -> int | None:
         return self.run_sync(self.apurge(policy), name="purge")
 
+    async def acounts(self) -> dict[str, int]:
+        await self.ready()
+        return await self.backend.counts_by_status()
+
+    def counts(self) -> dict[str, int]:
+        return self.run_sync(self.acounts(), name="counts")
+
     async def aexecutions(self, job_id: str) -> list:
         await self.ready()
         return await self.backend.executions(job_id)

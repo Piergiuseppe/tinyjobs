@@ -299,7 +299,7 @@ jobs per second was chosen as a comfortable rate to hold for ten hours, not as a
 
 ## Status
 
-v0.3.0. Working and measured, but young. What's in:
+v0.3.1. Working and measured, but young. What's in:
 
 - task registry, `enqueue`, `app.send`
 - SQLite backend, atomic claim, leases, reaper
@@ -349,7 +349,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-187 tests, no test dependencies. The one that matters most is
+191 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

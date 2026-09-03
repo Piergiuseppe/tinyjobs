@@ -42,9 +42,17 @@ class PurgeCommand(Command):
             print("retention is disabled by these settings, nothing to do")
             return 0
 
-        counts = app.run_sync(app.backend.counts_by_status(), name="counts")
+        counts = app.counts()
         print(f"before: {counts}")
-        print(f"policy: {policy.describe()}")
+        if args.before is None:
+            print(f"policy: {policy.describe()}")
+        elif args.before <= 0:
+            print("policy: pruning every terminal job, whatever its age")
+        else:
+            print(
+                f"policy: pruning terminal jobs that finished more than "
+                f"{format_duration(args.before)} ago"
+            )
         if args.dry_run:
             print("dry run, nothing removed")
             return 0
@@ -53,7 +61,7 @@ class PurgeCommand(Command):
         if removed is None:
             print("another process swept recently, nothing to do")
             return 0
-        after = app.run_sync(app.backend.counts_by_status(), name="counts")
+        after = app.counts()
         print(f"removed {removed} job(s)")
         print(f"after:  {after}")
         return 0
