@@ -231,24 +231,62 @@ in the way. SQLite is the odd one out: `sqlite3` is a blocking C library, so tha
 thread hop internally, on a dedicated single-worker executor. `tests/test_async_backend.py` implements
 a working in-memory backend in about 120 lines if you want a template.
 
+## Measured
+
+Ten hours of steady load on an Apple silicon laptop: three worker processes, eight slots each, one
+SQLite file, a deliberate 25 jobs per second.
+
+```
+892,825 jobs        24.8/s sustained, zero enqueue failures
+68 worker restarts  39 by SIGTERM, 29 by SIGKILL, zero unexpected deaths
+```
+
+Sampled once a minute for the whole run, comparing the first hour against the last:
+
+| | hour 0 | hour 9 |
+| --- | --- | --- |
+| worker RSS | 26.8 MB | 26.6 MB |
+| threads per worker | 10 | 10 |
+| open file descriptors | 47 | 47 |
+| database on disk | 22 MB | 23 MB |
+| end-to-end p95 | 405 ms | 406 ms |
+
+Nothing drifted. The p95 at hour nine is one millisecond off the p95 at hour zero, and the file
+descriptor count was the same 47 in all 595 samples.
+
+A separate burst harness pushes the other end: 2,398 enqueues per second from 24 threads, 572 jobs
+per second end-to-end with six workers, and a crash recovery check that kills every worker while 48
+jobs are mid-flight and confirms all 48 come back and finish. Some of them run twice, which is what
+at-least-once means; the check is that each one applied its side effect once, because the handlers
+are idempotent.
+
+Three caveats worth stating. Retention is not in the library yet, so the harness prunes old jobs; the
+database plateaus at 23 MB instead of growing all night, which is the behaviour you would get from
+the built-in purge once it exists. The tasks are synthetic, with `sleep` standing in for real I/O.
+And 25 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
+
 ## Status
 
-v0.1. Working and tested, but young. What's in:
+v0.2.0. Working and measured, but young. What's in:
 
 - task registry, `enqueue`, `app.send`
 - SQLite backend, atomic claim, leases, reaper
+- async backend protocol with a synchronous facade
 - worker with async and threaded executors, timeouts, graceful shutdown on `SIGTERM`
-- retries with backoff and jitter
+- retries with backoff and jitter, `Retry` and `Abandon`
 - priorities, named queues, delayed jobs, deduplication keys
+- `job.refresh()`, `job.wait()` and `job.result()`
 - `tinyjobs worker` / `jobs` / `send`
 - the backend plugin seam
 
 What's not in yet:
 
-- cron schedules and the scheduler (v0.2)
-- transactional enqueue, so a job is only created if your own transaction commits (v0.3)
-- reading results back, a process executor for CPU-bound work, `memory://` for tests (v0.4)
+- cron schedules and the scheduler, which is the next piece of work
+- automatic retention, so nothing prunes old jobs for you yet and the database grows
+- transactional enqueue, where a job is only created if your own transaction commits
+- a process executor for CPU-bound work, and `memory://` for tests
 - `tinyjobs stats` / `check` / `purge`
+- any backend other than SQLite
 
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
 
@@ -279,7 +317,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-134 tests, no test dependencies. The one that matters most is
+162 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 
