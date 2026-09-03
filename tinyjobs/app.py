@@ -12,6 +12,7 @@ from .exceptions import BackendNotReadyError
 from .models import Job, JobPayload, Page
 from .options import EnqueueOptions
 from .registry import TaskRegistry
+from .retention import RetentionPolicy
 from .retry import RetryPolicy
 from .runtime import LoopRunner
 from .services import DispatchService, JobLifecycleService, SerializationService
@@ -32,12 +33,14 @@ class TinyJobs:
         default_queue: str = "default",
         default_codec: str = "json",
         allow_pickle: bool = False,
+        retention: RetentionPolicy | None = None,
         clock: Clock | None = None,
         **backend_options: Any,
     ) -> None:
         self._url = url
         self._backend_options = backend_options
         self._default_queue = default_queue
+        self._retention = retention or RetentionPolicy()
         self._clock = clock or Clock()
         self._codecs = CodecRegistry(default=default_codec, allow_pickle=allow_pickle)
         self._registry = TaskRegistry()
@@ -56,6 +59,10 @@ class TinyJobs:
     @property
     def clock(self) -> Clock:
         return self._clock
+
+    @property
+    def retention(self) -> RetentionPolicy:
+        return self._retention
 
     @property
     def codec(self) -> CodecRegistry:
@@ -233,6 +240,15 @@ class TinyJobs:
     def retry(self, job_id: str) -> bool:
         return self.run_sync(self.aretry(job_id), name="retry")
 
+    async def apurge(self, policy: RetentionPolicy | None = None) -> int | None:
+        await self.ready()
+        return await self.backend.purge(
+            policy or self._retention, self._clock.now()
+        )
+
+    def purge(self, policy: RetentionPolicy | None = None) -> int | None:
+        return self.run_sync(self.apurge(policy), name="purge")
+
     async def aexecutions(self, job_id: str) -> list:
         await self.ready()
         return await self.backend.executions(job_id)
@@ -244,6 +260,7 @@ class TinyJobs:
         return self._serialization.decode_payload(job)
 
     def worker(self, **options: Any) -> Worker:
+        options.setdefault("retention", self._retention)
         return Worker(self, **options)
 
     async def aclose(self) -> None:

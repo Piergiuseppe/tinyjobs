@@ -502,3 +502,75 @@ class WaitTests(WorkerTestCase):
         with self.assertRaises(SynchronousCallInsideEventLoopError) as caught:
             job.wait(timeout=1)
         self.assertIn("awaited", str(caught.exception))
+
+
+class HousekeepingTests(WorkerTestCase):
+    async def test_the_worker_prunes_on_its_own(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        @self.app.task
+        async def handler(value):
+            return value
+
+        jobs = [await handler.aenqueue(n) for n in range(6)]
+        worker = self.make_worker(
+            retention=RetentionPolicy(
+                success=0.05, cancelled=0.05, failed=0.05, interval=0.0
+            )
+        )
+        runner = asyncio.create_task(worker.start())
+        deadline = time.monotonic() + 20
+        remaining = len(jobs)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            remaining = len((await self.app.ajobs(limit=100)).items)
+            if remaining == 0:
+                break
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+        self.assertEqual(remaining, 0)
+
+    async def test_a_disabled_policy_leaves_everything_alone(self):
+        from tinyjobs.retention import KEEP_EVERYTHING
+
+        @self.app.task
+        async def handler(value):
+            return value
+
+        jobs = [await handler.aenqueue(n) for n in range(4)]
+        worker = self.make_worker(retention=KEEP_EVERYTHING)
+        await self.settle(worker, jobs)
+        self.assertEqual(len((await self.app.ajobs(limit=100)).items), 4)
+
+    async def test_pruning_never_removes_work_still_to_do(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        running = asyncio.Event()
+
+        @self.app.task
+        async def handler(value):
+            running.set()
+            await asyncio.sleep(1.0)
+            return value
+
+        job = await handler.aenqueue(1)
+        queued = await handler.aenqueue(2)
+        worker = self.make_worker(
+            retention=RetentionPolicy(
+                success=1e-9, cancelled=1e-9, failed=1e-9, interval=0.0
+            ),
+            concurrency=1,
+        )
+        runner = asyncio.create_task(worker.start())
+        await asyncio.wait_for(running.wait(), timeout=10)
+        await asyncio.sleep(0.4)
+
+        in_flight = await self.app.aget(job.id)
+        waiting = await self.app.aget(queued.id)
+        self.assertIsNotNone(in_flight, "a running job was pruned")
+        self.assertIs(in_flight.status, JobStatus.RUNNING)
+        self.assertIsNotNone(waiting, "a queued job was pruned")
+        self.assertIs(waiting.status, JobStatus.QUEUED)
+
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=15)

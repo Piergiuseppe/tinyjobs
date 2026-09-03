@@ -74,6 +74,33 @@ job.refresh().result()     # '/tmp/123.pdf'
 Results are off by default because most jobs are run for their side effects, and storing return
 values nobody reads is write amplification on the hot path.
 
+## Keeping the database from growing forever
+
+Terminal jobs are pruned on a schedule. Successes and cancellations are kept for a week, failures for
+thirty days, because failures are the ones you come back to:
+
+```python
+app = TinyJobs("sqlite:///jobs.db", retention=RetentionPolicy(failed=90 * 86400))
+app = TinyJobs("sqlite:///jobs.db", retention=KEEP_EVERYTHING)   # prune nothing
+```
+
+```bash
+tinyjobs worker --app tasks:app --retain-success 7d --retain-failed 30d
+tinyjobs worker --app tasks:app --no-purge
+
+tinyjobs purge --app tasks:app --before 30d --dry-run
+```
+
+Every worker checks whether a sweep is due, and exactly one of them wins, because claiming the sweep
+is a single conditional `UPDATE` on a marker row. So running forty workers still means one sweep per
+interval, with no leader to elect. Queued and running jobs are never touched at any horizon, and each
+sweep deletes in small batches with a cap, so it never holds the write lock long enough to stall a
+claim.
+
+Note that pruning does not shrink the file. SQLite reuses the freed pages, so the database
+**plateaus** rather than shrinking. Handing space back to the filesystem needs `VACUUM`, which wants
+exclusive access, so it stays a manual thing.
+
 If you want to block until a job is finished, `wait` polls for you:
 
 ```python
@@ -151,6 +178,7 @@ tinyjobs worker --app examples.demo:app --concurrency 4
 | Multi-worker | multiple processes and machines over one file or backend |
 | Async throughout | the backend protocol is `async`, with a sync facade for ordinary code |
 | Cancellation | before a job starts; cooperative after |
+| Retention | old terminal jobs are pruned so the database stops growing |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -260,14 +288,18 @@ jobs are mid-flight and confirms all 48 come back and finish. Some of them run t
 at-least-once means; the check is that each one applied its side effect once, because the handlers
 are idempotent.
 
-Three caveats worth stating. Retention is not in the library yet, so the harness prunes old jobs; the
-database plateaus at 23 MB instead of growing all night, which is the behaviour you would get from
-the built-in purge once it exists. The tasks are synthetic, with `sleep` standing in for real I/O.
-And 25 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
+That run predates the built-in retention, so the harness did the pruning. Retention has since been
+measured on its own, same harness with the library doing the work: with it off the database climbed
+from 4.7 to 10.2 MB in three minutes and kept going, and with it on the same curve flattened at 6.9
+MB and stayed there. Under a `SIGKILL` on a worker every thirty seconds it moved 0.6% across eight
+minutes.
+
+Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
+jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
 ## Status
 
-v0.2.0. Working and measured, but young. What's in:
+v0.3.0. Working and measured, but young. What's in:
 
 - task registry, `enqueue`, `app.send`
 - SQLite backend, atomic claim, leases, reaper
@@ -276,16 +308,16 @@ v0.2.0. Working and measured, but young. What's in:
 - retries with backoff and jitter, `Retry` and `Abandon`
 - priorities, named queues, delayed jobs, deduplication keys
 - `job.refresh()`, `job.wait()` and `job.result()`
-- `tinyjobs worker` / `jobs` / `send`
+- retention, so the database plateaus instead of growing
+- `tinyjobs worker` / `jobs` / `send` / `purge`
 - the backend plugin seam
 
 What's not in yet:
 
 - cron schedules and the scheduler, which is the next piece of work
-- automatic retention, so nothing prunes old jobs for you yet and the database grows
 - transactional enqueue, where a job is only created if your own transaction commits
 - a process executor for CPU-bound work, and `memory://` for tests
-- `tinyjobs stats` / `check` / `purge`
+- `tinyjobs stats` and `check`
 - any backend other than SQLite
 
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
@@ -317,7 +349,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-162 tests, no test dependencies. The one that matters most is
+187 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

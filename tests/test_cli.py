@@ -23,7 +23,7 @@ def echo(value):
 '''
 
 
-class CommandLineTests(unittest.TestCase):
+class FixtureApp:
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)
@@ -52,6 +52,8 @@ class CommandLineTests(unittest.TestCase):
             code = main(list(argv))
         return code, buffer.getvalue()
 
+
+class CommandLineTests(FixtureApp, unittest.TestCase):
     def test_send_enqueues_and_prints_the_job_id(self):
         code, output = self.invoke(
             "send", "--app", "fixture_app:app", "fixture.echo", "--args", '["hi"]'
@@ -246,3 +248,40 @@ def tinyjobs_dir() -> str:
     from pathlib import Path
 
     return str(Path(tinyjobs.__file__).parent)
+
+
+class PurgeCommandTests(FixtureApp, unittest.TestCase):
+    def test_dry_run_removes_nothing(self):
+        self.invoke("send", "--app", "fixture_app:app", "fixture.echo",
+                    "--args", '["hi"]')
+        code, output = self.invoke(
+            "purge", "--app", "fixture_app:app", "--before", "0s", "--dry-run"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("dry run", output)
+        self.assertIn("fixture.echo", self.invoke(
+            "jobs", "list", "--app", "fixture_app:app")[1])
+
+    def test_it_refuses_to_prune_queued_jobs(self):
+        self.invoke("send", "--app", "fixture_app:app", "fixture.echo",
+                    "--args", '["hi"]')
+        code, output = self.invoke(
+            "purge", "--app", "fixture_app:app", "--before", "0s"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("removed 0", output)
+
+    def test_a_disabled_policy_says_so(self):
+        code, output = self.invoke(
+            "purge", "--app", "fixture_app:app",
+            "--retain-success", "0", "--retain-cancelled", "0",
+            "--retain-failed", "0",
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("disabled", output)
+
+    def test_a_bad_duration_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["purge", "--app", "x:y", "--before", "domani"]
+            )

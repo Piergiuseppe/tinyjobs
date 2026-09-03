@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
 from ..models import ExecutionError, Job, Page
+from ..retention import RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
 
@@ -14,6 +15,7 @@ class Capabilities:
     delayed: bool = True
     dedup: bool = False
     transactional_enqueue: bool = False
+    retention: bool = False
     max_payload_bytes: int | None = None
 
 
@@ -71,6 +73,10 @@ class Backend(Protocol):
 
     async def reap_expired(self) -> int: ...
 
+    async def purge(
+        self, policy: RetentionPolicy, now: float
+    ) -> int | None: ...
+
 
 class BaseBackend(ABC):
     capabilities: Capabilities = Capabilities()
@@ -86,6 +92,9 @@ class BaseBackend(ABC):
 
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         return [await self.enqueue(job) for job in jobs]
+
+    async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
+        return None
 
     async def __aenter__(self) -> "BaseBackend":
         await self.setup()

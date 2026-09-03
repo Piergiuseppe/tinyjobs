@@ -132,3 +132,19 @@ SELECT_EXECUTIONS = """
 """
 
 COUNT_BY_STATUS = "SELECT status, count(*) AS total FROM jobs GROUP BY status"
+
+CLAIM_HOUSEKEEPING = """
+    UPDATE meta SET value = ?
+     WHERE key = 'last_purge_at'
+       AND (CAST(value AS REAL) = 0 OR CAST(value AS REAL) <= ?)
+    RETURNING key
+"""
+
+PURGE_BATCH = """
+    DELETE FROM jobs
+     WHERE id IN (SELECT id FROM jobs
+                   WHERE status = ? AND finished_at IS NOT NULL AND finished_at < ?
+                   ORDER BY finished_at
+                   LIMIT ?)
+    RETURNING id
+"""

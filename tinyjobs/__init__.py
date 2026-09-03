@@ -26,6 +26,7 @@ from .exceptions import (
     WaitTimeout,
 )
 from .models import Execution, ExecutionError, Job, JobPayload
+from .retention import KEEP_EVERYTHING, RetentionPolicy
 from .retry import RetryPolicy
 from .status import ExecutionStatus, JobStatus
 from .task import Task
@@ -55,10 +56,12 @@ __all__ = [
     "Execution",
     "ExecutionError",
     "ExecutionStatus",
+    "KEEP_EVERYTHING",
     "Job",
     "JobPayload",
     "JobStatus",
     "Retry",
+    "RetentionPolicy",
     "RetryPolicy",
     "SerializationError",
     "Task",

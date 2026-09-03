@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Sequence
 from ..exceptions import UnknownTaskError
 from ..ids import new_worker_id
 from ..models import Job
+from ..retention import RetentionPolicy
 from ..executors import ExecutorResolver
 from ..polling import AdaptiveInterval
 from .signals import ShutdownWatcher
@@ -29,6 +30,7 @@ class Worker:
         reap_interval: float = 30.0,
         shutdown_timeout: float = 30.0,
         unknown_task_delay: float = 60.0,
+        retention: RetentionPolicy | None = None,
         poll_minimum: float = 0.005,
         poll_maximum: float = 0.5,
         worker_id: str | None = None,
@@ -40,6 +42,7 @@ class Worker:
         self._reap_interval = reap_interval
         self._shutdown_timeout = shutdown_timeout
         self._unknown_task_delay = unknown_task_delay
+        self._retention = retention or RetentionPolicy()
         self._interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)
         self._executors = ExecutorResolver(
             concurrency=concurrency, async_concurrency=async_concurrency
@@ -75,6 +78,9 @@ class Worker:
         background = [
             asyncio.create_task(self._heartbeat_loop(), name="tinyjobs-heartbeat"),
             asyncio.create_task(self._reaper_loop(), name="tinyjobs-reaper"),
+            asyncio.create_task(
+                self._housekeeping_loop(), name="tinyjobs-housekeeping"
+            ),
         ]
         try:
             await self._claim_loop()
@@ -197,6 +203,26 @@ class Worker:
                 continue
             if reaped:
                 logger.warning("reclaimed %d job(s) with an expired lease", reaped)
+
+    async def _housekeeping_loop(self) -> None:
+        if not self._retention.enabled:
+            logger.info("retention disabled, nothing will be pruned")
+            return
+        if not self._app.backend.capabilities.retention:
+            logger.info("this backend prunes on its own, skipping housekeeping")
+            return
+        logger.info("retention: %s", self._retention.describe())
+        while True:
+            await asyncio.sleep(self._retention.check_interval)
+            try:
+                removed = await self._app.backend.purge(
+                    self._retention, self._app.clock.now()
+                )
+            except Exception:
+                logger.exception("retention sweep failed")
+                continue
+            if removed:
+                logger.info("retention: pruned %d job(s)", removed)
 
     async def _drain(self) -> None:
         if not self._running:

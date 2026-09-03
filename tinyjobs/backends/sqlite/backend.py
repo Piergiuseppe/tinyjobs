@@ -12,12 +12,14 @@ from urllib.parse import urlsplit
 
 from ...clock import Clock
 from ...models import Execution, ExecutionError, Job, Page
+from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
 from .connection import ConnectionPool
 from .queries import (
     CANCEL_JOB,
+    CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
     FAIL_JOB,
     FINISH_EXECUTION,
@@ -25,6 +27,7 @@ from .queries import (
     INSERT_EXECUTION,
     INSERT_JOB,
     MARK_EXECUTIONS_LOST,
+    PURGE_BATCH,
     REAP_EXPIRED,
     RELEASE_JOB,
     REQUEUE_JOB,
@@ -35,7 +38,7 @@ from .queries import (
     SELECT_JOB,
 )
 from .records import JOB_COLUMN_LIST, execution_from_row, job_from_row, job_to_row
-from .schema import DDL, SCHEMA_VERSION
+from .schema import DDL, MIGRATIONS, SCHEMA_VERSION
 
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
 LEASE_EXPIRED_MESSAGE = (
@@ -49,6 +52,7 @@ class SQLiteBackend(BaseBackend):
         delayed=True,
         dedup=True,
         transactional_enqueue=True,
+        retention=True,
         max_payload_bytes=None,
     )
 
@@ -144,6 +148,9 @@ class SQLiteBackend(BaseBackend):
     async def reap_expired(self) -> int:
         return await self._call(self._reap_expired_sync)
 
+    async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
+        return await self._call(self._purge_sync, policy, now)
+
     async def counts_by_status(self) -> dict[str, int]:
         return await self._call(self._counts_by_status_sync)
 
@@ -163,6 +170,7 @@ class SQLiteBackend(BaseBackend):
 
     def _setup_sync(self) -> None:
         with self._connections.write() as connection:
+            existing = self._stored_version(connection)
             for statement in DDL:
                 connection.execute(statement)
             connection.execute(
@@ -170,7 +178,35 @@ class SQLiteBackend(BaseBackend):
                 "ON CONFLICT (key) DO NOTHING",
                 (str(SCHEMA_VERSION),),
             )
+            connection.execute(
+                "INSERT INTO meta (key, value) VALUES ('last_purge_at', '0') "
+                "ON CONFLICT (key) DO NOTHING"
+            )
+            if existing is not None:
+                self._migrate(connection, existing)
         self._assert_schema_supported()
+
+    def _stored_version(self, connection: sqlite3.Connection) -> int | None:
+        present = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone()
+        if present is None:
+            return None
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        return int(row["value"]) if row else None
+
+    def _migrate(self, connection: sqlite3.Connection, current: int) -> None:
+        if current >= SCHEMA_VERSION:
+            return
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            for statement in MIGRATIONS.get(version, ()):
+                connection.execute(statement)
+        connection.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'",
+            (str(SCHEMA_VERSION),),
+        )
 
     def _close_sync(self) -> None:
         self._connections.close()
@@ -354,6 +390,28 @@ class SQLiteBackend(BaseBackend):
                 MARK_EXECUTIONS_LOST.format(ids=placeholders), (now, *expired)
             )
         return len(expired)
+
+    def _purge_sync(self, policy: RetentionPolicy, now: float) -> int | None:
+        if not policy.enabled:
+            return None
+        with self._connections.write() as connection:
+            won = connection.execute(
+                CLAIM_HOUSEKEEPING, (str(now), now - policy.interval)
+            ).fetchone()
+        if won is None:
+            return None
+        removed = 0
+        for status, cutoff in policy.horizons(now).items():
+            while removed < policy.maximum_per_sweep:
+                batch = min(policy.batch, policy.maximum_per_sweep - removed)
+                with self._connections.write() as connection:
+                    gone = connection.execute(
+                        PURGE_BATCH, (str(status), cutoff, batch)
+                    ).fetchall()
+                removed += len(gone)
+                if len(gone) < batch:
+                    break
+        return removed
 
     def _counts_by_status_sync(self) -> dict[str, int]:
         rows = self._connections.connection.execute(

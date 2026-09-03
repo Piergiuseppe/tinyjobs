@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = (
     """
@@ -41,8 +41,17 @@ DDL = (
         WHERE status = 'running'
     """,
     """
-    CREATE INDEX IF NOT EXISTS idx_jobs_listing
-        ON jobs (status, created_at DESC)
+    CREATE INDEX IF NOT EXISTS idx_jobs_by_status
+        ON jobs (status, id DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_jobs_by_queue
+        ON jobs (queue, id DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_jobs_purge
+        ON jobs (status, finished_at)
+        WHERE finished_at IS NOT NULL
     """,
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup
@@ -67,3 +76,16 @@ DDL = (
         ON executions (job_id, attempt)
     """,
 )
+
+
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: (
+        "DROP INDEX IF EXISTS idx_jobs_listing",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_by_status ON jobs (status, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_by_queue ON jobs (queue, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_jobs_purge ON jobs (status, finished_at) "
+        "WHERE finished_at IS NOT NULL",
+        "INSERT INTO meta (key, value) VALUES ('last_purge_at', '0') "
+        "ON CONFLICT (key) DO NOTHING",
+    ),
+}
