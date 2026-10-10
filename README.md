@@ -245,6 +245,25 @@ def timing(job, result, duration):
 that raises is logged and ignored, so a broken metrics client never fails a job. A `def` hook runs on
 the worker's event loop, so keep it quick.
 
+```bash
+tinyjobs stats --app tasks:app
+tinyjobs check --app tasks:app --max-wait 5m      # exits 1 on any problem
+```
+
+```
+QUEUE    QUEUED  RUNNING  SUCCESS  FAILED  CANCELLED  OLDEST DUE
+-------  ------  -------  -------  ------  ---------  ----------
+default  2       2        0        0       0          16s
+mail     1       0        0        0       0          16s
+
+running past their lease: 2
+```
+
+A job past its lease means the worker holding it stopped reporting, usually because it died. `check`
+also fails on queued jobs for a task the app doesn't register (a missing `--import`), on a due job
+waiting longer than `--max-wait`, and on a cron schedule more than a minute overdue, which means no
+worker or scheduler is running. Both are `app.stats()` and `app.check()` in code.
+
 ## What you get
 
 | | |
@@ -263,6 +282,7 @@ the worker's event loop, so keep it quick.
 | Cancellation | before a job starts; cooperative after |
 | Retention | old terminal jobs are pruned so the database stops growing |
 | Hooks | `on_job_start`, `on_job_success`, `on_job_failure`, for metrics and alerts |
+| Health | `tinyjobs stats`, and `tinyjobs check` for probes |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -402,14 +422,13 @@ v0.3.1. Working and measured, but young. What's in:
 - retention, so the database plateaus instead of growing
 - lifecycle hooks for metrics and alerting
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
-- `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `send` / `purge`
+- `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
 - the backend plugin seam
 
 What's not in yet:
 
 - transactional enqueue, where a job is only created if your own transaction commits
 - a process executor for CPU-bound work, and `memory://` for tests
-- `tinyjobs stats` and `check`
 - any backend other than SQLite
 
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
@@ -441,7 +460,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-252 tests, no test dependencies. The one that matters most is
+270 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

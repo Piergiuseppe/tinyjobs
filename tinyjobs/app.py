@@ -9,7 +9,7 @@ from .backends.loader import load_backend
 from .clock import Clock
 from .codecs import CodecRegistry
 from .exceptions import BackendNotReadyError, ConfigurationError
-from .models import Job, JobPayload, Page, ScheduleState
+from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
 from .retention import RetentionPolicy
@@ -20,6 +20,8 @@ from .schedules import Schedule
 from .services import (
     DispatchService,
     ExecutionService,
+    Finding,
+    HealthService,
     Hooks,
     JobLifecycleService,
     SchedulingService,
@@ -63,6 +65,7 @@ class TinyJobs:
         self._lifecycle: JobLifecycleService | None = None
         self._execution: ExecutionService | None = None
         self._scheduling: SchedulingService | None = None
+        self._health: HealthService | None = None
         self._lock: asyncio.Lock | None = None
         self._lock_guard = threading.Lock()
 
@@ -123,6 +126,12 @@ class TinyJobs:
             raise BackendNotReadyError("the backend is not connected yet")
         return self._scheduling
 
+    @property
+    def health(self) -> HealthService:
+        if self._health is None:
+            raise BackendNotReadyError("the backend is not connected yet")
+        return self._health
+
     def run_sync(
         self,
         coroutine: Coroutine[Any, Any, T],
@@ -164,6 +173,7 @@ class TinyJobs:
             self._scheduling = SchedulingService(
                 backend, self._dispatch, self._registry, self._clock
             )
+            self._health = HealthService(backend, self._registry, self._clock)
             self._backend = backend
 
     def start(self) -> "TinyJobs":
@@ -307,6 +317,20 @@ class TinyJobs:
     def counts(self) -> dict[str, int]:
         return self.run_sync(self.acounts(), name="counts")
 
+    async def astats(self) -> Stats:
+        await self.ready()
+        return await self.health.stats()
+
+    def stats(self) -> Stats:
+        return self.run_sync(self.astats(), name="stats")
+
+    async def acheck(self, *, max_wait: float | None = None) -> list[Finding]:
+        await self.ready()
+        return await self.health.check(max_wait=max_wait)
+
+    def check(self, *, max_wait: float | None = None) -> list[Finding]:
+        return self.run_sync(self.acheck(max_wait=max_wait), name="check")
+
     async def aexecutions(self, job_id: str) -> list:
         await self.ready()
         return await self.backend.executions(job_id)
@@ -339,6 +363,7 @@ class TinyJobs:
         self._lifecycle = None
         self._execution = None
         self._scheduling = None
+        self._health = None
         self._lock = None
 
     def close(self) -> None:

@@ -8,7 +8,7 @@ from dataclasses import replace
 from tinyjobs import TinyJobs
 from tinyjobs.backends import Backend, BaseBackend, Capabilities, register_builtin
 from tinyjobs.exceptions import SynchronousCallInsideEventLoopError
-from tinyjobs.models import ExecutionError, Job, Page
+from tinyjobs.models import ExecutionError, Job, Page, QueueStats, Stats
 from tinyjobs.status import ExecutionStatus, JobStatus
 
 
@@ -125,6 +125,13 @@ class RamBackend(BaseBackend):
         for job in self._jobs.values():
             counts[str(job.status)] = counts.get(str(job.status), 0) + 1
         return counts
+
+    async def stats(self, now: float) -> Stats:
+        queues: dict[str, dict[str, int]] = {}
+        for job in self._jobs.values():
+            counts = queues.setdefault(job.queue, {})
+            counts[str(job.status)] = counts.get(str(job.status), 0) + 1
+        return Stats(queues=[QueueStats(queue, counts) for queue, counts in queues.items()])
 
     async def purge(self, policy, now: float) -> int | None:
         if not policy.enabled:

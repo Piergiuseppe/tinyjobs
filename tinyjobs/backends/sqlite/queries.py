@@ -133,6 +133,25 @@ SELECT_EXECUTIONS = """
 
 COUNT_BY_STATUS = "SELECT status, count(*) AS total FROM jobs GROUP BY status"
 
+COUNT_BY_QUEUE = """
+    SELECT queue, status, count(*) AS total FROM jobs GROUP BY queue, status
+"""
+
+OLDEST_DUE_BY_QUEUE = """
+    SELECT queue, min(run_at) AS oldest FROM jobs
+     WHERE status = 'queued' AND run_at <= ?
+     GROUP BY queue
+"""
+
+COUNT_EXPIRED_LEASES = """
+    SELECT count(*) AS total FROM jobs
+     WHERE status = 'running' AND lease_expires_at < ?
+"""
+
+QUEUED_BY_TASK = """
+    SELECT task, count(*) AS total FROM jobs WHERE status = 'queued' GROUP BY task
+"""
+
 CLAIM_HOUSEKEEPING = """
     UPDATE meta SET value = ?
      WHERE key = 'last_purge_at'

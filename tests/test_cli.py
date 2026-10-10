@@ -182,7 +182,9 @@ class AppLoadingTests(unittest.TestCase):
 class ParserTests(unittest.TestCase):
     def test_every_command_is_reachable(self):
         parser = build_parser()
-        for command in ("worker", "scheduler", "jobs", "schedules", "send", "purge"):
+        for command in (
+            "worker", "scheduler", "jobs", "schedules", "stats", "check", "send", "purge"
+        ):
             self.assertIn(command, parser.format_help())
 
 
@@ -347,3 +349,33 @@ class ScheduleCommandTests(FixtureApp, unittest.TestCase):
         )
         self.assertTrue(args.no_scheduler)
         self.assertEqual(args.misfire_grace, 300.0)
+
+
+class HealthCommandTests(FixtureApp, unittest.TestCase):
+    def test_stats_says_so_when_there_are_no_jobs(self):
+        code, output = self.invoke("stats", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertIn("no jobs yet", output)
+
+    def test_stats_counts_jobs_per_queue(self):
+        self.invoke("send", "--app", "fixture_app:app", "fixture.echo", "--queue", "mail")
+        code, output = self.invoke("stats", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertIn("OLDEST DUE", output)
+        self.assertIn("mail", output)
+        self.assertIn("running past their lease: 0", output)
+
+    def test_check_passes_on_a_healthy_app(self):
+        code, output = self.invoke("check", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertNotIn("FAIL", output)
+
+    def test_check_exits_one_on_a_problem(self):
+        self.invoke("send", "--app", "fixture_app:app", "nobody.home")
+        code, output = self.invoke("check", "--app", "fixture_app:app")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL  1 queued job(s) for nobody.home", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

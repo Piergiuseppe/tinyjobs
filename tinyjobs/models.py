@@ -160,6 +160,20 @@ class ScheduleState:
 
 
 @dataclass(frozen=True, slots=True)
+class QueueStats:
+    queue: str
+    counts: dict[str, int]
+    oldest_due_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Stats:
+    queues: list[QueueStats]
+    expired_leases: int = 0
+    queued_tasks: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class Page:
     items: list[Job]
     cursor: str | None = None

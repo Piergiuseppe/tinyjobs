@@ -1,5 +1,6 @@
 from .dispatch import DispatchService
 from .execution import Attempt, ExecutionService
+from .health import Finding, HealthService
 from .hooks import Hooks
 from .lifecycle import JobLifecycleService
 from .scheduling import Firing, SchedulingService, Tick
@@ -9,7 +10,9 @@ __all__ = [
     "Attempt",
     "DispatchService",
     "ExecutionService",
+    "Finding",
     "Firing",
+    "HealthService",
     "Hooks",
     "JobLifecycleService",
     "SchedulingService",

@@ -435,6 +435,7 @@ class Backend(Protocol):
     def get(self, job_id: str) -> Job | None: ...
     def list(self, *, status: str | None = None, queue: str | None = None,
              limit: int = 100, cursor: str | None = None) -> Page[Job]: ...
+    def stats(self, now: float) -> Stats: ...   # counts per queue, oldest due, expired leases
 
     # --- schedules --------------------------------------------------------
     def schedules(self) -> list[ScheduleState]: ...
@@ -1136,9 +1137,16 @@ ignored: observability must never change what happens to a job.
 
 ### Health
 
-`tinyjobs check` verifies configuration, schema version and clock skew. `tinyjobs stats` gives counts
-by status and queue, oldest queued job age, and the number of jobs currently past their lease, which
-is the metric to alert on, because it is the one that means workers are dying.
+`tinyjobs stats` gives counts by queue and status, how long the oldest due job has waited, and the
+number of jobs currently past their lease, which is the metric to alert on, because it is the one
+that means workers are dying.
+
+`tinyjobs check` is the same data turned into a verdict, exiting 1 on any problem so it can back a
+probe or a cron alert. It fails when the app registers no tasks, when queued jobs name a task the app
+does not register (the usual sign of a missing `--import`), when a job is past its lease, when a due
+job has waited longer than `--max-wait`, and when a cron schedule is more than a minute overdue, which
+means nothing is firing it. Reaching the store and its schema version is checked by connecting at
+all. Clock skew is not: on one SQLite file there is no second clock to compare against.
 
 ### Schema migrations
 

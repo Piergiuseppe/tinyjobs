@@ -11,7 +11,15 @@ from typing import Any, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from ...clock import Clock
-from ...models import Execution, ExecutionError, Job, Page, ScheduleState
+from ...models import (
+    Execution,
+    ExecutionError,
+    Job,
+    Page,
+    QueueStats,
+    ScheduleState,
+    Stats,
+)
 from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import BaseBackend, Capabilities
@@ -22,13 +30,18 @@ from .queries import (
     CANCEL_JOB,
     CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
+    COUNT_BY_QUEUE,
+    COUNT_BY_STATUS,
+    COUNT_EXPIRED_LEASES,
     FAIL_JOB,
     FINISH_EXECUTION,
     HEARTBEAT,
     INSERT_EXECUTION,
     INSERT_JOB,
     MARK_EXECUTIONS_LOST,
+    OLDEST_DUE_BY_QUEUE,
     PURGE_BATCH,
+    QUEUED_BY_TASK,
     REAP_EXPIRED,
     RECORD_SCHEDULE_RUN,
     REGISTER_SCHEDULE,
@@ -164,6 +177,9 @@ class SQLiteBackend(BaseBackend):
 
     async def counts_by_status(self) -> dict[str, int]:
         return await self._call(self._counts_by_status_sync)
+
+    async def stats(self, now: float) -> Stats:
+        return await self._call(self._stats_sync, now)
 
     async def schedules(self) -> list[ScheduleState]:
         return await self._call(self._schedules_sync)
@@ -443,10 +459,28 @@ class SQLiteBackend(BaseBackend):
         return removed
 
     def _counts_by_status_sync(self) -> dict[str, int]:
-        rows = self._connections.connection.execute(
-            "SELECT status, count(*) AS total FROM jobs GROUP BY status"
-        ).fetchall()
+        rows = self._connections.connection.execute(COUNT_BY_STATUS).fetchall()
         return {row["status"]: row["total"] for row in rows}
+
+    def _stats_sync(self, now: float) -> Stats:
+        connection = self._connections.connection
+        counts: dict[str, dict[str, int]] = {}
+        for row in connection.execute(COUNT_BY_QUEUE).fetchall():
+            counts.setdefault(row["queue"], {})[row["status"]] = row["total"]
+        oldest = {
+            row["queue"]: row["oldest"]
+            for row in connection.execute(OLDEST_DUE_BY_QUEUE, (now,)).fetchall()
+        }
+        expired = connection.execute(COUNT_EXPIRED_LEASES, (now,)).fetchone()
+        queued = connection.execute(QUEUED_BY_TASK).fetchall()
+        return Stats(
+            queues=[
+                QueueStats(queue, counts[queue], oldest.get(queue))
+                for queue in sorted(counts)
+            ],
+            expired_leases=expired["total"],
+            queued_tasks={row["task"]: row["total"] for row in queued},
+        )
 
     def _schedules_sync(self) -> list[ScheduleState]:
         rows = self._connections.connection.execute(SELECT_SCHEDULES).fetchall()
