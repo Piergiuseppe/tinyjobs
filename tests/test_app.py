@@ -4,7 +4,11 @@ import asyncio
 import unittest
 
 from tinyjobs import TinyJobs
-from tinyjobs.exceptions import TaskAlreadyRegisteredError, UnknownTaskError
+from tinyjobs.exceptions import (
+    ConfigurationError,
+    TaskAlreadyRegisteredError,
+    UnknownTaskError,
+)
 from tinyjobs.status import JobStatus
 from tests.support import BackendTestCase
 
@@ -56,6 +60,65 @@ class TaskDeclarationTests(BackendTestCase):
         with self.assertRaises(UnknownTaskError) as caught:
             self.app.registry.get("nope")
         self.assertIn("--import", str(caught.exception))
+
+
+class CronDeclarationTests(BackendTestCase):
+    def test_a_cron_task_carries_its_schedule(self):
+        @self.app.task(cron="*/5 * * * *", timezone="Europe/Rome")
+        def refresh():
+            return None
+
+        self.assertEqual(refresh.schedule.cron.source, "*/5 * * * *")
+        self.assertEqual(refresh.schedule.timezone, "Europe/Rome")
+        self.assertEqual(str(refresh.schedule.misfire), "skip")
+        self.assertFalse(refresh.schedule.overlap)
+
+    def test_a_plain_task_has_no_schedule(self):
+        @self.app.task
+        def handler():
+            return None
+
+        self.assertIsNone(handler.schedule)
+
+    def test_a_cron_task_is_still_enqueueable_by_hand(self):
+        @self.app.task(cron="@daily")
+        def nightly():
+            return None
+
+        self.assertIs(self.app.get(nightly.enqueue().id).status, JobStatus.QUEUED)
+
+    def test_mistakes_fail_at_declaration_not_at_midnight(self):
+        cases = {
+            "bad cron": dict(cron="61 * * * *"),
+            "bad timezone": dict(cron="@daily", timezone="Europe/Atlantis"),
+            "bad policy": dict(cron="@daily", misfire="sometimes"),
+            "run_all without overlap": dict(cron="@daily", misfire="run_all"),
+        }
+        for label, options in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(ConfigurationError):
+
+                    @self.app.task(name=f"broken.{label}", **options)
+                    def broken():
+                        return None
+
+                self.assertNotIn(f"broken.{label}", self.app.registry)
+
+    def test_a_cron_task_must_be_callable_without_arguments(self):
+        with self.assertRaises(ConfigurationError) as caught:
+
+            @self.app.task(name="needs.args", cron="@hourly")
+            def needs(document_id):
+                return None
+
+        self.assertIn("no arguments", str(caught.exception))
+
+    def test_optional_arguments_are_fine(self):
+        @self.app.task(cron="@hourly")
+        def optional(limit=100, *, dry_run=False):
+            return None
+
+        self.assertIsNotNone(optional.schedule)
 
 
 class EnqueueTests(BackendTestCase):

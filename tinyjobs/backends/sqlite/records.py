@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from ...models import Execution, Job
+from ...models import Execution, Job, ScheduleState
 from ...status import ExecutionStatus, JobStatus
 
 JOB_COLUMNS = (
@@ -84,4 +84,15 @@ def execution_from_row(row: sqlite3.Row) -> Execution:
         finished_at=row["finished_at"],
         error_type=row["error_type"],
         traceback=row["traceback"],
+    )
+
+
+def schedule_from_row(row: sqlite3.Row) -> ScheduleState:
+    return ScheduleState(
+        name=row["name"],
+        cron=row["cron"],
+        timezone=row["timezone"],
+        next_run_at=row["next_run_at"],
+        last_run_at=row["last_run_at"],
+        last_job_id=row["last_job_id"],
     )

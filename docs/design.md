@@ -119,7 +119,7 @@ ordinary history, and ordinary cancellation, with no special-casing anywhere in 
 ### How they flow
 
 ```
-   @app.task                      Schedule (separate process/thread)
+   @app.task                      Schedule (a coroutine in every worker)
        │                               │
        │ registers                     │ cron fires
        ▼                               │
@@ -182,14 +182,10 @@ CREATE INDEX idx_exec_job ON executions (job_id, attempt);
 CREATE TABLE schedules (
     name         TEXT PRIMARY KEY,           -- task name
     cron         TEXT NOT NULL,
-    timezone     TEXT NOT NULL DEFAULT 'UTC',
-    args         BLOB,
-    codec        TEXT,
-    next_run_at  REAL NOT NULL,
-    last_job_id  TEXT,
-    enabled      INTEGER NOT NULL DEFAULT 1,
-    misfire_policy TEXT NOT NULL DEFAULT 'skip',   -- skip | run_once | run_all
-    overlap      INTEGER NOT NULL DEFAULT 0        -- allow concurrent runs?
+    timezone     TEXT NOT NULL,
+    next_run_at  REAL NOT NULL,              -- the compare-and-set column
+    last_run_at  REAL,
+    last_job_id  TEXT
 );
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);  -- schema_version, ...
@@ -441,8 +437,10 @@ class Backend(Protocol):
              limit: int = 100, cursor: str | None = None) -> Page[Job]: ...
 
     # --- schedules --------------------------------------------------------
-    def upsert_schedule(self, schedule: Schedule) -> None: ...
-    def claim_due_schedules(self, now: float) -> list[Schedule]: ...
+    def schedules(self) -> list[ScheduleState]: ...
+    def register_schedules(self, states: Sequence[ScheduleState]) -> None: ...
+    def fire_schedule(self, name: str, *, expected: float, next_run_at: float,
+                      jobs: Sequence[Job]) -> list[Job] | None: ...
 
     # --- housekeeping -----------------------------------------------------
     def reap_expired(self, now: float) -> int: ...
@@ -473,6 +471,12 @@ and a conformance test suite ships with the package to check them:
    overwrite the result of the replacement attempt.
 6. **`enqueue` with a duplicate active `dedup_key` returns the existing job** rather than creating a
    second one.
+7. **`fire_schedule` is a compare-and-set.** It advances `next_run_at` only if it still holds
+   `expected`, and inserts the jobs in the same transaction, so a firing is either fully recorded or
+   not at all. A caller that loses the race gets `None` and creates nothing.
+8. **`register_schedules` keeps a stored `next_run_at`** unless the cron or the timezone changed.
+   That is what makes a restart pick up where it left off, and what lets the misfire policy see the
+   firings it missed.
 
 ### Capabilities
 
@@ -485,6 +489,8 @@ class Capabilities(NamedTuple):
     delayed: bool
     dedup: bool
     transactional_enqueue: bool
+    retention: bool
+    schedules: bool
     max_payload_bytes: int | None
 ```
 
@@ -652,21 +658,33 @@ the reason the backend seam exists.
 
 Cron looks like the easy part and contains most of the subtle bugs. What we commit to:
 
+```python
+@app.task(cron="*/15 * * * *", timezone="Europe/Rome", misfire="skip", overlap=False)
+async def refresh_cache() -> None:
+    ...
+```
+
+A cron task is an ordinary task with a rule attached. It can still be enqueued by hand, and the jobs
+the rule creates are ordinary jobs: same retries, same history, same cancellation. It is called with
+no arguments, so a signature that requires some is rejected when the decorator runs, as is a cron
+expression, a timezone or a misfire policy that cannot work. A mistake surfaces at import, not at
+midnight.
+
 ### Where it runs: inside every worker, by default
 
 `tinyjobs worker` runs the scheduler as one more coroutine on its event loop. Not as a separate
 process, and not on a designated leader.
 
-This is the dividend of leader-free firing below. Because the atomic `UPDATE` guarantees exactly one
+This is the dividend of leader-free firing below. Because the compare-and-set guarantees exactly one
 job per tick no matter how many schedulers race for it, running fifty schedulers is not a bug to be
 prevented, it is free high availability. There is no leader to elect, no failover to test, and no
 deployment where cron silently stops because one special process died. `--no-scheduler` opts out, and
-`tinyjobs scheduler` still exists standalone for anyone who wants the isolation.
+`tinyjobs scheduler` runs one standalone for anyone who wants the isolation.
 
 The cost is a polling loop per worker, which the tick makes negligible: the scheduler sleeps until the
-earliest `next_run_at` rather than waking on a fixed interval, capped at 30 seconds so that newly
-added schedules are picked up promptly. With cron granularity at one minute, worst-case drift is
-bounded well under the resolution anyone can express.
+earliest `next_run_at` rather than waking on a fixed interval, capped at 30 seconds so a worker that
+slept on stale state rereads it soon. A tick that fires nothing is one `SELECT` over the `schedules`
+table.
 
 ### Leader-free firing
 
@@ -674,25 +692,40 @@ Running three workers must not create three jobs per tick. The usual answer is l
 is cheaper, because the store already gives us atomicity:
 
 ```sql
-UPDATE schedules
-   SET next_run_at = :computed_next
- WHERE name = :name AND next_run_at <= :now
-RETURNING *;
+BEGIN IMMEDIATE;
+UPDATE schedules SET next_run_at = :computed_next
+ WHERE name = :name AND next_run_at = :expected;
+-- only if that matched one row:
+INSERT INTO jobs ...;
+COMMIT;
 ```
 
 Exactly one worker's `UPDATE` matches. That one creates the job, the others get zero rows and move
-on. No election, no leases, no split brain, and the property falls out of the same primitive the claim
-already relies on.
+on. The comparison is against the exact value the scheduler read, not against its own clock, so two
+workers whose clocks disagree by a few seconds still cannot both win. And the job goes in inside the
+same transaction as the advance, so a worker killed halfway leaves either both or neither: there is no
+window where the schedule moved on and the job was never written.
+
+Registration is the other half. Every scheduler upserts its declarations when it starts, and the
+upsert keeps the stored `next_run_at` unless the cron or the timezone changed. A restart therefore
+resumes where the previous process stopped, which is what lets the misfire policy see what it missed,
+while a changed expression starts afresh from now.
 
 ### Timezones and DST
 
 Schedules store an IANA timezone name and are evaluated with `zoneinfo` (stdlib). This makes the
 awkward cases explicit rather than accidental:
 
-- A job at `02:30` on the day a DST gap swallows 02:30. Policy: fire at the first valid instant
-  after the gap.
-- A job at `02:30` on the day it happens twice. Policy: fire once, on the first occurrence.
-- The default timezone is UTC, which has neither problem. Local time is opt-in.
+- A fixed time of day, `30 2 * * *`, on the day a DST gap swallows 02:30. Policy: fire at the first
+  valid instant after the gap, 03:00.
+- The same schedule on the day 02:30 happens twice. Policy: fire once, on the first occurrence.
+- A schedule whose hour field is a wildcard (`*/10 * * * *`, `0 * * * *`) is about frequency, not
+  about a time of day, so it follows the clock as it actually ticks: the repeated hour runs twice, and
+  the hour the gap removes does not run at all. The interval between firings stays what you wrote.
+  This is the rule Vixie cron uses.
+- The default timezone is UTC, which has none of these problems. Local time is opt-in. `"UTC"` never
+  touches the tz database; any other name needs one, which Windows lacks unless `tzdata` is
+  installed.
 
 ### Misfires
 
@@ -702,19 +735,78 @@ policy:
 
 - `skip` (default): forget them, resume from now.
 - `run_once`: create a single catch-up job.
-- `run_all`: create all eight. For accounting-style workloads where every period matters.
+- `run_all`: create all eight, each with the `run_at` it should have had, oldest first. For
+  accounting-style workloads where every period matters. At most 100 are created per tick, so a long
+  outage on a frequent schedule is worked off over consecutive ticks instead of in one transaction.
+
+"Missed" needs a threshold, because a firing a second late is not missed. That threshold is the
+**misfire grace**, 60 seconds by default (`--misfire-grace`). A firing at most that late counts as on
+time, under every policy. So does a firing that falls inside the grace at the end of an outage, which
+is why a restart that lands a few seconds after the minute still runs that minute; under `run_once` that
+job doubles as the catch-up.
+
+The clock can also go the other way. If it moves back, by hand or by a VM restored from a snapshot,
+the stored `next_run_at` is suddenly far in the future and the schedule would sit silent until the
+clock caught up. A stored firing later than the next one the cron allows from `now + grace` is
+treated as exactly that, and recomputed from now. The grace is the tolerance, so clocks that merely
+disagree by less than it between machines are never mistaken for a jump.
 
 ### Overlap
 
 By default a schedule will not create a new job while its previous one is still queued or running,
-implemented with the dedup key, so it needs no extra machinery. `overlap=True` opts out.
+implemented with the dedup key, so it needs no extra machinery. `overlap=True` opts out. A run that is
+waiting out its retry backoff is still queued, so it holds the key too: a failing hourly job does not
+pile up a second one behind it. `run_all` requires `overlap=True`, since its catch-up jobs would
+otherwise collapse into one.
 
 ### Cron syntax
 
 Standard five-field expressions (`minute hour day month weekday`) with `*`, ranges, steps, lists, and
-three-letter names. Plus the familiar macros: `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`.
+three-letter names; `0` and `7` are both Sunday. When both the day of the month and the weekday are
+restricted, either one matching is enough, as in every cron since Vixie. Plus the familiar macros:
+`@hourly`, `@daily`, `@midnight`, `@weekly`, `@monthly`, `@yearly`, `@annually`. An expression that can
+never fire, such as `0 0 30 2 *`, is rejected rather than accepted and left waiting.
+
 Seconds-level precision is out of scope. At that frequency you want a long-running task with a sleep,
 not a scheduler.
+
+### Where the limits are
+
+Measured on an Apple silicon laptop, every schedule set to `* * * * *`, all of them firing on the
+same minute boundary, which is the worst case:
+
+| | |
+| --- | --- |
+| one scheduler, in process | about 110 µs per firing, one transaction each: 10,000 in 1.05 s |
+| four workers racing, 2,000 schedules | 8,000 firings, each exactly once, p95 0.57 s late, max 0.62 s |
+| four workers racing, 10,000 schedules | 40,000 firings, each exactly once, p95 6.4 s late, max 7.5 s |
+| 56 schedulers racing, one schedule, 12 minutes | 12 jobs, no duplicates, p95 15 ms late |
+| 50 `SIGKILL`s in 10 minutes, 4 workers and a scheduler | 10 jobs, no gaps, no duplicates, max 4 ms late |
+
+Racing schedulers share one write lock, and every loser still takes it for an `UPDATE` that matches
+nothing, so lateness grows with schedules times workers. Applications have tens of schedules, where
+none of this is visible; at ten thousand firing on the same minute the tail is seconds late, and still
+exactly once.
+
+The other limits are about time rather than volume:
+
+- **A task that blocks the event loop blocks that worker's scheduler.** An `async def` calling
+  `time.sleep()` for 150 seconds on an every-minute schedule made its own worker skip the two firings
+  it slept through. The same task with `--no-scheduler` and a standalone `tinyjobs scheduler` fired
+  every minute within 36 ms; the jobs queued behind the blocked worker, but none were lost. Other
+  workers cover for a blocked one, unless they block the same way.
+- **Restarts.** A graceful stop and a `SIGKILL` behave the same, because the state is the row. Down
+  for 35 seconds across a firing: it ran 25 seconds late on restart. Down for 85 seconds: the firing
+  more than a minute late was skipped and the next one ran 15 seconds late. Down for four and a half
+  minutes: `skip` dropped four firings, `run_all` created all five in order.
+- **Clock jumps.** Forward by an hour: treated as an outage, missed firings skipped. Back by an hour:
+  realigned on the next tick, instead of falling silent for the hour.
+- **Rolling deploys that change a cron.** While both versions run, each firing is computed by
+  whichever version wins it, and it is still never doubled, since the compare-and-set does not care
+  whose expression produced the value. Once only the new version runs, every next time comes from the
+  new expression; the `cron` column that `tinyjobs schedules` prints catches up the next time a new
+  worker starts.
+
 
 ---
 

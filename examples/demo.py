@@ -57,6 +57,11 @@ async def never_finishes() -> None:
     await asyncio.sleep(60)
 
 
+@app.task(name="demo.heartbeat", cron="* * * * *")
+async def heartbeat() -> str:
+    return "still here"
+
+
 @app.task(name="demo.rich_arguments")
 def rich_arguments(when, amount, tags, path) -> str:
     return f"{when!r} {amount!r} {tags!r} {path!r}"
@@ -106,6 +111,7 @@ def seed() -> None:
     print(f"  {cli} jobs list --app examples.demo:app")
     print(f"  {cli} jobs list --app examples.demo:app --status failed")
     print(f"  {cli} jobs show <job-id> --app examples.demo:app")
+    print(f"  {cli} schedules --app examples.demo:app")
 
 
 if __name__ == "__main__":

@@ -25,9 +25,11 @@ from .exceptions import (
     UnknownTaskError,
     WaitTimeout,
 )
-from .models import Execution, ExecutionError, Job, JobPayload
+from .models import Execution, ExecutionError, Job, JobPayload, ScheduleState
 from .retention import KEEP_EVERYTHING, RetentionPolicy
 from .retry import RetryPolicy
+from .scheduler import Scheduler
+from .schedules import MisfirePolicy, Schedule
 from .status import ExecutionStatus, JobStatus
 from .task import Task
 from .worker import Worker
@@ -60,9 +62,13 @@ __all__ = [
     "Job",
     "JobPayload",
     "JobStatus",
+    "MisfirePolicy",
     "Retry",
     "RetentionPolicy",
     "RetryPolicy",
+    "Schedule",
+    "ScheduleState",
+    "Scheduler",
     "SerializationError",
     "Task",
     "TinyJobs",

@@ -20,6 +20,17 @@ app = TinyJobs("sqlite:///{database}")
 @app.task(name="fixture.echo")
 def echo(value):
     return value
+
+
+@app.task(name="fixture.tick", cron="*/5 * * * *", timezone="Europe/Rome")
+def tick():
+    return None
+'''
+
+PLAIN_FIXTURE = '''
+from tinyjobs import TinyJobs
+
+app = TinyJobs("sqlite:///{database}")
 '''
 
 
@@ -171,7 +182,7 @@ class AppLoadingTests(unittest.TestCase):
 class ParserTests(unittest.TestCase):
     def test_every_command_is_reachable(self):
         parser = build_parser()
-        for command in ("worker", "jobs", "send"):
+        for command in ("worker", "scheduler", "jobs", "schedules", "send", "purge"):
             self.assertIn(command, parser.format_help())
 
 
@@ -299,3 +310,40 @@ class PurgeCommandTests(FixtureApp, unittest.TestCase):
             build_parser().parse_args(
                 ["purge", "--app", "x:y", "--before", "domani"]
             )
+
+
+class ScheduleCommandTests(FixtureApp, unittest.TestCase):
+    def test_schedules_lists_a_declared_cron_before_any_worker_ran(self):
+        code, output = self.invoke("schedules", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertIn("fixture.tick", output)
+        self.assertIn("*/5 * * * *", output)
+        self.assertIn("Europe/Rome", output)
+        self.assertIn("not registered yet", output)
+
+    def test_schedules_shows_the_next_run_once_registered(self):
+        app = load_app("fixture_app:app").start()
+        app.run_sync(app.scheduling.register(), name="register")
+        code, output = self.invoke("schedules", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertNotIn("not registered yet", output)
+
+    def test_the_scheduler_refuses_an_app_without_cron_tasks(self):
+        import sys
+
+        (self.root / "plain_app.py").write_text(
+            PLAIN_FIXTURE.format(database=self.database)
+        )
+        try:
+            code, output = self.invoke("scheduler", "--app", "plain_app:app")
+        finally:
+            sys.modules.pop("plain_app", None)
+        self.assertEqual(code, 1)
+        self.assertIn("no cron tasks", output)
+
+    def test_the_worker_accepts_the_scheduler_flags(self):
+        args = build_parser().parse_args(
+            ["worker", "--app", "x:y", "--no-scheduler", "--misfire-grace", "5m"]
+        )
+        self.assertTrue(args.no_scheduler)
+        self.assertEqual(args.misfire_grace, 300.0)

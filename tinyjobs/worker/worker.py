@@ -31,6 +31,8 @@ class Worker:
         shutdown_timeout: float = 30.0,
         unknown_task_delay: float = 60.0,
         retention: RetentionPolicy | None = None,
+        scheduler: bool = True,
+        misfire_grace: float = 60.0,
         poll_minimum: float = 0.005,
         poll_maximum: float = 0.5,
         worker_id: str | None = None,
@@ -43,6 +45,9 @@ class Worker:
         self._shutdown_timeout = shutdown_timeout
         self._unknown_task_delay = unknown_task_delay
         self._retention = retention or RetentionPolicy()
+        self._scheduler = (
+            app.scheduler(misfire_grace=misfire_grace) if scheduler else None
+        )
         self._interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)
         self._executors = ExecutorResolver(
             concurrency=concurrency, async_concurrency=async_concurrency
@@ -82,6 +87,10 @@ class Worker:
                 self._housekeeping_loop(), name="tinyjobs-housekeeping"
             ),
         ]
+        if self._scheduler is not None:
+            background.append(
+                asyncio.create_task(self._scheduler.start(), name="tinyjobs-scheduler")
+            )
         try:
             await self._claim_loop()
         finally:

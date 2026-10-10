@@ -6,6 +6,7 @@ from typing import Any, Callable, TYPE_CHECKING
 from .models import Job, JobPayload
 from .options import EnqueueOptions
 from .retry import RetryPolicy
+from .schedules import Schedule
 
 if TYPE_CHECKING:
     from .app import TinyJobs
@@ -22,6 +23,7 @@ class Task:
         retry_policy: RetryPolicy,
         timeout: float | None = None,
         store_result: bool = False,
+        schedule: Schedule | None = None,
     ) -> None:
         self._app = app
         self._function = function
@@ -30,6 +32,7 @@ class Task:
         self._retry_policy = retry_policy
         self._timeout = timeout
         self._store_result = store_result
+        self._schedule = schedule
         self._signature = inspect.signature(function)
         self._is_coroutine = inspect.iscoroutinefunction(function)
 
@@ -60,6 +63,10 @@ class Task:
     @property
     def store_result(self) -> bool:
         return self._store_result
+
+    @property
+    def schedule(self) -> Schedule | None:
+        return self._schedule
 
     @property
     def is_coroutine(self) -> bool:

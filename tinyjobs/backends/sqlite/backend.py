@@ -11,13 +11,14 @@ from typing import Any, Iterator, Sequence
 from urllib.parse import urlsplit
 
 from ...clock import Clock
-from ...models import Execution, ExecutionError, Job, Page
+from ...models import Execution, ExecutionError, Job, Page, ScheduleState
 from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
 from .connection import ConnectionPool
 from .queries import (
+    ADVANCE_SCHEDULE,
     CANCEL_JOB,
     CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
@@ -29,6 +30,8 @@ from .queries import (
     MARK_EXECUTIONS_LOST,
     PURGE_BATCH,
     REAP_EXPIRED,
+    RECORD_SCHEDULE_RUN,
+    REGISTER_SCHEDULE,
     RELEASE_JOB,
     REQUEUE_JOB,
     RESCHEDULE_JOB,
@@ -36,8 +39,15 @@ from .queries import (
     SELECT_ACTIVE_BY_DEDUP,
     SELECT_EXPIRED_IDS,
     SELECT_JOB,
+    SELECT_SCHEDULES,
 )
-from .records import JOB_COLUMN_LIST, execution_from_row, job_from_row, job_to_row
+from .records import (
+    JOB_COLUMN_LIST,
+    execution_from_row,
+    job_from_row,
+    job_to_row,
+    schedule_from_row,
+)
 from .schema import DDL, MIGRATIONS, SCHEMA_VERSION
 
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
@@ -53,6 +63,7 @@ class SQLiteBackend(BaseBackend):
         dedup=True,
         transactional_enqueue=True,
         retention=True,
+        schedules=True,
         max_payload_bytes=None,
     )
 
@@ -153,6 +164,24 @@ class SQLiteBackend(BaseBackend):
 
     async def counts_by_status(self) -> dict[str, int]:
         return await self._call(self._counts_by_status_sync)
+
+    async def schedules(self) -> list[ScheduleState]:
+        return await self._call(self._schedules_sync)
+
+    async def register_schedules(self, states: Sequence[ScheduleState]) -> None:
+        await self._call(self._register_schedules_sync, tuple(states))
+
+    async def fire_schedule(
+        self,
+        name: str,
+        *,
+        expected: float,
+        next_run_at: float,
+        jobs: Sequence[Job],
+    ) -> list[Job] | None:
+        return await self._call(
+            self._fire_schedule_sync, name, expected, next_run_at, tuple(jobs)
+        )
 
     @property
     def database(self) -> str:
@@ -418,6 +447,38 @@ class SQLiteBackend(BaseBackend):
             "SELECT status, count(*) AS total FROM jobs GROUP BY status"
         ).fetchall()
         return {row["status"]: row["total"] for row in rows}
+
+    def _schedules_sync(self) -> list[ScheduleState]:
+        rows = self._connections.connection.execute(SELECT_SCHEDULES).fetchall()
+        return [schedule_from_row(row) for row in rows]
+
+    def _register_schedules_sync(self, states: Sequence[ScheduleState]) -> None:
+        with self._connections.write() as connection:
+            connection.executemany(
+                REGISTER_SCHEDULE,
+                [
+                    (state.name, state.cron, state.timezone, state.next_run_at)
+                    for state in states
+                ],
+            )
+
+    def _fire_schedule_sync(
+        self,
+        name: str,
+        expected: float,
+        next_run_at: float,
+        jobs: Sequence[Job],
+    ) -> list[Job] | None:
+        with self._connections.write() as connection:
+            cursor = connection.execute(ADVANCE_SCHEDULE, (next_run_at, name, expected))
+            if cursor.rowcount != 1:
+                return None
+            stored = [self._insert(connection, job) for job in jobs]
+            if stored:
+                connection.execute(
+                    RECORD_SCHEDULE_RUN, (self._clock.now(), stored[-1].id, name)
+                )
+        return stored
 
     def _select_expired(
         self, connection: sqlite3.Connection, now: float

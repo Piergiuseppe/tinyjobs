@@ -8,14 +8,21 @@ from .backends.base import Backend
 from .backends.loader import load_backend
 from .clock import Clock
 from .codecs import CodecRegistry
-from .exceptions import BackendNotReadyError
-from .models import Job, JobPayload, Page
+from .exceptions import BackendNotReadyError, ConfigurationError
+from .models import Job, JobPayload, Page, ScheduleState
 from .options import EnqueueOptions
 from .registry import TaskRegistry
 from .retention import RetentionPolicy
 from .retry import RetryPolicy
 from .runtime import LoopRunner
-from .services import DispatchService, JobLifecycleService, SerializationService
+from .scheduler import Scheduler
+from .schedules import Schedule
+from .services import (
+    DispatchService,
+    JobLifecycleService,
+    SchedulingService,
+    SerializationService,
+)
 from .status import JobStatus
 from .task import Task
 from .worker import Worker
@@ -49,6 +56,7 @@ class TinyJobs:
         self._backend: Backend | None = None
         self._dispatch: DispatchService | None = None
         self._lifecycle: JobLifecycleService | None = None
+        self._scheduling: SchedulingService | None = None
         self._lock: asyncio.Lock | None = None
         self._lock_guard = threading.Lock()
 
@@ -97,6 +105,12 @@ class TinyJobs:
             raise BackendNotReadyError("the backend is not connected yet")
         return self._lifecycle
 
+    @property
+    def scheduling(self) -> SchedulingService:
+        if self._scheduling is None:
+            raise BackendNotReadyError("the backend is not connected yet")
+        return self._scheduling
+
     def run_sync(
         self,
         coroutine: Coroutine[Any, Any, T],
@@ -132,6 +146,9 @@ class TinyJobs:
             self._lifecycle = JobLifecycleService(
                 backend, self._serialization, self._clock
             )
+            self._scheduling = SchedulingService(
+                backend, self._dispatch, self._registry, self._clock
+            )
             self._backend = backend
 
     def start(self) -> "TinyJobs":
@@ -154,12 +171,17 @@ class TinyJobs:
         retry_base: float = 1.0,
         retry_max: float = 600.0,
         retry_jitter: bool = True,
+        cron: str | None = None,
+        timezone: str = "UTC",
+        misfire: str = "skip",
+        overlap: bool = False,
     ) -> Any:
         def decorate(target: Callable[..., Any]) -> Task:
+            task_name = name or f"{target.__module__}.{target.__qualname__}"
             resolved = Task(
                 self,
                 target,
-                name=name or f"{target.__module__}.{target.__qualname__}",
+                name=task_name,
                 options=EnqueueOptions(
                     queue=queue,
                     priority=priority,
@@ -176,7 +198,12 @@ class TinyJobs:
                 ),
                 timeout=timeout,
                 store_result=store_result,
+                schedule=_declare_schedule(
+                    task_name, cron, timezone, misfire, overlap
+                ),
             )
+            if cron is not None:
+                _assert_callable_without_arguments(resolved)
             self._registry.register(resolved)
             return resolved
 
@@ -263,6 +290,13 @@ class TinyJobs:
     def executions(self, job_id: str) -> list:
         return self.run_sync(self.aexecutions(job_id), name="executions")
 
+    async def aschedules(self) -> list[ScheduleState]:
+        await self.ready()
+        return await self.backend.schedules()
+
+    def schedules(self) -> list[ScheduleState]:
+        return self.run_sync(self.aschedules(), name="schedules")
+
     def decode(self, job: Job) -> JobPayload:
         return self._serialization.decode_payload(job)
 
@@ -270,12 +304,16 @@ class TinyJobs:
         options.setdefault("retention", self._retention)
         return Worker(self, **options)
 
+    def scheduler(self, **options: Any) -> Scheduler:
+        return Scheduler(self, **options)
+
     async def aclose(self) -> None:
         if self._backend is not None:
             await self._backend.close()
         self._backend = None
         self._dispatch = None
         self._lifecycle = None
+        self._scheduling = None
         self._lock = None
 
     def close(self) -> None:
@@ -295,3 +333,23 @@ class TinyJobs:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def _declare_schedule(
+    task: str, cron: str | None, timezone: str, misfire: str, overlap: bool
+) -> Schedule | None:
+    if cron is None:
+        return None
+    return Schedule.declare(
+        task, cron, timezone=timezone, misfire=misfire, overlap=overlap
+    )
+
+
+def _assert_callable_without_arguments(task: Task) -> None:
+    try:
+        task.bind((), {})
+    except TypeError:
+        raise ConfigurationError(
+            f"{task.name} runs on a cron schedule, which calls it with no "
+            f"arguments, but its signature requires some"
+        ) from None

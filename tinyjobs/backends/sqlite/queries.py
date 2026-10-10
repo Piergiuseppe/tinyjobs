@@ -140,6 +140,28 @@ CLAIM_HOUSEKEEPING = """
     RETURNING key
 """
 
+SELECT_SCHEDULES = """
+    SELECT name, cron, timezone, next_run_at, last_run_at, last_job_id
+      FROM schedules ORDER BY name
+"""
+
+REGISTER_SCHEDULE = """
+    INSERT INTO schedules (name, cron, timezone, next_run_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT (name) DO UPDATE
+       SET cron = excluded.cron, timezone = excluded.timezone,
+           next_run_at = excluded.next_run_at
+     WHERE schedules.cron != excluded.cron OR schedules.timezone != excluded.timezone
+"""
+
+ADVANCE_SCHEDULE = """
+    UPDATE schedules SET next_run_at = ?
+     WHERE name = ? AND next_run_at = ?
+"""
+
+RECORD_SCHEDULE_RUN = """
+    UPDATE schedules SET last_run_at = ?, last_job_id = ? WHERE name = ?
+"""
+
 PURGE_BATCH = """
     DELETE FROM jobs
      WHERE id IN (SELECT id FROM jobs

@@ -36,9 +36,12 @@ class DispatchService:
     async def dispatch_by_name(
         self, name: str, payload: JobPayload, options: EnqueueOptions
     ) -> Job:
-        return await self._backend.enqueue(
-            self.build(name, payload, self._with_task_defaults(name, options))
-        )
+        return await self._backend.enqueue(self.prepare(name, payload, options))
+
+    def prepare(
+        self, name: str, payload: JobPayload, options: EnqueueOptions
+    ) -> Job:
+        return self.build(name, payload, self._with_task_defaults(name, options))
 
     def _with_task_defaults(
         self, name: str, options: EnqueueOptions

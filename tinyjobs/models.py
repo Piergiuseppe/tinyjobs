@@ -149,6 +149,16 @@ class ExecutionError:
         return f"{self.type}: {self.message}" if self.message else self.type
 
 
+@dataclass(slots=True)
+class ScheduleState:
+    name: str
+    cron: str
+    timezone: str
+    next_run_at: float
+    last_run_at: float | None = None
+    last_job_id: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class Page:
     items: list[Job]

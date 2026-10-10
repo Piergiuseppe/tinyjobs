@@ -37,6 +37,12 @@ class WorkerCommand(Command):
                             metavar="DURATION", help="how often to sweep, e.g. 1h")
         parser.add_argument("--no-purge", action="store_true",
                             help="never prune anything")
+        parser.add_argument("--no-scheduler", action="store_true",
+                            help="do not fire cron schedules from this worker")
+        parser.add_argument("--misfire-grace", type=parse_duration, default=60.0,
+                            metavar="DURATION",
+                            help="how late a cron firing may be and still count "
+                                 "as on time (default: 60s)")
 
     def run(self, args: argparse.Namespace) -> int:
         app = self.resolve_app(args)
@@ -50,6 +56,8 @@ class WorkerCommand(Command):
             shutdown_timeout=args.shutdown_timeout,
             poll_minimum=args.poll_min,
             poll_maximum=args.poll_max,
+            scheduler=not args.no_scheduler,
+            misfire_grace=args.misfire_grace,
         )
         worker.run()
         return 0

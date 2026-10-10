@@ -75,6 +75,16 @@ DDL = (
     CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_attempt
         ON executions (job_id, attempt)
     """,
+    """
+    CREATE TABLE IF NOT EXISTS schedules (
+        name        TEXT PRIMARY KEY,
+        cron        TEXT NOT NULL,
+        timezone    TEXT NOT NULL,
+        next_run_at REAL NOT NULL,
+        last_run_at REAL,
+        last_job_id TEXT
+    )
+    """,
 )
 
 

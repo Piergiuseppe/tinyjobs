@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
-from ..models import ExecutionError, Job, Page
+from ..models import ExecutionError, Job, Page, ScheduleState
 from ..retention import RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
@@ -16,6 +16,7 @@ class Capabilities:
     dedup: bool = False
     transactional_enqueue: bool = False
     retention: bool = False
+    schedules: bool = False
     max_payload_bytes: int | None = None
 
 
@@ -79,6 +80,19 @@ class Backend(Protocol):
         self, policy: RetentionPolicy, now: float
     ) -> int | None: ...
 
+    async def schedules(self) -> list[ScheduleState]: ...
+
+    async def register_schedules(self, states: Sequence[ScheduleState]) -> None: ...
+
+    async def fire_schedule(
+        self,
+        name: str,
+        *,
+        expected: float,
+        next_run_at: float,
+        jobs: Sequence[Job],
+    ) -> list[Job] | None: ...
+
 
 class BaseBackend(ABC):
     capabilities: Capabilities = Capabilities()
@@ -96,6 +110,22 @@ class BaseBackend(ABC):
         return [await self.enqueue(job) for job in jobs]
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
+        return None
+
+    async def schedules(self) -> list[ScheduleState]:
+        return []
+
+    async def register_schedules(self, states: Sequence[ScheduleState]) -> None:
+        return None
+
+    async def fire_schedule(
+        self,
+        name: str,
+        *,
+        expected: float,
+        next_run_at: float,
+        jobs: Sequence[Job],
+    ) -> list[Job] | None:
         return None
 
     async def __aenter__(self) -> "BaseBackend":

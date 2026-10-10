@@ -155,13 +155,77 @@ attempts
     3  success      12ms  laptop/8821/9389541d
 ```
 
-There's a runnable example in `examples/demo.py` covering retries, timeouts, priorities, delays and
-deduplication:
+There's a runnable example in `examples/demo.py` covering retries, timeouts, priorities, delays,
+deduplication and cron:
 
 ```bash
 python -m examples.demo
 tinyjobs worker --app examples.demo:app --concurrency 4
 ```
+
+## Cron
+
+```python
+@app.task(cron="*/15 * * * *")
+async def refresh_cache() -> None:
+    ...
+
+
+@app.task(cron="30 2 * * *", timezone="Europe/Rome")
+def nightly_report() -> None:
+    ...
+```
+
+There is no extra process to run. Every `tinyjobs worker` also runs the scheduler, and however many
+workers you start, each firing creates exactly one job: the schedule moves on with a single
+conditional `UPDATE`, and only the worker whose update matched writes the job, in the same
+transaction. Kill any of them, even with `kill -9`, and the rest carry on.
+
+What it creates is an ordinary job, with the task's retries, queue and priority.
+
+```bash
+tinyjobs schedules --app tasks:app
+```
+
+```
+NAME                  CRON          TIMEZONE     NEXT RUN             LAST RUN             LAST JOB
+--------------------  ------------  -----------  -------------------  -------------------  ------------------------------------
+tasks.nightly_report  30 2 * * *    Europe/Rome  2026-10-11 02:30:00  -                    -
+tasks.refresh_cache   */15 * * * *  UTC          2026-10-10 14:15:00  2026-10-10 14:09:00  01a125b7-6b62-7135-b9a0-b7707bf39c1c
+```
+
+```bash
+tinyjobs worker --app tasks:app --no-scheduler     # runs jobs, fires nothing
+tinyjobs scheduler --app tasks:app                 # fires schedules, runs nothing
+```
+
+When nothing was running at the moment a schedule was due, `misfire` decides what happens on restart:
+
+```python
+@app.task(cron="0 * * * *")                                   # skip, the default
+@app.task(cron="0 * * * *", misfire="run_once")               # one catch-up run
+@app.task(cron="0 0 * * *", misfire="run_all", overlap=True)  # every missed day, oldest first
+```
+
+A firing only counts as missed when it is more than a minute late (`--misfire-grace`). A schedule
+won't start a run while the previous one is still queued or running, unless `overlap=True`.
+
+A malformed expression, an unknown timezone, `0 0 30 2 *` (which never fires) or a cron task that
+needs arguments all raise at import, not at 2 a.m.
+
+Worth knowing:
+
+- **The resolution is one minute.**
+- **An `async` task that blocks the event loop also blocks its worker's scheduler**, which then skips
+  the firings it slept through. Write blocking work as `def`, or run a standalone `tinyjobs scheduler`.
+- **Daylight saving.** A time of day (`30 2 * * *`) fires once, even when 02:30 happens twice or not
+  at all. A frequency (`*/10 * * * *`) follows the real clock: the repeated hour runs twice, the
+  skipped one not at all. Local timezones on Windows need `pip install tzdata`.
+- **Clocks** that disagree by less than the grace are harmless. A jump forward counts as an outage; a
+  jump back is noticed on the next tick.
+- **One schedule per task name.** For two cadences, register the function twice under two names.
+- **Volume.** Ten thousand schedules on the same minute all fire exactly once, the last few seconds
+  late. Numbers in [Measured](#measured).
 
 ## What you get
 
@@ -169,6 +233,7 @@ tinyjobs worker --app examples.demo:app --concurrency 4
 | --- | --- |
 | Async and sync tasks | `async def` runs on the worker's event loop, `def` in a thread pool |
 | Retries | exponential backoff with jitter, per-exception policy, `Retry` and `Abandon` |
+| Cron | `cron="*/15 * * * *"`, timezones and DST, misfire and overlap policies, in every worker |
 | Delayed jobs | `delay=60` or `run_at=<datetime>` |
 | Priorities and queues | integers, highest first; workers subscribe to a subset |
 | Timeouts | hard for async tasks, soft for threaded sync ones (see below) |
@@ -294,6 +359,13 @@ from 4.7 to 10.2 MB in three minutes and kept going, and with it on the same cur
 MB and stayed there. Under a `SIGKILL` on a worker every thirty seconds it moved 0.6% across eight
 minutes.
 
+Cron was measured on its own. Ten thousand schedules all due on the same minute fire in about a
+second from one scheduler, roughly 110 microseconds each. With four workers racing for them, 2,000
+schedules a minute were fired 8,000 times in four minutes, each exactly once, p95 0.57 seconds late;
+10,000 a minute, 40,000 times, each exactly once, p95 6.4 seconds late. Fifty-six schedulers racing on
+one schedule for twelve minutes produced twelve jobs, and fifty `SIGKILL`s across four workers and a
+standalone scheduler in ten minutes left no gap and no duplicate.
+
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
@@ -309,12 +381,12 @@ v0.3.1. Working and measured, but young. What's in:
 - priorities, named queues, delayed jobs, deduplication keys
 - `job.refresh()`, `job.wait()` and `job.result()`
 - retention, so the database plateaus instead of growing
-- `tinyjobs worker` / `jobs` / `send` / `purge`
+- cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
+- `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `send` / `purge`
 - the backend plugin seam
 
 What's not in yet:
 
-- cron schedules and the scheduler, which is the next piece of work
 - transactional enqueue, where a job is only created if your own transaction commits
 - a process executor for CPU-bound work, and `memory://` for tests
 - `tinyjobs stats` and `check`
@@ -349,7 +421,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-191 tests, no test dependencies. The one that matters most is
+252 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 
