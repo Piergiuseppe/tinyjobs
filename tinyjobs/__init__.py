@@ -15,6 +15,7 @@ if sys.version_info < MINIMUM_PYTHON:
     )
 
 from .app import TinyJobs
+from .clock import FrozenClock
 from .exceptions import (
     Abandon,
     ConfigurationError,
@@ -58,6 +59,7 @@ __all__ = [
     "Execution",
     "ExecutionError",
     "ExecutionStatus",
+    "FrozenClock",
     "KEEP_EVERYTHING",
     "Job",
     "JobPayload",

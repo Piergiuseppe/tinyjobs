@@ -1168,23 +1168,29 @@ start against a schema newer than they understand, so a partial rollback cannot 
 Testing background jobs is normally miserable, so it is a design constraint rather than an afterthought.
 
 ```python
-# 1. Eager mode: run inline on enqueue, no worker, no store
+# 1. Eager mode: every enqueue runs the job before it returns
 app = TinyJobs("memory://", eager=True)
 
 # 2. Manual draining: real queue semantics, deterministic ordering
 app = TinyJobs("memory://")
 generate_pdf.enqueue(1)
-app.drain()                      # run everything currently queued, then stop
+app.drain()                      # run everything due, highest priority first, then stop
 
-# 3. Fake clock: test backoff and cron without waiting
-with app.freeze_time("2026-01-01T00:00:00Z") as clock:
-    refresh_cache.enqueue()
-    clock.advance(minutes=5)
-    app.drain()
+# 3. Fake clock: test delays and backoff without waiting
+clock = FrozenClock(time.time())
+app = TinyJobs("memory://", clock=clock)
+flaky.enqueue()
+app.drain()                      # first attempt fails, the retry is due in 10s
+clock.advance(10)
+app.drain()
 ```
 
-The `memory://` backend runs the same conformance suite as SQLite, so behaviour under test matches
-behaviour in production.
+`memory://` is not a second implementation. It is the SQLite backend on a private in-memory database,
+so a test exercises the same claim, the same dedup index and the same retry bookkeeping as
+production, with nothing to keep in sync. Eager mode is a drain after every enqueue, so a delayed job
+or a retry with backoff stays queued until the clock reaches it, exactly as it would under a worker.
+`drain()` runs jobs one at a time, fires hooks, and raises `UnknownTaskError` on a job no task in the
+app can run, leaving it queued. It does not fire cron schedules; enqueue the task to test it.
 
 ---
 

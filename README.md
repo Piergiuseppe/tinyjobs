@@ -260,9 +260,37 @@ running past their lease: 2
 ```
 
 A job past its lease means the worker holding it stopped reporting, usually because it died. `check`
-also fails on queued jobs for a task the app doesn't register (a missing `--import`), on a due job
+fails on that, on queued jobs for a task the app doesn't register (a missing `--import`), on a due job
 waiting longer than `--max-wait`, and on a cron schedule more than a minute overdue, which means no
 worker or scheduler is running. Both are `app.stats()` and `app.check()` in code.
+
+## Testing your tasks
+
+```python
+app = TinyJobs("memory://", eager=True)
+
+job = generate_pdf.enqueue(123)     # runs before enqueue returns
+job.status                          # success
+job.result()                        # '/tmp/123.pdf'
+```
+
+Or keep the queue and run it when you choose, with a clock you control:
+
+```python
+from tinyjobs import FrozenClock
+
+clock = FrozenClock(time.time())
+app = TinyJobs("memory://", clock=clock)
+
+flaky.enqueue()
+app.drain()             # runs everything due, highest priority first; returns how many ran
+clock.advance(10)       # the retry's backoff
+app.drain()
+```
+
+`memory://` is the SQLite backend on a private in-memory database, so tests run the same claim,
+dedup and retries as production. Delays and backoff are respected in eager mode too: advance the clock
+and drain. A failing task is recorded on the job, not raised, as it would be in a worker.
 
 ## What you get
 
@@ -283,6 +311,7 @@ worker or scheduler is running. Both are `app.stats()` and `app.check()` in code
 | Retention | old terminal jobs are pruned so the database stops growing |
 | Hooks | `on_job_start`, `on_job_success`, `on_job_failure`, for metrics and alerts |
 | Health | `tinyjobs stats`, and `tinyjobs check` for probes |
+| Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -421,6 +450,7 @@ v0.3.1. Working and measured, but young. What's in:
 - `job.refresh()`, `job.wait()` and `job.result()`
 - retention, so the database plateaus instead of growing
 - lifecycle hooks for metrics and alerting
+- `memory://`, eager mode and `app.drain()` for testing
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
 - the backend plugin seam
@@ -428,7 +458,7 @@ v0.3.1. Working and measured, but young. What's in:
 What's not in yet:
 
 - transactional enqueue, where a job is only created if your own transaction commits
-- a process executor for CPU-bound work, and `memory://` for tests
+- a process executor for CPU-bound work
 - any backend other than SQLite
 
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
@@ -460,7 +490,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-270 tests, no test dependencies. The one that matters most is
+284 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

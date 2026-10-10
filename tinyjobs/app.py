@@ -30,7 +30,7 @@ from .services import (
 from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
-from .worker import Worker
+from .worker import Drain, Worker
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -48,12 +48,14 @@ class TinyJobs:
         allow_pickle: bool = False,
         retention: RetentionPolicy | None = None,
         clock: Clock | None = None,
+        eager: bool = False,
         **backend_options: Any,
     ) -> None:
         self._url = url
         self._backend_options = backend_options
         self._default_queue = default_queue
         self._retention = retention or RetentionPolicy()
+        self._eager = eager
         self._clock = clock or Clock()
         self._codecs = CodecRegistry(default=default_codec, allow_pickle=allow_pickle)
         self._registry = TaskRegistry()
@@ -76,6 +78,10 @@ class TinyJobs:
     @property
     def clock(self) -> Clock:
         return self._clock
+
+    @property
+    def eager(self) -> bool:
+        return self._eager
 
     @property
     def retention(self) -> RetentionPolicy:
@@ -143,6 +149,13 @@ class TinyJobs:
 
     def bind(self, job: Job | None) -> Job | None:
         return job.bound_to(self) if job is not None else None
+
+    async def settle(self, job: Job) -> Job:
+        bound = self.bind(job)
+        if not self._eager:
+            return bound
+        await self.adrain()
+        return await bound.arefresh()
 
     async def ready(self) -> None:
         if self._backend is not None:
@@ -252,7 +265,7 @@ class TinyJobs:
     ) -> Job:
         await self.ready()
         payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
-        return self.bind(
+        return await self.settle(
             await self.dispatch.dispatch_by_name(
                 name, payload, EnqueueOptions().merged_with(**options)
             )
@@ -330,6 +343,12 @@ class TinyJobs:
 
     def check(self, *, max_wait: float | None = None) -> list[Finding]:
         return self.run_sync(self.acheck(max_wait=max_wait), name="check")
+
+    async def adrain(self, queues: Sequence[str] | None = None) -> int:
+        return await Drain(self, queues).run()
+
+    def drain(self, queues: Sequence[str] | None = None) -> int:
+        return self.run_sync(self.adrain(queues), name="drain")
 
     async def aexecutions(self, job_id: str) -> list:
         await self.ready()

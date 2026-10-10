@@ -3,6 +3,7 @@ from .loader import available_schemes, load_backend, register_builtin
 from .sqlite import SQLiteBackend
 
 register_builtin("sqlite", SQLiteBackend.from_url)
+register_builtin("memory", SQLiteBackend.from_url)
 
 __all__ = [
     "Backend",
