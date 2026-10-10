@@ -19,10 +19,13 @@ from .scheduler import Scheduler
 from .schedules import Schedule
 from .services import (
     DispatchService,
+    ExecutionService,
+    Hooks,
     JobLifecycleService,
     SchedulingService,
     SerializationService,
 )
+from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Worker
@@ -30,6 +33,7 @@ from .worker import Worker
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
 T = TypeVar("T")
+Listener = TypeVar("Listener", bound=Callable[..., Any])
 
 
 class TinyJobs:
@@ -52,10 +56,12 @@ class TinyJobs:
         self._codecs = CodecRegistry(default=default_codec, allow_pickle=allow_pickle)
         self._registry = TaskRegistry()
         self._serialization = SerializationService(self._codecs)
+        self._hooks = Hooks()
         self._runner = LoopRunner()
         self._backend: Backend | None = None
         self._dispatch: DispatchService | None = None
         self._lifecycle: JobLifecycleService | None = None
+        self._execution: ExecutionService | None = None
         self._scheduling: SchedulingService | None = None
         self._lock: asyncio.Lock | None = None
         self._lock_guard = threading.Lock()
@@ -106,6 +112,12 @@ class TinyJobs:
         return self._lifecycle
 
     @property
+    def execution(self) -> ExecutionService:
+        if self._execution is None:
+            raise BackendNotReadyError("the backend is not connected yet")
+        return self._execution
+
+    @property
     def scheduling(self) -> SchedulingService:
         if self._scheduling is None:
             raise BackendNotReadyError("the backend is not connected yet")
@@ -145,6 +157,9 @@ class TinyJobs:
             )
             self._lifecycle = JobLifecycleService(
                 backend, self._serialization, self._clock
+            )
+            self._execution = ExecutionService(
+                self._serialization, self._lifecycle, self._hooks, self._clock
             )
             self._scheduling = SchedulingService(
                 backend, self._dispatch, self._registry, self._clock
@@ -208,6 +223,15 @@ class TinyJobs:
             return resolved
 
         return decorate(function) if function is not None else decorate
+
+    def on_job_start(self, listener: Listener) -> Listener:
+        return self._hooks.add(START, listener)
+
+    def on_job_success(self, listener: Listener) -> Listener:
+        return self._hooks.add(SUCCESS, listener)
+
+    def on_job_failure(self, listener: Listener) -> Listener:
+        return self._hooks.add(FAILURE, listener)
 
     async def asend(
         self,
@@ -313,6 +337,7 @@ class TinyJobs:
         self._backend = None
         self._dispatch = None
         self._lifecycle = None
+        self._execution = None
         self._scheduling = None
         self._lock = None
 

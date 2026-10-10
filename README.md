@@ -227,6 +227,24 @@ Worth knowing:
 - **Volume.** Ten thousand schedules on the same minute all fire exactly once, the last few seconds
   late. Numbers in [Measured](#measured).
 
+## Watching it
+
+```python
+@app.on_job_failure
+def alert(job, error, will_retry):
+    if not will_retry:
+        sentry_sdk.capture_exception(error)
+
+
+@app.on_job_success
+def timing(job, result, duration):
+    statsd.timing(job.task, duration)
+```
+
+`on_job_start(job)` completes the set. Hooks run in the worker and can be `def` or `async def`. One
+that raises is logged and ignored, so a broken metrics client never fails a job. A `def` hook runs on
+the worker's event loop, so keep it quick.
+
 ## What you get
 
 | | |
@@ -244,6 +262,7 @@ Worth knowing:
 | Async throughout | the backend protocol is `async`, with a sync facade for ordinary code |
 | Cancellation | before a job starts; cooperative after |
 | Retention | old terminal jobs are pruned so the database stops growing |
+| Hooks | `on_job_start`, `on_job_success`, `on_job_failure`, for metrics and alerts |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -381,6 +400,7 @@ v0.3.1. Working and measured, but young. What's in:
 - priorities, named queues, delayed jobs, deduplication keys
 - `job.refresh()`, `job.wait()` and `job.result()`
 - retention, so the database plateaus instead of growing
+- lifecycle hooks for metrics and alerting
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `send` / `purge`
 - the backend plugin seam

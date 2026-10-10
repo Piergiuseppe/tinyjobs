@@ -158,26 +158,22 @@ class Worker:
             await self._release_unknown(job)
             return
         try:
-            payload = self._app.serialization.decode_payload(job)
-            result = await self._executors.resolve(task).execute(task, payload)
-            await self._app.lifecycle.succeed(job, task, result)
+            attempt = await self._app.execution.execute(
+                self._app.bind(job), task, self._executors
+            )
         except asyncio.CancelledError:
             await asyncio.shield(self._app.backend.release(job))
             raise
-        except BaseException as error:
-            await self._record_failure(job, task, error)
+        if attempt.error is None:
+            logger.info("job %s succeeded on attempt %d", job.id, job.attempts)
             return
-        logger.info("job %s succeeded on attempt %d", job.id, job.attempts)
-
-    async def _record_failure(self, job: Job, task, error: BaseException) -> None:
-        _, will_retry = await self._app.lifecycle.fail(job, task, error)
         logger.warning(
             "job %s failed on attempt %d/%d (%s)%s",
             job.id,
             job.attempts,
             job.max_attempts,
-            type(error).__name__,
-            "; will retry" if will_retry else "",
+            type(attempt.error).__name__,
+            "; will retry" if attempt.will_retry else "",
         )
 
     async def _release_unknown(self, job: Job) -> None:

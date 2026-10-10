@@ -504,6 +504,78 @@ class WaitTests(WorkerTestCase):
         self.assertIn("awaited", str(caught.exception))
 
 
+class HookTests(WorkerTestCase):
+    async def test_start_and_success_see_the_job_the_result_and_the_duration(self):
+        seen = []
+
+        @self.app.task
+        async def handler(value):
+            return value * 2
+
+        @self.app.on_job_start
+        def started(job):
+            seen.append(("start", job.task, job.attempts))
+
+        @self.app.on_job_success
+        async def succeeded(job, result, duration):
+            seen.append(("success", result, duration >= 0))
+
+        job = await handler.aenqueue(21)
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(
+            seen, [("start", handler.name, 1), ("success", 42, True)]
+        )
+
+    async def test_failure_says_whether_the_job_will_be_retried(self):
+        seen = []
+
+        @self.app.task(max_attempts=2, retry_base=0.01, retry_jitter=False)
+        def flaky():
+            raise ConnectionError("down")
+
+        @self.app.on_job_failure
+        def failed(job, error, will_retry):
+            seen.append((job.attempts, type(error).__name__, will_retry))
+
+        job = await flaky.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(
+            seen, [(1, "ConnectionError", True), (2, "ConnectionError", False)]
+        )
+
+    async def test_a_hook_that_raises_leaves_the_job_alone(self):
+        @self.app.task(store_result=True)
+        def handler():
+            return "done"
+
+        @self.app.on_job_success
+        def broken(job, result, duration):
+            raise RuntimeError("metrics are down")
+
+        job = await handler.aenqueue()
+        with self.assertLogs("tinyjobs.hooks", "ERROR") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertIn("metrics are down", "\n".join(logs.output))
+        stored = await self.app.aget(job.id)
+        self.assertIs(stored.status, JobStatus.SUCCESS)
+        self.assertEqual(stored.result(), "done")
+
+    async def test_hooks_get_a_bound_job(self):
+        statuses = []
+
+        @self.app.task
+        async def handler():
+            return None
+
+        @self.app.on_job_success
+        async def succeeded(job, result, duration):
+            statuses.append((await job.arefresh()).status)
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(statuses, [JobStatus.SUCCESS])
+
+
 class HousekeepingTests(WorkerTestCase):
     async def test_the_worker_prunes_on_its_own(self):
         from tinyjobs.retention import RetentionPolicy

@@ -1130,6 +1130,10 @@ def _(job, result, duration): ...
 def _(job, exc, will_retry): ...
 ```
 
+Hooks run in the worker. Success and failure fire after the outcome is recorded, so a hook that reads
+the job back sees it. They may be sync or async. One that raises is logged on `tinyjobs.hooks` and
+ignored: observability must never change what happens to a job.
+
 ### Health
 
 `tinyjobs check` verifies configuration, schema version and clock skew. `tinyjobs stats` gives counts
