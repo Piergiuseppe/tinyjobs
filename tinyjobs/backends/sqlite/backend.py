@@ -22,7 +22,7 @@ from ...models import (
 )
 from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
-from ..base import BaseBackend, Capabilities
+from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
 from .connection import ConnectionPool
 from .queries import (
@@ -64,9 +64,6 @@ from .records import (
 from .schema import DDL, MIGRATIONS, SCHEMA_VERSION
 
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
-LEASE_EXPIRED_MESSAGE = (
-    "lease expired: the worker holding this job stopped reporting"
-)
 
 
 class SQLiteBackend(BaseBackend):

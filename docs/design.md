@@ -532,7 +532,8 @@ app = TinyJobs("redis://localhost/0")   # after
 
 The URL scheme selects the backend. The core package never imports, references or knows the names of
 optional backends; it looks up the scheme in the entry point group and raises a helpful error
-(`pip install tinyjobs-redis`) if nothing is registered for it. Bundled: `sqlite://`, `memory://`.
+(`pip install tinyjobs-postgres`) if nothing is registered for it. Bundled: `sqlite://`, `memory://`,
+and `redis://` behind the `redis` extra, imported only when a `redis://` URL is used.
 
 ---
 
@@ -667,6 +668,60 @@ rather than by Python. That covers most applications. It will not cover a high-v
 pipeline, and it degrades on network filesystems. SQLite's locking over NFS is unreliable, and the
 backend refuses to run on a detected network mount rather than corrupting data quietly. Both cases are
 the reason the backend seam exists.
+
+---
+
+## The Redis backend
+
+Bundled rather than a separate `tinyjobs-redis` package: until the protocol freezes at v1.0, a change
+to it would otherwise need two releases in lockstep. It depends on nothing but the public protocol, so
+it can move out later without touching a line. The client library is an extra, `tinyjobs[redis]`, and
+is imported only when a `redis://` URL is used, so the core stays dependency-free.
+
+### Atomicity
+
+Every state change is one Lua script: enqueue, claim, complete, fail, release, cancel, requeue,
+heartbeat, reap, a purge batch, a cron firing. Redis runs a script without interleaving any other
+command, which gives each transition the guarantee SQLite gets from `BEGIN IMMEDIATE`. The scripts
+share one library, and in it a single pair of functions, `leave` and `enter`, knows which indexes
+each status lives in. A transition is `leave(old)`, write the hash, `enter(new)`, so no script can
+forget an index.
+
+### Data model
+
+All keys sit under `{prefix}`, which by default is `{tinyjobs}`:
+
+| key | type | holds |
+| --- | --- | --- |
+| `job:<id>` | hash | the job's fields, the same columns as the SQLite table |
+| `executions:<id>` | hash | attempt number to a JSON record |
+| `ready:<queue>` | sorted set | due jobs, score `-priority`, member `run_at\|id`, so order is priority then age |
+| `waiting:<queue>` | sorted set | jobs not due yet, by `run_at`; a claim promotes the due ones first |
+| `queued:<queue>` | sorted set | every queued job by `run_at`, for the oldest-due figure |
+| `leases` | sorted set | running jobs by lease expiry, for the reaper |
+| `finished:<status>` | sorted set | terminal jobs by `finished_at`, for retention |
+| `index:all`, `index:status:<s>`, `index:queue:<q>` | sorted sets | ids for listing; UUIDv7 ids sort by creation |
+| `dedup:<key>` | string | the active job holding a dedup key |
+| `counts`, `queued_tasks` | hashes | counters kept by `enter` and `leave`, so `stats` is O(queues) |
+| `schedule:<name>`, `schedules` | hash, set | cron state; firing compares `next_run_at` and swaps it |
+
+Times come from the worker's clock, as on SQLite, never from Redis's. That keeps one notion of time
+across backends and lets the contract suite drive Redis with a `FrozenClock`.
+
+### Where the limits are
+
+- **Persistence is Redis's job.** On its default snapshots a crash loses everything since the last
+  one, which in testing was the whole queue. `appendonly yes` with the default `everysec` lost nothing
+  when Redis was killed mid-run. The README says so where people will read it.
+- **One hash slot.** The hash tag puts every key in the same slot, which is what lets a script touch
+  them all. It runs on a single Redis or a primary with replicas; a cluster would hold the queue on one
+  node.
+- **Script length bounds latency.** Redis serves nobody else while a script runs. Enqueues go in
+  batches of 100 and a claim promotes at most 100 due delayed jobs, which kept the slowest call at
+  18 ms when 100,000 delayed jobs fell due at once. Claiming stays at 0.7 ms with 200,000 queued.
+- **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
+  pop would save the idle round trips but cannot express priorities across queues.
+- **No transactional enqueue.** Redis shares no transaction with your database.
 
 ---
 

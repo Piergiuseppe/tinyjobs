@@ -26,6 +26,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+redis = ["redis>=5.0.1"]
+
 [project.urls]
 Homepage = "https://github.com/Piergiuseppe/tinyjobs"
 Repository = "https://github.com/Piergiuseppe/tinyjobs"

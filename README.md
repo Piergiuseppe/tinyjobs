@@ -11,7 +11,7 @@ That's the whole setup. No broker, no result backend, no daemon. The queue is a 
 Celery is the right tool for a lot of systems, but it asks for a Redis or RabbitMQ instance before it
 will run a single job. This is for the projects that never needed that: a Django app that sends
 emails, a scraper with a nightly refresh, a CLI that offloads slow work. When you outgrow SQLite you
-swap the backend for a plugin and your task code doesn't change.
+switch the URL to Redis and your task code doesn't change.
 
 Requires Python 3.11 or newer.
 
@@ -305,7 +305,7 @@ and drain. A failing task is recorded on the job, not raised, as it would be in 
 | Crash recovery | leases plus heartbeats, so a killed worker's jobs come back |
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
 | Attempt history | every attempt is a row, with its traceback and timings |
-| Multi-worker | multiple processes and machines over one file or backend |
+| Multi-worker | multiple processes over one SQLite file, or machines over one Redis |
 | Async throughout | the backend protocol is `async`, with a sync facade for ordinary code |
 | Cancellation | before a job starts; cooperative after |
 | Retention | old terminal jobs are pruned so the database stops growing |
@@ -366,32 +366,45 @@ sync_invoice|failed|3|{"args":[8842],"kwargs":{}}
 
 That readability is most of the reason for preferring JSON over pickle.
 
-## Other backends
+## Redis
 
-Backend choice is a URL:
-
-```python
-app = TinyJobs("sqlite:///jobs.db")
-app = TinyJobs("redis://localhost/0")
+```bash
+pip install 'tinyjobs[redis]'
 ```
 
-The core package doesn't import or know about optional backends. It looks the scheme up in the
-`tinyjobs.backends` entry point group, so a third-party package registers itself with:
+```python
+app = TinyJobs("redis://localhost:6379/0")
+app = TinyJobs("redis://localhost:6379/0", prefix="billing")    # several apps on one server
+```
+
+Nothing else changes: the same tasks, workers, cron, hooks, `stats` and `check`. Every state change
+is one Lua script, so a claim is as atomic as on SQLite, and any number of workers on any number of
+machines can share the queue. It passes the same contract suite as SQLite.
+
+**Turn persistence on.** Redis keeps the queue in memory. Killed with `SIGKILL` mid-run, a Redis on
+its default snapshots lost the whole queue; with `appendonly yes` the same crash lost nothing, and
+the jobs that were running came back once their leases expired. A restart, graceful or not, is
+otherwise harmless: workers log the outage, back off, and carry on.
+
+Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like on SQLite, and
+`transactional enqueue` is SQLite only. All keys share one hash slot (`{prefix}`), so it runs on a
+single Redis or a primary with replicas, not spread across a cluster.
+
+## Other backends
+
+The core package doesn't know about third-party backends. It looks an unknown URL scheme up in the
+`tinyjobs.backends` entry point group, so a package registers itself with:
 
 ```toml
 [project.entry-points."tinyjobs.backends"]
-redis = "tinyjobs_redis:RedisBackend"
+postgres = "tinyjobs_postgres:PostgresBackend.from_url"
 ```
 
 Backends declare what they support (`priority`, `delayed`, `dedup`, ...) and asking for something
-unsupported raises when you enqueue rather than failing quietly later. No Redis or Postgres backend
-exists yet.
-
-The protocol is `async`, so a backend built on a network client talks to it directly with no threads
-in the way. SQLite is the odd one out: `sqlite3` is a blocking C library, so that backend does its own
-thread hop internally, on a dedicated single-worker executor. `tests/test_async_backend.py` implements
-a working in-memory backend in about 120 lines if you want a template, and
-`tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite runs.
+unsupported raises when you enqueue rather than failing quietly later. The protocol is `async`, and
+`tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite and
+Redis run. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130 lines if
+you want a template.
 
 ## Measured
 
@@ -428,6 +441,11 @@ from 4.7 to 10.2 MB in three minutes and kept going, and with it on the same cur
 MB and stayed there. Under a `SIGKILL` on a worker every thirty seconds it moved 0.6% across eight
 minutes.
 
+Redis was measured with the same kind of harness, on a laptop with Redis 7.4 in Docker: 20,000 jobs
+over four workers of eight slots in 2.1 seconds, against 4 seconds on SQLite, each run exactly once.
+Twelve `SIGKILL`s on workers during 4,000 jobs left none lost; 43 came back through an expired lease,
+and 2 applied their side effect twice. Claiming stays at 0.7 ms with 200,000 jobs queued.
+
 Cron was measured on its own. Ten thousand schedules all due on the same minute fire in about a
 second from one scheduler, roughly 110 microseconds each. With four workers racing for them, 2,000
 schedules a minute were fired 8,000 times in four minutes, each exactly once, p95 0.57 seconds late;
@@ -454,13 +472,14 @@ v0.4.0. Working and measured, but young. What's in:
 - `memory://`, eager mode and `app.drain()` for testing
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
-- the backend plugin seam
+- a Redis backend, `pip install 'tinyjobs[redis]'`
+- the backend plugin seam and its contract suite
 
 What's not in yet:
 
 - transactional enqueue, where a job is only created if your own transaction commits
 - a process executor for CPU-bound work
-- any backend other than SQLite
+- a Postgres backend
 
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
 
@@ -491,9 +510,17 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-337 tests, no test dependencies. The one that matters most is
+390 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
+
+The 50 Redis tests skip unless they have a server and the client library:
+
+```bash
+docker run -d -p 6379:6379 redis:7.4-alpine
+pip install -e '.[redis]'
+TINYJOBS_REDIS_URL=redis://localhost:6379/0 python -m unittest discover -s tests -t .
+```
 
 ## License
 

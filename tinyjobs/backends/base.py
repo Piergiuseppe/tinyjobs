@@ -9,6 +9,11 @@ from ..retention import RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
 
+LEASE_EXPIRED_MESSAGE = (
+    "lease expired: the worker holding this job stopped reporting"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Capabilities:
     priority: bool = True

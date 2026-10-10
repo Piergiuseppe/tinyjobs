@@ -63,10 +63,10 @@ class BackendResolutionTests(unittest.TestCase):
 
     def test_unknown_scheme_names_the_missing_package(self):
         with self.assertRaises(UnknownBackendError) as caught:
-            load_backend("redis://localhost/0")
+            load_backend("postgres://localhost/jobs")
         message = str(caught.exception)
-        self.assertIn("redis", message)
-        self.assertIn("pip install tinyjobs-redis", message)
+        self.assertIn("postgres", message)
+        self.assertIn("pip install tinyjobs-postgres", message)
         self.assertIn("sqlite", message)
 
     def test_a_url_without_a_scheme_is_rejected(self):
