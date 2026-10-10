@@ -26,7 +26,9 @@ class JobLifecycleService:
         self._clock = clock
 
     async def succeed(self, job: Job, task: "Task", result: Any) -> bool:
-        encoded = self._encode_result(job, task, result)
+        return await self.complete(job, self.encode_result(job, task, result))
+
+    async def complete(self, job: Job, encoded: bytes | None) -> bool:
         return await self._backend.complete(job, encoded)
 
     async def fail(
@@ -51,7 +53,7 @@ class JobLifecycleService:
         delay = task.retry_policy.delay_for(job.attempts, error)
         return self._clock.now() + delay
 
-    def _encode_result(self, job: Job, task: "Task", result: Any) -> bytes | None:
+    def encode_result(self, job: Job, task: "Task", result: Any) -> bytes | None:
         if not task.store_result or result is None:
             return None
         return self._serialization.encode_result(result, job.codec)

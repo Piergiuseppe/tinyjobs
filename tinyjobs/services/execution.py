@@ -42,12 +42,14 @@ class ExecutionService:
         try:
             payload = self._serialization.decode_payload(job)
             result = await executors.resolve(task).execute(task, payload)
-            await self._lifecycle.succeed(job, task, result)
+            encoded = self._lifecycle.encode_result(job, task, result)
         except asyncio.CancelledError:
             raise
         except BaseException as error:
             _, will_retry = await self._lifecycle.fail(job, task, error)
             await self._hooks.failed(job, error, will_retry)
             return Attempt(error, will_retry)
-        await self._hooks.succeeded(job, result, self._clock.monotonic() - started)
+        duration = self._clock.monotonic() - started
+        await self._lifecycle.complete(job, encoded)
+        await self._hooks.succeeded(job, result, duration)
         return Attempt()

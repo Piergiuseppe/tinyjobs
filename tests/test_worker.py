@@ -504,6 +504,33 @@ class WaitTests(WorkerTestCase):
         self.assertIn("awaited", str(caught.exception))
 
 
+class BackendOutageTests(WorkerTestCase):
+    async def test_a_store_that_cannot_record_success_does_not_fail_the_job(self):
+        @self.app.task
+        def handler():
+            self.calls.append("ran")
+
+        job = await handler.aenqueue()
+        await self.app.ready()
+        backend = self.app.backend
+        original = backend.complete
+
+        async def unreachable(*args, **kwargs):
+            raise ConnectionError("store unreachable")
+
+        backend.complete = unreachable
+        try:
+            with self.assertLogs("tinyjobs.worker", "ERROR") as logs:
+                await self.run_briefly(self.make_worker(), 0.5)
+        finally:
+            backend.complete = original
+        stored = await self.app.aget(job.id)
+        self.assertEqual(self.calls, ["ran"])
+        self.assertIs(stored.status, JobStatus.RUNNING)
+        self.assertIsNone(stored.last_error)
+        self.assertIn("could not record the outcome", "\n".join(logs.output))
+
+
 class HookTests(WorkerTestCase):
     async def test_start_and_success_see_the_job_the_result_and_the_duration(self):
         seen = []

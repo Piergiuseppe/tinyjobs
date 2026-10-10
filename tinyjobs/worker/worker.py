@@ -164,6 +164,13 @@ class Worker:
         except asyncio.CancelledError:
             await asyncio.shield(self._app.backend.release(job))
             raise
+        except Exception:
+            logger.exception(
+                "could not record the outcome of job %s; it runs again once its "
+                "lease expires",
+                job.id,
+            )
+            return
         if attempt.error is None:
             logger.info("job %s succeeded on attempt %d", job.id, job.attempts)
             return
