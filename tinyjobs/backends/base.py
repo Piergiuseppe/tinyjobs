@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
 
-from ..models import ExecutionError, Job, Page, ScheduleState, Stats
+from ..models import Execution, ExecutionError, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
@@ -71,6 +71,8 @@ class Backend(Protocol):
         limit: int = 100,
         cursor: str | None = None,
     ) -> Page: ...
+
+    async def executions(self, job_id: str) -> list[Execution]: ...
 
     async def reap_expired(self) -> int: ...
 

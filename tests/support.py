@@ -20,16 +20,3 @@ class BackendTestCase(unittest.TestCase):
 
     def drive(self, coroutine):
         return self.app.run_sync(coroutine, name="test")
-
-
-class AsyncBackendTestCase(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
-        self.database = Path(self.directory.name) / "jobs.db"
-        self.app = TinyJobs(f"sqlite:///{self.database}")
-        await self.app.ready()
-        self.backend = self.app.backend
-
-    async def asyncTearDown(self) -> None:
-        await self.app.aclose()
-        self.directory.cleanup()

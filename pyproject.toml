@@ -35,7 +35,7 @@ Issues = "https://github.com/Piergiuseppe/tinyjobs/issues"
 tinyjobs = "tinyjobs.cli:main"
 
 [project.entry-points."tinyjobs.backends"]
-sqlite = "tinyjobs.backends.sqlite:SQLiteBackend"
+sqlite = "tinyjobs.backends.sqlite:SQLiteBackend.from_url"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tinyjobs"]

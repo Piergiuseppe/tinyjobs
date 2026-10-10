@@ -390,7 +390,8 @@ exists yet.
 The protocol is `async`, so a backend built on a network client talks to it directly with no threads
 in the way. SQLite is the odd one out: `sqlite3` is a blocking C library, so that backend does its own
 thread hop internally, on a dedicated single-worker executor. `tests/test_async_backend.py` implements
-a working in-memory backend in about 120 lines if you want a template.
+a working in-memory backend in about 120 lines if you want a template, and
+`tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite runs.
 
 ## Measured
 
@@ -490,7 +491,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-284 tests, no test dependencies. The one that matters most is
+337 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

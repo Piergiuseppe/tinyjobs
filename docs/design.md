@@ -435,6 +435,7 @@ class Backend(Protocol):
     def get(self, job_id: str) -> Job | None: ...
     def list(self, *, status: str | None = None, queue: str | None = None,
              limit: int = 100, cursor: str | None = None) -> Page[Job]: ...
+    def executions(self, job_id: str) -> list[Execution]: ...
     def stats(self, now: float) -> Stats: ...   # counts per queue, oldest due, expired leases
 
     # --- schedules --------------------------------------------------------
@@ -459,7 +460,21 @@ around a loop over `enqueue()`) so that simple backends get the correct behaviou
 ### The contract a backend must honour
 
 The signatures are the easy part. These invariants are what an implementation is actually promising,
-and a conformance test suite ships with the package to check them:
+and the conformance suite that checks them ships with the package, so a plugin runs the same tests
+as the bundled backends:
+
+```python
+from tinyjobs.testing import BackendContract
+
+class MyBackendTests(BackendContract, unittest.IsolatedAsyncioTestCase):
+    async def make_backend(self, clock):
+        return MyBackend("my://test", clock=clock)   # a fresh, empty store per test
+```
+
+It drives the backend through a `FrozenClock`, so leases, delays and retention are tested without
+sleeping, and it races several clients against one store for the claim, dedup and cron invariants.
+Tests for a capability the backend does not declare are skipped. A backend whose clients cannot share
+a store, like `memory://`, sets `independent_clients = False` and races one client against itself.
 
 1. **`claim` is atomic.** A job is handed to exactly one worker. Two concurrent claims never return
    the same job. This is the one hard requirement; everything else is comfort.
