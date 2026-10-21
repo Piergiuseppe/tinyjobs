@@ -41,6 +41,10 @@ class SynchronousCallInsideEventLoopError(TinyJobsError):
     pass
 
 
+class EventLoopStoppedError(TinyJobsError):
+    pass
+
+
 class WaitTimeout(TinyJobsError, TimeoutError):
     pass
 

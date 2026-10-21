@@ -938,6 +938,26 @@ and waits up to `--shutdown-timeout` for them to finish. Anything still running 
 `QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. A
 second `SIGINT` exits at once and lets the leases lapse.
 
+### Inside a web server
+
+`app.serve(worker=True)` runs the same worker as a task on the server's own loop, and
+`app.lifespan()` wraps it in the shape FastAPI and Starlette expect. The server owns the process
+signals, so an embedded worker installs no handlers: leaving the lifespan is its `SIGTERM`, with the
+same drain and release.
+
+Where the limits are:
+
+- **One loop for both.** An `async` task that blocks stalls every request in that process, not only
+  other jobs.
+- **One GIL for both.** CPU-bound `def` tasks raise request latency; the README has the numbers. Moving
+  them to `tinyjobs worker` changes nothing in the task code.
+- **No forced stop.** The standalone worker's second signal has no equivalent, because the server
+  keeps the signals. Under `docker stop` with the default 30 s timeout, a 15 s job was killed at
+  10 s and finished 76 s after the restart, once its lease expired. With `shutdown_timeout=5` the
+  container exited cleanly and the released job finished 16 s after the restart.
+- **One worker per server process.** `uvicorn --workers 4` means four workers on one queue, which the
+  claim and the leader-free scheduler already handle.
+
 ---
 
 ## Retries
@@ -1045,6 +1065,11 @@ The facade drives a single background event loop, started lazily on the first sy
 marshals coroutines onto it. The obvious alternative, one `asyncio.run()` per call, was rejected
 because connection pools in async network clients are bound to the loop that created them; a fresh
 loop per enqueue would break precisely the backends this design exists to support.
+
+The same reasoning sets one exception. When the backend was connected from a loop that is still
+running, which is what happens under a web server's lifespan, the facade marshals onto that loop
+instead of its own. A `def` endpoint runs in a threadpool next to the server's loop, and before this
+rule its `enqueue()` reached a Redis connection pool from the wrong loop and failed every time.
 
 Calling a synchronous method from inside a running loop raises `SynchronousCallInsideEventLoopError`
 and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's

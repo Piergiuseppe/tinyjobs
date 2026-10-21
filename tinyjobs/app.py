@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import Any, Callable, Coroutine, Sequence, TypeVar
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
 from .backends.loader import load_backend
@@ -30,7 +31,7 @@ from .services import (
 from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
-from .worker import Drain, Worker
+from .worker import Drain, EmbeddedWorker, Worker
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -188,6 +189,7 @@ class TinyJobs:
             )
             self._health = HealthService(backend, self._registry, self._clock)
             self._backend = backend
+            self._runner.attach(asyncio.get_running_loop())
 
     def start(self) -> "TinyJobs":
         self.run_sync(self.ready(), name="start")
@@ -374,6 +376,31 @@ class TinyJobs:
     def scheduler(self, **options: Any) -> Scheduler:
         return Scheduler(self, **options)
 
+    @asynccontextmanager
+    async def serve(
+        self, *, worker: bool = False, **worker_options: Any
+    ) -> AsyncIterator["TinyJobs"]:
+        _assert_worker_requested(worker, worker_options)
+        embedded = (
+            EmbeddedWorker(self.worker(**worker_options, handle_signals=False))
+            if worker
+            else nullcontext()
+        )
+        async with self, embedded:
+            yield self
+
+    def lifespan(
+        self, *, worker: bool = False, **worker_options: Any
+    ) -> Callable[[Any], AbstractAsyncContextManager[None]]:
+        _assert_worker_requested(worker, worker_options)
+
+        @asynccontextmanager
+        async def bind(_: Any) -> AsyncIterator[None]:
+            async with self.serve(worker=worker, **worker_options):
+                yield
+
+        return bind
+
     async def aclose(self) -> None:
         if self._backend is not None:
             await self._backend.close()
@@ -384,6 +411,7 @@ class TinyJobs:
         self._scheduling = None
         self._health = None
         self._lock = None
+        self._runner.detach()
 
     def close(self) -> None:
         if self._backend is not None:
@@ -412,6 +440,14 @@ def _declare_schedule(
     return Schedule.declare(
         task, cron, timezone=timezone, misfire=misfire, overlap=overlap
     )
+
+
+def _assert_worker_requested(worker: bool, options: dict[str, Any]) -> None:
+    if options and not worker:
+        raise ConfigurationError(
+            f"worker options {sorted(options)} were given without worker=True, "
+            f"so no worker would run to use them"
+        )
 
 
 def _assert_callable_without_arguments(task: Task) -> None:

@@ -264,6 +264,47 @@ fails on that, on queued jobs for a task the app doesn't register (a missing `--
 waiting longer than `--max-wait`, and on a cron schedule more than a minute overdue, which means no
 worker or scheduler is running. Both are `app.stats()` and `app.check()` in code.
 
+## FastAPI
+
+```python
+from fastapi import FastAPI
+from tasks import app as jobs, generate_pdf
+
+api = FastAPI(lifespan=jobs.lifespan(worker=True))
+
+
+@api.post("/documents/{document_id}/pdf")
+async def render(document_id: int) -> dict:
+    job = await generate_pdf.aenqueue(document_id)
+    return {"job": job.id}
+```
+
+`uvicorn main:api` is the whole deployment. The lifespan connects when the server starts, runs a
+worker inside it, and on shutdown lets in-flight jobs finish before closing. Plain `def` endpoints
+can call `enqueue()`: it runs on the server's event loop, so it is safe on Redis too.
+
+`worker=True` takes the options of `app.worker()`, such as `concurrency`, `queues` and
+`shutdown_timeout`. Under `uvicorn --workers 4` each process runs its own worker on the same queue,
+and cron still fires once. If you already have a lifespan, nest it:
+
+```python
+@asynccontextmanager
+async def lifespan(api: FastAPI):
+    async with jobs.serve(worker=True):
+        yield
+```
+
+Shutdown waits up to `shutdown_timeout` (30 s) for running jobs, and a second Ctrl-C does not cut it
+short. Keep it under your orchestrator's grace period: `docker stop` allows 10 s, and past it the
+process is killed and its jobs wait out their leases instead of going straight back to the queue.
+
+Starlette takes the same `lifespan`. Leave out `worker=True` and the server only enqueues, with
+`tinyjobs worker --app tasks:app` running the jobs elsewhere.
+
+The worker shares the process with your API: an async task that blocks the loop stalls requests too,
+and CPU-heavy `def` tasks compete for the GIL. That is the point where a separate worker pays off.
+Numbers in [Measured](#measured).
+
 ## Testing your tasks
 
 ```python
@@ -312,6 +353,7 @@ and drain. A failing task is recorded on the job, not raised, as it would be in 
 | Hooks | `on_job_start`, `on_job_success`, `on_job_failure`, for metrics and alerts |
 | Health | `tinyjobs stats`, and `tinyjobs check` for probes |
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
+| FastAPI | `lifespan()`, with an optional worker inside the server process |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -453,6 +495,17 @@ schedules a minute were fired 8,000 times in four minutes, each exactly once, p9
 one schedule for twelve minutes produced twelve jobs, and fifty `SIGKILL`s across four workers and a
 standalone scheduler in ten minutes left no gap and no duplicate.
 
+FastAPI was measured under uvicorn in Docker, with the worker embedded. 3,000 jobs through one
+process on SQLite and 4,000 through `--workers 4` each ran exactly once, and cron fired once in each
+of 13 minutes across the four processes. Three API containers on one Redis took 5,638 jobs while one
+was `SIGKILL`ed; the eight it was running came back on the others when their leases expired, and none
+ran twice. An 8-second Redis outage turned enqueues into 500s while it lasted, then everything
+resumed; the one job that finished during it ran again. `docker stop` waited only for the jobs in flight, 1.5 seconds.
+
+Sharing the process costs the API little: `/ping` p95 went from 2.1 ms to 12.9 ms under eight
+CPU-bound `def` tasks, and back to 1.6 ms with the worker moved out. Six `async def` tasks calling
+`time.sleep(1)` froze it for six seconds.
+
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
@@ -474,6 +527,7 @@ v0.5.0. Working and measured, but young. What's in:
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
 - a Redis backend, `pip install 'tinyjobs[redis]'`
 - the backend plugin seam and its contract suite
+- `app.lifespan()` and `app.serve()` for FastAPI and Starlette, with an embedded worker
 
 What's not in yet:
 
@@ -510,15 +564,16 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-390 tests, no test dependencies. The one that matters most is
+404 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 
-The 50 Redis tests skip unless they have a server and the client library:
+The Redis tests skip unless they have a server and the client library, and the FastAPI ones
+unless `fastapi` and `httpx` are installed:
 
 ```bash
 docker run -d -p 6379:6379 redis:7.4-alpine
-pip install -e '.[redis]'
+pip install -e '.[redis]' fastapi httpx
 TINYJOBS_REDIS_URL=redis://localhost:6379/0 python -m unittest discover -s tests -t .
 ```
 

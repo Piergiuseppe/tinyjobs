@@ -36,6 +36,7 @@ class Worker:
         poll_minimum: float = 0.005,
         poll_maximum: float = 0.5,
         worker_id: str | None = None,
+        handle_signals: bool = True,
     ) -> None:
         self._app = app
         self._queues = tuple(queues)
@@ -53,6 +54,7 @@ class Worker:
             concurrency=concurrency, async_concurrency=async_concurrency
         )
         self._id = worker_id or new_worker_id()
+        self._handle_signals = handle_signals
         self._inflight: dict[str, Job] = {}
         self._running: set[asyncio.Task] = set()
         self._stopping = asyncio.Event()
@@ -73,7 +75,8 @@ class Worker:
     async def start(self) -> None:
         await self._app.ready()
         watcher = ShutdownWatcher(self._request_stop, self._request_force)
-        watcher.install()
+        if self._handle_signals:
+            watcher.install()
         logger.info(
             "worker %s listening on %s with concurrency %d",
             self._id,
