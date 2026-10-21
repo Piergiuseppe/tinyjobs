@@ -9,7 +9,7 @@ from .backends.base import Backend
 from .backends.loader import load_backend
 from .clock import Clock
 from .codecs import CodecRegistry
-from .exceptions import BackendNotReadyError, ConfigurationError
+from .exceptions import AppClosedError, BackendNotReadyError, ConfigurationError
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -34,6 +34,11 @@ from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
+
+CLOSED_MESSAGE = (
+    "this app was closed, so it will not reconnect on its own; call app.start() "
+    "or await app.ready() to connect it again"
+)
 
 T = TypeVar("T")
 Listener = TypeVar("Listener", bound=Callable[..., Any])
@@ -71,6 +76,8 @@ class TinyJobs:
         self._health: HealthService | None = None
         self._lock: asyncio.Lock | None = None
         self._lock_guard = threading.Lock()
+        self._closed = False
+        self._sessions = 0
 
     @property
     def url(self) -> str:
@@ -158,7 +165,13 @@ class TinyJobs:
         await self.adrain()
         return await bound.arefresh()
 
+    async def ensure_connected(self) -> None:
+        if self._closed:
+            raise AppClosedError(CLOSED_MESSAGE)
+        await self.ready()
+
     async def ready(self) -> None:
+        self._closed = False
         if self._backend is not None:
             return
         with self._lock_guard:
@@ -265,7 +278,7 @@ class TinyJobs:
         kwargs: dict[str, Any] | None = None,
         **options: Any,
     ) -> Job:
-        await self.ready()
+        await self.ensure_connected()
         payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
         return await self.settle(
             await self.dispatch.dispatch_by_name(
@@ -277,7 +290,7 @@ class TinyJobs:
         return self.run_sync(self.asend(name, *args, **kwargs), name="send")
 
     async def aget(self, job_id: str) -> Job | None:
-        await self.ready()
+        await self.ensure_connected()
         return self.bind(await self.backend.get(job_id))
 
     def get(self, job_id: str) -> Job | None:
@@ -291,7 +304,7 @@ class TinyJobs:
         limit: int = 100,
         cursor: str | None = None,
     ) -> Page:
-        await self.ready()
+        await self.ensure_connected()
         page = await self.backend.list(
             status=status, queue=queue, limit=limit, cursor=cursor
         )
@@ -303,21 +316,21 @@ class TinyJobs:
         return self.run_sync(self.ajobs(**options), name="jobs")
 
     async def acancel(self, job_id: str) -> bool:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.cancel(job_id)
 
     def cancel(self, job_id: str) -> bool:
         return self.run_sync(self.acancel(job_id), name="cancel")
 
     async def aretry(self, job_id: str) -> bool:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.requeue(job_id)
 
     def retry(self, job_id: str) -> bool:
         return self.run_sync(self.aretry(job_id), name="retry")
 
     async def apurge(self, policy: RetentionPolicy | None = None) -> int | None:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.purge(
             policy or self._retention, self._clock.now()
         )
@@ -326,21 +339,21 @@ class TinyJobs:
         return self.run_sync(self.apurge(policy), name="purge")
 
     async def acounts(self) -> dict[str, int]:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.counts_by_status()
 
     def counts(self) -> dict[str, int]:
         return self.run_sync(self.acounts(), name="counts")
 
     async def astats(self) -> Stats:
-        await self.ready()
+        await self.ensure_connected()
         return await self.health.stats()
 
     def stats(self) -> Stats:
         return self.run_sync(self.astats(), name="stats")
 
     async def acheck(self, *, max_wait: float | None = None) -> list[Finding]:
-        await self.ready()
+        await self.ensure_connected()
         return await self.health.check(max_wait=max_wait)
 
     def check(self, *, max_wait: float | None = None) -> list[Finding]:
@@ -353,14 +366,14 @@ class TinyJobs:
         return self.run_sync(self.adrain(queues), name="drain")
 
     async def aexecutions(self, job_id: str) -> list:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.executions(job_id)
 
     def executions(self, job_id: str) -> list:
         return self.run_sync(self.aexecutions(job_id), name="executions")
 
     async def aschedules(self) -> list[ScheduleState]:
-        await self.ready()
+        await self.ensure_connected()
         return await self.backend.schedules()
 
     def schedules(self) -> list[ScheduleState]:
@@ -411,19 +424,28 @@ class TinyJobs:
         self._scheduling = None
         self._health = None
         self._lock = None
+        self._closed = True
         self._runner.detach()
 
     def close(self) -> None:
         if self._backend is not None:
             self.run_sync(self.aclose(), name="close")
+        self._closed = True
         self._runner.close()
 
     async def __aenter__(self) -> "TinyJobs":
-        await self.ready()
+        self._sessions += 1
+        try:
+            await self.ready()
+        except BaseException:
+            self._sessions -= 1
+            raise
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
-        await self.aclose()
+        self._sessions -= 1
+        if self._sessions == 0:
+            await self.aclose()
 
     def __enter__(self) -> "TinyJobs":
         return self.start()

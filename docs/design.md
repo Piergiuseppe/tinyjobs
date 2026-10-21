@@ -722,6 +722,10 @@ across backends and lets the contract suite drive Redis with a `FrozenClock`.
 - **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
   pop would save the idle round trips but cannot express priorities across queues.
 - **No transactional enqueue.** Redis shares no transaction with your database.
+- **A bounded pool that waits.** redis-py 8 caps its pool at 100 and raises `MaxConnectionsError` the
+  moment a caller finds it full, which turned half of 200 concurrent `aenqueue()` calls into errors.
+  The backend uses a blocking pool of the same size instead, so 400 concurrent requests to a FastAPI
+  endpoint all succeeded, and a caller only fails after `pool_timeout`.
 
 ---
 
@@ -1075,6 +1079,12 @@ Calling a synchronous method from inside a running loop raises `SynchronousCallI
 and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's
 loop.
 
+Every call connects lazily, except after the app has been closed. `close()`, `aclose()` and leaving
+`async with app` or `app.serve()` mark it closed, and a later `enqueue()` raises `AppClosedError`
+rather than quietly opening a connection nobody will close; so do `drain()` and a scheduler tick.
+`start()`, `ready()`, `serve()` and starting a worker open it again. Nested `async with` blocks
+share one connection, which closes when the outermost one ends.
+
 Async does not make the queue faster on its own. On SQLite the limit is still `fsync`. It pays when
 there are many concurrent I/O waits in flight, which is the network-backend case, and it is why the
 protocol has to be async before those backends exist rather than after.
@@ -1201,7 +1211,11 @@ tinyjobs worker --app myproject:app --import "myproject.jobs.*"
 
 A job whose task is unknown to the worker is left `QUEUED` and logged, never failed: the usual cause
 is a misconfigured `--import` or a partially rolled-out deploy, and failing the job would destroy work
-that a correctly configured worker could still run.
+that a correctly configured worker could still run. Each hand-back in a row waits twice as long as
+the one before, from `unknown_task_delay` (60 s) up to `unknown_task_max_delay` (an hour); attempts
+that ran before the task went missing do not count. A fixed delay wrote an execution row and an
+`ERROR` line every minute, forever, for a job retention never prunes because it never finishes;
+doubling brings that to 24 a day once the delay reaches the hour.
 
 ---
 

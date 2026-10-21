@@ -83,7 +83,7 @@ class Task:
         self, options: EnqueueOptions, args: tuple, kwargs: dict
     ) -> Job:
         payload = self.bind(args, kwargs)
-        await self._app.ready()
+        await self._app.ensure_connected()
         return await self._app.settle(
             await self._app.dispatch.dispatch_by_name(self._name, payload, options)
         )

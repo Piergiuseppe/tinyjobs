@@ -20,7 +20,7 @@ class Drain:
         self._executors = ExecutorResolver(concurrency=1)
 
     async def run(self) -> int:
-        await self._app.ready()
+        await self._app.ensure_connected()
         ran = 0
         try:
             while True:

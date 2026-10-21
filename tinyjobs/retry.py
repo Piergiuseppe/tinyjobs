@@ -8,6 +8,8 @@ from .exceptions import Abandon, Retry
 
 BackoffStrategy = str | Callable[[int], float]
 
+MAX_DOUBLINGS = 62
+
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
@@ -39,7 +41,8 @@ class RetryPolicy:
             return min(float(self.backoff(attempt)), self.maximum)
         if self.backoff == "fixed":
             return min(self.base, self.maximum)
-        return min(self.base * 2 ** max(attempt - 1, 0), self.maximum)
+        doublings = min(max(attempt - 1, 0), MAX_DOUBLINGS)
+        return min(self.base * 2**doublings, self.maximum)
 
     def _apply_jitter(self, delay: float) -> float:
         if not self.jitter:

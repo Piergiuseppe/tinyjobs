@@ -13,6 +13,8 @@ from tinyjobs.testing import BackendContract
 REDIS_URL = os.environ.get("TINYJOBS_REDIS_URL")
 
 try:
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
     from tinyjobs.backends.redis import RedisBackend
 except ImportError:
     RedisBackend = None
@@ -120,6 +122,49 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
         failures = [f.message for f in await self.app.acheck() if not f.ok]
         self.assertEqual(len(failures), 1)
         self.assertIn("elsewhere.task", failures[0])
+
+    async def test_a_burst_larger_than_the_pool_waits_instead_of_failing(self):
+        small = TinyJobs(REDIS_URL, prefix=self.prefix, max_connections=4)
+
+        @small.task
+        async def noop(value):
+            return value
+
+        try:
+            jobs = await asyncio.gather(*(noop.aenqueue(n) for n in range(200)))
+            self.assertEqual(len({job.id for job in jobs}), 200)
+        finally:
+            await small.aclose()
+
+    async def test_a_client_option_still_reaches_the_client(self):
+        single = TinyJobs(REDIS_URL, prefix=self.prefix, single_connection_client=True)
+        try:
+            await single.ready()
+            self.assertEqual(await single.acounts(), {})
+            self.assertTrue(single.backend._client.single_connection_client)
+        finally:
+            await single.aclose()
+
+    async def test_an_exhausted_pool_gives_up_after_its_timeout(self):
+        small = TinyJobs(
+            REDIS_URL, prefix=self.prefix, max_connections=1, pool_timeout=0.2
+        )
+
+        @small.task
+        async def noop():
+            return None
+
+        await small.ready()
+        holding = asyncio.create_task(
+            small.backend._client.blpop("tinyjobs-test-nothing", 2)
+        )
+        try:
+            await asyncio.sleep(0.1)
+            with self.assertRaises(RedisConnectionError):
+                await noop.aenqueue()
+        finally:
+            await holding
+            await small.aclose()
 
     async def test_two_prefixes_on_one_server_do_not_see_each_other(self):
         other_prefix = f"tinyjobs-test-{uuid.uuid4().hex}"

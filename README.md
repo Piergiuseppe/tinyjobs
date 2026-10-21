@@ -432,6 +432,10 @@ Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like 
 `transactional enqueue` is SQLite only. All keys share one hash slot (`{prefix}`), so it runs on a
 single Redis or a primary with replicas, not spread across a cluster.
 
+Each process holds at most 100 connections (`max_connections=`). A burst beyond that waits for a free
+one rather than failing, and gives up with redis-py's `ConnectionError` after `pool_timeout=` seconds
+(20).
+
 ## Other backends
 
 The core package doesn't know about third-party backends. It looks an unknown URL scheme up in the
@@ -564,7 +568,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-404 tests, no test dependencies. The one that matters most is
+418 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

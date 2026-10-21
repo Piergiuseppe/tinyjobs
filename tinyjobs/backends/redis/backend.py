@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from redis.asyncio import Redis
+from redis.asyncio import BlockingConnectionPool, Redis
 
 from ...clock import Clock
 from ...models import (
@@ -29,6 +29,8 @@ from .records import (
 from .scripts import Scripts
 
 DEFAULT_PREFIX = "tinyjobs"
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_POOL_TIMEOUT = 20.0
 SCHEMA_VERSION = 1
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
@@ -64,9 +66,19 @@ class RedisBackend(BaseBackend):
         *,
         prefix: str = DEFAULT_PREFIX,
         clock: Clock | None = None,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        pool_timeout: float = DEFAULT_POOL_TIMEOUT,
         **options: Any,
     ) -> "RedisBackend":
-        return cls(Redis.from_url(url, **options), prefix=prefix, clock=clock)
+        single_connection_client = options.pop("single_connection_client", False)
+        pool = BlockingConnectionPool.from_url(
+            url, max_connections=max_connections, timeout=pool_timeout, **options
+        )
+        client = Redis(
+            connection_pool=pool, single_connection_client=single_connection_client
+        )
+        client.auto_close_connection_pool = True
+        return cls(client, prefix=prefix, clock=clock)
 
     async def setup(self) -> None:
         version = self._keys("schema_version")

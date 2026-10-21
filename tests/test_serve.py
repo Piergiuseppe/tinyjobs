@@ -10,7 +10,11 @@ from pathlib import Path
 
 from tinyjobs import ConfigurationError, JobStatus, TinyJobs, WaitTimeout
 from tinyjobs.backends import register_builtin
-from tinyjobs.exceptions import BackendNotReadyError, EventLoopStoppedError
+from tinyjobs.exceptions import (
+    AppClosedError,
+    BackendNotReadyError,
+    EventLoopStoppedError,
+)
 from tests.test_async_backend import RamBackend
 
 SETTLE_TIMEOUT = 10.0
@@ -141,6 +145,27 @@ class ServeTests(ServeTestCase):
                 await asyncio.wait_for(
                     asyncio.to_thread(job.wait, timeout=0.2), timeout=5
                 )
+
+    async def test_an_inner_block_ending_leaves_the_outer_one_connected(self):
+        @self.app.task
+        async def noop():
+            return None
+
+        async with self.app.serve():
+            async with self.app.serve():
+                pass
+            job = await noop.aenqueue()
+            self.assertIs((await self.app.aget(job.id)).status, JobStatus.QUEUED)
+
+    async def test_a_call_after_the_block_ends_does_not_reconnect(self):
+        @self.app.task
+        async def noop():
+            return None
+
+        async with self.app.serve():
+            pass
+        with self.assertRaises(AppClosedError):
+            await asyncio.to_thread(noop.enqueue)
 
     async def test_worker_options_without_a_worker_are_rejected(self):
         with self.assertRaises(ConfigurationError) as caught:

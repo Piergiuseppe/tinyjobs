@@ -5,6 +5,7 @@ import unittest
 
 from tinyjobs import TinyJobs
 from tinyjobs.exceptions import (
+    AppClosedError,
     ConfigurationError,
     TaskAlreadyRegisteredError,
     UnknownTaskError,
@@ -377,3 +378,34 @@ class RefreshTests(BackendTestCase):
             )
         )
         self.assertEqual(job.refresh().result(), {"doubled": 42})
+
+
+class ClosedAppTests(BackendTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+        @self.app.task
+        def noop():
+            return None
+
+        self.noop = noop
+
+    def test_a_closed_app_does_not_reconnect_on_its_own(self):
+        self.app.close()
+        with self.assertRaises(AppClosedError):
+            self.noop.enqueue()
+
+    def test_draining_a_closed_app_does_not_reconnect_it(self):
+        self.app.close()
+        with self.assertRaises(AppClosedError):
+            self.app.drain()
+
+    def test_a_scheduler_tick_does_not_reconnect_a_closed_app(self):
+        self.app.close()
+        with self.assertRaises(AppClosedError):
+            self.app.run_sync(self.app.scheduler().tick(), name="tick")
+
+    def test_start_reopens_a_closed_app(self):
+        self.app.close()
+        self.app.start()
+        self.assertIs(self.noop.enqueue().status, JobStatus.QUEUED)

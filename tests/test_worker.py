@@ -327,6 +327,52 @@ class RoutingTests(WorkerTestCase):
         self.assertIs(stored.status, JobStatus.QUEUED)
         self.assertGreater(stored.run_at, self.app.clock.now())
 
+    async def test_an_unregistered_task_is_handed_back_less_and_less_often(self):
+        job = await self.app.asend("nobody.knows.this")
+        worker = self.make_worker(
+            unknown_task_delay=0.1, unknown_task_max_delay=0.4, poll_maximum=0.02
+        )
+        await self.run_briefly(worker, seconds=2.0)
+        self.assertLessEqual((await self.app.aget(job.id)).attempts, 8)
+
+    async def test_attempts_that_ran_before_a_hand_back_do_not_lengthen_it(self):
+        @self.app.task(max_attempts=10)
+        def flaky():
+            raise Retry(in_=0.3)
+
+        job = await flaky.aenqueue()
+        knowing = self.make_worker(poll_maximum=0.02)
+        runner = asyncio.create_task(knowing.start())
+        while (await self.app.aget(job.id)).attempts < 3:
+            await asyncio.sleep(0.02)
+        knowing.stop()
+        await asyncio.wait_for(runner, timeout=10)
+
+        unaware = TinyJobs(self.app.url)
+        try:
+            await asyncio.sleep(0.3)
+            await self.run_briefly(unaware.worker(poll_maximum=0.02), seconds=0.5)
+        finally:
+            await unaware.aclose()
+        stored = await self.app.aget(job.id)
+        self.assertEqual(stored.attempts, 4)
+        self.assertLessEqual(stored.run_at - self.app.clock.now(), 60.0)
+
+    async def test_a_hand_back_delay_above_the_maximum_is_kept(self):
+        job = await self.app.asend("nobody.knows.this")
+        await self.run_briefly(self.make_worker(unknown_task_delay=7200.0))
+        stored = await self.app.aget(job.id)
+        self.assertGreater(stored.run_at - self.app.clock.now(), 7000.0)
+
+    async def test_the_hand_back_delay_never_exceeds_its_maximum(self):
+        job = await self.app.asend("nobody.knows.this")
+        worker = self.make_worker(
+            unknown_task_delay=0.05, unknown_task_max_delay=0.1, poll_maximum=0.02
+        )
+        await self.run_briefly(worker, seconds=1.0)
+        stored = await self.app.aget(job.id)
+        self.assertLessEqual(stored.run_at - self.app.clock.now(), 0.1)
+
 
 class ShutdownTests(WorkerTestCase):
     async def test_in_flight_jobs_finish_during_a_graceful_stop(self):

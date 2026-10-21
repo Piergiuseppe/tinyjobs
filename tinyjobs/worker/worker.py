@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from itertools import takewhile
 from typing import TYPE_CHECKING, Sequence
 
 from ..exceptions import UnknownTaskError
 from ..ids import new_worker_id
 from ..models import Job
+from ..status import ExecutionStatus
 from ..retention import RetentionPolicy
+from ..retry import RetryPolicy
 from ..executors import ExecutorResolver
 from ..polling import AdaptiveInterval
 from .signals import ShutdownWatcher
@@ -30,6 +33,7 @@ class Worker:
         reap_interval: float = 30.0,
         shutdown_timeout: float = 30.0,
         unknown_task_delay: float = 60.0,
+        unknown_task_max_delay: float = 3600.0,
         retention: RetentionPolicy | None = None,
         scheduler: bool = True,
         misfire_grace: float = 60.0,
@@ -44,7 +48,11 @@ class Worker:
         self._lease_seconds = lease_seconds
         self._reap_interval = reap_interval
         self._shutdown_timeout = shutdown_timeout
-        self._unknown_task_delay = unknown_task_delay
+        self._unknown_task_backoff = RetryPolicy(
+            base=unknown_task_delay,
+            maximum=max(unknown_task_max_delay, unknown_task_delay),
+            jitter=False,
+        )
         self._retention = retention or RetentionPolicy()
         self._scheduler = (
             app.scheduler(misfire_grace=misfire_grace) if scheduler else None
@@ -187,14 +195,28 @@ class Worker:
         )
 
     async def _release_unknown(self, job: Job) -> None:
+        delay = self._unknown_task_backoff.delay_for(
+            await self._hand_backs_in_a_row(job) + 1
+        )
         logger.error(
             "task %r is not registered in this worker; leaving job %s queued "
             "and retrying it in %.0fs",
             job.task,
             job.id,
-            self._unknown_task_delay,
+            delay,
         )
-        await self._app.backend.release(job, self._unknown_task_delay)
+        await self._app.backend.release(job, delay)
+
+    async def _hand_backs_in_a_row(self, job: Job) -> int:
+        earlier = [
+            execution.status
+            for execution in await self._app.backend.executions(job.id)
+            if execution.attempt < job.attempts
+        ]
+        lost = takewhile(
+            lambda status: status == ExecutionStatus.LOST, reversed(earlier)
+        )
+        return sum(1 for _ in lost)
 
     async def _heartbeat_loop(self) -> None:
         interval = max(self._lease_seconds / 3.0, 1.0)

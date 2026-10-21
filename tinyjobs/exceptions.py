@@ -53,6 +53,10 @@ class BackendNotReadyError(TinyJobsError):
     pass
 
 
+class AppClosedError(BackendNotReadyError):
+    pass
+
+
 class Retry(TinyJobsError):
     def __init__(self, in_: float | None = None, at: float | None = None) -> None:
         if in_ is not None and at is not None:

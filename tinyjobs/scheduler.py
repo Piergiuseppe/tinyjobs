@@ -60,7 +60,7 @@ class Scheduler:
             await self._pause(self._sleep_for(tick))
 
     async def tick(self) -> Tick:
-        await self._app.ready()
+        await self._app.ensure_connected()
         tick = await self._app.scheduling.fire_due(self._grace)
         for job in tick.created:
             logger.info("schedule %s created job %s", job.task, job.id)

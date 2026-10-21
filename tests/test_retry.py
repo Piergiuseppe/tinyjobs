@@ -37,6 +37,10 @@ class RetryPolicyTests(unittest.TestCase):
             [policy.delay_for(n) for n in range(1, 6)], [1.0, 2.0, 4.0, 8.0, 8.0]
         )
 
+    def test_exponential_backoff_stays_capped_after_a_thousand_attempts(self):
+        policy = RetryPolicy(base=1.0, maximum=600.0, jitter=False)
+        self.assertEqual(policy.delay_for(5000), 600.0)
+
     def test_fixed_backoff_is_constant(self):
         policy = RetryPolicy(backoff="fixed", base=2.5, jitter=False)
         self.assertEqual([policy.delay_for(n) for n in (1, 4)], [2.5, 2.5])
