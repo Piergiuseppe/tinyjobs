@@ -39,8 +39,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install the redis extra and fastapi
-        run: python -m pip install "redis>=5.0.1" fastapi httpx
+      - name: Install the redis extra, fastapi and django
+        run: python -m pip install "redis>=5.0.1" fastapi httpx "django>=6.0; python_version >= '3.12'"
 
       - name: Run the test suite
         run: python -m unittest discover -s tests -t . --verbose

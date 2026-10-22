@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
 from typing import Any, TYPE_CHECKING
 
@@ -19,7 +20,9 @@ class ThreadExecutor(Executor):
         )
 
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
-        call = partial(task.function, *payload.args, **payload.kwargs)
+        call = partial(
+            copy_context().run, task.function, *payload.args, **payload.kwargs
+        )
         future = asyncio.get_running_loop().run_in_executor(self._pool, call)
         if task.timeout is None:
             return await future

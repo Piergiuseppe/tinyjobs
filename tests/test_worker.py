@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from tinyjobs import Abandon, Retry, TinyJobs
+from tinyjobs.services.execution import current_job
 from tinyjobs.status import ExecutionStatus, JobStatus
 
 SETTLE_TIMEOUT = 15.0
@@ -103,6 +104,26 @@ class ExecutionTests(WorkerTestCase):
         self.assertEqual(received["when"], datetime(2026, 8, 31, 12, 0))
         self.assertEqual(received["amount"], Decimal("19.99"))
         self.assertEqual(received["tags"], {"a", "b"})
+
+
+class CurrentJobTests(WorkerTestCase):
+    async def test_a_sync_task_sees_the_job_it_runs_as(self):
+        @self.app.task
+        def handler():
+            self.calls.append(current_job.get().id)
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(self.calls, [job.id])
+
+    async def test_an_async_task_sees_the_job_it_runs_as(self):
+        @self.app.task
+        async def handler():
+            self.calls.append(current_job.get().id)
+
+        jobs = [await handler.aenqueue() for _ in range(3)]
+        await self.settle(self.make_worker(), jobs)
+        self.assertEqual(sorted(self.calls), sorted(job.id for job in jobs))
 
 
 class FailureTests(WorkerTestCase):

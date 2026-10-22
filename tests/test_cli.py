@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import contextlib
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 
+from tinyjobs import TinyJobs
 from tinyjobs.cli import build_parser, main
 from tinyjobs.cli.formatting import format_duration, render_table, shorten
 from tinyjobs.cli.loader import load_app
@@ -165,6 +167,38 @@ class CommandLineTests(FixtureApp, unittest.TestCase):
             "jobs", "--app", "fixture_app:app", "list", "--status", "failed"
         )
         self.assertIn("no matching jobs", output)
+
+
+class EmbeddedAppTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.app = TinyJobs(f"sqlite:///{Path(self.directory.name) / 'jobs.db'}")
+        self.logger = logging.getLogger("tinyjobs")
+        self.saved = (self.logger.handlers[:], self.logger.level, self.logger.propagate)
+        self.root_handlers = logging.getLogger().handlers[:]
+
+    def tearDown(self) -> None:
+        self.logger.handlers[:], self.logger.level, self.logger.propagate = (
+            self.saved[0], self.saved[1], self.saved[2]
+        )
+        logging.getLogger().handlers[:] = self.root_handlers
+        self.app.close()
+        self.directory.cleanup()
+
+    def test_a_host_can_hand_over_its_app_instead_of_an_import_path(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["send", "hosted.task"], app=self.app)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.app.get(buffer.getvalue().strip()).task, "hosted.task")
+
+    def test_a_hosted_run_leaves_the_root_logger_to_the_host(self):
+        self.logger.handlers[:] = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["stats"], app=self.app)
+        self.assertEqual(logging.getLogger().handlers, self.root_handlers)
+        self.assertEqual(len(self.logger.handlers), 1)
+        self.assertFalse(self.logger.propagate)
 
 
 class AppLoadingTests(unittest.TestCase):

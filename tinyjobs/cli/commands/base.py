@@ -26,14 +26,17 @@ class Command(ABC):
     def run(self, args: argparse.Namespace) -> int: ...
 
     def resolve_app(self, args: argparse.Namespace) -> TinyJobs:
-        spec = getattr(args, "app", None)
-        if not spec:
-            raise ConfigurationError(MISSING_APP)
-        app = load_app(spec)
+        app = getattr(args, "instance", None) or self._load(args)
         patterns = getattr(args, "imports", None)
         if patterns:
             import_modules(patterns)
         return app
+
+    def _load(self, args: argparse.Namespace) -> TinyJobs:
+        spec = getattr(args, "app", None)
+        if not spec:
+            raise ConfigurationError(MISSING_APP)
+        return load_app(spec)
 
 
 def build_app_options() -> argparse.ArgumentParser:

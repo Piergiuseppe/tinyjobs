@@ -6,6 +6,7 @@ import sys
 from typing import Sequence
 
 from .. import __version__
+from ..app import TinyJobs
 from ..exceptions import TinyJobsError
 from .commands import COMMANDS
 from .commands.base import build_app_options
@@ -49,13 +50,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=getattr(args, "log_level", DEFAULT_LOG_LEVEL),
-        format=LOG_FORMAT,
-        stream=sys.stderr,
-    )
+def configure_own_logger(level: str) -> None:
+    logger = logging.getLogger("tinyjobs")
+    logger.setLevel(level)
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    logger.addHandler(handler)
+    logger.propagate = False
+
+
+def main(argv: Sequence[str] | None = None, *, app: TinyJobs | None = None) -> int:
+    parser = build_parser()
+    parser.set_defaults(instance=app)
+    args = parser.parse_args(argv)
+    level = getattr(args, "log_level", DEFAULT_LOG_LEVEL)
+    if app is None:
+        logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+    else:
+        configure_own_logger(level)
     try:
         return args.handler.run(args)
     except TinyJobsError as error:

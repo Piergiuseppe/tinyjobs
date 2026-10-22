@@ -558,6 +558,10 @@ classic source of "database is locked" in multi-process SQLite.
 
 One connection per thread (`check_same_thread=True`), never shared across threads.
 
+Switching a fresh file to WAL needs an exclusive lock, and SQLite answers "database is locked" at
+once instead of honouring `busy_timeout`. Two workers starting together on a new file lost that race
+in 11 of 60 tries, so the switch is retried until `busy_timeout` runs out.
+
 ### The claim
 
 The heart of the system. On SQLite >= 3.35 it is one statement, atomic by definition:
@@ -1216,6 +1220,44 @@ the one before, from `unknown_task_delay` (60 s) up to `unknown_task_max_delay` 
 that ran before the task went missing do not count. A fixed delay wrote an execution row and an
 `ERROR` line every minute, forever, for a job retention never prunes because it never finishes;
 doubling brings that to 24 a day once the delay reaches the hour.
+
+### Django tasks
+
+`tinyjobs.contrib.django.TinyJobsBackend` is a `django.tasks` backend. A Django task has no name of
+its own, only an import path, so the job stores that path and the registry takes a resolver: a name
+it has not seen is looked up once, wrapped as a tinyjobs task and kept.
+
+The resolver is the trust boundary. A job row is data, and whoever can write one should not be able
+to make the worker import arbitrary modules, so it only imports modules that belong to an app in
+`INSTALLED_APPS`, and only accepts a `django.tasks.Task` whose path is the job's; `enqueue` refuses
+any other task with `InvalidTask`, so it cannot be sent. Anything else stays unknown and is handed
+back like any unregistered task; an import that raises is logged with its traceback. A task bound to
+another alias is rebound to this one, since `Task.using(backend=...)` sends it here without changing
+the module attribute. So the alias a task is declared with is a default, not a boundary: whoever can
+write a job row can already name any task of the installed apps. Django validated the task when it
+was enqueued, so the copies made for a stored job, rebound or carrying the job's queue and priority,
+are not validated again: a queue since dropped from `QUEUES`, or a priority outside Django's range
+sent through `app.send`, still runs and reads back. `manage.py tinyjobs` also imports each installed
+app's `tasks` module first, so `check` counts every task found there, whatever alias it is declared
+with, before any job arrives.
+
+Django builds one backend instance per thread. They share one `TinyJobs` per alias and options, so a
+WSGI server does not open a connection pool per thread. The async methods go through the sync ones
+in a thread: Django under ASGI has no lifespan to connect at startup, and the first connection,
+raced from the server's loop and from a sync view's thread at once, turned 33 of 400 requests into
+500s. Through one loop, 1,000 out of 1,000 succeed.
+
+The mapping to `TaskResult` follows what tinyjobs already stores. Executions give `worker_ids`,
+`started_at` and the errors; the exception path comes from the last line of the stored traceback,
+because the execution keeps only the class name. Cancelled reads as `FAILED`, since Django has no
+such status, and so does a task whose worker died. Neither raised anything, so each gets a
+`JobCancelled` or `WorkerLost` error from `tinyjobs.contrib.django.exceptions`, and `errors[-1]`
+always exists on a failed result. Django tasks are not retried, so every job gets one attempt.
+
+`takes_context` needs the running job inside the task. The execution service puts it in a context
+variable, and the thread executor copies the context into the thread that runs a `def` task.
+Signals fire as Django's own backend fires them; in eager mode `task_enqueued` arrives last, because
+the task has already run by the time `enqueue()` returns.
 
 ---
 

@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from tinyjobs import TinyJobs
+from tinyjobs import RetryPolicy, Task, TinyJobs
 from tinyjobs.exceptions import (
     AppClosedError,
     ConfigurationError,
     TaskAlreadyRegisteredError,
     UnknownTaskError,
 )
+from tinyjobs.options import EnqueueOptions
 from tinyjobs.status import JobStatus
 from tests.support import BackendTestCase
 
@@ -267,6 +268,47 @@ class SendByNameTests(BackendTestCase):
         self.assertEqual(stored.queue, "gpu")
         self.assertEqual(stored.priority, 9)
         self.assertEqual(stored.max_attempts, 4)
+
+
+class ResolverTests(BackendTestCase):
+    def make_resolver(self, known: str):
+        asked = []
+
+        def resolve(name):
+            asked.append(name)
+            if name != known:
+                return None
+            return Task(
+                self.app,
+                lambda: "resolved",
+                name=name,
+                options=EnqueueOptions(queue="found"),
+                retry_policy=RetryPolicy(),
+            )
+
+        self.app.registry.add_resolver(resolve)
+        return asked
+
+    def test_a_resolver_supplies_a_task_nobody_registered(self):
+        self.make_resolver("lazy.task")
+        self.assertEqual(self.app.registry.get("lazy.task")(), "resolved")
+
+    def test_a_resolved_task_is_registered_once_and_kept(self):
+        asked = self.make_resolver("lazy.task")
+        first = self.app.registry.get("lazy.task")
+        self.assertIs(self.app.registry.get("lazy.task"), first)
+        self.assertEqual(asked, ["lazy.task"])
+
+    def test_membership_and_send_defaults_go_through_the_resolver(self):
+        self.make_resolver("lazy.task")
+        self.assertIn("lazy.task", self.app.registry)
+        self.assertNotIn("other.task", self.app.registry)
+        self.assertEqual(self.app.get(self.app.send("lazy.task").id).queue, "found")
+
+    def test_a_name_no_resolver_knows_is_still_unknown(self):
+        self.make_resolver("lazy.task")
+        with self.assertRaises(UnknownTaskError):
+            self.app.registry.get("other.task")
 
 
 class ControlTests(BackendTestCase):

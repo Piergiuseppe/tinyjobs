@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
-FILE_PRAGMAS = (
-    "PRAGMA journal_mode = WAL",
-    "PRAGMA synchronous = NORMAL",
-)
+FILE_PRAGMAS = ("PRAGMA synchronous = NORMAL",)
+
+WAL_RETRY_SECONDS = 0.05
 
 SHARED_PRAGMAS = ("PRAGMA foreign_keys = ON",)
 
@@ -80,6 +80,7 @@ class ConnectionPool:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
         if not self._uri:
+            self._enable_wal(connection)
             for pragma in FILE_PRAGMAS:
                 connection.execute(pragma)
         for pragma in SHARED_PRAGMAS:
@@ -87,3 +88,14 @@ class ConnectionPool:
         with self._guard:
             self._all.append(connection)
         return connection
+
+    def _enable_wal(self, connection: sqlite3.Connection) -> None:
+        deadline = time.monotonic() + self._busy_timeout
+        while True:
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                return
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(WAL_RETRY_SECONDS)

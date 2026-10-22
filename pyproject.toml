@@ -13,10 +13,13 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Piergiuseppe D'Abbraccio", email = "piergiuseppedabbraccio@gmail.com" },
 ]
-keywords = ["jobs", "queue", "cron", "background", "sqlite", "worker", "tasks"]
+keywords = ["jobs", "queue", "cron", "background", "sqlite", "worker", "tasks", "django", "fastapi"]
 dependencies = []
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 6.0",
+    "Framework :: FastAPI",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

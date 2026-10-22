@@ -305,6 +305,52 @@ The worker shares the process with your API: an async task that blocks the loop 
 and CPU-heavy `def` tasks compete for the GIL. That is the point where a separate worker pays off.
 Numbers in [Measured](#measured).
 
+## Django
+
+Django 6 ships `django.tasks`, a standard API for background tasks, without a worker to run them.
+tinyjobs is that worker. Your tasks stay plain Django code:
+
+```python
+# settings.py
+INSTALLED_APPS = [..., "tinyjobs.contrib.django"]
+
+TASKS = {
+    "default": {
+        "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+        "OPTIONS": {"url": "sqlite:///jobs.db"},
+    }
+}
+```
+
+```python
+# shop/tasks.py
+from django.tasks import task
+
+
+@task
+def send_receipt(order_id: int) -> None:
+    ...
+
+
+send_receipt.enqueue(42)
+```
+
+```bash
+python manage.py tinyjobs worker
+```
+
+`manage.py tinyjobs` takes every `tinyjobs` command, such as `worker`, `jobs`, `stats` and `check`,
+against the configured backend, with `--backend` to pick a `TASKS` alias other than `default`.
+`OPTIONS` takes the arguments of `TinyJobs(...)`: a `redis://` URL, `"eager": True` for tests.
+Queues, priorities, `run_after`, async tasks, `takes_context` and `get_result()` all work, and the
+`task_enqueued`, `task_started` and `task_finished` signals fire.
+
+Tasks are found by their import path, and only inside your `INSTALLED_APPS`: a job can never make
+the worker import code your project does not already trust, and enqueueing a task defined elsewhere
+raises `InvalidTask`. Django has no retries, so a failed task
+stays failed. Enqueue from inside a transaction with `transaction.on_commit`, or the worker may run
+before the row it needs is committed.
+
 ## Testing your tasks
 
 ```python
@@ -510,6 +556,13 @@ Sharing the process costs the API little: `/ping` p95 went from 2.1 ms to 12.9 m
 CPU-bound `def` tasks, and back to 1.6 ms with the worker moved out. Six `async def` tasks calling
 `time.sleep(1)` froze it for six seconds.
 
+Django was measured with a real project under uvicorn `--workers 2` and under `runserver`: 1,000
+requests split between sync and async views, each enqueuing a task that writes a row, with two
+`manage.py tinyjobs worker` processes on SQLite and then on Redis. Every task ran exactly once.
+Enqueueing through `django.tasks` costs about what a direct `send` does, 6,000 a second against
+6,600. A worker `SIGKILL`ed mid-task leaves that task `FAILED` once its lease expires, since Django
+tasks are not retried.
+
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
@@ -532,6 +585,7 @@ v0.6.0. Working and measured, but young. What's in:
 - a Redis backend, `pip install 'tinyjobs[redis]'`
 - the backend plugin seam and its contract suite
 - `app.lifespan()` and `app.serve()` for FastAPI and Starlette, with an embedded worker
+- a `django.tasks` backend and `manage.py tinyjobs`
 
 What's not in yet:
 
@@ -568,7 +622,7 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-418 tests, no test dependencies. The one that matters most is
+461 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

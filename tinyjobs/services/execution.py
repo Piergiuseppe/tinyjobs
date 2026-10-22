@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,8 @@ from .serialization import SerializationService
 
 if TYPE_CHECKING:
     from ..task import Task
+
+current_job: ContextVar[Job] = ContextVar("tinyjobs_current_job")
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,7 @@ class ExecutionService:
     async def execute(
         self, job: Job, task: "Task", executors: ExecutorResolver
     ) -> Attempt:
+        current_job.set(job)
         await self._hooks.started(job)
         started = self._clock.monotonic()
         try:
