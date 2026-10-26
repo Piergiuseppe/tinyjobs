@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import fields
 
 from ..backends.base import Backend
 from ..clock import Clock
 from ..exceptions import UnsupportedCapabilityError
 from ..ids import new_job_id
 from ..models import Job, JobPayload
-from dataclasses import fields
-
 from ..options import EnqueueOptions
 from ..registry import TaskRegistry
 from ..status import JobStatus
 from .serialization import SerializationService
-
-if TYPE_CHECKING:
-    from ..task import Task
 
 
 class DispatchService:

@@ -33,7 +33,7 @@ def race(database: str, at: float, barrier, sink) -> None:
     declare(app)
     app.start()
     barrier.wait()
-    tick = app.run_sync(app.scheduling.fire_due(GRACE), name="tick")
+    tick = app.run_sync(lambda: app.scheduling.fire_due(GRACE), name="tick")
     sink.put([job.id for job in tick.created])
     app.close()
 
@@ -377,6 +377,101 @@ class WorkerTests(SchedulingTestCase):
             [job.status for job in await self.jobs()], [JobStatus.QUEUED]
         )
 
+
+class SchedulerLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.app = TinyJobs(f"sqlite:///{Path(self.directory.name) / 'jobs.db'}")
+        declare(self.app)
+
+    def run_once(self, scheduler) -> float:
+        import threading
+
+        async def main() -> float:
+            runner = asyncio.create_task(scheduler.start())
+            await asyncio.sleep(1.0)
+            self.assertFalse(runner.done())
+            started = time.monotonic()
+            stopper = threading.Thread(target=scheduler.stop)
+            stopper.start()
+            await asyncio.wait_for(runner, timeout=10)
+            stopper.join(5)
+            await self.app.aclose()
+            return time.monotonic() - started
+
+        return asyncio.run(main(), debug=True)
+
+    def test_a_stopped_scheduler_puts_back_the_handlers_it_replaced(self):
+        import signal
+        import threading
+
+        def mine(signum, frame) -> None:
+            return None
+
+        numbers = (signal.SIGINT, signal.SIGTERM)
+        for number in numbers:
+            self.addCleanup(signal.signal, number, signal.signal(number, mine))
+        scheduler = self.app.scheduler(maximum_sleep=30.0)
+        stopper = threading.Timer(0.3, scheduler.stop)
+        stopper.start()
+        scheduler.run()
+        stopper.join(5)
+        self.assertEqual([signal.getsignal(number) for number in numbers], [mine, mine])
+
+    def test_a_scheduler_off_the_main_thread_runs_without_signal_handlers(self):
+        import threading
+
+        scheduler = self.app.scheduler(maximum_sleep=30.0)
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                scheduler.run()
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while scheduler._loop is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        scheduler.stop()
+        thread.join(10)
+        self.assertEqual(errors, [])
+
+    def test_a_scheduler_stopped_from_another_thread_stops_at_once(self):
+        self.assertLess(self.run_once(self.app.scheduler(maximum_sleep=30.0)), 2.0)
+
+    def test_a_stop_after_a_run_ended_stops_the_next_run(self):
+        scheduler = self.app.scheduler(maximum_sleep=30.0)
+        self.run_once(scheduler)
+        scheduler.stop()
+
+        async def again() -> None:
+            await asyncio.wait_for(scheduler.start(), timeout=5)
+            await self.app.aclose()
+
+        asyncio.run(again())
+
+    def test_a_stop_from_its_own_loop_takes_effect_at_once(self):
+        scheduler = self.app.scheduler(maximum_sleep=30.0)
+
+        async def main() -> bool:
+            runner = asyncio.create_task(scheduler.start())
+            await asyncio.sleep(0.3)
+            scheduler.stop()
+            stopped = scheduler._stopping.is_set()
+            await asyncio.wait_for(runner, timeout=10)
+            await self.app.aclose()
+            return stopped
+
+        self.assertTrue(asyncio.run(main()))
+
+    def test_a_stopped_scheduler_can_start_again_on_a_new_loop(self):
+        scheduler = self.app.scheduler(maximum_sleep=30.0)
+        self.run_once(scheduler)
+        self.assertLess(self.run_once(scheduler), 2.0)
 
 if __name__ == "__main__":
     unittest.main()

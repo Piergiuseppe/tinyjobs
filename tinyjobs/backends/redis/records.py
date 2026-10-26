@@ -7,7 +7,7 @@ from ...models import Execution, Job, ScheduleState
 from ...status import ExecutionStatus, JobStatus
 
 BINARY_FIELDS = ("payload", "result")
-INTEGER_FIELDS = ("priority", "attempts", "max_attempts")
+INTEGER_FIELDS = ("priority", "attempts", "max_attempts", "hand_backs", "claims")
 TIME_FIELDS = ("run_at", "created_at", "finished_at", "lease_expires_at")
 TEXT_FIELDS = ("id", "task", "codec", "queue", "status", "worker_id", "dedup_key", "last_error")
 
@@ -27,6 +27,8 @@ def job_to_arguments(job: Job) -> list[Any]:
         "priority": str(job.priority),
         "attempts": str(job.attempts),
         "max_attempts": str(job.max_attempts),
+        "hand_backs": str(job.hand_backs),
+        "claims": str(job.claims),
         "run_at": number(job.run_at),
         "created_at": number(job.created_at),
         "finished_at": None if job.finished_at is None else number(job.finished_at),
@@ -77,6 +79,8 @@ def job_from_fields(raw: dict[bytes, bytes]) -> Job:
         priority=int(fields["priority"]),
         attempts=int(fields["attempts"]),
         max_attempts=int(fields["max_attempts"]),
+        hand_backs=int(fields.get("hand_backs", b"0")),
+        claims=int(fields["claims"]),
         run_at=moment("run_at"),
         created_at=moment("created_at"),
         finished_at=moment("finished_at"),
@@ -88,12 +92,12 @@ def job_from_fields(raw: dict[bytes, bytes]) -> Job:
     )
 
 
-def execution_from(job_id: str, attempt: bytes, encoded: bytes) -> Execution:
+def execution_from(job_id: str, claim: bytes, encoded: bytes) -> Execution:
     data = json.loads(encoded)
     finished_at = data.get("finished_at")
     return Execution(
         job_id=job_id,
-        attempt=int(attempt),
+        attempt=int(data.get("attempt", claim)),
         status=ExecutionStatus(data["status"]),
         worker_id=data["worker_id"],
         started_at=float(data["started_at"]),

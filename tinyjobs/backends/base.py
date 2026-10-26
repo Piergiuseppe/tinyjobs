@@ -23,6 +23,7 @@ class Capabilities:
     retention: bool = False
     schedules: bool = False
     max_payload_bytes: int | None = None
+    loop_bound: bool = False
 
 
 @runtime_checkable
@@ -47,7 +48,10 @@ class Backend(Protocol):
     ) -> list[Job]: ...
 
     async def heartbeat(
-        self, job_ids: Sequence[str], lease_seconds: float
+        self,
+        job_ids: Sequence[str],
+        lease_seconds: float,
+        worker_id: str | None = None,
     ) -> None: ...
 
     async def complete(self, job: Job, result: bytes | None) -> bool: ...
@@ -61,6 +65,8 @@ class Backend(Protocol):
     ) -> bool: ...
 
     async def release(self, job: Job, delay: float = 0.0) -> bool: ...
+
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
 
     async def cancel(self, job_id: str) -> bool: ...
 
@@ -117,6 +123,9 @@ class BaseBackend(ABC):
 
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         return [await self.enqueue(job) for job in jobs]
+
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+        return await self.release(job, delay)
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return None

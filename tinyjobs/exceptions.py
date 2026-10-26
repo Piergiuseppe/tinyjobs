@@ -45,6 +45,10 @@ class EventLoopStoppedError(TinyJobsError):
     pass
 
 
+class InterruptedCallError(TinyJobsError):
+    pass
+
+
 class WaitTimeout(TinyJobsError, TimeoutError):
     pass
 
@@ -54,6 +58,10 @@ class BackendNotReadyError(TinyJobsError):
 
 
 class AppClosedError(BackendNotReadyError):
+    pass
+
+
+class ExecutorClosedError(AppClosedError):
     pass
 
 

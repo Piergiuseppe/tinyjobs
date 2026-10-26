@@ -51,8 +51,8 @@ Where we *can* help:
   submitting the same job three times.
 - **Attempt visibility.** Every attempt is recorded as an `Execution` row, so a duplicate run is
   visible after the fact rather than silent.
-- **Transactional enqueue.** With the SQLite backend, `enqueue` can join your application's own
-  transaction: if the transaction rolls back, the job is never created. This removes the classic
+- **Transactional enqueue, planned.** With the SQLite backend, `enqueue` will be able to join your
+  application's own transaction: if the transaction rolls back, the job is never created. This removes the classic
   dual-write bug where a job starts running against a row that was never committed. It is a genuine
   advantage of a database-backed queue over a broker-backed one; see
   [Transactional enqueue](#transactional-enqueue) for the API and its one hard constraint.
@@ -148,6 +148,8 @@ CREATE TABLE jobs (
     status          TEXT NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
     max_attempts    INTEGER NOT NULL DEFAULT 1,
+    hand_backs      INTEGER NOT NULL DEFAULT 0, -- hand-backs in a row
+    claims          INTEGER NOT NULL DEFAULT 0, -- every claim ever; never reset
     run_at          REAL NOT NULL,           -- earliest execution time (unix)
     created_at      REAL NOT NULL,
     finished_at     REAL,
@@ -170,14 +172,15 @@ CREATE TABLE executions (
     id          INTEGER PRIMARY KEY,
     job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     attempt     INTEGER NOT NULL,
-    status      TEXT NOT NULL,               -- running | success | failed | timeout | lost
+    claim       INTEGER NOT NULL,            -- the jobs.claims value of this run
+    status      TEXT NOT NULL,               -- running | success | failed | timeout | lost | cancelled
     worker_id   TEXT NOT NULL,
     started_at  REAL NOT NULL,
     finished_at REAL,
     error_type  TEXT,
     traceback   TEXT
 );
-CREATE INDEX idx_exec_job ON executions (job_id, attempt);
+CREATE UNIQUE INDEX idx_executions_claim ON executions (job_id, claim);
 
 CREATE TABLE schedules (
     name         TEXT PRIMARY KEY,           -- task name
@@ -407,46 +410,52 @@ one-way door: you can migrate task by task, in either direction, with a mixed qu
 
 ## The backend protocol
 
-The seam that makes storage swappable. It is narrow on purpose, and synchronous on purpose;
+The seam that makes storage swappable. It is narrow on purpose, and async on purpose;
 see [Public API](#public-api) for why.
 
 ```python
 class Backend(Protocol):
+    capabilities: Capabilities
 
     # --- lifecycle -------------------------------------------------------
-    def setup(self) -> None: ...              # create schema, run migrations
-    def close(self) -> None: ...
+    async def setup(self) -> None: ...        # create schema, run migrations
+    async def close(self) -> None: ...
 
     # --- producer side ---------------------------------------------------
-    def enqueue(self, job: Job) -> Job: ...
-    def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]: ...   # see note
-    def transaction(self) -> AbstractContextManager[Transaction]: ...
+    async def enqueue(self, job: Job) -> Job: ...
+    async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]: ...   # see note
 
     # --- consumer side ---------------------------------------------------
-    def claim(self, *, worker_id: str, queues: Sequence[str],
-              limit: int, lease_seconds: float) -> list[Job]: ...
-    def heartbeat(self, job_ids: Sequence[str], lease_seconds: float) -> None: ...
-    def complete(self, job_id: str, result: bytes | None) -> None: ...
-    def fail(self, job_id: str, error: ExecutionError,
-             retry_at: float | None) -> None: ...
+    async def claim(self, *, worker_id: str, queues: Sequence[str],
+                    limit: int, lease_seconds: float) -> list[Job]: ...
+    async def heartbeat(
+        self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None = None
+    ) -> None: ...
+    async def complete(self, job: Job, result: bytes | None) -> bool: ...
+    async def fail(self, job: Job, error: ExecutionError, retry_at: float | None,
+                   execution_status: ExecutionStatus = ExecutionStatus.FAILED) -> bool: ...
+    async def release(self, job: Job, delay: float = 0.0) -> bool: ...
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
 
     # --- control ---------------------------------------------------------
-    def cancel(self, job_id: str) -> bool: ...
-    def get(self, job_id: str) -> Job | None: ...
-    def list(self, *, status: str | None = None, queue: str | None = None,
-             limit: int = 100, cursor: str | None = None) -> Page[Job]: ...
-    def executions(self, job_id: str) -> list[Execution]: ...
-    def stats(self, now: float) -> Stats: ...   # counts per queue, oldest due, expired leases
+    async def cancel(self, job_id: str) -> bool: ...
+    async def requeue(self, job_id: str) -> bool: ...
+    async def get(self, job_id: str) -> Job | None: ...
+    async def list(self, *, status: JobStatus | None = None, queue: str | None = None,
+                   limit: int = 100, cursor: str | None = None) -> Page: ...
+    async def executions(self, job_id: str) -> list[Execution]: ...
+    async def counts_by_status(self) -> dict[str, int]: ...
+    async def stats(self, now: float) -> Stats: ...
 
     # --- schedules --------------------------------------------------------
-    def schedules(self) -> list[ScheduleState]: ...
-    def register_schedules(self, states: Sequence[ScheduleState]) -> None: ...
-    def fire_schedule(self, name: str, *, expected: float, next_run_at: float,
-                      jobs: Sequence[Job]) -> list[Job] | None: ...
+    async def schedules(self) -> list[ScheduleState]: ...
+    async def register_schedules(self, states: Sequence[ScheduleState]) -> None: ...
+    async def fire_schedule(self, name: str, *, expected: float, next_run_at: float,
+                            jobs: Sequence[Job]) -> list[Job] | None: ...
 
     # --- housekeeping -----------------------------------------------------
-    def reap_expired(self, now: float) -> int: ...
-    def purge(self, *, before: float, statuses: Sequence[str]) -> int: ...
+    async def reap_expired(self) -> int: ...
+    async def purge(self, policy: RetentionPolicy, now: float) -> int | None: ...
 ```
 
 `enqueue_many` earns its place as a distinct method rather than a loop in the core, because **the
@@ -454,8 +463,8 @@ transaction boundary is the optimization**. A thousand separate `enqueue` calls 
 thousand fsyncs; the same thousand inside one transaction means one, which is two orders of magnitude.
 Redis backends will want pipelining, Postgres a multi-row `INSERT`. None of that is reachable if the
 core does the looping. And since the protocol freezes at v1.0, a seam that is not there at v1.0 cannot
-be added later, so it goes in now, with a default implementation in the base mixin (`transaction()`
-around a loop over `enqueue()`) so that simple backends get the correct behaviour for free.
+be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
+`enqueue()`) so that simple backends get the correct behaviour for free.
 
 ### The contract a backend must honour
 
@@ -482,9 +491,12 @@ a store, like `memory://`, sets `independent_clients = False` and races one clie
 3. **`claim` respects `status`.** Never return a cancelled or terminal job.
 4. **A claimed job carries a lease.** If the holder stops calling `heartbeat`, `reap_expired`
    eventually makes the job claimable again.
-5. **`complete` and `fail` are idempotent**, and both are no-ops on a job the caller no longer holds
-   the lease for. A worker that stalls past its lease, then wakes up and reports success, must not
-   overwrite the result of the replacement attempt.
+5. **`complete`, `fail`, `release` and `hand_back` are idempotent**, and all are no-ops on a job the
+   caller no longer holds. The holder is the worker and the claim, a per-job counter that only ever
+   grows, so a run that stalls past its lease, or was cancelled and retried, cannot report for the run
+   that replaced it, even when the same worker claimed the job again. Executions are keyed by claim
+   too, so a retried job keeps the history of its earlier runs, and cancelling a running job marks
+   its execution `cancelled`.
 6. **`enqueue` with a duplicate active `dedup_key` returns the existing job** rather than creating a
    second one.
 7. **`fire_schedule` is a compare-and-set.** It advances `next_run_at` only if it still holds
@@ -508,9 +520,13 @@ class Capabilities(NamedTuple):
     retention: bool
     schedules: bool
     max_payload_bytes: int | None
+    loop_bound: bool
 ```
 
 Requesting an unsupported feature raises at *enqueue* time with a clear message, not silently later.
+`loop_bound` is not a feature but a constraint: a backend whose connections belong to the event loop
+that opened them, as an asyncio Redis or Postgres client's do, sets it, and the app opens it on the
+facade's loop and routes every call there (see [Async core, sync facade](#async-core-sync-facade)).
 
 ### Plugin discovery
 
@@ -602,7 +618,10 @@ latency to sub-millisecond without changing the polling fallback that covers cro
 ### Crash recovery
 
 A claimed job holds a lease. The worker refreshes it (`heartbeat`) at one third of the lease duration
-while the job runs. If the worker is killed by SIGKILL, by the OOM killer or by a yanked power cable, the lease
+while the job runs, naming itself, so a worker that lost the job cannot extend the lease of the one
+that holds it now. A plugin gets `worker_id` only when its `heartbeat` names that parameter; an
+older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it. If
+the worker is killed by SIGKILL, by the OOM killer or by a yanked power cable, the lease
 simply expires.
 
 Any worker can run the reaper; it is another single atomic statement:
@@ -684,7 +703,7 @@ is imported only when a `redis://` URL is used, so the core stays dependency-fre
 
 ### Atomicity
 
-Every state change is one Lua script: enqueue, claim, complete, fail, release, cancel, requeue,
+Every state change is one Lua script: enqueue, claim, complete, fail, release, hand back, cancel, requeue,
 heartbeat, reap, a purge batch, a cron firing. Redis runs a script without interleaving any other
 command, which gives each transition the guarantee SQLite gets from `BEGIN IMMEDIATE`. The scripts
 share one library, and in it a single pair of functions, `leave` and `enter`, knows which indexes
@@ -725,7 +744,8 @@ across backends and lets the contract suite drive Redis with a `FrozenClock`.
   18 ms when 100,000 delayed jobs fell due at once. Claiming stays at 0.7 ms with 200,000 queued.
 - **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
   pop would save the idle round trips but cannot express priorities across queues.
-- **No transactional enqueue.** Redis shares no transaction with your database.
+- **No transactional enqueue, ever.** Redis shares no transaction with your database, so the
+  planned SQLite feature has no Redis counterpart.
 - **A bounded pool that waits.** redis-py 8 caps its pool at 100 and raises `MaxConnectionsError` the
   moment a caller finds it full, which turned half of 200 concurrent `aenqueue()` calls into errors.
   The backend uses a blocking pool of the same size instead, so 400 concurrent requests to a FastAPI
@@ -900,16 +920,15 @@ the interesting decisions are in the dispatch.
 | ---------------------------- | ----------------------- | -------------- | ------------------------------ |
 | `async def`                  | worker event loop       | hard           | `asyncio.timeout`, real cancel |
 | `def`                        | `ThreadPoolExecutor`    | **soft**       | see below                      |
-| `def`, `isolated=True`       | `ProcessPoolExecutor`   | hard           | survives segfaults too         |
 
-A single worker process runs an event loop plus a thread pool, plus a process pool created lazily and
-only if some registered task declares `isolated=True`. Async and sync tasks share the process without
-either starving the other.
+A single worker process runs an event loop plus a thread pool. Async and sync tasks share the process
+without either starving the other. A process executor for tasks declared `isolated=True` is planned,
+not in 0.7 yet.
 
 **There is no `--concurrency-model` flag.** The alternative is tempting, so here is the argument
 against it. The thing such a flag would select, threads versus processes, is not a property of the
 deployment, it is a property of the individual task: a function that holds the GIL for four seconds
-needs a process whether you run one worker or forty. `isolated=True` already expresses that at the
+needs a process whether you run one worker or forty. `isolated=True`, once it lands, expresses that at the
 declaration site, where the person who knows the answer is standing. A global flag would ask the same
 question again at the layer with the least information, and answer it the same way for every task.
 
@@ -919,8 +938,7 @@ supervise children itself; that stays out of v1, where adding it later is purely
 it would not be.
 
 Knobs: `--concurrency N` sets the thread pool size and doubles as the default ceiling for concurrent
-async tasks and isolated processes, each overridable (`--async-concurrency`, `--isolated-concurrency`)
-when the defaults do not fit.
+async tasks, overridable with `--async-concurrency` when the default does not fit.
 
 ### Timeouts are not uniform, and pretending otherwise would be a lie
 
@@ -935,8 +953,8 @@ This catches people out, so, plainly:
 - A blocking socket read with no timeout of its own blocks past your `timeout=`.
 
 Mitigations, in order of preference: pass timeouts to the library you are calling (every HTTP client
-has one); write the task as `async def`, where cancellation actually works; or mark it
-`isolated=True` and pay for a process that can be killed. The documentation says all of this at the
+has one); or write the task as `async def`, where cancellation actually works. `isolated=True`, a
+process that can be killed, is planned. The documentation says all of this at the
 point where `timeout=` is introduced, not in a footnote.
 
 ### Graceful shutdown
@@ -946,12 +964,41 @@ and waits up to `--shutdown-timeout` for them to finish. Anything still running 
 `QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. A
 second `SIGINT` exits at once and lets the leases lapse.
 
+A claim whose caller is cancelled while it is in flight still lands in the backend, so tinyjobs lets
+it finish and hands its jobs back, as if they were never claimed; otherwise a cancelled drain would
+leave its job `running` for the hour its lease lasts. The claim runs on tinyjobs' own loop, not the
+caller's, so this holds when the caller's loop ends with the claim in flight (`asyncio.run`
+returning, Ctrl-C under it) and when the process exits: that loop finishes such claims before it
+stops, including a hand-back sent while that loop is being closed. Closing it cancels every other task
+at once and waits five seconds at most: a task that keeps ignoring cancellation is logged and left
+behind, so the close never hangs. At exit SQLite runs only the calls
+that return jobs (complete, fail, release, hand back) on the loop thread once the interpreter refuses
+new work to its executor; a claim is refused, so a worker still running stops instead of claiming
+jobs it cannot start. A job whose job threads were already shut down is handed back without using an
+attempt, never recorded as failed. Once the interpreter is exiting, tinyjobs starts no new loop
+thread, and the exit closes only the connections no live thread is using, so a worker left running
+in a daemon thread cannot crash the process. A job task cancelled before it starts is released the
+same way as one cancelled while it runs.
+
+A worker or scheduler installs SIGINT and SIGTERM handlers only on the main thread; elsewhere it
+runs without them, since Python delivers signals to the main thread only. Workers on one loop share
+one handler, so a signal reaches each of them. When the last one stops it puts back what it found: a
+handler the loop already had, or the process's previous handler, including one set outside Python
+(read and restored with `sigaction`). A handler replaced meanwhile is kept. On asyncio's own loop the
+shared handler is a loop handler. Elsewhere (uvloop, or a loop without `add_signal_handler`) it is a
+Python handler that schedules the stop on the loop, so the loop's own handlers stay in place and keep
+receiving the signal.
+
 ### Inside a web server
 
 `app.serve(worker=True)` runs the same worker as a task on the server's own loop, and
 `app.lifespan()` wraps it in the shape FastAPI and Starlette expect. The server owns the process
 signals, so an embedded worker installs no handlers: leaving the lifespan is its `SIGTERM`, with the
-same drain and release.
+same drain and release. `handle_signals=False` is accepted there and `True` is refused.
+
+A worker, a drain or a scheduler can be started again after it stops, on the same loop or a new one,
+and `stop()` is safe to call from any thread; called before the start, it makes that run return at
+once.
 
 Where the limits are:
 
@@ -1000,7 +1047,7 @@ Two escapes from the default policy, raised from inside a task:
 
 Jobs that exhaust their attempts stay in the store as `FAILED` with the full traceback of every
 attempt. `tinyjobs jobs retry <id>` resets the counter and requeues, giving you a dead letter queue without a
-second queue to operate.
+second queue to operate. A retry is refused while another active job holds the same dedup key.
 
 ---
 
@@ -1010,17 +1057,17 @@ Off by default. Most background jobs are run for their side effects, and storing
 nobody reads is pure write amplification on the hot path.
 
 ```python
-@app.task(store_result=True, result_ttl=3600)
+@app.task(store_result=True)
 async def render_report(report_id: int) -> str:
     return "/tmp/report.pdf"
 
 job = render_report.enqueue(42)
-result = await job.result(timeout=30)     # polls; raises on failure or timeout
+result = job.wait(timeout=30).result()     # polls, then decodes the stored value
 ```
 
-Results are serialized with the same codec as the arguments, capped at a configurable size (default
-64 KiB; a result larger than that belongs in object storage, with the job returning a key), and
-deleted when the TTL expires.
+Results are serialized with the same codec as the arguments and stored on the job row, so they live
+as long as the job does and go when retention purges it. There is no size cap; a large result belongs
+in object storage, with the job returning a key. A cap and a per-task TTL are planned.
 
 `job.wait(timeout=...)` and `await job.awaited(timeout=...)` poll with the same adaptive backoff as
 the worker loop, and return the job rather than raising on failure: a job that failed still has a
@@ -1074,10 +1121,166 @@ marshals coroutines onto it. The obvious alternative, one `asyncio.run()` per ca
 because connection pools in async network clients are bound to the loop that created them; a fresh
 loop per enqueue would break precisely the backends this design exists to support.
 
-The same reasoning sets one exception. When the backend was connected from a loop that is still
-running, which is what happens under a web server's lifespan, the facade marshals onto that loop
-instead of its own. A `def` endpoint runs in a threadpool next to the server's loop, and before this
-rule its `enqueue()` reached a Redis connection pool from the wrong loop and failed every time.
+That loop is also where such a backend lives. Redis declares `Capabilities(loop_bound=True)`, and its
+connection is always opened on the facade's loop, whoever connects first: a sync call, `ready()`, a
+lifespan or a worker. A call from any other loop hops there and awaits the result, and cancelling it
+cancels its work there. One app therefore serves any number of loops at once, a lifespan and a
+worker thread with its own `asyncio.run()` included, and a loop that ends or is stopped takes nothing
+with it. Before this rule a FastAPI app on Redis without a lifespan answered 421 of 1,000 mixed `def`
+and `async def` requests with a 500, and a worker on a second loop failed every claim; now neither
+does. SQLite and `memory://` hold nothing bound to a loop and are used in place from any of them.
+The hop costs about a tenth of a millisecond, 3,600 sequential enqueues a second from one loop
+instead of 5,200 when that loop held the connection; four workers still drain 20,000 jobs in 2.1
+seconds.
+
+Closing is ordered. `aclose()` refuses new calls with `AppClosedError`, waits up to five seconds for
+the calls already running, closes the backend and stops the facade's loop. A call caught by the
+close gets `AppClosedError` too, never a `RuntimeError` from a shut-down executor or a closed pool:
+four threads calling `enqueue`, `start` and `close` and three event loops calling `aenqueue`, `ready`
+and `aclose` at random for 9 s saw nothing else, on SQLite and on Redis, and asyncio logged no
+unretrieved exception. A loop being shut down refuses new work instead of running it beside the
+closing connection. A
+sync call on a closed app raises without starting the loop thread, and an app dropped without
+`close()` stops that thread and closes its connections when it is collected, so `python -X dev` stays
+quiet at exit. That cleanup runs on a `threading.Thread` of its own: run from a bare OS thread, it
+would leave a dummy thread in `threading` for good on 3.12, and every later fork would
+count it as a foreign thread and skip the pause. At exit tinyjobs waits for these cleanups,
+including one whose thread is registered but has not started yet: joining it straight away raised
+`RuntimeError` and skipped the rest of the exit cleanup. Closing stops the app's workers first and waits for the jobs they are running, up to
+their `shutdown_timeout`, so a finished job is never left `running`. A job that closes its own app
+does not wait at all: it tells every worker to stop and returns, and the close takes effect once its
+runner has recorded the outcome and the other workers have finished, so two jobs in two workers that
+each close the app do not wait on each other. A worker or
+scheduler whose app is closed stops instead of retrying. After
+`os.fork()` the child leaves the parent's loop thread and connections alone, never closing them, and
+connects on its first call, so an app started before a preforking server forks works in every child.
+A fork waits for SQLite calls already running in other threads, and for the write transactions open
+there, up to ten seconds, so the child never inherits a lock held by a thread it does not have, and
+new calls wait from the moment the fork starts until it is done. SQLite keeps its file locks in
+per-process memory that a fork copies, so a child forked while another thread still holds a write
+open, past those ten seconds, cannot write to that database at all. A thread that forks inside a transaction does not wait for itself, and the child
+cannot commit or roll back the parent's transaction. When tinyjobs' own threads are the only other
+threads, the fork first pauses them, before the wait, and they resume right after, so Python's
+multi-threaded `fork()` warning stays quiet and an idle app adds no delay. A SQLite executor thread
+that the pause retires leaves its connection to the thread that replaces it, so no thread is left
+closing it when the fork happens. A SQLite call queued, or waiting at the fork gate, when the fork
+starts steps aside: it runs on the next executor once the fork is done, so that executor's thread
+retires too. Cleanups inherited by a child, such as the close of a connection whose thread the child
+does not have, do nothing there. The pause gives up rather
+than wait for work: a loop that does not stop within 0.1 s (a job blocking it) or a job running in a
+worker thread through `asyncio.to_thread` forks with the threads running, and the warning is then
+accurate. So does a process with threads Python did not start (a BLAS pool, a gRPC channel), where
+Python warns whatever tinyjobs does. A call already waiting on the loop when it pauses keeps waiting
+and gets its result once the loop resumes, a call made during the pause is served then, and a close
+that lands during a pause still stops the loop and closes it. A closed SQLite backend stays closed
+across a fork. A signal handler that raises while a fork waits, Ctrl-C or a `SIGTERM` handler calling
+`sys.exit()`, does not cut the wait short: the wait starts again, up to three times, and the exception is raised from the
+fork hook afterwards, where CPython reports it and drops it, as it does for any fork hook. Without
+tinyjobs the handler would run after `fork()` returns; with it, that exception is lost.
+
+A signal handler may call the synchronous API. The calling thread waits on a lock of its own, which
+is released when the work is done, so a handler that interrupts a sync call in progress is served.
+Two cases cannot be: the handler interrupted its thread while that thread held one of tinyjobs'
+locks, which only async code takes, or while it was inside the fork hooks, where the work it would
+wait for needs that same thread to go on. There the call raises `InterruptedCallError` at once
+instead of hanging, `close()` included, which then leaves the app open; setting a flag in the handler
+and making the call after it returns always works. tinyjobs' locks are plain C `RLock`s it keeps weak
+references to, and whether a thread holds one is read from the lock itself, so a thread that is only
+waiting for a lock does not count as holding it. A forked child frees every such lock another thread
+held at the fork and keeps the ones its own thread holds.
+
+A handler that raises, such as Ctrl-C, cannot leave tinyjobs half-done either, and tinyjobs never
+touches signal handlers, signal masks or the wakeup fd to get there. Python runs handlers only on the
+main thread, so the main thread keeps no books. A synchronous call, `close()` included, builds its
+request, hands it to tinyjobs' control thread through a `SimpleQueue` and waits on the request's
+lock. That thread starts and stops the loops and schedules the call, and the coroutine is made on the
+loop, so an interrupted call is either cancelled before it starts or finishes without its waiter; a
+close keeps going on its own thread and the app still ends closed. The fork hooks follow the same
+rule. The hooks that run after a fork are C callables, so no handler can run inside them. The hook
+before it only adds entries keyed by its own thread, which those C hooks remove, and asks the control
+thread to pause the loops and exit; in the parent a C hook starts the thread that resumes them, and a
+child settles itself from the first such thread it starts. Each pause carries its fork's own resume
+callable and is dropped once that fork is over, so a pause left behind by an interrupted hook never
+stops the loops during a later fork, and a pause that outlasts its fork resumes the loops itself. A handler that raises inside a fork hook
+is reported and dropped, as CPython does for every fork hook, and the fork goes on. SQLite's fork gate
+and connection pool keep their state in dicts and sets changed one C call at a time. A write nested
+inside another joins it through a savepoint, as in 0.6, so a failure inside it undoes only its own
+work, whether it sits in a plain block, a coroutine, a `@contextmanager` or `@asynccontextmanager`
+helper or an `ExitStack`. A nested write held by a generator that other code drives with `next()` is
+different, because the outer code keeps writing while the generator is suspended: closing that
+generator keeps what was done, and any other failure rolls back the whole transaction if anything
+changed since the nested write opened, schema and `user_version` included. A nested write
+interrupted before it finished poisons the outer one, which rolls back instead of committing. A nested
+write still suspended when the nested write it joined exits passes to the outer one: its work is
+part of that transaction, and a later failure of it, or the exit of the write it left having
+failed, rolls the whole transaction back. A root write that ends while such a write is still
+suspended commits or rolls back without it and retires its connection: the pool forgets it, closes
+it once no call runs on it, and every later statement through it, from any frame, cursor or
+thread, fails with `ProgrammingError` instead of writing outside a transaction, as does a new
+write or `pool.connection` opened from inside the block of the write cut loose. One that ends while
+a write that joined it is still running on the same thread, as when a generator dependency is
+closed from inside the endpoint's own write, waits for that write and then commits or rolls back,
+without any write that was only suspended; a rolled-back outer makes that write raise instead of
+committing, and so does an outer poisoned meanwhile, even when that write failed itself. One that ends while a joined write runs on another thread retires the connection the
+same way, stops the statement in flight, then rolls back and raises. A transaction whose
+connection another thread used meanwhile, as when `asyncio.to_thread` outlives a timeout, retires
+it at the end the same way, so that thread's later statements fail instead of committing on their
+own: a committing root waits out a statement still running there, a failing root stops it first,
+and a failing nested write rolls the whole transaction back. A write entered by hand inside an open one must
+exit before it, or the outer one rolls back, raises and retires the connection. Every connection
+the pool closes is retired first, so a close never lands under a statement another thread is
+running. A write that would
+join a transaction SQLite has already ended, as `INSERT OR ROLLBACK` does, is refused, and the
+outer write rolls back. A write entered by hand and dropped without exiting is rolled back when it is collected,
+together with any write that joined it meanwhile, and logs a warning on `tinyjobs.sqlite`. A write counts as open while the `with` block that holds it runs: the block where it was
+entered, or, for a write opened inside some `__enter__`, the block that entered that; the frame's
+exception table and the jumps inside the block tell this exactly. A write entered through an
+`ExitStack` counts as open while that stack still holds its exit, wherever the stack moves, and one
+opened by a generator outside any block, such as a pytest fixture, counts as open until it exits.
+So a later write never joins a dead one, and the fork gate counts a write as held until its exit is
+done. A later write joins an open one when it runs inside its block, in the same `contextvars`
+context, or in the same asyncio task; otherwise it gets a connection of its own and waits for the
+lock, so concurrent FastAPI requests served by one thread never share a transaction; two asyncio
+tasks on one thread are the exception described below. Context is
+what Python's `contextvars` says it is: `asyncio.to_thread` and FastAPI give each call its own copy,
+while `loop.run_in_executor` runs everything in the worker thread's one context, so work sent there
+joins a transaction an earlier call left open on that thread. That also
+means a write opened by a sync FastAPI endpoint does not join the one its sync dependency holds,
+since FastAPI runs each in a separate context; use the connection the dependency yields. A
+transaction whose entry or exit was interrupted is rolled back by the next tinyjobs call on that
+thread, sync or async, even while something still holds the interrupted write, and at once when
+nothing does. A write may exit on another thread than the one that entered it and commits there,
+untouched by the first thread meanwhile, and its connection stays open if that first thread ends.
+Two asyncio tasks on one thread share its connection, so a task that writes while another task's
+transaction is open gets an error instead of joining it; `asyncio.run` called inside a write joins
+it, one task at a time. A tinyjobs call made while the thread is
+opening or closing a transaction, which is where a signal handler lands, is refused with
+`InterruptedCallError`, so the half-open transaction is neither healed nor joined. An interrupted
+write that a later one rolled back refuses to commit. All of this relies on the GIL making each of those C calls atomic; free-threaded builds
+are not supported. Only the main thread is checked for holding a lock, since a handler cannot run
+anywhere else; a fork in progress counts on every thread. Async code on a loop in the main thread is
+outside this: `asyncio.run` and uvicorn turn Ctrl-C into a cancellation, which tinyjobs handles at
+every `await`, and a handler that raises in the middle of that code is not covered. The tests raise
+an exception at every point of a call, a close, a drain, a transaction and a fork where CPython can
+run a handler, and check that nothing is left behind.
+
+The main thread keeps no books because CPython itself is not safe against a handler raising at an
+arbitrary instruction. On 3.13 and 3.14, the backward jump of a loop whose body ends inside a `try` is
+missing from the exception table. An exception raised there skips the enclosing `except` and
+`finally`: 200 of 200 trials on 3.13 and 3.14, none on 3.12. On 3.14, `with lock:` checks
+for signals after `__enter__` returns but before the block is protected, so the lock stays held. On
+3.12, an interrupted `Thread.is_alive()` reports a live thread as dead, so a fork reads
+whether the control thread has exited from the thread's handle instead, which 3.14 renamed from
+`_handle` to `_os_thread_handle`.
+
+The first connection is elected across loops and threads: one caller connects, and the others wait
+on a thread-safe future without blocking their own loop and share its error if it fails, so a server
+that refuses the connection is asked once, not once per waiter. If the caller's loop stops first, a
+waiter takes over; a Redis connection is made on the facade's loop and finishes either way. A second
+backend made in that race is closed, as is one whose `setup()` fails. An `asyncio.Lock` did this
+before, and it belongs to one loop: two loops connecting at once deadlocked in every trial, and four
+loops racing four threads hung all of them. With the election, 0 of 100 such trials fail on SQLite
+and 0 of 50 on Redis.
 
 Calling a synchronous method from inside a running loop raises `SynchronousCallInsideEventLoopError`
 and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's
@@ -1176,7 +1379,8 @@ reaching for it.
 The dual-write bug is old and common: you commit a row, enqueue a job about it, and the enqueue
 succeeds while the commit rolls back, or the worker claims the job a millisecond before the commit
 lands and finds nothing there. A broker-backed queue cannot fix this, because the broker and your
-database have no transaction in common. A database-backed queue can.
+database have no transaction in common. A database-backed queue can. This is planned, not in 0.7
+yet; the shape it will take:
 
 ```python
 with app.transaction() as tx:
@@ -1188,7 +1392,21 @@ with app.transaction() as tx:
 tinyjobs owns the connection and hands it to you, rather than borrowing one of yours. That is what
 lets it guarantee the settings this whole design rests on (WAL, `busy_timeout`, `BEGIN IMMEDIATE`)
 instead of inheriting whatever an ORM happened to configure. Passing `tx=` to a backend whose
-`Capabilities.transactional_enqueue` is `False` raises at enqueue time, not silently degrades.
+`Capabilities.transactional_enqueue` is `False` will raise at enqueue time, not silently degrade;
+until the feature lands every backend reports `False`.
+
+Until then, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
+made while the same context holds an open `backend.transaction()` on the same database file is
+refused at once: it would run on another connection and wait for the write lock that transaction
+holds. Make the call after the block, or from `transaction.on_commit` in Django. An asyncio task
+started inside the block is not refused, since it can wait while the block goes on; a thread handed
+the context, as `asyncio.to_thread` does, is. The refusal sees only the context that opened the
+transaction; a FastAPI endpoint enqueueing while its dependency holds one runs in another context, so
+there the enqueue waits for the lock and fails after `busy_timeout`. Inside the block, `commit()`,
+`rollback()`, `executescript()`, `with connection:` and setting `isolation_level` or `autocommit`
+are refused because they would end the transaction early, and a
+transaction SQLite ends by itself, as `INSERT OR ROLLBACK` does, makes the block raise when it exits,
+since every statement after that point committed on its own.
 
 **The constraint, stated plainly: the `jobs` table must live in the same SQLite file as your data.**
 There is no way around it. SQLite documents that transactions spanning `ATTACH`ed databases are not
@@ -1201,7 +1419,8 @@ is unaffected.
 Joining a connection your ORM already owns, via something like `app.using(django_connection)`, is the
 natural next step and is deliberately **not** in v1. Designing an ORM integration before there is a
 real ORM to test it against produces an API shaped by imagination, and v1.0 freezes it. The hook it
-would attach to is the same `Backend.transaction()` already in the protocol.
+would attach to is `transaction()`, which the SQLite backend already has and the protocol will gain
+with transactional enqueue.
 
 ### Task discovery
 
@@ -1215,11 +1434,16 @@ tinyjobs worker --app myproject:app --import "myproject.jobs.*"
 
 A job whose task is unknown to the worker is left `QUEUED` and logged, never failed: the usual cause
 is a misconfigured `--import` or a partially rolled-out deploy, and failing the job would destroy work
-that a correctly configured worker could still run. Each hand-back in a row waits twice as long as
-the one before, from `unknown_task_delay` (60 s) up to `unknown_task_max_delay` (an hour); attempts
-that ran before the task went missing do not count. A fixed delay wrote an execution row and an
-`ERROR` line every minute, forever, for a job retention never prunes because it never finishes;
-doubling brings that to 24 a day once the delay reaches the hour.
+that a correctly configured worker could still run. A hand-back gives the attempt back: `attempts`
+and the execution history read as if the claim never happened, and only the job's `hand_backs`
+counts it, so a task allowed three attempts still gets three once a worker knows it. Any other
+outcome resets `hand_backs`, so it counts the hand-backs in a row, including those of a claim
+whose caller was cancelled. A backend without `hand_back`
+falls back to `release`, which uses the attempt up. Each hand-back
+waits twice as long as the one before, from `unknown_task_delay` (60 s) up to
+`unknown_task_max_delay` (an hour). A fixed delay wrote an `ERROR` line every minute, forever, for a
+job retention never prunes because it never finishes; doubling brings that to 24 a day once the
+delay reaches the hour.
 
 ### Django tasks
 
@@ -1265,9 +1489,9 @@ the task has already run by the time `enqueue()` returns.
 
 ### Observability
 
-Structured logging through the stdlib `logging` module, on the `tinyjobs` logger, with `job_id`,
-`task`, `queue`, `attempt` and `duration_ms` as `extra` fields. No logging is configured by the
-library. A library that calls `basicConfig` is a library that fights your application.
+Logging goes through the stdlib `logging` module, on the `tinyjobs` logger and its children, with the
+job id in the message. Structured `extra` fields (`job_id`, `task`, `queue`, `attempt`,
+`duration_ms`) are planned. No logging is configured by the library. A library that calls `basicConfig` is a library that fights your application.
 
 Lifecycle hooks for metrics, tracing or alerting, with no framework assumptions:
 
@@ -1303,6 +1527,18 @@ all. Clock skew is not: on one SQLite file there is no second clock to compare a
 
 A `schema_version` row in `meta`, forward-only migrations applied at `setup()`. Workers refuse to
 start against a schema newer than they understand, so a partial rollback cannot corrupt a queue.
+Version 3 adds `jobs.hand_backs` and `jobs.claims`, and keys executions by claim. The migration
+numbers each job's existing executions in the order they started, and sets `claims` to the larger of
+`attempts` and that count, so a job retried under 0.6 keeps every row. On Redis the store moves to
+version 2: a job without `hand_backs` reads as zero, and a job without `claims` gets the same
+renumbering the first time a script touches it or it is read, so `get`, `list` and `executions`
+already show the adopted order and `claims`.
+
+Upgrading from 0.6 is a stop-the-world step. A 0.6 worker writes executions by attempt, which no
+longer matches the layout, so stop every 0.6 process before the first 0.7 one starts. Once the store
+is upgraded, a 0.6 process refuses to start against it. 0.6 runs its schema statements before it
+checks the version, so 0.7 keeps an empty index under the 0.6 unique index's name: that statement
+becomes a no-op, and a refused 0.6 start cannot stop a running 0.7 worker from retrying jobs.
 
 ### Security notes
 
@@ -1387,11 +1623,15 @@ policies, timezone and DST handling.
 
 **v0.3, production shape**
 Leases and the reaper, graceful shutdown, multi-queue routing, priorities, deduplication keys,
-lifecycle hooks, retention and automatic purge, `app.transaction()` for transactional enqueue.
+lifecycle hooks, retention and automatic purge.
 
 **v0.4, comfort**
 Result storage, `memory://` backend and the conformance suite, eager and drain test modes,
-`tinyjobs stats` / `check`, the process executor and `isolated=True`.
+`tinyjobs stats` / `check`.
+
+**Next**
+Transactional enqueue (`app.transaction()`, `enqueue(tx=)`), the process executor and
+`isolated=True`, a result size cap and TTL, structured log fields.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
@@ -1399,8 +1639,7 @@ protocol is a compatibility promise.
 
 **Beyond**
 `app.using(conn)` to join an ORM's own transaction, designed against a real Django or SQLAlchemy
-application rather than against a guess. `tinyjobs-redis` and `tinyjobs-postgres` as separate
-packages. `--processes N`, if running one worker per core under a supervisor turns out to be the
+application rather than against a guess. A Postgres backend. `--processes N`, if running one worker per core under a supervisor turns out to be the
 friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
 file). Chains and groups only if usage demands them. They are where task queues usually go to become
 frameworks.

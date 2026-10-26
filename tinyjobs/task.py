@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from functools import partial
 from typing import Any, Callable, TYPE_CHECKING
 
 from .models import Job, JobPayload
@@ -93,7 +94,7 @@ class Task:
 
     def enqueue(self, *args: Any, **kwargs: Any) -> Job:
         return self._app.run_sync(
-            self.aenqueue_with(self._options, args, kwargs), name="enqueue"
+            partial(self.aenqueue_with, self._options, args, kwargs), name="enqueue"
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
@@ -116,5 +117,6 @@ class BoundTask:
 
     def enqueue(self, *args: Any, **kwargs: Any) -> Job:
         return self._task.app.run_sync(
-            self._task.aenqueue_with(self._options, args, kwargs), name="enqueue"
+            partial(self._task.aenqueue_with, self._options, args, kwargs),
+            name="enqueue",
         )

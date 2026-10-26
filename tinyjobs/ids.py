@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import secrets
 import socket
-import threading
 import time
 import uuid
+
+from .runtime import tracked_lock
 
 COUNTER_BITS = 12
 COUNTER_MAX = (1 << COUNTER_BITS) - 1
@@ -16,7 +17,7 @@ VARIANT_BITS = 0x80
 
 class JobIdGenerator:
     def __init__(self) -> None:
-        self._guard = threading.Lock()
+        self._guard = tracked_lock()
         self._last_milliseconds = -1
         self._counter = 0
 

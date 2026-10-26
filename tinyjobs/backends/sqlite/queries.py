@@ -23,6 +23,7 @@ CLAIM_RETURNING = f"""
        SET status = 'running',
            worker_id = ?,
            attempts = attempts + 1,
+           claims = claims + 1,
            lease_expires_at = ?
      WHERE id IN (
            SELECT id FROM jobs
@@ -38,53 +39,79 @@ CLAIM_ONE = """
        SET status = 'running',
            worker_id = ?,
            attempts = attempts + 1,
+           claims = claims + 1,
            lease_expires_at = ?
      WHERE id = ? AND status = 'queued'
 """
 
 HEARTBEAT = """
     UPDATE jobs SET lease_expires_at = ?
-     WHERE status = 'running' AND id IN ({ids})
+     WHERE status = 'running' AND (? IS NULL OR worker_id = ?) AND id IN ({ids})
 """
 
 COMPLETE_JOB = """
     UPDATE jobs
        SET status = 'success', finished_at = ?, result = ?,
-           lease_expires_at = NULL, last_error = NULL
-     WHERE id = ? AND status = 'running' AND worker_id = ?
+           lease_expires_at = NULL, last_error = NULL, hand_backs = 0
+     WHERE id = ? AND status = 'running' AND worker_id = ? AND claims = ?
 """
 
 FAIL_JOB = """
     UPDATE jobs
        SET status = 'failed', finished_at = ?, last_error = ?,
-           lease_expires_at = NULL
-     WHERE id = ? AND status = 'running' AND worker_id = ?
+           lease_expires_at = NULL, hand_backs = 0
+     WHERE id = ? AND status = 'running' AND worker_id = ? AND claims = ?
 """
 
 RESCHEDULE_JOB = """
     UPDATE jobs
        SET status = 'queued', run_at = ?, last_error = ?,
-           lease_expires_at = NULL, worker_id = NULL
-     WHERE id = ? AND status = 'running' AND worker_id = ?
+           lease_expires_at = NULL, worker_id = NULL, hand_backs = 0
+     WHERE id = ? AND status = 'running' AND worker_id = ? AND claims = ?
 """
 
 RELEASE_JOB = """
     UPDATE jobs
-       SET status = 'queued', run_at = ?, lease_expires_at = NULL, worker_id = NULL
-     WHERE id = ? AND status = 'running' AND worker_id = ?
+       SET status = 'queued', run_at = ?, lease_expires_at = NULL, worker_id = NULL,
+           hand_backs = 0
+     WHERE id = ? AND status = 'running' AND worker_id = ? AND claims = ?
+"""
+
+HAND_BACK_JOB = """
+    UPDATE jobs
+       SET status = 'queued', run_at = ?, attempts = attempts - 1,
+           hand_backs = hand_backs + 1, lease_expires_at = NULL, worker_id = NULL
+     WHERE id = ? AND status = 'running' AND worker_id = ? AND claims = ?
+"""
+
+DELETE_EXECUTION = """
+    DELETE FROM executions WHERE job_id = ? AND claim = ?
+"""
+
+CANCEL_EXECUTIONS = """
+    UPDATE executions
+       SET status = 'cancelled', finished_at = ?
+     WHERE job_id = ? AND status = 'running'
 """
 
 CANCEL_JOB = """
     UPDATE jobs
-       SET status = 'cancelled', finished_at = ?, lease_expires_at = NULL
+       SET status = 'cancelled', finished_at = ?, lease_expires_at = NULL,
+           hand_backs = 0
      WHERE id = ? AND status IN ('queued', 'running')
 """
 
 REQUEUE_JOB = """
     UPDATE jobs
-       SET status = 'queued', run_at = ?, attempts = 0, finished_at = NULL,
+       SET status = 'queued', run_at = ?, attempts = 0,
+           finished_at = NULL,
            lease_expires_at = NULL, worker_id = NULL, last_error = NULL
      WHERE id = ? AND status IN ('failed', 'cancelled')
+       AND NOT EXISTS (
+           SELECT 1 FROM jobs AS holder
+            WHERE holder.dedup_key = jobs.dedup_key
+              AND holder.status IN ('queued', 'running')
+       )
 """
 
 REAP_EXPIRED = """
@@ -94,6 +121,7 @@ REAP_EXPIRED = """
            finished_at = CASE WHEN attempts < max_attempts THEN NULL ELSE ? END,
            lease_expires_at = NULL,
            worker_id = NULL,
+           hand_backs = 0,
            last_error = 'lease expired: the worker holding this job stopped reporting'
      WHERE status = 'running' AND lease_expires_at < ?
     RETURNING id, attempts
@@ -105,9 +133,9 @@ SELECT_EXPIRED_IDS = """
 """
 
 INSERT_EXECUTION = """
-    INSERT INTO executions (job_id, attempt, status, worker_id, started_at)
-    VALUES (?, ?, 'running', ?, ?)
-    ON CONFLICT (job_id, attempt) DO UPDATE
+    INSERT INTO executions (job_id, attempt, claim, status, worker_id, started_at)
+    VALUES (?, ?, ?, 'running', ?, ?)
+    ON CONFLICT (job_id, claim) DO UPDATE
        SET status = 'running', worker_id = excluded.worker_id,
            started_at = excluded.started_at, finished_at = NULL,
            error_type = NULL, traceback = NULL
@@ -116,7 +144,7 @@ INSERT_EXECUTION = """
 FINISH_EXECUTION = """
     UPDATE executions
        SET status = ?, finished_at = ?, error_type = ?, traceback = ?
-     WHERE job_id = ? AND attempt = ?
+     WHERE job_id = ? AND claim = ?
 """
 
 MARK_EXECUTIONS_LOST = """
@@ -128,7 +156,7 @@ MARK_EXECUTIONS_LOST = """
 SELECT_EXECUTIONS = """
     SELECT id, job_id, attempt, status, worker_id, started_at,
            finished_at, error_type, traceback
-      FROM executions WHERE job_id = ? ORDER BY attempt ASC
+      FROM executions WHERE job_id = ? ORDER BY claim ASC
 """
 
 COUNT_BY_STATUS = "SELECT status, count(*) AS total FROM jobs GROUP BY status"

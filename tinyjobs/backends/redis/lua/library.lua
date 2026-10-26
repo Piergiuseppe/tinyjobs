@@ -57,9 +57,23 @@ local function release_dedup(job)
   end
 end
 
+local function dedup_holder(job)
+  if not job.dedup_key then
+    return nil
+  end
+  local holder = redis.call('GET', key('dedup', job.dedup_key))
+  if holder and holder ~= job.id then
+    local existing = load(holder)
+    if existing and ACTIVE[existing.status] then
+      return holder
+    end
+  end
+  return nil
+end
+
 local function hold_dedup(job)
   if job.dedup_key then
-    redis.call('SET', key('dedup', job.dedup_key), job.id, 'NX')
+    redis.call('SET', key('dedup', job.dedup_key), job.id)
   end
 end
 
@@ -116,28 +130,57 @@ local function transition(job, status, changes, removals)
 end
 
 local function insert(job)
-  if job.dedup_key then
-    local holder = redis.call('GET', key('dedup', job.dedup_key))
-    if holder then
-      local existing = load(holder)
-      if existing and ACTIVE[existing.status] then
-        return holder
-      end
-    end
+  local holder = dedup_holder(job)
+  if holder then
+    return holder
   end
   redis.call('HSET', job_key(job.id), unpack(flatten(job)))
   redis.call('ZADD', key('index', 'all'), 0, job.id)
   redis.call('ZADD', key('index', 'queue', job.queue), 0, job.id)
-  if ACTIVE[job.status] and job.dedup_key then
-    redis.call('SET', key('dedup', job.dedup_key), job.id)
+  if ACTIVE[job.status] then
+    hold_dedup(job)
   end
   enter(job)
   return job.id
 end
 
-local function held_by(id, worker)
+local function earlier(left, right)
+  local first, second = tonumber(left.execution.started_at) or 0, tonumber(right.execution.started_at) or 0
+  if first ~= second then
+    return first < second
+  end
+  return left.field < right.field
+end
+
+local function adopt_history(job)
+  local hash = key('executions', job.id)
+  local raw = redis.call('HGETALL', hash)
+  local entries = {}
+  for index = 1, #raw, 2 do
+    local execution = cjson.decode(raw[index + 1])
+    execution.attempt = execution.attempt or tonumber(raw[index])
+    table.insert(entries, { field = tonumber(raw[index]), execution = execution })
+  end
+  table.sort(entries, earlier)
+  if #entries > 0 then
+    redis.call('DEL', hash)
+    for claim, entry in ipairs(entries) do
+      redis.call('HSET', hash, claim, cjson.encode(entry.execution))
+    end
+  end
+  job.claims = tostring(math.max(tonumber(job.attempts), #entries))
+  redis.call('HSET', job_key(job.id), 'claims', job.claims)
+  return job.claims
+end
+
+local function claim_of(job)
+  return job.claims or adopt_history(job)
+end
+
+local function held_by(id, worker, claim)
   local job = load(id)
-  if job and job.status == 'running' and job.worker_id == worker then
+  if job and job.status == 'running' and job.worker_id == worker
+      and tonumber(claim_of(job)) == tonumber(claim) then
     return job
   end
   return nil
@@ -153,14 +196,15 @@ local function record_execution(id, attempt, fields)
 end
 
 local function start_execution(job)
-  redis.call('HSET', key('executions', job.id), job.attempts, cjson.encode({
+  redis.call('HSET', key('executions', job.id), claim_of(job), cjson.encode({
     status = 'running', worker_id = job.worker_id, started_at = NOW,
+    attempt = tonumber(job.attempts),
   }))
 end
 
 local function close_running_execution(job, status)
-  local stored = redis.call('HGET', key('executions', job.id), job.attempts)
+  local stored = redis.call('HGET', key('executions', job.id), claim_of(job))
   if stored and cjson.decode(stored).status == 'running' then
-    record_execution(job.id, job.attempts, { status = status, finished_at = NOW })
+    record_execution(job.id, claim_of(job), { status = status, finished_at = NOW })
   end
 end

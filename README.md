@@ -1,5 +1,7 @@
 # tinyjobs
 
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/tinyjobs?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/tinyjobs)
+
 Background jobs and cron for Python, backed by SQLite, with no dependencies.
 
 ```bash
@@ -13,7 +15,7 @@ will run a single job. This is for the projects that never needed that: a Django
 emails, a scraper with a nightly refresh, a CLI that offloads slow work. When you outgrow SQLite you
 switch the URL to Redis and your task code doesn't change.
 
-Requires Python 3.11 or newer.
+Requires Python 3.12 or newer.
 
 ## Quick start
 
@@ -281,7 +283,7 @@ async def render(document_id: int) -> dict:
 
 `uvicorn main:api` is the whole deployment. The lifespan connects when the server starts, runs a
 worker inside it, and on shutdown lets in-flight jobs finish before closing. Plain `def` endpoints
-can call `enqueue()`: it runs on the server's event loop, so it is safe on Redis too.
+can call `enqueue()` too, on SQLite or on Redis.
 
 `worker=True` takes the options of `app.worker()`, such as `concurrency`, `queues` and
 `shutdown_timeout`. Under `uvicorn --workers 4` each process runs its own worker on the same queue,
@@ -400,6 +402,7 @@ and drain. A failing task is recorded on the job, not raised, as it would be in 
 | Health | `tinyjobs stats`, and `tinyjobs check` for probes |
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 | FastAPI | `lifespan()`, with an optional worker inside the server process |
+| Django | a `django.tasks` backend and `manage.py tinyjobs` |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -423,6 +426,31 @@ of registration:
 app.codec.register_dataclass(Money)
 app.codec.register_enum(Priority)
 ```
+
+## How it compares
+
+[Huey](https://github.com/coleifer/huey) is the closest relative and worth a look: it also runs on
+SQLite with no dependencies, and has cron, retries and a `django.tasks` backend. tinyjobs adds three
+things. `async def` tasks run natively on the worker's loop, where Huey has no asyncio pipeline for
+running tasks, only helpers to await their results. FastAPI and Starlette can run the worker inside
+the server's lifespan. And cron fires from every worker without a leader, with timezones and misfire
+policies, on SQLite or on Redis. [LiteQ](https://github.com/ddreamboy/liteq), at 0.2, makes much
+the same pitch on SQLite.
+
+[RQ](https://python-rq.org) and [arq](https://github.com/python-arq/arq) need Redis. RQ's cron
+scheduler is still marked beta, and its retries take a fixed interval or a list of delays, with no
+built-in exponential backoff. arq is asyncio-only and in maintenance mode, with security fixes only.
+[Celery](https://docs.celeryq.dev) and [Dramatiq](https://dramatiq.io) need a broker; Celery is
+still the answer for RabbitMQ routing, workflows and large fleets.
+
+On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the better fit today: async,
+with cron and retries, and jobs that can be deferred inside your own transaction. In Django,
+[django-tasks-db](https://github.com/RealOrangeOne/django-tasks-db) keeps `django.tasks` tasks in
+your database through the ORM, so an enqueue can share your transaction, and
+[django-q2](https://github.com/GDay/django-q2) can use the ORM as its broker and has cron schedules.
+tinyjobs keeps the queue out of your database, so it cannot share a transaction yet.
+
+As of October 2026, from each project's documentation.
 
 ## How it works
 
@@ -475,7 +503,7 @@ the jobs that were running came back once their leases expired. A restart, grace
 otherwise harmless: workers log the outage, back off, and carry on.
 
 Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like on SQLite, and
-`transactional enqueue` is SQLite only. All keys share one hash slot (`{prefix}`), so it runs on a
+transactional enqueue, once it lands, will be SQLite only. All keys share one hash slot (`{prefix}`), so it runs on a
 single Redis or a primary with replicas, not spread across a cluster.
 
 Each process holds at most 100 connections (`max_connections=`). A burst beyond that waits for a free
@@ -593,6 +621,10 @@ What's not in yet:
 - a process executor for CPU-bound work
 - a Postgres backend
 
+Upgrading from 0.6: stop every 0.6 worker before starting 0.7. The first 0.7 process migrates the
+store, and from then on a 0.6 process refuses to start against it. 0.7 also needs Python 3.12 or
+newer.
+
 `docs/design.md` explains the design and why it looks like this, including the parts not built yet.
 
 ## Working on it
@@ -613,8 +645,7 @@ python -m examples.demo
 tinyjobs worker --app examples.demo:app --concurrency 4
 ```
 
-Importing the package on anything older than 3.11 raises with the version it found and the path to it,
-rather than an unhelpful error about `StrEnum`.
+Importing the package on anything older than 3.12 raises with the version it found and the path to it.
 
 ## Tests
 
@@ -622,9 +653,14 @@ rather than an unhelpful error about `StrEnum`.
 python -m unittest discover -s tests -t .
 ```
 
-461 tests, no test dependencies. The one that matters most is
+944 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
+
+Interruptions get tests of their own. One kind raises an exception at every call and loop edge inside
+tinyjobs in turn, during a send, an enqueue, a start, a close, a drain, a transaction and a fork, and
+after each one checks that no lock is held, no transaction is open and no job is stuck running. The
+other fires a real `SIGALRM` every 20 µs to 1.5 ms while calls run.
 
 The Redis tests skip unless they have a server and the client library, and the FastAPI ones
 unless `fastapi` and `httpx` are installed:

@@ -24,8 +24,12 @@ local claimed = {}
 for index = 1, math.min(limit, #candidates) do
   local id = string.match(candidates[index].member, '|(.+)$')
   local job = load(id)
-  local attempt = tostring(tonumber(job.attempts) + 1)
-  transition(job, 'running', { worker_id = worker, attempts = attempt, lease_expires_at = lease_expires_at })
+  transition(job, 'running', {
+    worker_id = worker,
+    attempts = tostring(tonumber(job.attempts) + 1),
+    claims = tostring(tonumber(claim_of(job)) + 1),
+    lease_expires_at = lease_expires_at,
+  })
   start_execution(job)
   claimed[#claimed + 1] = flatten(job)
 end

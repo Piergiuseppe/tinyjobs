@@ -26,7 +26,7 @@ class HealthTestCase(unittest.TestCase):
 
     def claim(self, lease_seconds: float = 30.0):
         return self.app.run_sync(
-            self.app.backend.claim(
+            lambda: self.app.backend.claim(
                 worker_id="w", queues=("default",), limit=1, lease_seconds=lease_seconds
             ),
             name="claim",
@@ -102,7 +102,7 @@ class CheckTests(HealthTestCase):
         def tick():
             return None
 
-        self.app.run_sync(self.app.scheduling.register(), name="register")
+        self.app.run_sync(lambda: self.app.scheduling.register(), name="register")
         self.assertEqual(self.failures(), [])
         self.clock.advance(180)
         self.assertIn("schedule health.tick is", self.failures()[0])

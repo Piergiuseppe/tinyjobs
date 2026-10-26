@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 UNITS = (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60))
 
 
@@ -9,7 +11,13 @@ def format_duration(seconds: float) -> str:
     for suffix, size in UNITS:
         if seconds >= size and seconds % size == 0:
             return f"{int(seconds // size)}{suffix}"
-    return f"{seconds:g}s"
+    return format_seconds(seconds)
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds >= 1:
+        return f"{seconds:.3f}".rstrip("0").rstrip(".") + "s"
+    return format(Decimal(f"{seconds:.3g}"), "f") + "s"
 
 
 def format_age(seconds: float) -> str:

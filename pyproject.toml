@@ -7,7 +7,7 @@ name = "tinyjobs"
 version = "0.6.0"
 description = "Background jobs and cron for Python, on SQLite, with zero dependencies"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
@@ -21,7 +21,6 @@ classifiers = [
     "Framework :: Django :: 6.0",
     "Framework :: FastAPI",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",

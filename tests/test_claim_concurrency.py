@@ -24,7 +24,7 @@ PACING_SECONDS = 0.001
 def seed(database: str, count: int) -> None:
     app = TinyJobs(f"sqlite:///{database}").start()
     app.run_sync(
-        app.backend.enqueue_many(
+        lambda: app.backend.enqueue_many(
         [
             Job(
                 id=new_job_id(),
@@ -46,7 +46,7 @@ def seed(database: str, count: int) -> None:
 
 def claim_once(app, worker_id: str):
     return app.run_sync(
-        app.backend.claim(
+        lambda: app.backend.claim(
             worker_id=worker_id,
             queues=("default",),
             limit=CLAIM_BATCH,
@@ -155,7 +155,7 @@ class ClaimExclusivityTests(unittest.TestCase):
     def test_every_job_ends_up_running_exactly_once(self):
         app = TinyJobs(f"sqlite:///{self.database}").start()
         drained = app.run_sync(
-            app.backend.claim(
+            lambda: app.backend.claim(
                 worker_id="solo",
                 queues=("default",),
                 limit=JOB_COUNT,

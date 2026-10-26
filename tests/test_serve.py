@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import signal
 import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
-from tinyjobs import ConfigurationError, JobStatus, TinyJobs, WaitTimeout
+from tinyjobs import ConfigurationError, JobStatus, TinyJobs, WaitTimeout, runtime
 from tinyjobs.backends import register_builtin
 from tinyjobs.exceptions import (
     AppClosedError,
     BackendNotReadyError,
     EventLoopStoppedError,
 )
+from tinyjobs.runtime import LoopRunner, run_on, submit
 from tests.test_async_backend import RamBackend
 
 SETTLE_TIMEOUT = 10.0
 
 
 class LoopBoundBackend(RamBackend):
+    capabilities = replace(RamBackend.capabilities, loop_bound=True)
+
     async def setup(self) -> None:
         self._home = asyncio.get_running_loop()
 
@@ -174,6 +180,14 @@ class ServeTests(ServeTestCase):
         self.assertIn("concurrency", str(caught.exception))
 
 
+    async def test_an_embedded_worker_takes_handle_signals_false_and_refuses_true(self):
+        async with self.app.serve(worker=True, handle_signals=False):
+            pass
+        with self.assertRaises(ConfigurationError) as caught:
+            async with self.app.serve(worker=True, handle_signals=True):
+                pass
+        self.assertIn("signal handlers", str(caught.exception))
+
 class LifespanTests(ServeTestCase):
     async def test_lifespan_takes_the_asgi_app_and_serves(self):
         @self.app.task
@@ -203,30 +217,131 @@ class SyncFacadeFromThreadsTests(unittest.IsolatedAsyncioTestCase):
         async with app.serve():
             job = await asyncio.to_thread(noop.enqueue)
             self.assertIs((await app.aget(job.id)).status, JobStatus.QUEUED)
-        app.close()
 
 
-class StoppedHomeLoopTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self.loop.run_forever)
-        self.thread.start()
-        self.app = TinyJobs("stopping://")
-        asyncio.run_coroutine_threadsafe(self.app.ready(), self.loop).result()
+class InterruptedCallTests(unittest.TestCase):
+    def test_a_call_routed_to_the_home_loop_from_a_lock_holder_is_refused(self):
+        from tinyjobs.exceptions import InterruptedCallError
 
-    def tearDown(self) -> None:
-        self.thread.join(timeout=5)
-        self.loop.run_until_complete(asyncio.sleep(0))
-        self.loop.close()
-        self.app.close()
+        app = TinyJobs("loopbound://")
+        self.addCleanup(app.close)
+        app.counts()
 
-    def test_a_sync_call_raises_when_the_home_loop_stops_under_it(self):
-        @self.app.task
+        async def call() -> None:
+            with app._lock_guard:
+                await app.acounts()
+
+        with self.assertRaises(InterruptedCallError):
+            asyncio.run(call())
+        self.assertEqual(app.counts(), {})
+
+
+class StoppedLoopTests(unittest.TestCase):
+    def test_a_sync_call_raises_when_the_backend_loop_stops_under_it(self):
+        app = TinyJobs("stopping://").start()
+
+        @app.task
         async def noop():
             return None
 
-        with self.assertRaises(EventLoopStoppedError):
-            noop.enqueue()
+        try:
+            with self.assertRaises(EventLoopStoppedError):
+                noop.enqueue()
+        finally:
+            app.close()
+
+
+class Closable:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def noop() -> None:
+    return None
+
+
+class LoopRunnerTests(unittest.TestCase):
+    def test_a_call_handed_a_loop_closed_under_it_says_the_app_closed(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        runner.close()
+        made: list = []
+        with mock.patch.object(runner, "_ensure_loop", return_value=loop):
+            with self.assertRaises(AppClosedError):
+                runner.run(lambda: made.append(noop()))
+        self.assertEqual(made, [])
+
+    def test_an_interrupted_sync_call_cancels_its_work(self):
+        ran: list[int] = []
+
+        async def later():
+            await asyncio.sleep(0.3)
+            ran.append(1)
+
+        runner = LoopRunner()
+        try:
+            with mock.patch.object(runtime, "_wait", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    runner.run(lambda: later())
+            time.sleep(0.5)
+        finally:
+            runner.close()
+        self.assertEqual(ran, [])
+
+    def test_a_call_cancelled_before_it_starts_never_runs(self):
+        ran: list[int] = []
+
+        async def record():
+            ran.append(1)
+
+        loop = asyncio.new_event_loop()
+        serving = threading.Thread(target=loop.run_forever)
+        serving.start()
+        try:
+            loop.call_soon_threadsafe(time.sleep, 0.3)
+            pending = record()
+            submit(loop, pending, "record").cancel()
+            time.sleep(0.5)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            serving.join()
+            loop.close()
+        self.assertEqual(ran, [])
+        self.assertEqual(inspect.getcoroutinestate(pending), inspect.CORO_CLOSED)
+
+    def test_every_resident_of_a_loop_is_closed_when_it_stops(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        first, second = Closable(), Closable()
+        runner.keep(loop, first)
+        runner.keep(loop, second)
+        runner.close()
+        self.assertEqual((first.closed, second.closed), (True, True))
+
+    def test_a_call_that_never_started_is_discarded_when_its_loop_stops(self):
+        loop = asyncio.new_event_loop()
+        serving = threading.Thread(target=loop.run_forever)
+        serving.start()
+        busy = threading.Event()
+
+        def stall() -> None:
+            busy.set()
+            time.sleep(0.3)
+            loop.stop()
+
+        loop.call_soon_threadsafe(stall)
+        busy.wait(5)
+        pending = noop()
+        try:
+            with self.assertRaises(EventLoopStoppedError):
+                asyncio.run(run_on(loop, pending, "noop"))
+        finally:
+            serving.join()
+            loop.close()
+        self.assertEqual(inspect.getcoroutinestate(pending), inspect.CORO_CLOSED)
 
 
 if __name__ == "__main__":

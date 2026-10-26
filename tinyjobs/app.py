@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import threading
-from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
+import concurrent.futures
+import time
+import weakref
+from contextlib import (
+    AbstractAsyncContextManager,
+    asynccontextmanager,
+    nullcontext,
+    suppress,
+)
+from functools import partial
 from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
 from .backends.loader import load_backend
+from .backends.managed import ManagedBackend
 from .clock import Clock
 from .codecs import CodecRegistry
 from .exceptions import AppClosedError, BackendNotReadyError, ConfigurationError
@@ -15,7 +24,20 @@ from .options import EnqueueOptions
 from .registry import TaskRegistry
 from .retention import RetentionPolicy
 from .retry import RetryPolicy
-from .runtime import LoopRunner
+from .runtime import (
+    CLOSED_MESSAGE,
+    LOOP_POLL_SECONDS,
+    LoopRunner,
+    after_fork_in_child,
+    refuse_inside_loop,
+    refuse_interrupted,
+    drive,
+    run_on,
+    settled,
+    tracked_lock,
+    wake,
+    when_collected,
+)
 from .scheduler import Scheduler
 from .schedules import Schedule
 from .services import (
@@ -28,6 +50,7 @@ from .services import (
     SchedulingService,
     SerializationService,
 )
+from .services.execution import current_runner
 from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
@@ -35,13 +58,27 @@ from .worker import Drain, EmbeddedWorker, Worker
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
-CLOSED_MESSAGE = (
-    "this app was closed, so it will not reconnect on its own; call app.start() "
-    "or await app.ready() to connect it again"
+WORKER_GRACE_SECONDS = 5.0
+CLOSE_WAIT_SECONDS = 10.0
+
+NOT_READY_MESSAGE = (
+    "the backend is not connected yet; await app.ready() from async code "
+    "or call app.start() from sync code"
 )
 
+EMBEDDED_SIGNALS_MESSAGE = (
+    "an embedded worker installs no signal handlers: the server owns them, and "
+    "leaving serve() or the lifespan is what stops the worker"
+)
+
+WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
+
 T = TypeVar("T")
+
+_apps: "weakref.WeakSet[TinyJobs]" = weakref.WeakSet()
+_inherited: list[ManagedBackend] = []
 Listener = TypeVar("Listener", bound=Callable[..., Any])
+Attempt = tuple[concurrent.futures.Future, asyncio.AbstractEventLoop]
 
 
 class TinyJobs:
@@ -68,16 +105,22 @@ class TinyJobs:
         self._serialization = SerializationService(self._codecs)
         self._hooks = Hooks()
         self._runner = LoopRunner()
-        self._backend: Backend | None = None
+        when_collected(self, self._runner.close_here)
+        self._backend: ManagedBackend | None = None
         self._dispatch: DispatchService | None = None
         self._lifecycle: JobLifecycleService | None = None
         self._execution: ExecutionService | None = None
         self._scheduling: SchedulingService | None = None
         self._health: HealthService | None = None
-        self._lock: asyncio.Lock | None = None
-        self._lock_guard = threading.Lock()
+        self._connecting: Attempt | None = None
+        self._lock_guard = tracked_lock()
         self._closed = False
+        self._closes = 0
+        self._backend_closing: concurrent.futures.Future | None = None
         self._sessions = 0
+        self._workers: set[Worker | Drain] = set()
+        self._closing_after: set[Worker | Drain] = set()
+        _apps.add(self)
 
     @property
     def url(self) -> str:
@@ -108,52 +151,50 @@ class TinyJobs:
         return self._serialization
 
     @property
-    def backend(self) -> Backend:
-        if self._backend is None:
-            raise BackendNotReadyError(
-                "the backend is not connected yet; await app.ready() from async code "
-                "or call app.start() from sync code"
-            )
-        return self._backend
+    def backend(self) -> ManagedBackend:
+        return self._connected(self._backend)
 
     @property
     def dispatch(self) -> DispatchService:
-        if self._dispatch is None:
-            raise BackendNotReadyError("the backend is not connected yet")
-        return self._dispatch
+        return self._connected(self._dispatch)
 
     @property
     def lifecycle(self) -> JobLifecycleService:
-        if self._lifecycle is None:
-            raise BackendNotReadyError("the backend is not connected yet")
-        return self._lifecycle
+        return self._connected(self._lifecycle)
 
     @property
     def execution(self) -> ExecutionService:
-        if self._execution is None:
-            raise BackendNotReadyError("the backend is not connected yet")
-        return self._execution
+        return self._connected(self._execution)
 
     @property
     def scheduling(self) -> SchedulingService:
-        if self._scheduling is None:
-            raise BackendNotReadyError("the backend is not connected yet")
-        return self._scheduling
+        return self._connected(self._scheduling)
 
     @property
     def health(self) -> HealthService:
-        if self._health is None:
-            raise BackendNotReadyError("the backend is not connected yet")
-        return self._health
+        return self._connected(self._health)
+
+    def _connected(self, part: T | None) -> T:
+        if part is not None:
+            return part
+        if self._closed or self._closes:
+            raise AppClosedError(CLOSED_MESSAGE)
+        raise BackendNotReadyError(NOT_READY_MESSAGE)
 
     def run_sync(
         self,
-        coroutine: Coroutine[Any, Any, T],
+        factory: Callable[[], Coroutine[Any, Any, T]],
         *,
         name: str,
         async_name: str | None = None,
     ) -> T:
-        return self._runner.run(coroutine, name=name, async_name=async_name)
+        if self._closed:
+            raise AppClosedError(CLOSED_MESSAGE)
+        if name in WRITING_CALLS:
+            refuse = getattr(self._backend, "refuse_held_transaction", None)
+            if refuse is not None:
+                refuse()
+        return self._runner.run(factory, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
         return job.bound_to(self) if job is not None else None
@@ -166,46 +207,147 @@ class TinyJobs:
         return await bound.arefresh()
 
     async def ensure_connected(self) -> None:
+        await settled()
         if self._closed:
             raise AppClosedError(CLOSED_MESSAGE)
-        await self.ready()
+        await self._connect()
 
     async def ready(self) -> None:
+        await settled()
         self._closed = False
-        if self._backend is not None:
+        await self._connect()
+
+    async def _connect(self) -> None:
+        attempt = await self._elect()
+        if attempt is None:
             return
+        try:
+            raw = load_backend(self._url, clock=self._clock, **self._backend_options)
+        except Exception as error:
+            self._settle(attempt, error)
+            raise
+        if raw.capabilities.loop_bound:
+            await self._connect_on_own_loop(raw, attempt)
+        else:
+            await self._attempt(raw, attempt)
+
+    async def _elect(self) -> concurrent.futures.Future | None:
+        while True:
+            with self._lock_guard:
+                if self._backend is not None and self._backend.alive:
+                    return None
+                current = self._connecting
+                if current is None or not current[1].is_running():
+                    attempt: concurrent.futures.Future = concurrent.futures.Future()
+                    self._connecting = (attempt, asyncio.get_running_loop())
+                    if current is not None and not current[0].done():
+                        current[0].set_result(None)
+                    return attempt
+            await self._outcome(current[0])
+
+    async def _connect_on_own_loop(
+        self, raw: Backend, attempt: concurrent.futures.Future
+    ) -> None:
+        home = self._runner.own_loop()
         with self._lock_guard:
-            if self._lock is None:
-                self._lock = asyncio.Lock()
-        async with self._lock:
-            if self._backend is not None:
+            if self._connecting is not None and self._connecting[0] is attempt:
+                self._connecting = (attempt, home)
+        await run_on(home, self._attempt(raw, attempt), "connect")
+
+    async def _outcome(self, attempt: concurrent.futures.Future) -> None:
+        loop = asyncio.get_running_loop()
+        waiting = loop.create_future()
+        attempt.add_done_callback(partial(wake, loop, waiting))
+        while not attempt.done():
+            with self._lock_guard:
+                current = self._connecting
+            if current is None or current[0] is not attempt:
+                break
+            if not current[1].is_running():
+                break
+            await asyncio.wait({waiting}, timeout=LOOP_POLL_SECONDS)
+        if attempt.done() and attempt.exception() is not None:
+            raise attempt.exception()
+
+    async def _attempt(self, raw: Backend, attempt: concurrent.futures.Future) -> None:
+        try:
+            await self._install(raw)
+        except Exception as error:
+            self._settle(attempt, error)
+            raise
+        except BaseException:
+            self._settle(attempt, None)
+            raise
+        self._settle(attempt, None)
+
+    def _settle(
+        self, attempt: concurrent.futures.Future, error: Exception | None
+    ) -> None:
+        with self._lock_guard:
+            if self._connecting is not None and self._connecting[0] is attempt:
+                self._connecting = None
+            if attempt.done():
                 return
-            backend = load_backend(
-                self._url, clock=self._clock, **self._backend_options
-            )
+            if error is None:
+                attempt.set_result(None)
+            else:
+                attempt.set_exception(error)
+
+    async def _install(self, raw: Backend) -> None:
+        backend = ManagedBackend(raw, self._runner)
+        try:
             await backend.setup()
-            self._dispatch = DispatchService(
-                backend,
-                self._serialization,
-                self._clock,
-                self._default_queue,
-                self._registry,
-            )
-            self._lifecycle = JobLifecycleService(
-                backend, self._serialization, self._clock
-            )
-            self._execution = ExecutionService(
-                self._serialization, self._lifecycle, self._hooks, self._clock
-            )
-            self._scheduling = SchedulingService(
-                backend, self._dispatch, self._registry, self._clock
-            )
-            self._health = HealthService(backend, self._registry, self._clock)
-            self._backend = backend
-            self._runner.attach(asyncio.get_running_loop())
+        except BaseException:
+            with suppress(Exception):
+                await backend.close()
+            raise
+        with self._lock_guard:
+            closed = self._closed
+            current = self._backend
+            superseded = closed or (current is not None and current.alive)
+            if not superseded:
+                self._publish(backend)
+        if superseded:
+            with suppress(Exception):
+                await backend.close()
+        if closed:
+            raise AppClosedError(CLOSED_MESSAGE)
+
+    def _publish(self, backend: ManagedBackend) -> None:
+        self._dispatch = DispatchService(
+            backend,
+            self._serialization,
+            self._clock,
+            self._default_queue,
+            self._registry,
+        )
+        self._lifecycle = JobLifecycleService(backend, self._serialization, self._clock)
+        self._execution = ExecutionService(
+            self._serialization, self._lifecycle, self._hooks, self._clock
+        )
+        self._scheduling = SchedulingService(
+            backend, self._dispatch, self._registry, self._clock
+        )
+        self._health = HealthService(backend, self._registry, self._clock)
+        self._backend = backend
+        self._closes = 0
+
+    def forget_inherited_connection(self) -> None:
+        self._workers = set()
+        self._closing_after = set()
+        if self._backend is not None:
+            _inherited.append(self._backend)
+        self._backend = None
+        self._dispatch = None
+        self._lifecycle = None
+        self._execution = None
+        self._scheduling = None
+        self._health = None
+        self._connecting = None
+        self._backend_closing = None
 
     def start(self) -> "TinyJobs":
-        self.run_sync(self.ready(), name="start")
+        self._runner.run(self.ready, name="start", async_name="ready")
         return self
 
     def task(
@@ -287,14 +429,14 @@ class TinyJobs:
         )
 
     def send(self, name: str, *args: Any, **kwargs: Any) -> Job:
-        return self.run_sync(self.asend(name, *args, **kwargs), name="send")
+        return self.run_sync(partial(self.asend, name, *args, **kwargs), name="send")
 
     async def aget(self, job_id: str) -> Job | None:
         await self.ensure_connected()
         return self.bind(await self.backend.get(job_id))
 
     def get(self, job_id: str) -> Job | None:
-        return self.run_sync(self.aget(job_id), name="get")
+        return self.run_sync(partial(self.aget, job_id), name="get")
 
     async def ajobs(
         self,
@@ -313,21 +455,21 @@ class TinyJobs:
         return page
 
     def jobs(self, **options: Any) -> Page:
-        return self.run_sync(self.ajobs(**options), name="jobs")
+        return self.run_sync(partial(self.ajobs, **options), name="jobs")
 
     async def acancel(self, job_id: str) -> bool:
         await self.ensure_connected()
         return await self.backend.cancel(job_id)
 
     def cancel(self, job_id: str) -> bool:
-        return self.run_sync(self.acancel(job_id), name="cancel")
+        return self.run_sync(partial(self.acancel, job_id), name="cancel")
 
     async def aretry(self, job_id: str) -> bool:
         await self.ensure_connected()
         return await self.backend.requeue(job_id)
 
     def retry(self, job_id: str) -> bool:
-        return self.run_sync(self.aretry(job_id), name="retry")
+        return self.run_sync(partial(self.aretry, job_id), name="retry")
 
     async def apurge(self, policy: RetentionPolicy | None = None) -> int | None:
         await self.ensure_connected()
@@ -336,48 +478,52 @@ class TinyJobs:
         )
 
     def purge(self, policy: RetentionPolicy | None = None) -> int | None:
-        return self.run_sync(self.apurge(policy), name="purge")
+        return self.run_sync(partial(self.apurge, policy), name="purge")
 
     async def acounts(self) -> dict[str, int]:
         await self.ensure_connected()
         return await self.backend.counts_by_status()
 
     def counts(self) -> dict[str, int]:
-        return self.run_sync(self.acounts(), name="counts")
+        return self.run_sync(self.acounts, name="counts")
 
     async def astats(self) -> Stats:
         await self.ensure_connected()
         return await self.health.stats()
 
     def stats(self) -> Stats:
-        return self.run_sync(self.astats(), name="stats")
+        return self.run_sync(self.astats, name="stats")
 
     async def acheck(self, *, max_wait: float | None = None) -> list[Finding]:
         await self.ensure_connected()
         return await self.health.check(max_wait=max_wait)
 
     def check(self, *, max_wait: float | None = None) -> list[Finding]:
-        return self.run_sync(self.acheck(max_wait=max_wait), name="check")
+        return self.run_sync(partial(self.acheck, max_wait=max_wait), name="check")
 
     async def adrain(self, queues: Sequence[str] | None = None) -> int:
         return await Drain(self, queues).run()
 
     def drain(self, queues: Sequence[str] | None = None) -> int:
-        return self.run_sync(self.adrain(queues), name="drain")
+        try:
+            return self.run_sync(partial(self.adrain, queues), name="drain")
+        finally:
+            if self._closed:
+                self._runner.close()
 
     async def aexecutions(self, job_id: str) -> list:
         await self.ensure_connected()
         return await self.backend.executions(job_id)
 
     def executions(self, job_id: str) -> list:
-        return self.run_sync(self.aexecutions(job_id), name="executions")
+        return self.run_sync(partial(self.aexecutions, job_id), name="executions")
 
     async def aschedules(self) -> list[ScheduleState]:
         await self.ensure_connected()
         return await self.backend.schedules()
 
     def schedules(self) -> list[ScheduleState]:
-        return self.run_sync(self.aschedules(), name="schedules")
+        return self.run_sync(self.aschedules, name="schedules")
 
     def decode(self, job: Job) -> JobPayload:
         return self._serialization.decode_payload(job)
@@ -394,6 +540,8 @@ class TinyJobs:
         self, *, worker: bool = False, **worker_options: Any
     ) -> AsyncIterator["TinyJobs"]:
         _assert_worker_requested(worker, worker_options)
+        if worker_options.pop("handle_signals", False):
+            raise ConfigurationError(EMBEDDED_SIGNALS_MESSAGE)
         embedded = (
             EmbeddedWorker(self.worker(**worker_options, handle_signals=False))
             if worker
@@ -414,24 +562,101 @@ class TinyJobs:
 
         return bind
 
+    def attach(self, worker: Worker | Drain) -> None:
+        with self._lock_guard:
+            self._workers.add(worker)
+
+    def detach(self, worker: Worker | Drain) -> bool:
+        with self._lock_guard:
+            self._workers.discard(worker)
+            if worker not in self._closing_after:
+                return False
+            self._closing_after.discard(worker)
+            return True
+
     async def aclose(self) -> None:
-        if self._backend is not None:
-            await self._backend.close()
-        self._backend = None
-        self._dispatch = None
-        self._lifecycle = None
-        self._execution = None
-        self._scheduling = None
-        self._health = None
-        self._lock = None
-        self._closed = True
-        self._runner.detach()
+        await settled()
+        await self._close(current_runner.get(None))
+
+    async def _close(self, inside: object | None) -> None:
+        if self._defer_close(inside):
+            self._signal_workers()
+            return
+        try:
+            await self._stop_workers()
+            await self._shutdown()
+        finally:
+            if not self._runner.on_own_loop():
+                self._runner.stop_own()
+
+    def _defer_close(self, inside: object | None) -> bool:
+        with self._lock_guard:
+            if inside not in self._workers:
+                return False
+            self._closing_after.add(inside)
+            return True
+
+    def _closes_later(self, inside: object | None) -> bool:
+        with self._lock_guard:
+            return inside is not None and inside in self._closing_after
+
+    def _signal_workers(self) -> list[Worker | Drain]:
+        with self._lock_guard:
+            workers = list(self._workers)
+        for worker in workers:
+            worker.stop()
+        return workers
+
+    async def _stop_workers(self) -> None:
+        waiting = self._signal_workers()
+        if not waiting:
+            return
+        deadline = time.monotonic() + WORKER_GRACE_SECONDS + max(
+            worker.shutdown_timeout for worker in waiting
+        )
+        while time.monotonic() < deadline and not all(
+            worker.finished for worker in waiting
+        ):
+            await asyncio.sleep(LOOP_POLL_SECONDS / 10)
+
+    async def _shutdown(self) -> None:
+        with self._lock_guard:
+            backend, self._backend = self._backend, None
+            self._dispatch = None
+            self._lifecycle = None
+            self._execution = None
+            self._scheduling = None
+            self._health = None
+            self._closed = True
+            self._closes += 1
+            closing = self._backend_closing
+            if backend is not None:
+                closing = self._backend_closing = concurrent.futures.Future()
+        if backend is None:
+            while closing is not None and not closing.done():
+                await asyncio.sleep(LOOP_POLL_SECONDS / 10)
+            return
+        try:
+            await backend.close()
+        finally:
+            closing.set_result(None)
 
     def close(self) -> None:
-        if self._backend is not None:
-            self.run_sync(self.aclose(), name="close")
-        self._closed = True
-        self._runner.close()
+        refuse_inside_loop("close")
+        refuse_interrupted("close")
+        drive(partial(self._close_app, current_runner.get(None)), name="close")
+
+    def _close_app(self, inside: object | None) -> None:
+        try:
+            if self._backend is not None:
+                with suppress(AppClosedError):
+                    self._runner.run(partial(self._close, inside), name="close")
+            elif self._backend_closing is not None:
+                concurrent.futures.wait([self._backend_closing], timeout=CLOSE_WAIT_SECONDS)
+        finally:
+            if not self._closes_later(inside):
+                self._closed = True
+                self._runner.close_here()
 
     async def __aenter__(self) -> "TinyJobs":
         self._sessions += 1
@@ -452,6 +677,14 @@ class TinyJobs:
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def _forget_inherited_connections() -> None:
+    for app in list(_apps):
+        app.forget_inherited_connection()
+
+
+after_fork_in_child(_forget_inherited_connections)
 
 
 def _declare_schedule(

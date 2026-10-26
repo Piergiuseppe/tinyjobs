@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field, fields
+from functools import partial
 from typing import Any, TYPE_CHECKING
 
 from .exceptions import JobNotFoundError, TinyJobsError, WaitTimeout
@@ -44,6 +45,8 @@ class Job:
     dedup_key: str | None = None
     result_payload: bytes | None = None
     last_error: str | None = None
+    hand_backs: int = 0
+    claims: int = 0
     _app: "TinyJobs | None" = field(default=None, compare=False, repr=False)
 
     @property
@@ -55,7 +58,7 @@ class Job:
         return self
 
     def refresh(self) -> "Job":
-        return self._app_or_fail().run_sync(self.arefresh(), name="refresh")
+        return self._app_or_fail().run_sync(self.arefresh, name="refresh")
 
     async def arefresh(self) -> "Job":
         fresh = await self._app_or_fail().aget(self.id)
@@ -73,8 +76,11 @@ class Job:
         poll_maximum: float = 1.0,
     ) -> "Job":
         return self._app_or_fail().run_sync(
-            self.awaited(
-                timeout, poll_minimum=poll_minimum, poll_maximum=poll_maximum
+            partial(
+                self.awaited,
+                timeout,
+                poll_minimum=poll_minimum,
+                poll_maximum=poll_maximum,
             ),
             name="wait",
             async_name="awaited",

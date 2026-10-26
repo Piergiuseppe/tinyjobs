@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 
 from ...retention import RetentionPolicy
 from ..duration import parse_duration

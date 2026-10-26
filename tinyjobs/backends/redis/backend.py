@@ -31,7 +31,7 @@ from .scripts import Scripts
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MAX_CONNECTIONS = 100
 DEFAULT_POOL_TIMEOUT = 20.0
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
 
@@ -45,6 +45,7 @@ class RedisBackend(BaseBackend):
         retention=True,
         schedules=True,
         max_payload_bytes=None,
+        loop_bound=True,
     )
 
     def __init__(
@@ -81,9 +82,7 @@ class RedisBackend(BaseBackend):
         return cls(client, prefix=prefix, clock=clock)
 
     async def setup(self) -> None:
-        version = self._keys("schema_version")
-        await self._client.set(version, SCHEMA_VERSION, nx=True)
-        stored = int(await self._client.get(version))
+        stored = int(await self._run("schema", SCHEMA_VERSION))
         if stored > SCHEMA_VERSION:
             raise RuntimeError(
                 f"redis schema version {stored} is newer than this tinyjobs "
@@ -120,11 +119,20 @@ class RedisBackend(BaseBackend):
         )
         return [job_from_flat(flat) for flat in claimed]
 
-    async def heartbeat(self, job_ids: Sequence[str], lease_seconds: float) -> None:
+    async def heartbeat(
+        self,
+        job_ids: Sequence[str],
+        lease_seconds: float,
+        worker_id: str | None = None,
+    ) -> None:
         if job_ids:
             now = self._clock.now()
             await self._scripts.run(
-                "heartbeat", now, number(now + lease_seconds), *job_ids
+                "heartbeat",
+                now,
+                number(now + lease_seconds),
+                worker_id or "",
+                *job_ids,
             )
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
@@ -133,6 +141,7 @@ class RedisBackend(BaseBackend):
                 "complete",
                 job.id,
                 job.worker_id or "",
+                job.claims,
                 "0" if result is None else "1",
                 result or b"",
             )
@@ -150,6 +159,7 @@ class RedisBackend(BaseBackend):
                 "fail",
                 job.id,
                 job.worker_id or "",
+                job.claims,
                 error.summary,
                 str(execution_status),
                 error.type,
@@ -161,7 +171,17 @@ class RedisBackend(BaseBackend):
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         run_at = number(self._clock.now() + delay)
         return bool(
-            await self._run("release", job.id, job.worker_id or "", run_at)
+            await self._run(
+                "release", job.id, job.worker_id or "", job.claims, run_at
+            )
+        )
+
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+        run_at = number(self._clock.now() + delay)
+        return bool(
+            await self._run(
+                "hand_back", job.id, job.worker_id or "", job.claims, run_at
+            )
         )
 
     async def cancel(self, job_id: str) -> bool:
@@ -171,8 +191,7 @@ class RedisBackend(BaseBackend):
         return bool(await self._run("requeue", job_id))
 
     async def get(self, job_id: str) -> Job | None:
-        raw = await self._client.hgetall(self._keys("job", job_id))
-        return job_from_fields(raw) if raw else None
+        return (await self._load([job_id.encode()]))[0]
 
     async def list(
         self,
@@ -200,11 +219,12 @@ class RedisBackend(BaseBackend):
         return Page(items=items, cursor=items[-1].id if len(found) > limit else None)
 
     async def executions(self, job_id: str) -> list[Execution]:
-        raw = await self._client.hgetall(self._keys("executions", job_id))
-        executions = [
-            execution_from(job_id, attempt, encoded) for attempt, encoded in raw.items()
+        flat = await self._run("history", job_id)
+        raw = dict(zip(flat[::2], flat[1::2]))
+        return [
+            execution_from(job_id, claim, raw[claim])
+            for claim in sorted(raw, key=int)
         ]
-        return sorted(executions, key=lambda execution: execution.attempt)
 
     async def reap_expired(self) -> int:
         return await self._run("reap", LEASE_EXPIRED_MESSAGE)
@@ -300,10 +320,19 @@ class RedisBackend(BaseBackend):
         return resolved
 
     async def _load(self, ids: Sequence[bytes]) -> list[Job | None]:
+        found = await self._fetch(ids)
+        legacy = [job_id for job_id, raw in zip(ids, found) if raw and b"claims" not in raw]
+        if legacy:
+            await self._run("adopt", *legacy)
+            adopted = dict(zip(legacy, await self._fetch(legacy)))
+            found = [adopted.get(job_id, raw) for job_id, raw in zip(ids, found)]
+        return [job_from_fields(raw) if raw else None for raw in found]
+
+    async def _fetch(self, ids: Sequence[bytes]) -> list[dict[bytes, bytes]]:
         pipeline = self._client.pipeline(transaction=False)
         for job_id in ids:
             pipeline.hgetall(self._keys("job", job_id.decode()))
-        return [job_from_fields(raw) if raw else None for raw in await pipeline.execute()]
+        return await pipeline.execute()
 
     async def _counts(self) -> dict[tuple[str, str], int]:
         raw = await self._client.hgetall(self._keys("counts"))

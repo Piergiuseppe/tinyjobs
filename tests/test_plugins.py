@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,7 +9,6 @@ from pathlib import Path
 from tinyjobs import TinyJobs
 from tinyjobs.backends import (
     Backend,
-    Capabilities,
     SQLiteBackend,
     available_schemes,
     load_backend,
@@ -32,19 +32,19 @@ class BackendResolutionTests(unittest.TestCase):
     def test_url_resolves_to_the_sqlite_backend(self):
         backend = load_backend(f"sqlite:///{self.path}")
         self.assertIsInstance(backend, SQLiteBackend)
-        backend.close()
+        asyncio.run(backend.close())
 
     def test_three_slashes_mean_a_relative_path(self):
         backend = SQLiteBackend.from_url("sqlite:///relative.db")
         self.assertEqual(backend.database, "relative.db")
-        backend.close()
+        asyncio.run(backend.close())
         Path("relative.db").unlink(missing_ok=True)
 
     def test_four_slashes_mean_an_absolute_path(self):
         backend = SQLiteBackend.from_url(f"sqlite:///{self.path}")
         self.assertEqual(backend.database, str(self.path))
         self.assertTrue(backend.database.startswith("/"))
-        backend.close()
+        asyncio.run(backend.close())
 
     def test_memory_urls_are_supported(self):
         for url in ("sqlite://", "sqlite:///:memory:"):
@@ -109,7 +109,7 @@ class PluginSeamTests(unittest.TestCase):
     def test_the_sqlite_backend_satisfies_the_protocol(self):
         backend = SQLiteBackend(str(Path(self.directory.name) / "p.db"))
         self.assertIsInstance(backend, Backend)
-        backend.close()
+        asyncio.run(backend.close())
 
 
 class CapabilityTests(unittest.TestCase):

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
+from .duration import format_seconds
+from .exceptions import AppClosedError
+from .runtime import inside_running_loop
 from .services import Tick
 from .worker.signals import ShutdownWatcher
 
@@ -26,15 +30,33 @@ class Scheduler:
         self._grace = misfire_grace
         self._maximum_sleep = maximum_sleep
         self._error_backoff = error_backoff
+        self._prepare_run()
+
+    def _prepare_run(self) -> None:
         self._stopping = asyncio.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     def run(self) -> None:
         asyncio.run(self._serve())
 
     def stop(self) -> None:
-        self._stopping.set()
+        stopping, loop = self._stopping, self._loop
+        if loop is None or (
+            inside_running_loop() and loop is asyncio.get_running_loop()
+        ):
+            stopping.set()
+            return
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(stopping.set)
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        try:
+            await self._watch()
+        finally:
+            self._prepare_run()
+
+    async def _watch(self) -> None:
         await self._app.ready()
         declared = self._app.scheduling.declared()
         if not declared:
@@ -53,6 +75,9 @@ class Scheduler:
         while not self._stopping.is_set():
             try:
                 tick = await self.tick()
+            except AppClosedError:
+                logger.info("the app was closed; the scheduler is stopping")
+                return
             except Exception:
                 logger.exception("scheduler tick failed; backing off")
                 await self._pause(self._error_backoff)
@@ -71,10 +96,10 @@ class Scheduler:
             )
         for name in tick.missed:
             logger.warning(
-                "schedule %s missed runs by more than %.0fs, while nothing could "
+                "schedule %s missed runs by more than %s, while nothing could "
                 "fire it; applying its misfire policy",
                 name,
-                self._grace,
+                format_seconds(self._grace),
             )
         for name in tick.rewound:
             logger.warning(
@@ -88,6 +113,10 @@ class Scheduler:
         while not self._stopping.is_set():
             try:
                 await self._app.scheduling.register()
+            except AppClosedError:
+                logger.info("the app was closed; the scheduler is stopping")
+                self.stop()
+                return
             except Exception:
                 logger.exception("registering schedules failed; backing off")
                 await self._pause(self._error_backoff)
@@ -102,8 +131,8 @@ class Scheduler:
 
     async def _serve(self) -> None:
         watcher = ShutdownWatcher(self.stop, self.stop)
-        watcher.install()
         try:
+            watcher.install()
             await self.start()
         finally:
             watcher.uninstall()

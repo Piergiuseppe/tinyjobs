@@ -11,6 +11,7 @@ NAMES = (
     "complete",
     "fail",
     "release",
+    "hand_back",
     "cancel",
     "requeue",
     "heartbeat",
@@ -19,6 +20,9 @@ NAMES = (
     "purge_batch",
     "register_schedules",
     "fire_schedule",
+    "schema",
+    "adopt",
+    "history",
 )
 
 

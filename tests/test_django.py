@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -76,6 +77,27 @@ class EnqueueTests(DjangoTestCase):
         self.assertEqual(result.backend, "default")
         self.assertEqual(result.worker_ids, [])
         self.assertIsNotNone(result.enqueued_at.tzinfo)
+
+    def test_threads_sharing_an_app_for_the_first_time_get_the_same_one(self):
+        from tinyjobs.contrib.django import connections
+
+        options = {"url": "sqlite:///:memory:"}
+        self.addCleanup(connections._apps.pop, ("race", repr(sorted(options.items()))), None)
+        both_preparing = threading.Barrier(2)
+        apps: list = []
+
+        def share() -> None:
+            apps.append(
+                connections.shared_app("race", options, lambda app: both_preparing.wait(5))
+            )
+
+        sharers = [threading.Thread(target=share) for _ in range(2)]
+        for sharer in sharers:
+            sharer.start()
+        for sharer in sharers:
+            sharer.join(10)
+        self.assertEqual(len(apps), 2)
+        self.assertEqual(len({id(app) for app in apps}), 1)
 
     def test_the_job_carries_queue_priority_and_task_path(self):
         result = self.tasks.greet.using(priority=-5).enqueue("ada")

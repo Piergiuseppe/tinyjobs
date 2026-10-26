@@ -25,6 +25,7 @@ class ExecutionStatus(StrEnum):
     FAILED = "failed"
     TIMEOUT = "timeout"
     LOST = "lost"
+    CANCELLED = "cancelled"
 
 
 _TERMINAL_JOB_STATUSES = frozenset(

@@ -98,7 +98,10 @@ class JobsCommand(Command):
 
     def _retry(self, app, args: argparse.Namespace) -> int:
         if not app.retry(args.job_id):
-            print(f"job {args.job_id} is not in a retryable state")
+            print(
+                f"job {args.job_id} is not in a retryable state, or another active "
+                "job holds its dedup key"
+            )
             return 1
         print(f"job {args.job_id} requeued")
         return 0

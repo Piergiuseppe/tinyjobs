@@ -3,11 +3,10 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 from ...clock import Clock
@@ -21,20 +20,25 @@ from ...models import (
     Stats,
 )
 from ...retention import RetentionPolicy
+from ...exceptions import AppClosedError
+from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
-from .connection import ConnectionPool
+from .connection import FORK_GATE, ConnectionPool, StepAside
 from .queries import (
     ADVANCE_SCHEDULE,
+    CANCEL_EXECUTIONS,
     CANCEL_JOB,
     CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
     COUNT_BY_QUEUE,
     COUNT_BY_STATUS,
     COUNT_EXPIRED_LEASES,
+    DELETE_EXECUTION,
     FAIL_JOB,
     FINISH_EXECUTION,
+    HAND_BACK_JOB,
     HEARTBEAT,
     INSERT_EXECUTION,
     INSERT_JOB,
@@ -61,9 +65,55 @@ from .records import (
     job_to_row,
     schedule_from_row,
 )
-from .schema import DDL, MIGRATIONS, SCHEMA_VERSION
+from .schema import (
+    DDL,
+    DROP_LEGACY_INDEX,
+    LEGACY_INDEX_IS_UNIQUE,
+    MIGRATIONS,
+    SCHEMA_VERSION,
+)
+
+T = TypeVar("T")
 
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
+
+EXECUTOR_GONE_MESSAGE = (
+    "this SQLite backend was closed or the interpreter is shutting down, so it "
+    "takes no more calls"
+)
+
+HELD_TRANSACTION_MESSAGE = (
+    "this tinyjobs call writes to the queue, whose write lock your own open "
+    "backend.transaction() holds, so it could only wait for that lock and fail; "
+    "make the call after the transaction ends"
+)
+
+RETIRE_SECONDS = 1.0
+
+STEPPED_ASIDE = object()
+
+RETURNING_CALLS = frozenset(
+    {
+        "_complete_sync",
+        "_fail_sync",
+        "_release_sync",
+        "_hand_back_sync",
+        "_heartbeat_sync",
+        "_close_sync",
+    }
+)
+
+LOCK_FREE_CALLS = frozenset(
+    {
+        "_get_sync",
+        "_list_sync",
+        "_executions_sync",
+        "_counts_by_status_sync",
+        "_stats_sync",
+        "_schedules_sync",
+        "_close_sync",
+    }
+)
 
 
 class SQLiteBackend(BaseBackend):
@@ -71,7 +121,7 @@ class SQLiteBackend(BaseBackend):
         priority=True,
         delayed=True,
         dedup=True,
-        transactional_enqueue=True,
+        transactional_enqueue=False,
         retention=True,
         schedules=True,
         max_payload_bytes=None,
@@ -90,21 +140,58 @@ class SQLiteBackend(BaseBackend):
             database, uri=uri, busy_timeout=busy_timeout
         )
         self._claim_strategy = build_claim_strategy()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="tinyjobs-sqlite"
-        )
-
+        self._executor = _executor()
+        self._closed = False
+        pause_threads_at_fork(self)
 
     async def _call(self, function, *args):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, partial(function, *args))
+        refuse_interrupted(function.__name__.strip("_"))
+        if function.__name__ not in LOCK_FREE_CALLS:
+            self.refuse_held_transaction()
+        while True:
+            executor = self._executor
+            try:
+                pending = loop.run_in_executor(
+                    executor, partial(_gated, executor, function, *args)
+                )
+            except RuntimeError as error:
+                if executor.retiring:
+                    continue
+                if self._closed or function.__name__ not in RETURNING_CALLS:
+                    raise AppClosedError(EXECUTOR_GONE_MESSAGE) from error
+                return _gated(None, function, *args)
+            result = await pending
+            if result is not STEPPED_ASIDE:
+                return result
 
     async def setup(self) -> None:
         await self._call(self._setup_sync)
 
     async def close(self) -> None:
-        await self._call(self._close_sync)
+        try:
+            await self._call(self._close_sync)
+        except BaseException:
+            self._closed = True
+            with suppress(RuntimeError):
+                self._executor.submit(_gated, None, self._close_sync)
+            self._executor.shutdown(wait=False)
+            raise
+        self._closed = True
         self._executor.shutdown(wait=True)
+
+    def pause_for_fork(self) -> None:
+        if self._executor.idle:
+            self.step_aside_for_fork()
+
+    def step_aside_for_fork(self) -> None:
+        if self._closed or not self._executor.started:
+            return
+        retired, self._executor = self._executor, _executor()
+        retired.retiring = True
+        retired.submit(self._connections.hand_over)
+        retired.shutdown(wait=False)
+        retired.join(RETIRE_SECONDS)
 
     async def enqueue(self, job: Job) -> Job:
         return await self._call(self._enqueue_sync, job)
@@ -124,8 +211,15 @@ class SQLiteBackend(BaseBackend):
             self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
         )
 
-    async def heartbeat(self, job_ids: Sequence[str], lease_seconds: float) -> None:
-        await self._call(self._heartbeat_sync, tuple(job_ids), lease_seconds)
+    async def heartbeat(
+        self,
+        job_ids: Sequence[str],
+        lease_seconds: float,
+        worker_id: str | None = None,
+    ) -> None:
+        await self._call(
+            self._heartbeat_sync, tuple(job_ids), lease_seconds, worker_id
+        )
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return await self._call(self._complete_sync, job, result)
@@ -143,6 +237,9 @@ class SQLiteBackend(BaseBackend):
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._release_sync, job, delay)
+
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+        return await self._call(self._hand_back_sync, job, delay)
 
     async def cancel(self, job_id: str) -> bool:
         return await self._call(self._cancel_sync, job_id)
@@ -213,6 +310,10 @@ class SQLiteBackend(BaseBackend):
     def _setup_sync(self) -> None:
         with self._connections.write() as connection:
             existing = self._stored_version(connection)
+            if existing is not None:
+                _refuse_newer(existing)
+                self._migrate(connection, existing)
+            _drop_unique_legacy_index(connection)
             for statement in DDL:
                 connection.execute(statement)
             connection.execute(
@@ -224,8 +325,6 @@ class SQLiteBackend(BaseBackend):
                 "INSERT INTO meta (key, value) VALUES ('last_purge_at', '0') "
                 "ON CONFLICT (key) DO NOTHING"
             )
-            if existing is not None:
-                self._migrate(connection, existing)
         self._assert_schema_supported()
 
     def _stored_version(self, connection: sqlite3.Connection) -> int | None:
@@ -255,6 +354,10 @@ class SQLiteBackend(BaseBackend):
 
     def transaction(self) -> AbstractContextManager[sqlite3.Connection]:
         return self._connections.write()
+
+    def refuse_held_transaction(self) -> None:
+        if self._connections.held_here():
+            raise RuntimeError(HELD_TRANSACTION_MESSAGE)
 
     def _enqueue_sync(self, job: Job) -> Job:
         with self._connections.write() as connection:
@@ -310,25 +413,28 @@ class SQLiteBackend(BaseBackend):
             )
             for job in jobs:
                 connection.execute(
-                    INSERT_EXECUTION, (job.id, job.attempts, worker_id, now)
+                    INSERT_EXECUTION, (job.id, job.attempts, job.claims, worker_id, now)
                 )
         return jobs
 
-    def _heartbeat_sync(self, job_ids: Sequence[str], lease_seconds: float) -> None:
+    def _heartbeat_sync(
+        self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None
+    ) -> None:
         if not job_ids:
             return
         placeholders = ", ".join("?" for _ in job_ids)
         expiry = self._clock.now() + lease_seconds
         with self._connections.write() as connection:
             connection.execute(
-                HEARTBEAT.format(ids=placeholders), (expiry, *job_ids)
+                HEARTBEAT.format(ids=placeholders),
+                (expiry, worker_id, worker_id, *job_ids),
             )
 
     def _complete_sync(self, job: Job, result: bytes | None) -> bool:
         now = self._clock.now()
         with self._connections.write() as connection:
             cursor = connection.execute(
-                COMPLETE_JOB, (now, result, job.id, job.worker_id)
+                COMPLETE_JOB, (now, result, job.id, job.worker_id, job.claims)
             )
             if cursor.rowcount != 1:
                 return False
@@ -348,11 +454,12 @@ class SQLiteBackend(BaseBackend):
         with self._connections.write() as connection:
             if retry_at is None:
                 cursor = connection.execute(
-                    FAIL_JOB, (now, error.summary, job.id, job.worker_id)
+                    FAIL_JOB, (now, error.summary, job.id, job.worker_id, job.claims)
                 )
             else:
                 cursor = connection.execute(
-                    RESCHEDULE_JOB, (retry_at, error.summary, job.id, job.worker_id)
+                    RESCHEDULE_JOB,
+                    (retry_at, error.summary, job.id, job.worker_id, job.claims),
                 )
             if cursor.rowcount != 1:
                 return False
@@ -363,7 +470,7 @@ class SQLiteBackend(BaseBackend):
         now = self._clock.now()
         with self._connections.write() as connection:
             cursor = connection.execute(
-                RELEASE_JOB, (now + delay, job.id, job.worker_id)
+                RELEASE_JOB, (now + delay, job.id, job.worker_id, job.claims)
             )
             if cursor.rowcount != 1:
                 return False
@@ -372,10 +479,25 @@ class SQLiteBackend(BaseBackend):
             )
         return True
 
-    def _cancel_sync(self, job_id: str) -> bool:
+    def _hand_back_sync(self, job: Job, delay: float) -> bool:
         with self._connections.write() as connection:
-            cursor = connection.execute(CANCEL_JOB, (self._clock.now(), job_id))
-        return cursor.rowcount == 1
+            cursor = connection.execute(
+                HAND_BACK_JOB,
+                (self._clock.now() + delay, job.id, job.worker_id, job.claims),
+            )
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(DELETE_EXECUTION, (job.id, job.claims))
+        return True
+
+    def _cancel_sync(self, job_id: str) -> bool:
+        now = self._clock.now()
+        with self._connections.write() as connection:
+            cursor = connection.execute(CANCEL_JOB, (now, job_id))
+            if cursor.rowcount != 1:
+                return False
+            connection.execute(CANCEL_EXECUTIONS, (now, job_id))
+        return True
 
     def _requeue_sync(self, job_id: str) -> bool:
         with self._connections.write() as connection:
@@ -522,7 +644,8 @@ class SQLiteBackend(BaseBackend):
             exhausted = row["attempts"] >= row["max_attempts"]
             connection.execute(
                 "UPDATE jobs SET status = ?, run_at = ?, finished_at = ?, "
-                "lease_expires_at = NULL, worker_id = NULL, last_error = ? "
+                "lease_expires_at = NULL, worker_id = NULL, hand_backs = 0, "
+                "last_error = ? "
                 "WHERE id = ?",
                 (
                     "failed" if exhausted else "queued",
@@ -550,7 +673,7 @@ class SQLiteBackend(BaseBackend):
                 error.type if error else None,
                 error.traceback if error else None,
                 job.id,
-                job.attempts,
+                job.claims,
             ),
         )
 
@@ -558,9 +681,34 @@ class SQLiteBackend(BaseBackend):
         row = self._connections.connection.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        stored = int(row["value"]) if row else SCHEMA_VERSION
-        if stored > SCHEMA_VERSION:
-            raise RuntimeError(
-                f"database schema version {stored} is newer than this tinyjobs "
-                f"build understands ({SCHEMA_VERSION}); upgrade the package"
-            )
+        _refuse_newer(int(row["value"]) if row else SCHEMA_VERSION)
+
+
+def _refuse_newer(stored: int) -> None:
+    if stored > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"database schema version {stored} is newer than this tinyjobs "
+            f"build understands ({SCHEMA_VERSION}); upgrade the package"
+        )
+
+
+def _drop_unique_legacy_index(connection: sqlite3.Connection) -> None:
+    if connection.execute(LEGACY_INDEX_IS_UNIQUE).fetchone() is not None:
+        connection.execute(DROP_LEGACY_INDEX)
+
+
+def _executor() -> CountingPool:
+    return CountingPool(max_workers=1, thread_name_prefix="tinyjobs-sqlite")
+
+
+def _gated(pool: CountingPool | None, function: Callable[..., T], *args: Any) -> T:
+    if pool is None:
+        with FORK_GATE.using():
+            return function(*args)
+    if pool.retiring:
+        return STEPPED_ASIDE
+    try:
+        with FORK_GATE.using(partial(getattr, pool, "retiring")):
+            return function(*args)
+    except StepAside:
+        return STEPPED_ASIDE

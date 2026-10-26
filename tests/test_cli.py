@@ -10,6 +10,7 @@ from pathlib import Path
 from tinyjobs import TinyJobs
 from tinyjobs.cli import build_parser, main
 from tinyjobs.cli.formatting import format_duration, render_table, shorten
+from tinyjobs.duration import format_seconds
 from tinyjobs.cli.loader import load_app
 from tinyjobs.exceptions import ConfigurationError
 
@@ -236,6 +237,23 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(format_duration(2.5), "2.50s")
         self.assertEqual(format_duration(None), "-")
 
+    def test_log_durations_keep_their_precision_without_exponents(self):
+        self.assertEqual(format_seconds(2592000.0), "2592000s")
+        self.assertEqual(format_seconds(1234567.891), "1234567.891s")
+        self.assertEqual(format_seconds(30.0), "30s")
+        self.assertEqual(format_seconds(0.25), "0.25s")
+        self.assertEqual(format_seconds(0.0001), "0.0001s")
+        self.assertEqual(format_seconds(0.00001), "0.00001s")
+        self.assertEqual(format_seconds(1.5e-9), "0.0000000015s")
+        self.assertEqual(format_seconds(0.0), "0s")
+
+    def test_retention_durations_never_use_exponents(self):
+        from tinyjobs.duration import format_duration as retention_duration
+
+        self.assertEqual(retention_duration(1234567.5), "1234567.5s")
+        self.assertEqual(retention_duration(0.00001), "0.00001s")
+        self.assertEqual(retention_duration(7200), "2h")
+
     def test_long_values_are_truncated(self):
         self.assertEqual(shorten("abcdefghij", 5), "abcd…")
         self.assertEqual(shorten(None, 5), "-")
@@ -359,7 +377,7 @@ class ScheduleCommandTests(FixtureApp, unittest.TestCase):
 
     def test_schedules_shows_the_next_run_once_registered(self):
         app = load_app("fixture_app:app").start()
-        app.run_sync(app.scheduling.register(), name="register")
+        app.run_sync(lambda: app.scheduling.register(), name="register")
         code, output = self.invoke("schedules", "--app", "fixture_app:app")
         self.assertEqual(code, 0)
         self.assertNotIn("not registered yet", output)

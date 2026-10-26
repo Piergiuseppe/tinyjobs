@@ -84,6 +84,10 @@ class BackendContract:
     async def stored(self, job: Job) -> Job:
         return await self.backend.get(job.id)
 
+    async def reap_after_the_lease(self) -> int:
+        self.clock.advance(61)
+        return await self.backend.reap_expired()
+
     async def test_enqueued_job_is_readable(self):
         job = await self.enqueue(payload=b'{"args":[1],"kwargs":{}}', priority=3)
         stored = await self.stored(job)
@@ -229,6 +233,14 @@ class BackendContract:
         await self.backend.heartbeat([claimed.id, new_job_id()], 600.0)
         self.assertIsNone((await self.stored(claimed)).lease_expires_at)
 
+    async def test_a_heartbeat_from_another_worker_leaves_the_lease_alone(self):
+        claimed = await self.claimed_one()
+        self.clock.advance(50)
+        await self.backend.heartbeat([claimed.id], 600.0, worker_id="someone-else")
+        self.assertEqual((await self.stored(claimed)).lease_expires_at, START + 60)
+        await self.backend.heartbeat([claimed.id], 600.0, worker_id=claimed.worker_id)
+        self.assertEqual((await self.stored(claimed)).lease_expires_at, START + 650)
+
     async def test_an_expired_lease_returns_the_job_to_the_queue(self):
         claimed = await self.claimed_one(max_attempts=3)
         self.clock.advance(61)
@@ -265,6 +277,118 @@ class BackendContract:
             (await self.backend.executions(claimed.id))[0].status, ExecutionStatus.LOST
         )
 
+    async def test_hand_back_returns_a_job_as_if_it_was_never_claimed(self):
+        claimed = await self.claimed_one(max_attempts=2)
+        self.assertTrue(await self.backend.hand_back(claimed, delay=10))
+        stored = await self.stored(claimed)
+        self.assertIs(stored.status, JobStatus.QUEUED)
+        self.assertEqual(stored.run_at, START + 10)
+        self.assertEqual((stored.attempts, stored.hand_backs), (0, 1))
+        self.assertIsNone(stored.worker_id)
+        self.assertEqual(await self.backend.executions(claimed.id), [])
+        self.clock.advance(10)
+        again = (await self.claim())[0]
+        self.assertEqual((again.attempts, again.hand_backs), (1, 1))
+        self.assertEqual(len(await self.backend.executions(claimed.id)), 1)
+
+    async def test_only_the_holder_can_hand_a_job_back(self):
+        claimed = await self.claimed_one()
+        impostor = replace(claimed, worker_id="worker-b")
+        self.assertFalse(await self.backend.hand_back(impostor))
+        stored = await self.stored(claimed)
+        self.assertIs(stored.status, JobStatus.RUNNING)
+        self.assertEqual((stored.attempts, stored.hand_backs), (1, 0))
+
+    async def test_a_stale_claim_cannot_report_for_the_next_one(self):
+        stale = await self.claimed_one(max_attempts=3)
+        await self.reap_after_the_lease()
+        current = (await self.claim())[0]
+        self.assertEqual((current.worker_id, current.attempts), (stale.worker_id, 2))
+        self.assertFalse(await self.backend.complete(stale, None))
+        self.assertFalse(await self.backend.fail(stale, ERROR, None))
+        self.assertFalse(await self.backend.fail(stale, ERROR, retry_at=START))
+        self.assertFalse(await self.backend.release(stale))
+        self.assertFalse(await self.backend.hand_back(stale))
+        stored = await self.stored(current)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.RUNNING, 2))
+        statuses = [e.status for e in await self.backend.executions(current.id)]
+        self.assertEqual(statuses, [ExecutionStatus.LOST, ExecutionStatus.RUNNING])
+
+    async def test_a_run_cancelled_and_retried_cannot_report_for_the_retry(self):
+        stale = await self.claimed_one()
+        self.assertTrue(await self.backend.cancel(stale.id))
+        self.assertTrue(await self.backend.requeue(stale.id))
+        current = (await self.claim())[0]
+        self.assertEqual((current.worker_id, current.attempts), (stale.worker_id, 1))
+        self.assertFalse(await self.backend.complete(stale, b"stale"))
+        self.assertFalse(await self.backend.fail(stale, ERROR, None))
+        self.assertFalse(await self.backend.release(stale))
+        self.assertFalse(await self.backend.hand_back(stale))
+        self.assertTrue(await self.backend.complete(current, b"fresh"))
+        stored = await self.stored(current)
+        self.assertEqual((stored.status, stored.result_payload), (JobStatus.SUCCESS, b"fresh"))
+        history = [(e.attempt, e.status) for e in await self.backend.executions(current.id)]
+        self.assertEqual(
+            history, [(1, ExecutionStatus.CANCELLED), (1, ExecutionStatus.SUCCESS)]
+        )
+
+    async def test_a_retried_job_keeps_the_history_of_its_earlier_runs(self):
+        first = await self.claimed_one(max_attempts=2)
+        await self.backend.fail(first, ERROR, retry_at=START)
+        second = (await self.claim())[0]
+        await self.backend.fail(second, ERROR, None)
+        self.assertTrue(await self.backend.requeue(first.id))
+        third = (await self.claim())[0]
+        await self.backend.complete(third, None)
+        history = [(e.attempt, e.status) for e in await self.backend.executions(first.id)]
+        self.assertEqual(
+            history,
+            [
+                (1, ExecutionStatus.FAILED),
+                (2, ExecutionStatus.FAILED),
+                (1, ExecutionStatus.SUCCESS),
+            ],
+        )
+
+    async def test_cancelling_a_running_job_closes_its_execution(self):
+        claimed = await self.claimed_one()
+        self.assertTrue(await self.backend.cancel(claimed.id))
+        execution = (await self.backend.executions(claimed.id))[0]
+        self.assertIs(execution.status, ExecutionStatus.CANCELLED)
+        self.assertEqual(execution.finished_at, START)
+
+    async def test_any_other_outcome_resets_the_hand_backs(self):
+        outcomes = {
+            "complete": lambda job: self.backend.complete(job, None),
+            "fail": lambda job: self.backend.fail(job, ERROR, None),
+            "retry": lambda job: self.backend.fail(job, ERROR, retry_at=START),
+            "release": lambda job: self.backend.release(job),
+            "reap": lambda job: self.reap_after_the_lease(),
+            "cancel": lambda job: self.backend.cancel(job.id),
+        }
+        for name, outcome in outcomes.items():
+            with self.subTest(name):
+                await self.enqueue(queue=name, max_attempts=3)
+                job = (await self.claim(queues=(name,)))[0]
+                self.assertTrue(await self.backend.hand_back(job))
+                again = (await self.claim(queues=(name,)))[0]
+                self.assertEqual(again.hand_backs, 1)
+                await outcome(again)
+                self.assertEqual((await self.stored(again)).hand_backs, 0)
+
+    async def test_an_exhausted_lease_resets_the_hand_backs(self):
+        job = await self.claimed_one(max_attempts=2)
+        self.assertTrue(await self.backend.hand_back(job))
+        again = (await self.claim())[0]
+        await self.backend.fail(again, ERROR, retry_at=START)
+        last = (await self.claim())[0]
+        self.assertTrue(await self.backend.hand_back(last))
+        final = (await self.claim())[0]
+        self.assertEqual((final.attempts, final.hand_backs), (2, 1))
+        await self.reap_after_the_lease()
+        stored = await self.stored(final)
+        self.assertEqual((stored.status, stored.hand_backs), (JobStatus.FAILED, 0))
+
     async def test_cancel_stops_a_running_job_from_reporting(self):
         claimed = await self.claimed_one()
         self.assertTrue(await self.backend.cancel(claimed.id))
@@ -279,11 +403,13 @@ class BackendContract:
 
     async def test_requeue_resets_a_failed_job(self):
         claimed = await self.claimed_one()
+        await self.backend.hand_back(claimed)
+        claimed = (await self.claim())[0]
         await self.backend.fail(claimed, ERROR, None)
         self.assertTrue(await self.backend.requeue(claimed.id))
         stored = await self.stored(claimed)
         self.assertIs(stored.status, JobStatus.QUEUED)
-        self.assertEqual(stored.attempts, 0)
+        self.assertEqual((stored.attempts, stored.hand_backs), (0, 0))
         self.assertIsNone(stored.last_error)
         self.assertIsNone(stored.finished_at)
         self.assertEqual(len(await self.claim()), 1)
@@ -292,6 +418,24 @@ class BackendContract:
         claimed = await self.claimed_one()
         await self.backend.complete(claimed, None)
         self.assertFalse(await self.backend.requeue(claimed.id))
+
+    async def test_requeue_refuses_a_job_whose_dedup_key_another_job_holds(self):
+        self.requires("dedup")
+        failed = await self.claimed_one(dedup_key="invoice:1")
+        await self.backend.fail(failed, ERROR, None)
+        active = await self.enqueue(dedup_key="invoice:1")
+        self.assertFalse(await self.backend.requeue(failed.id))
+        self.assertIs((await self.stored(failed)).status, JobStatus.FAILED)
+        self.assertEqual(
+            (await self.enqueue(dedup_key="invoice:1")).id, active.id
+        )
+
+    async def test_a_retried_job_holds_its_dedup_key_again(self):
+        self.requires("dedup")
+        failed = await self.claimed_one(dedup_key="invoice:1")
+        await self.backend.fail(failed, ERROR, None)
+        self.assertTrue(await self.backend.requeue(failed.id))
+        self.assertEqual((await self.enqueue(dedup_key="invoice:1")).id, failed.id)
 
     async def test_a_dedup_key_returns_the_active_job(self):
         self.requires("dedup")

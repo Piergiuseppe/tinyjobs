@@ -81,12 +81,9 @@ class FastAPIRedisTests(FastAPITests):
         return TinyJobs(REDIS_URL, prefix=self.prefix)
 
     def tearDown(self) -> None:
-        self.jobs.run_sync(self.forget_keys(), name="forget")
-
-    async def forget_keys(self) -> None:
-        await self.jobs.ready()
-        await forget(self.jobs, self.prefix)
-        await self.jobs.aclose()
+        self.jobs.start()
+        self.jobs.run_sync(lambda: forget(self.jobs, self.prefix), name="forget")
+        self.jobs.close()
 
 
 if __name__ == "__main__":

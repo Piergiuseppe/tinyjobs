@@ -1,6 +1,6 @@
 import sys
 
-MINIMUM_PYTHON = (3, 11)
+MINIMUM_PYTHON = (3, 12)
 
 if sys.version_info < MINIMUM_PYTHON:
     raise RuntimeError(

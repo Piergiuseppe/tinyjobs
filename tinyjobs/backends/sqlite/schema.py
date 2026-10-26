@@ -1,6 +1,17 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+DROP_LEGACY_INDEX = "DROP INDEX IF EXISTS idx_executions_attempt"
+
+LEGACY_INDEX_IS_UNIQUE = (
+    "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+    "AND name = 'idx_executions_attempt' AND sql LIKE 'CREATE UNIQUE%'"
+)
+
+RESERVE_LEGACY_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_executions_attempt ON executions (job_id) WHERE 0"
+)
 
 DDL = (
     """
@@ -20,6 +31,8 @@ DDL = (
         priority         INTEGER NOT NULL DEFAULT 0,
         attempts         INTEGER NOT NULL DEFAULT 0,
         max_attempts     INTEGER NOT NULL DEFAULT 1,
+        hand_backs       INTEGER NOT NULL DEFAULT 0,
+        claims           INTEGER NOT NULL DEFAULT 0,
         run_at           REAL NOT NULL,
         created_at       REAL NOT NULL,
         finished_at      REAL,
@@ -63,6 +76,7 @@ DDL = (
         id          INTEGER PRIMARY KEY,
         job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
         attempt     INTEGER NOT NULL,
+        claim       INTEGER NOT NULL,
         status      TEXT NOT NULL,
         worker_id   TEXT NOT NULL,
         started_at  REAL NOT NULL,
@@ -72,9 +86,10 @@ DDL = (
     )
     """,
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_attempt
-        ON executions (job_id, attempt)
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_claim
+        ON executions (job_id, claim)
     """,
+    RESERVE_LEGACY_INDEX,
     """
     CREATE TABLE IF NOT EXISTS schedules (
         name        TEXT PRIMARY KEY,
@@ -97,5 +112,18 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "WHERE finished_at IS NOT NULL",
         "INSERT INTO meta (key, value) VALUES ('last_purge_at', '0') "
         "ON CONFLICT (key) DO NOTHING",
+    ),
+    3: (
+        "ALTER TABLE jobs ADD COLUMN hand_backs INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE jobs ADD COLUMN claims INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE executions ADD COLUMN claim INTEGER NOT NULL DEFAULT 0",
+        "UPDATE executions SET claim = ("
+        "SELECT count(*) FROM executions AS earlier "
+        "WHERE earlier.job_id = executions.job_id "
+        "AND (earlier.started_at < executions.started_at "
+        "OR (earlier.started_at = executions.started_at "
+        "AND earlier.id <= executions.id)))",
+        "UPDATE jobs SET claims = max(attempts, ("
+        "SELECT count(*) FROM executions WHERE executions.job_id = jobs.id))",
     ),
 }
