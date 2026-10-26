@@ -892,6 +892,7 @@ class ForkHookTests(unittest.TestCase):
             _, status = os.waitpid(child, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0)
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores RLIMIT_NPROC, so the fork cannot be made to fail")
     def test_a_fork_that_fails_still_resumes_everything(self):
         import subprocess
         import sys

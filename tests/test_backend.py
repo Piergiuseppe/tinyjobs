@@ -3449,31 +3449,35 @@ class FreshDatabaseTests(unittest.TestCase):
         from tinyjobs.backends.sqlite import connection
 
         closed: list = []
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(
-                connection, "_close_one", lambda *args: closed.append(args)
-            ),
-        ):
+        close_one = connection._close_one
+        with tempfile.TemporaryDirectory() as directory:
             pool = ConnectionPool(str(Path(directory) / "jobs.db"))
-            try:
-                seen: list = []
 
-                def retire() -> None:
+            def tracked(*args) -> None:
+                if args[1] is pool._all:
+                    closed.append(args)
+                else:
+                    close_one(*args)
+
+            with mock.patch.object(connection, "_close_one", tracked):
+                try:
+                    seen: list = []
+
+                    def retire() -> None:
+                        seen.append(pool.connection)
+                        pool.hand_over()
+
+                    retiring = threading.Thread(target=retire)
+                    retiring.start()
+                    retiring.join(5)
+                    gc.collect()
+                    time.sleep(0.1)
                     seen.append(pool.connection)
-                    pool.hand_over()
-
-                retiring = threading.Thread(target=retire)
-                retiring.start()
-                retiring.join(5)
-                gc.collect()
-                time.sleep(0.1)
-                seen.append(pool.connection)
-                self.assertIs(seen[1], seen[0])
-                self.assertEqual(seen[1].execute("SELECT 1").fetchone()[0], 1)
-                self.assertEqual(closed, [])
-            finally:
-                pool.close()
+                    self.assertIs(seen[1], seen[0])
+                    self.assertEqual(seen[1].execute("SELECT 1").fetchone()[0], 1)
+                    self.assertEqual(closed, [])
+                finally:
+                    pool.close()
 
     def test_the_pools_left_open_are_closed_when_the_process_exits(self):
         from tinyjobs.backends.sqlite import connection
