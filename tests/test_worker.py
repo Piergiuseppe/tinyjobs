@@ -581,7 +581,9 @@ class SignalHandlerTests(WorkerTestCase):
         libc.signal(signal.SIGTERM, ctypes.c_void_p(1))
         ignored = signals._raw_action(signal.SIGTERM)
         await self.run_briefly(self.make_worker(), 0.2)
-        self.assertEqual(signals._raw_action(signal.SIGTERM), ignored)
+        self.assertEqual(
+            signals._pointer(signals._raw_action(signal.SIGTERM)), signals._pointer(ignored)
+        )
 
     @unittest.skipUnless(os.name == "posix", "needs sigaction")
     async def test_a_stopped_worker_keeps_sigint_ignored_outside_python(self):
@@ -598,7 +600,9 @@ class SignalHandlerTests(WorkerTestCase):
         libc.signal(signal.SIGINT, ctypes.c_void_p(1))
         ignored = signals._raw_action(signal.SIGINT)
         await self.run_briefly(self.make_worker(), 0.2)
-        self.assertEqual(signals._raw_action(signal.SIGINT), ignored)
+        self.assertEqual(
+            signals._pointer(signals._raw_action(signal.SIGINT)), signals._pointer(ignored)
+        )
 
     async def test_one_signal_stops_every_worker_on_the_loop(self):
         import os

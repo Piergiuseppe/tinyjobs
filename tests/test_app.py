@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 import unittest
 import warnings
 import weakref
@@ -787,6 +788,18 @@ class ClosedAppTests(BackendTestCase):
         del app
         gc.collect()
         loop_thread.join(5)
+        self.assertFalse(loop_thread.is_alive())
+
+    def test_an_app_dropped_after_an_enqueue_stops_its_loop(self):
+        app = TinyJobs(f"sqlite:///{self.database}")
+        handler = app.task(name="handler")(lambda value: value)
+        handler.enqueue(1)
+        loop_thread = app._runner._thread
+        collected = weakref.ref(app)
+        del app, handler
+        gc.collect()
+        loop_thread.join(5)
+        self.assertIsNone(collected())
         self.assertFalse(loop_thread.is_alive())
 
     def test_a_child_connects_although_a_parent_thread_held_the_app_lock(self):
@@ -2100,8 +2113,15 @@ class ForkTests(BackendTestCase):
         if os.getpid() != parent:
             os._exit(1)
         self.assertGreater(interrupts + len(reported), 0)
+        unexpected = [
+            report for report in reported if not isinstance(report.exc_value, KeyboardInterrupt)
+        ]
         self.assertEqual(
-            {type(report.exc_value) for report in reported} - {KeyboardInterrupt}, set()
+            unexpected,
+            [],
+            "".join(traceback.format_exception(unexpected[0].exc_value))[-6000:]
+            if unexpected
+            else "",
         )
         self.assertIsNotNone(self.app.send("noted"))
         assert_fork_hooks_settled(self, self.app)

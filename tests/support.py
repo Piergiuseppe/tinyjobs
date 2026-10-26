@@ -92,9 +92,17 @@ def sweep_interrupts(case: unittest.TestCase, action, check) -> int:
 
 def interrupt_repeatedly(action, seconds: float = 1.5, *, only_tinyjobs: bool = False) -> int:
     armed = [False]
+    busy = [False]
 
     def interrupt(signum, frame) -> None:
-        if armed[0] and (not only_tinyjobs or inside_tinyjobs(frame)):
+        if busy[0]:
+            return
+        busy[0] = True
+        try:
+            hit = armed[0] and (not only_tinyjobs or inside_tinyjobs(frame))
+        finally:
+            busy[0] = False
+        if hit:
             raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGALRM, interrupt)

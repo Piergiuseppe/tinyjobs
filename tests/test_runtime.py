@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import suppress
 from unittest import mock
 
 from tinyjobs import runtime
@@ -25,6 +26,9 @@ def wait_running(loop: asyncio.AbstractEventLoop) -> None:
     deadline = time.monotonic() + 5
     while not loop.is_running() and time.monotonic() < deadline:
         time.sleep(0.005)
+    if loop.is_running():
+        with suppress(Exception):
+            asyncio.run_coroutine_threadsafe(asyncio.sleep(0), loop).result(5)
 
 
 class ForkPauseTests(unittest.TestCase):
@@ -646,6 +650,26 @@ class ControlTests(unittest.TestCase):
 
 @unittest.skipUnless(hasattr(os, "fork"), "needs os.fork")
 class ForkHookTests(unittest.TestCase):
+    def test_the_fork_hook_takes_no_lock_of_the_threading_module(self):
+        held, release = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            with threading._active_limbo_lock:
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.assertTrue(held.wait(5))
+        try:
+            started = time.monotonic()
+            runtime._pause_idle_owners()
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            holder.join(5)
+        self.assertLess(elapsed, 1.0)
+
     def test_the_after_hooks_undo_what_the_before_hook_marked(self):
         gate = mock.Mock()
         ident = threading.get_ident()
@@ -1432,6 +1456,21 @@ class KeptTaskTests(unittest.TestCase):
         outcome.result(5)
         self.assertEqual(done, ["handed back"])
 
+    def test_a_task_that_fails_as_the_loop_winds_down_still_reports_why(self):
+        for steps in range(6):
+            loop = asyncio.new_event_loop()
+
+            async def failing(steps: int = steps) -> None:
+                for _ in range(steps):
+                    await asyncio.sleep(0)
+                raise RuntimeError("boom")
+
+            outcome = runtime.submit(loop, failing(), "failing", returning=True)
+            runtime._finish_tasks(loop, time.monotonic() + 1)
+            loop.close()
+            with self.subTest(steps=steps), self.assertRaises(RuntimeError):
+                outcome.result(0)
+
     def test_other_work_submitted_as_the_loop_closes_is_refused(self):
         runner = LoopRunner()
         loop = runner.own_loop()
@@ -1666,11 +1705,7 @@ class OsThreadTests(unittest.TestCase):
         with (
             mock.patch.object(runtime, "_runners", weakref_set()),
             mock.patch.object(runtime, "_fork_pausers", weakref_set(owner)),
-            mock.patch.object(
-                threading,
-                "enumerate",
-                return_value=[threading.current_thread(), loop_thread],
-            ),
+            self.threads(loop_thread),
         ):
             self.assertTrue(self.pause_here())
         owner.pause_for_fork.assert_not_called()
@@ -1680,9 +1715,7 @@ class OsThreadTests(unittest.TestCase):
         with (
             mock.patch.object(runtime, "_runners", weakref_set()),
             mock.patch.object(runtime, "_fork_pausers", weakref_set(owner)),
-            mock.patch.object(
-                threading, "enumerate", return_value=[threading.current_thread()]
-            ),
+            self.threads(),
         ):
             self.assertTrue(self.pause_here())
         owner.pause_for_fork.assert_called_once_with()

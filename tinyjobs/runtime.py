@@ -503,13 +503,14 @@ def _control_bootstrap(resuming: bool) -> None:
 
 
 def _control_main() -> None:
-    while True:
-        message = _inbox.get()
-        leave = False
-        with suppress(Exception):
-            leave = message[0](*message[1:])
-        if leave:
-            return
+    while not _handled(_inbox.get()):
+        pass
+
+
+def _handled(message: tuple[Any, ...]) -> bool:
+    with suppress(Exception):
+        return bool(message[0](*message[1:]))
+    return False
 
 
 def _start(request: _Request) -> bool:
@@ -842,6 +843,7 @@ def _finish_tasks(loop: asyncio.AbstractEventLoop, deadline: float) -> None:
             asked.add(task)
         loop.run_until_complete(asyncio.wait(pending, timeout=max(left, 0)))
         loop.run_until_complete(asyncio.sleep(0))
+    loop.run_until_complete(asyncio.sleep(0))
 
 
 def _is_kept(task: asyncio.Task) -> bool:
@@ -920,6 +922,11 @@ def _owned(thread: threading.Thread) -> bool:
     return thread.name.startswith(OWNED_THREAD_PREFIXES)
 
 
+def _loop_threads_alive() -> bool:
+    threads = [*threading._active.values(), *threading._limbo.values()]
+    return any(thread.name.startswith(LOOP_THREAD_PREFIX) for thread in threads)
+
+
 def _pause_wanted(ident: int) -> bool:
     threads = list(threading._active.items())
     current = threading._active.get(ident)
@@ -946,9 +953,7 @@ def _pause(ident: int, pid: int, acked: Any, resume: Any) -> bool:
             with suppress(Exception):
                 if runner.pause():
                     _paused_for_fork.append(runner)
-        if not any(
-            thread.name.startswith(LOOP_THREAD_PREFIX) for thread in threading.enumerate()
-        ):
+        if not _loop_threads_alive():
             for owner in list(_fork_pausers):
                 with suppress(Exception):
                     owner.pause_for_fork()
@@ -1036,7 +1041,7 @@ def _before_fork() -> None:
 
 
 def _pause_idle_owners() -> None:
-    if any(thread.name.startswith(LOOP_THREAD_PREFIX) for thread in threading.enumerate()):
+    if _loop_threads_alive():
         return
     for owner in list(_fork_pausers):
         with suppress(Exception):
