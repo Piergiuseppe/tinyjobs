@@ -203,6 +203,17 @@ class ManagedBackend:
         if method is not None:
             await self._forward(method)
 
+    @property
+    def wakes_workers(self) -> bool:
+        return hasattr(self._inner, "wait_for_jobs")
+
+    async def wait_for_jobs(
+        self, *, worker_id: str, queues: Sequence[str], timeout: float
+    ) -> None:
+        await self._forward(
+            self._inner.wait_for_jobs, worker_id=worker_id, queues=queues, timeout=timeout
+        )
+
     async def cancel(self, job_id: str) -> bool:
         return await self._forward(self._inner.cancel, job_id)
 

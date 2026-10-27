@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Sequence, TypeVar
+import weakref
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from typing import Any, AsyncIterator, Awaitable, Generator, Sequence, TypeVar
 
 import psycopg
 from psycopg import errors
@@ -13,6 +14,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
 
 from ...clock import Clock, FollowingClock, elapsed
+from ...exceptions import ConfigurationError
 from ...models import (
     Execution,
     ExecutionError,
@@ -46,6 +48,7 @@ SETUP_LOCK_SECONDS = 5
 MAX_IDLE_SECONDS = 300.0
 MAX_LIFETIME_SECONDS = 1800.0
 NOTIFY_SECONDS = 0.05
+LISTEN_RETRY_SECONDS = 1.0
 KEEPALIVES = {
     "keepalives": 1,
     "keepalives_idle": 30,
@@ -61,6 +64,7 @@ WAKE_ERRORS = (psycopg.Error, PoolTimeout)
 logger = logging.getLogger("tinyjobs.postgres")
 
 T = TypeVar("T")
+Steps = Generator[tuple[str, dict[str, Any]], list[dict[str, Any]], T]
 
 
 class PostgresBackend(BaseBackend):
@@ -68,7 +72,7 @@ class PostgresBackend(BaseBackend):
         priority=True,
         delayed=True,
         dedup=True,
-        transactional_enqueue=False,
+        transactional_enqueue=True,
         retention=True,
         schedules=True,
         max_payload_bytes=None,
@@ -100,6 +104,13 @@ class PostgresBackend(BaseBackend):
         self._woken: dict[str, float] = {}
         self._waiting: set[str] = set()
         self._waking: asyncio.Task | None = None
+        self._heard: dict[str, int] = {}
+        self._hearing = 0
+        self._marks: dict[str, int] = {}
+        self._waiters: dict[asyncio.Event, frozenset[str]] = {}
+        self._listening: asyncio.Task | None = None
+        self._connection_options = connection_options
+        self._joined: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
         self._statement_timeout = statement_timeout
         self._pool_timeout = pool_timeout
         self._opening: asyncio.Future[None] | None = None
@@ -189,7 +200,64 @@ class PostgresBackend(BaseBackend):
         if opening is not None and not opening.done():
             opening.cancel()
             await asyncio.wait({opening})
+        listening, self._listening = self._listening, None
+        if listening is not None:
+            listening.cancel()
+            await asyncio.wait({listening})
+        for event in self._waiters:
+            event.set()
         await self._pool.close()
+
+    async def wait_for_jobs(
+        self, *, worker_id: str, queues: Sequence[str], timeout: float
+    ) -> None:
+        if not self._notify or self._closed:
+            await asyncio.sleep(timeout)
+            return
+        if self._listening is None:
+            with spared_until_close():
+                self._listening = asyncio.create_task(
+                    self._listen(), name="tinyjobs-postgres-listen"
+                )
+        wanted = frozenset(queues)
+        mark = self._marks.get(worker_id, 0)
+        if any(self._heard.get(queue, 0) > mark for queue in wanted):
+            return
+        event = asyncio.Event()
+        self._waiters[event] = wanted
+        try:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(event.wait(), timeout)
+        finally:
+            self._waiters.pop(event, None)
+
+    async def _listen(self) -> None:
+        options = {
+            key: value
+            for key, value in _connection_kwargs(self._conninfo, self._connection_options).items()
+            if key != "row_factory"
+        }
+        while True:
+            try:
+                async with await psycopg.AsyncConnection.connect(
+                    self._conninfo, **options
+                ) as connection:
+                    await connection.execute(f'LISTEN "{self._tables.channel}"')
+                    self._hear(None)
+                    async for notice in connection.notifies():
+                        self._hear(notice.payload)
+            except psycopg.Error as error:
+                logger.debug("listening for new jobs failed: %s", error)
+            self._hear(None)
+            await asyncio.sleep(LISTEN_RETRY_SECONDS)
+
+    def _hear(self, queue: str | None) -> None:
+        self._hearing += 1
+        for event, wanted in self._waiters.items():
+            if queue is None or queue in wanted:
+                event.set()
+        if queue is not None:
+            self._heard[queue] = self._hearing
 
     async def follow_clock(self) -> None:
         await self._now()
@@ -224,6 +292,7 @@ class PostgresBackend(BaseBackend):
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
+        self._marks[worker_id] = self._hearing
         now = await self._now()
         rows = await self._retrying(
             self._queries.claim,
@@ -449,12 +518,64 @@ class PostgresBackend(BaseBackend):
         now: float,
         due: set[str],
     ) -> list[Job]:
+        return await _driven(connection, self._inserting(jobs, now, due))
+
+    def enqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
+        connection = _connection_of(tx)
+        if not isinstance(connection, psycopg.Connection):
+            raise TypeError(
+                "tx must be a psycopg connection or cursor; pass an async one to "
+                "aenqueue or asend"
+            )
+        steps = self._joining(connection, jobs)
+        rows: list[dict[str, Any]] | None = None
+        while True:
+            try:
+                query, parameters = steps.send(rows)
+            except StopIteration as finished:
+                return finished.value
+            with connection.cursor(row_factory=dict_row) as cursor:
+                rows = cursor.execute(query, parameters).fetchall()
+
+    async def aenqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
+        connection = _connection_of(tx)
+        if not isinstance(connection, psycopg.AsyncConnection):
+            raise TypeError(
+                "tx must be a psycopg async connection or cursor; pass a sync one to "
+                "enqueue or send"
+            )
+        return await _driven(connection, self._joining(connection, jobs))
+
+    def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
+        if connection not in self._joined:
+            rows = yield self._queries.table_exists, {"name": self._tables.jobs}
+            if not rows[0]["present"]:
+                raise ConfigurationError(
+                    f"{self._tables.jobs} is not in the database of the connection "
+                    "passed as tx; enqueue through a connection to the database "
+                    "tinyjobs uses"
+                )
+            self._joined[connection] = True
+        now = self._clock.now()
+        due: set[str] = set()
+        stored: list[Job] = []
+        for start in range(0, len(jobs), ENQUEUE_BATCH):
+            batch = jobs[start : start + ENQUEUE_BATCH]
+            stored.extend((yield from self._inserting(batch, now, due)))
+        if self._notify and due:
+            yield self._queries.notify, {
+                "channel": self._tables.channel,
+                "queues": sorted(due),
+            }
+        return stored
+
+    def _inserting(self, jobs: Sequence[Job], now: float, due: set[str]) -> Steps[list[Job]]:
         resolved: dict[int, Job] = {}
         pending = list(enumerate(jobs))
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
-            rows = await _fetch(connection, self._queries.insert, self._at(now, **parameters))
+            rows = yield self._queries.insert, self._at(now, **parameters)
             inserted = {row["id"] for row in rows}
             due.update(row["queue"] for row in rows if row["due"])
             missing = [(index, job) for index, job in pending if job.id not in inserted]
@@ -463,7 +584,7 @@ class PostgresBackend(BaseBackend):
                     resolved[index] = job
             if not missing:
                 break
-            pending = await self._holders(connection, missing, resolved)
+            pending = yield from self._holders(missing, resolved)
             if not pending:
                 break
         else:
@@ -473,29 +594,16 @@ class PostgresBackend(BaseBackend):
             )
         return [resolved[index] for index in range(len(jobs))]
 
-    async def _holders(
-        self,
-        connection: psycopg.AsyncConnection,
-        missing: list[tuple[int, Job]],
-        resolved: dict[int, Job],
-    ) -> list[tuple[int, Job]]:
-        existing = {
-            row["id"]: job_from_row(row)
-            for row in await _fetch(
-                connection, self._queries.by_ids, {"ids": [job.id for _, job in missing]}
-            )
-        }
+    def _holders(
+        self, missing: list[tuple[int, Job]], resolved: dict[int, Job]
+    ) -> Steps[list[tuple[int, Job]]]:
+        rows = yield self._queries.by_ids, {"ids": [job.id for _, job in missing]}
+        existing = {row["id"]: job_from_row(row) for row in rows}
         keys = [job.dedup_key for _, job in missing if job.id not in existing and job.dedup_key]
-        holders = (
-            {
-                row["dedup_key"]: job_from_row(row)
-                for row in await _fetch(
-                    connection, self._queries.active_by_keys, {"keys": keys}
-                )
-            }
-            if keys
-            else {}
-        )
+        holders: dict[str, Job] = {}
+        if keys:
+            rows = yield self._queries.active_by_keys, {"keys": keys}
+            holders = {row["dedup_key"]: job_from_row(row) for row in rows}
         retry = []
         for index, job in missing:
             found = existing.get(job.id) or holders.get(job.dedup_key)
@@ -624,7 +732,7 @@ class PostgresBackend(BaseBackend):
 
     async def _stored_version(self, connection: psycopg.AsyncConnection) -> int | None:
         present = await _fetch(
-            connection, self._queries.meta_exists, {"name": self._tables.meta}
+            connection, self._queries.table_exists, {"name": self._tables.meta}
         )
         if not present[0]["present"]:
             return None
@@ -689,6 +797,24 @@ async def _begin(transaction: psycopg.AsyncTransaction) -> None:
         if transaction.status is psycopg.AsyncTransaction.Status.ACTIVE:
             await transaction.__aexit__(type(error), error, error.__traceback__)
         raise
+
+
+def _connection_of(tx: Any) -> Any:
+    if isinstance(tx, (psycopg.Cursor, psycopg.AsyncCursor)):
+        return tx.connection
+    return tx
+
+
+async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
+    rows: list[dict[str, Any]] | None = None
+    while True:
+        try:
+            query, parameters = steps.send(rows)
+        except StopIteration as finished:
+            return finished.value
+        async with connection.cursor(row_factory=dict_row) as cursor:
+            await cursor.execute(query, parameters)
+            rows = await cursor.fetchall()
 
 
 async def _fetch(

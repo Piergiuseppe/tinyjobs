@@ -149,6 +149,12 @@ class CapabilityTests(unittest.TestCase):
         with self.assertRaises(UnsupportedCapabilityError):
             self.handler.with_options(delay=60).enqueue()
 
+    def test_enqueueing_inside_a_transaction_on_a_backend_without_it_fails(self):
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "inside a transaction"):
+            self.handler.with_options(tx=object()).enqueue()
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "inside a transaction"):
+            asyncio.run(self.app.asend("handler", tx=object()))
+
     def test_a_plain_enqueue_still_works(self):
         self.assertIsNotNone(self.handler.enqueue())
 

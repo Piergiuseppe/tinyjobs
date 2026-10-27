@@ -6,7 +6,12 @@ import threading
 from contextlib import suppress
 from typing import TYPE_CHECKING, Sequence
 
-from ..exceptions import AppClosedError, ExecutorClosedError, UnknownTaskError
+from ..exceptions import (
+    AppClosedError,
+    BackendNotReadyError,
+    ExecutorClosedError,
+    UnknownTaskError,
+)
 from ..ids import new_worker_id
 from ..models import Job
 from ..retention import RetentionPolicy
@@ -175,7 +180,7 @@ class Worker:
                 continue
             jobs = await self._claim(capacity)
             if not jobs:
-                await self._pause(self._interval.next())
+                await self._idle(self._interval.next())
                 continue
             self._interval.reset()
             for job in jobs:
@@ -392,6 +397,29 @@ class Worker:
         )
         for task in pending:
             task.cancel()
+
+    async def _idle(self, seconds: float) -> None:
+        try:
+            backend = self._app.backend
+        except BackendNotReadyError:
+            backend = None
+        if not getattr(backend, "wakes_workers", False):
+            await self._pause(seconds)
+            return
+        waiting = asyncio.create_task(
+            backend.wait_for_jobs(worker_id=self._id, queues=self._queues, timeout=seconds)
+        )
+        stopping = asyncio.create_task(self._stopping.wait())
+        try:
+            await asyncio.wait({waiting, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (waiting, stopping):
+                task.cancel()
+            await asyncio.gather(waiting, stopping, return_exceptions=True)
+        failure = None if waiting.cancelled() else waiting.exception()
+        if failure is not None and not isinstance(failure, AppClosedError):
+            logger.warning("waiting for new jobs failed: %s", failure)
+            await self._pause(seconds)
 
     async def _pause(self, seconds: float) -> None:
         try:

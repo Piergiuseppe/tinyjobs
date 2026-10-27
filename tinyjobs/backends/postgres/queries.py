@@ -358,4 +358,4 @@ class Queries:
             f"SELECT value FROM {meta} WHERE key = 'schema_version'"
         )
 
-        self.meta_exists = "SELECT to_regclass(%(name)s) IS NOT NULL AS present"
+        self.table_exists = "SELECT to_regclass(%(name)s) IS NOT NULL AS present"

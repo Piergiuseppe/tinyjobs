@@ -18,7 +18,12 @@ from .backends.loader import load_backend
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .codecs import CodecRegistry
-from .exceptions import AppClosedError, BackendNotReadyError, ConfigurationError
+from .exceptions import (
+    AppClosedError,
+    BackendNotReadyError,
+    ConfigurationError,
+    UnsupportedCapabilityError,
+)
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -421,18 +426,68 @@ class TinyJobs:
         name: str,
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
+        *,
+        tx: Any = None,
         **options: Any,
     ) -> Job:
-        await self.ensure_connected()
         payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
+        chosen = EnqueueOptions().merged_with(**options)
+        if tx is not None:
+            return await self.aenqueue_in(tx, name, payload, chosen)
+        await self.ensure_connected()
         return await self.settle(
-            await self.dispatch.dispatch_by_name(
-                name, payload, EnqueueOptions().merged_with(**options)
-            )
+            await self.dispatch.dispatch_by_name(name, payload, chosen)
         )
 
-    def send(self, name: str, *args: Any, **kwargs: Any) -> Job:
-        return self.run_sync(partial(self.asend, name, *args, **kwargs), name="send")
+    def send(
+        self,
+        name: str,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+        *,
+        tx: Any = None,
+        **options: Any,
+    ) -> Job:
+        if tx is None:
+            return self.run_sync(
+                partial(self.asend, name, args, kwargs, **options), name="send"
+            )
+        payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
+        return self.enqueue_in(
+            tx, name, payload, EnqueueOptions().merged_with(**options), call="send"
+        )
+
+    async def aenqueue_in(
+        self, tx: Any, name: str, payload: JobPayload, options: EnqueueOptions
+    ) -> Job:
+        await self.ensure_connected()
+        job = self._joining(name, payload, options)
+        return self.bind((await self.backend.aenqueue_in(tx, [job]))[0])
+
+    def enqueue_in(
+        self,
+        tx: Any,
+        name: str,
+        payload: JobPayload,
+        options: EnqueueOptions,
+        *,
+        call: str = "enqueue",
+    ) -> Job:
+        self.run_sync(self.ensure_connected, name=call)
+        job = self._joining(name, payload, options)
+        return self.bind(self.backend.enqueue_in(tx, [job])[0])
+
+    def _joining(self, name: str, payload: JobPayload, options: EnqueueOptions) -> Job:
+        if self._eager:
+            raise UnsupportedCapabilityError(
+                "eager mode runs each job as it is sent, before any transaction "
+                "could commit; tx is not available with eager=True"
+            )
+        if not self.backend.capabilities.transactional_enqueue:
+            raise UnsupportedCapabilityError(
+                "this backend does not support enqueueing inside a transaction"
+            )
+        return self.dispatch.prepare(name, payload, options)
 
     async def aget(self, job_id: str) -> Job | None:
         await self.ensure_connected()

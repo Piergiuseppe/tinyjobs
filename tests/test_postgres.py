@@ -12,7 +12,7 @@ from unittest import mock
 
 import tinyjobs.clock
 from tinyjobs import JobStatus, TinyJobs
-from tinyjobs.exceptions import ConfigurationError
+from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
 from tinyjobs.runtime import run_on
 from tinyjobs.testing import BackendContract
 from tinyjobs.testing.contract import ERROR, make_job
@@ -32,6 +32,7 @@ try:
     from psycopg import errors
     from psycopg_pool import PoolClosed, PoolTimeout
     import psycopg.rows
+    import psycopg.sql
 
     from tinyjobs.backends.postgres import PostgresBackend
 except ImportError:
@@ -137,6 +138,19 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual({stored[n].id for n in (10, 1500, 2400)}, {jobs[10].id})
         self.assertEqual((await self.backend.counts_by_status())["queued"], 2498)
 
+    async def test_a_large_batch_inside_a_caller_transaction_lives_and_dies_with_it(self):
+        jobs = [make_job(created_at=float(n)) for n in range(2500)]
+        jobs[2400].dedup_key = jobs[10].dedup_key = "shared"
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            async with connection.transaction(force_rollback=True):
+                stored = await self.backend.aenqueue_in(connection, jobs)
+                self.assertEqual(stored[2400].id, jobs[10].id)
+                self.assertEqual(await self.backend.counts_by_status(), {})
+            self.assertEqual(await self.backend.counts_by_status(), {})
+            async with connection.transaction():
+                await self.backend.aenqueue_in(connection.cursor(), jobs)
+        self.assertEqual((await self.backend.counts_by_status())["queued"], 2499)
+
     async def test_a_large_batch_that_fails_halfway_stores_nothing(self):
         jobs = [make_job() for _ in range(1500)]
         jobs[1200].priority = 2**40
@@ -148,12 +162,12 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         holder = await self.claimed_one(dedup_key="invoice:1")
         real = self.backend._holders
 
-        async def finishing_first(connection, missing, resolved):
-            await sql(
-                f"UPDATE \"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s",
+        def finishing_first(missing, resolved):
+            yield (
+                f"UPDATE \"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s RETURNING id",
                 {"id": holder.id},
             )
-            return await real(connection, missing, resolved)
+            return (yield from real(missing, resolved))
 
         with mock.patch.object(self.backend, "_holders", finishing_first):
             entered = await self.enqueue(dedup_key="invoice:1")
@@ -163,8 +177,9 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_holders_that_keep_vanishing_end_in_an_error(self):
         await self.enqueue(dedup_key="invoice:1")
 
-        async def vanished(connection, missing, resolved):
+        def vanished(missing, resolved):
             return missing
+            yield
 
         with mock.patch.object(self.backend, "_holders", vanished):
             with self.assertRaisesRegex(RuntimeError, "dedup holders"):
@@ -289,6 +304,11 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         [(version,)] = await sql("SHOW server_version_num")
         if int(version) < 150000:
             self.skipTest("pg_stat_force_next_flush needs postgres 15")
+        await self.backend.close()
+        self.backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, clock=self.clock, max_connections=1
+        )
+        await self.backend.setup()
         claimed = [await self.claimed_one() for _ in range(20)]
         query = (
             "SELECT n_tup_upd, n_tup_hot_upd FROM pg_stat_user_tables WHERE relname = %(name)s"
@@ -772,9 +792,9 @@ class PostgresClockTests(unittest.IsolatedAsyncioTestCase):
 
         clock = FollowingClock()
         await self.open(clock)
-        spelled = POSTGRES_URL.replace("127.0.0.1", "localhost")
-        other = PostgresBackend.from_url(spelled, prefix=self.prefix, clock=clock)
+        other = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, clock=clock)
         self.opened.append(other)
+        other._server = lambda: "postgres elsewhere:5432 db other"
         other._queries.server_time = (
             "SELECT extract(epoch FROM clock_timestamp())::double precision + 120 AS now"
         )
@@ -1246,6 +1266,96 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await other.aclose()
             await drop(other_prefix)
 
+    async def idle_worker(self, app, **options):
+        ran: list[float] = []
+
+        @app.task(name="timed")
+        def timed() -> None:
+            ran.append(time.monotonic())
+
+        worker = app.worker(concurrency=2, scheduler=False, **options)
+        runner = asyncio.create_task(worker.start())
+        self.addAsyncCleanup(self.stopped, worker, runner)
+        await asyncio.sleep(0.5)
+        return ran
+
+    async def stopped(self, worker, runner) -> None:
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+
+    async def latency(self, app, ran: list[float]) -> float:
+        sent = time.monotonic()
+        await app.asend("timed")
+        deadline = sent + 10
+        while not ran:
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.005)
+        return ran.pop() - sent
+
+    async def test_an_idle_worker_starts_a_new_job_long_before_its_next_poll(self):
+        ran = await self.idle_worker(self.app, poll_minimum=5.0, poll_maximum=5.0)
+        for _ in range(3):
+            self.assertLess(await self.latency(self.app, ran), 0.3)
+            await asyncio.sleep(0.2)
+
+    async def test_an_idle_worker_without_notifications_still_polls(self):
+        quiet = TinyJobs(POSTGRES_URL, prefix=self.prefix, notify=False)
+        self.addAsyncCleanup(quiet.aclose)
+        ran = await self.idle_worker(quiet, poll_minimum=0.05, poll_maximum=0.1)
+        self.assertLess(await self.latency(quiet, ran), 1.0)
+
+    async def test_a_worker_keeps_waking_after_its_listening_connection_drops(self):
+        ran = await self.idle_worker(self.app, poll_minimum=5.0, poll_maximum=5.0)
+        query = "SELECT pid FROM pg_stat_activity WHERE query LIKE 'LISTEN %%' AND query LIKE %(channel)s"
+        channel = f"%{self.app.backend._tables.channel}%"
+        [(pid,)] = await sql(query, {"channel": channel})
+        await sql("SELECT pg_terminate_backend(%(pid)s)", {"pid": pid})
+        await asyncio.sleep(2.5)
+        self.assertNotEqual(await sql(query, {"channel": channel}), [(pid,)])
+        self.assertLess(await self.latency(self.app, ran), 0.3)
+
+    async def test_only_jobs_sent_after_the_last_claim_cut_the_wait_short(self):
+        backend = self.app.backend._inner
+
+        async def waited(heard_before: bool) -> float:
+            if heard_before:
+                backend._hear("default")
+            await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=30)
+            if not heard_before:
+                backend._hear("default")
+            started = time.monotonic()
+            await backend.wait_for_jobs(worker_id="w", queues=["default"], timeout=0.4)
+            return time.monotonic() - started
+
+        await on_backend_loop(self.app, waited(True))
+        self.assertGreater(await on_backend_loop(self.app, waited(True)), 0.3)
+        self.assertLess(await on_backend_loop(self.app, waited(False)), 0.1)
+
+    async def test_a_job_on_another_queue_does_not_wake_the_worker(self):
+        backend = self.app.backend
+
+        async def wait() -> float:
+            started = time.monotonic()
+            await backend.wait_for_jobs(worker_id="w", queues=["mail"], timeout=0.6)
+            return time.monotonic() - started
+
+        await wait()
+        waiting = asyncio.create_task(wait())
+        await asyncio.sleep(0.2)
+        await self.app.asend("anything", queue="sms")
+        self.assertGreater(await waiting, 0.5)
+
+    async def test_closing_the_app_wakes_idle_workers_at_once(self):
+        app = TinyJobs(POSTGRES_URL, prefix=self.prefix)
+        await app.ready()
+        worker = app.worker(scheduler=False, poll_minimum=10.0, poll_maximum=10.0)
+        runner = asyncio.create_task(worker.start())
+        await asyncio.sleep(0.5)
+        started = time.monotonic()
+        await app.aclose()
+        await asyncio.wait_for(runner, timeout=10)
+        self.assertLess(time.monotonic() - started, 2.0)
+
     async def test_closing_leaves_no_connection_behind(self):
         name = f"tinyjobs-{uuid.uuid4().hex[:8]}"
         app = TinyJobs(POSTGRES_URL, prefix=self.prefix, application_name=name)
@@ -1256,6 +1366,203 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         while (await sql(query, {"name": name}))[0][0] and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
         self.assertEqual(await sql(query, {"name": name}), [(0,)])
+
+
+    async def connect(self, **options):
+        return await psycopg.AsyncConnection.connect(POSTGRES_URL, **options)
+
+    def noted_task(self):
+        @self.app.task(name="noted", queue="notes")
+        def noted(value=None) -> None:
+            return None
+
+        return noted
+
+    async def test_a_job_sent_inside_a_transaction_appears_when_it_commits(self):
+        noted = self.noted_task()
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                job = await noted.with_options(tx=connection, priority=4).aenqueue(7)
+                self.assertIsNone(await self.app.aget(job.id))
+            stored = await self.app.aget(job.id)
+        self.assertEqual(
+            (stored.status, stored.queue, stored.priority, self.app.decode(stored).args),
+            (JobStatus.QUEUED, "notes", 4, (7,)),
+        )
+
+    async def test_a_job_sent_inside_a_rolled_back_transaction_is_never_stored(self):
+        noted = self.noted_task()
+        async with await self.connect() as connection:
+            with self.assertRaises(ZeroDivisionError):
+                async with connection.transaction():
+                    job = await noted.with_options(tx=connection).aenqueue()
+                    1 / 0
+        self.assertIsNone(await self.app.aget(job.id))
+        self.assertEqual((await self.app.ajobs()).items, [])
+
+    async def test_send_and_a_cursor_join_the_transaction_too(self):
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                cursor = connection.cursor()
+                job = await self.app.asend("x.task", args=[1], tx=cursor, queue="q")
+                await cursor.execute("SELECT 1")
+                self.assertEqual(await cursor.fetchall(), [(1,)])
+            await connection.rollback()
+        self.assertEqual((await self.app.aget(job.id)).queue, "q")
+
+    async def test_a_bound_task_keeps_its_transaction_through_more_options(self):
+        noted = self.noted_task()
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                bound = noted.with_options(tx=connection).with_options(queue="later")
+                job = await bound.aenqueue()
+                self.assertIsNone(await self.app.aget(job.id))
+        self.assertEqual((await self.app.aget(job.id)).queue, "later")
+
+    async def test_a_dedup_key_inside_a_transaction_finds_its_holder(self):
+        noted = self.noted_task()
+        held = await noted.with_options(key="k1").aenqueue()
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                keyed = noted.with_options(tx=connection, key="k1")
+                self.assertEqual((await keyed.aenqueue()).id, held.id)
+                first = await noted.with_options(tx=connection, key="k2").aenqueue()
+                again = await noted.with_options(tx=connection, key="k2").aenqueue()
+                self.assertEqual(again.id, first.id)
+        self.assertEqual(len((await self.app.ajobs()).items), 2)
+
+    async def test_workers_hear_of_a_job_only_when_its_transaction_commits(self):
+        noted = self.noted_task()
+        channel = self.app.backend._tables.channel
+        async with await self.connect(autocommit=True) as listener:
+            await listener.execute(
+                psycopg.sql.SQL("LISTEN {}").format(psycopg.sql.Identifier(channel))
+            )
+            async with await self.connect() as connection:
+                async with connection.transaction():
+                    await noted.with_options(tx=connection).aenqueue()
+                    self.assertEqual(await self.heard(listener, 0.3), [])
+                self.assertEqual(await self.heard(listener, 5), ["notes"])
+
+    async def test_a_quiet_app_sends_no_notification_from_a_transaction(self):
+        quiet = TinyJobs(POSTGRES_URL, prefix=self.prefix, notify=False)
+        self.addAsyncCleanup(quiet.aclose)
+        channel = self.app.backend._tables.channel
+        async with await self.connect(autocommit=True) as listener:
+            await listener.execute(
+                psycopg.sql.SQL("LISTEN {}").format(psycopg.sql.Identifier(channel))
+            )
+            async with await self.connect() as connection:
+                async with connection.transaction():
+                    job = await quiet.asend("x.task", tx=connection)
+            self.assertEqual(await self.heard(listener, 0.5), [])
+        self.assertIsNotNone(await quiet.aget(job.id))
+
+    async def heard(self, listener, timeout: float) -> list[str]:
+        return [
+            notice.payload
+            async for notice in listener.notifies(timeout=timeout, stop_after=1)
+        ]
+
+    async def test_an_idle_worker_runs_a_job_soon_after_its_transaction_commits(self):
+        ran = await self.idle_worker(self.app, poll_minimum=5.0, poll_maximum=5.0)
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                await self.app.asend("timed", tx=connection)
+                await asyncio.sleep(0.3)
+                self.assertEqual(ran, [])
+            committed = time.monotonic()
+        deadline = committed + 10
+        while not ran:
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.005)
+        self.assertLess(ran.pop() - committed, 0.3)
+
+    async def test_a_connection_that_cannot_see_the_tables_is_refused(self):
+        async with await self.connect(options="-c search_path=nowhere") as connection:
+            with self.assertRaisesRegex(ConfigurationError, "not in the database"):
+                await self.app.asend("x.task", tx=connection)
+            await connection.rollback()
+            with self.assertRaisesRegex(ConfigurationError, "not in the database"):
+                await self.app.asend("x.task", tx=connection)
+
+    async def test_the_table_check_runs_once_per_connection(self):
+        async with await self.connect() as connection:
+            with mock.patch.object(
+                psycopg.AsyncCursor, "execute", autospec=True, side_effect=psycopg.AsyncCursor.execute
+            ) as executed:
+                await self.app.asend("x.task", tx=connection)
+                await self.app.asend("x.task", tx=connection)
+            await connection.commit()
+        queries = [str(call.args[1]) for call in executed.call_args_list]
+        self.assertEqual(sum("to_regclass" in query for query in queries), 1)
+
+    async def test_a_sync_connection_is_refused_by_the_async_calls(self):
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with self.assertRaisesRegex(TypeError, "async connection"):
+                await self.app.asend("x.task", tx=connection)
+
+    async def test_a_failure_later_in_the_transaction_takes_the_job_with_it(self):
+        async with await self.connect() as connection:
+            with self.assertRaises(errors.DivisionByZero):
+                async with connection.transaction():
+                    job = await self.app.asend("x.task", tx=connection)
+                    await connection.execute("SELECT 1 / 0")
+        self.assertIsNone(await self.app.aget(job.id))
+
+
+@requires_postgres
+class PostgresSyncTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.prefix = new_prefix()
+        self.app = TinyJobs(POSTGRES_URL, prefix=self.prefix).start()
+        self.addCleanup(asyncio.run, drop(self.prefix))
+        self.addCleanup(self.app.close)
+
+        @self.app.task(name="noted")
+        def noted(value=None) -> None:
+            return None
+
+        self.noted = noted
+
+    def test_a_sync_connection_joins_the_transaction(self):
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with connection.transaction():
+                job = self.noted.with_options(tx=connection).enqueue(3)
+                self.assertIsNone(self.app.get(job.id))
+            self.assertEqual(self.app.decode(self.app.get(job.id)).args, (3,))
+
+    def test_a_rolled_back_sync_transaction_stores_nothing(self):
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with connection.transaction(force_rollback=True):
+                job = self.app.send("noted", tx=connection.cursor())
+        self.assertIsNone(self.app.get(job.id))
+
+    def test_a_sync_enqueue_runs_in_the_calling_thread(self):
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with connection.transaction():
+                job = self.app.send("noted", tx=connection, key="once")
+                again = self.app.send("noted", tx=connection, key="once")
+        self.assertEqual(again.id, job.id)
+        self.assertEqual(len(self.app.jobs().items), 1)
+
+    def test_an_async_connection_is_refused_by_the_sync_calls(self):
+        async def connected():
+            return await psycopg.AsyncConnection.connect(POSTGRES_URL)
+
+        connection = asyncio.run(connected())
+        try:
+            with self.assertRaisesRegex(TypeError, "pass an async one"):
+                self.app.send("noted", tx=connection)
+        finally:
+            connection.pgconn.finish()
+
+    def test_eager_mode_refuses_a_transaction(self):
+        eager = TinyJobs(POSTGRES_URL, prefix=self.prefix, eager=True).start()
+        self.addCleanup(eager.close)
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with self.assertRaisesRegex(UnsupportedCapabilityError, "eager"):
+                eager.send("noted", tx=connection)
 
 
 @requires_postgres

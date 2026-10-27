@@ -16,7 +16,7 @@ from ...app import TinyJobs
 from ...models import Job
 from ...services.execution import current_job
 from .adapter import adapt
-from .connections import shared_app
+from .connections import joined_connection, shared_app
 from .discovery import discover_tasks, find_task
 from .results import build_result, record_failure, record_success
 
@@ -31,7 +31,9 @@ class TinyJobsBackend(BaseTaskBackend):
 
     def __init__(self, alias: str, params: dict[str, Any]) -> None:
         super().__init__(alias, params)
-        self.app = shared_app(alias, dict(self.options), self._prepare)
+        options = dict(self.options)
+        self.database: str | None = options.pop("database", None)
+        self.app = shared_app(alias, options, self._prepare)
 
     @classmethod
     def named(cls, alias: str) -> "TinyJobsBackend":
@@ -59,15 +61,16 @@ class TinyJobsBackend(BaseTaskBackend):
             )
         job = self.app.send(
             task.module_path, normalize_json(args), normalize_json(kwargs),
+            tx=None if self.database is None else joined_connection(self.database),
             **self._options_for(task),
         )
         executions = self.app.executions(job.id) if job.attempts else []
         return self._announce(self._result(task, job, executions))
 
     async def aenqueue(self, task: Task, args, kwargs) -> TaskResult:
-        return await sync_to_async(self.enqueue, thread_sensitive=False)(
-            task, args, kwargs
-        )
+        return await sync_to_async(
+            self.enqueue, thread_sensitive=self.database is not None
+        )(task, args, kwargs)
 
     def get_result(self, result_id: str) -> TaskResult:
         job, task = self._find(self.app.get(result_id), result_id)
