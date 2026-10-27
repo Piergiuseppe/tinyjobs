@@ -9,10 +9,18 @@ def _redis(url: str, **options):
     return RedisBackend.from_url(url, **options)
 
 
+def _postgres(url: str, **options):
+    from .postgres import PostgresBackend
+
+    return PostgresBackend.from_url(url, **options)
+
+
 register_builtin("sqlite", SQLiteBackend.from_url)
 register_builtin("memory", SQLiteBackend.from_url)
 register_builtin("redis", _redis)
 register_builtin("rediss", _redis)
+register_builtin("postgres", _postgres)
+register_builtin("postgresql", _postgres)
 
 __all__ = [
     "Backend",

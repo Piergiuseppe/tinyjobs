@@ -30,6 +30,7 @@ classifiers = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0.1"]
+postgres = ["psycopg>=3.2", "psycopg-pool>=3.2"]
 
 [project.urls]
 Homepage = "https://github.com/Piergiuseppe/tinyjobs"
