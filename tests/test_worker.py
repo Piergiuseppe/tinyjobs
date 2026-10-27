@@ -1355,6 +1355,57 @@ class BackendOutageTests(WorkerTestCase):
         self.assertEqual((stored.status, len(calls)), (JobStatus.FAILED, 2))
         self.assertIn("bad input", stored.last_error)
 
+    async def test_an_attempt_cancelled_during_the_outage_is_not_counted_as_recorded(self):
+        succeeded = []
+
+        @self.app.task
+        def handler():
+            return None
+
+        self.app.on_job_success(lambda job, result, duration: succeeded.append(job.id))
+        job = await handler.aenqueue()
+        await self.app.ready()
+        backend = self.app.backend
+        original = backend.complete
+        calls = []
+
+        async def cancelled_meanwhile(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                await self.app.acancel(job.id)
+                raise ConnectionError("store unreachable")
+            return await original(*args, **kwargs)
+
+        backend.complete = cancelled_meanwhile
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        self.addCleanup(setattr, backend, "complete", original)
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            await self.run_briefly(self.make_worker(), 1.0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(succeeded, [])
+        self.assertIn("no longer held", "\n".join(logs.output))
+
+    async def test_the_retry_window_ends_before_the_lease_can_run_out(self):
+        @self.app.task
+        def handler():
+            return None
+
+        await handler.aenqueue()
+        await self.app.ready()
+        execution = self.app.execution
+        real = execution.execute
+        windows = []
+
+        async def watched(*args, **kwargs):
+            windows.append(kwargs.get("patience"))
+            return await real(*args, **kwargs)
+
+        execution.execute = watched
+        self.addCleanup(vars(execution).pop, "execute", None)
+        await self.run_briefly(self.make_worker(lease_seconds=30.0), 0.5)
+        self.assertEqual(windows, [20.0])
+
     async def test_an_error_the_backend_does_not_call_transient_is_not_retried(self):
         @self.app.task
         def handler():
@@ -1386,8 +1437,8 @@ class BackendOutageTests(WorkerTestCase):
         calls = await self.flaky_store("complete", 1000)
         started = time.monotonic()
         with self.assertLogs("tinyjobs.worker", "ERROR") as logs:
-            await self.run_briefly(self.make_worker(lease_seconds=1.0), 2.0)
-        self.assertLess(time.monotonic() - started, 5)
+            await self.run_briefly(self.make_worker(lease_seconds=3.0), 3.5)
+        self.assertLess(time.monotonic() - started, 7)
         self.assertGreater(len(calls), 1)
         self.assertIn("could not record the outcome", "\n".join(logs.output))
         self.assertIs((await self.app.aget(job.id)).status, JobStatus.RUNNING)

@@ -28,7 +28,7 @@ from ...retention import RetentionPolicy
 from ...runtime import spared_until_close
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
-from .queries import Queries
+from .queries import NOTICE_CHARACTERS, Queries
 from .records import (
     JOB_COLUMNS,
     execution_from_row,
@@ -56,7 +56,7 @@ KEEPALIVES = {
     "keepalives_count": 3,
 }
 ENQUEUE_BATCH = 1000
-INSERT_ROUNDS = 5
+INSERT_ROUNDS = 50
 RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure)
 RETRIES = 3
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
@@ -94,6 +94,11 @@ class PostgresBackend(BaseBackend):
         notify: bool = True,
         **connection_options: Any,
     ) -> None:
+        if statement_timeout is not None and not statement_timeout >= 0.001:
+            raise ConfigurationError(
+                f"statement_timeout must be None or at least 0.001 seconds, "
+                f"not {statement_timeout!r}"
+            )
         self._conninfo = conninfo
         self._tables = Tables(prefix, schema)
         self._clock = FollowingClock() if clock is None else clock
@@ -106,26 +111,35 @@ class PostgresBackend(BaseBackend):
         self._waiting: set[str] = set()
         self._waking: asyncio.Task | None = None
         self._heard: dict[str, int] = {}
+        self._listened: set[str] = set()
         self._hearing = 0
         self._marks: dict[str, int] = {}
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
         self._connection_options = connection_options
         self._joined: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+        self._instance: str | None = None
+        self._joint: Queries | None = None
         self._statement_timeout = statement_timeout
         self._pool_timeout = pool_timeout
         self._opening: asyncio.Future[None] | None = None
         self._closing: asyncio.Future[None] | None = None
         self._closed = False
-        self._pool = AsyncConnectionPool(
-            conninfo,
-            min_size=min(min_connections, max_connections),
-            max_size=max_connections,
-            timeout=pool_timeout,
+        self._spent = False
+        self._sizes = (min(min_connections, max_connections), max_connections)
+        self._pool = self._new_pool()
+
+    def _new_pool(self) -> AsyncConnectionPool:
+        smallest, largest = self._sizes
+        return AsyncConnectionPool(
+            self._conninfo,
+            min_size=smallest,
+            max_size=largest,
+            timeout=self._pool_timeout,
             max_idle=MAX_IDLE_SECONDS,
             max_lifetime=MAX_LIFETIME_SECONDS,
             open=False,
-            kwargs=_connection_kwargs(conninfo, connection_options),
+            kwargs=_connection_kwargs(self._conninfo, self._connection_options),
             configure=self._configure,
             name="tinyjobs",
         )
@@ -142,7 +156,37 @@ class PostgresBackend(BaseBackend):
             stored = await self._stored_version(connection)
         if stored != SCHEMA_VERSION:
             await self._create()
+        await self._place()
         await self._now()
+
+    async def _place(self) -> None:
+        tables = self._tables
+        names = {
+            "jobs": tables.jobs,
+            "executions": tables.executions,
+            "schedules": tables.schedules,
+            "meta": tables.meta,
+        }
+        async with self._connection() as connection:
+            placed = await _fetch(connection, self._queries.placement, names)
+            if len(placed) != 1 or placed[0]["tables"] != len(names):
+                raise ConfigurationError(
+                    f"the tinyjobs tables for prefix {tables.prefix!r} resolve to more "
+                    "than one schema on this connection's search_path; pass schema= "
+                    "to name the one to use"
+                )
+            if not placed[0]["owned"]:
+                raise ConfigurationError(
+                    f"the tinyjobs tables for prefix {tables.prefix!r} belong to a role "
+                    "the connecting user is not a member of; tinyjobs only uses tables "
+                    "its own role owns"
+                )
+            rows = await _fetch(connection, self._queries.instance, {})
+            if not rows:
+                await connection.execute(tables.instance())
+                rows = await _fetch(connection, self._queries.instance, {})
+        self._instance = rows[0]["value"]
+        self._joint = Queries(tables.within(placed[0]["schema"]), self._following)
 
     async def _create(self) -> None:
         async with self._transaction() as connection:
@@ -167,6 +211,8 @@ class PostgresBackend(BaseBackend):
         if self._opening is None:
             if self._closed:
                 raise PoolClosed(f"the pool {self._pool.name!r} is closed")
+            if self._spent:
+                self._pool, self._spent = self._new_pool(), False
             with spared_until_close():
                 self._opening = asyncio.ensure_future(
                     self._pool.open(wait=True, timeout=self._pool_timeout)
@@ -183,6 +229,7 @@ class PostgresBackend(BaseBackend):
         except BaseException:
             if self._opening is opening:
                 self._opening = None
+                self._spent = self._pool.closed
             raise
 
     async def close(self) -> None:
@@ -220,7 +267,8 @@ class PostgresBackend(BaseBackend):
                 self._listening = asyncio.create_task(
                     self._listen(), name="tinyjobs-postgres-listen"
                 )
-        wanted = frozenset(queues)
+        wanted = frozenset(_noticed(queue) for queue in queues)
+        self._listened.update(wanted)
         mark = self._marks.get(worker_id, 0)
         if any(self._heard.get(queue, 0) > mark for queue in wanted):
             return
@@ -257,7 +305,7 @@ class PostgresBackend(BaseBackend):
         for event, wanted in self._waiters.items():
             if queue is None or queue in wanted:
                 event.set()
-        if queue is not None:
+        if queue is not None and queue in self._listened:
             self._heard[queue] = self._hearing
 
     async def follow_clock(self) -> None:
@@ -271,17 +319,26 @@ class PostgresBackend(BaseBackend):
             return []
         now = await self._now()
         due: set[str] = set()
-        if len(jobs) <= ENQUEUE_BATCH:
-            async with self._connection() as connection:
-                stored = await self._insert(connection, jobs, now, due)
-        else:
-            async with self._transaction() as connection:
-                stored = []
-                for start in range(0, len(jobs), ENQUEUE_BATCH):
-                    batch = jobs[start : start + ENQUEUE_BATCH]
-                    stored.extend(await self._insert(connection, batch, now, due))
+        order = _lock_order(jobs)
+        ordered = [jobs[index] for index in order]
+        for attempt in range(RETRIES):
+            try:
+                if len(jobs) <= ENQUEUE_BATCH:
+                    async with self._connection() as connection:
+                        stored = await self._insert(connection, ordered, now, due)
+                else:
+                    async with self._transaction() as connection:
+                        stored = []
+                        for start in range(0, len(jobs), ENQUEUE_BATCH):
+                            batch = ordered[start : start + ENQUEUE_BATCH]
+                            stored.extend(await self._insert(connection, batch, now, due))
+                break
+            except RETRIED_ERRORS as error:
+                if attempt == RETRIES - 1:
+                    raise
+                logger.warning("retrying a postgres enqueue after %s", error)
         await self._wake(due)
-        return stored
+        return _in_order(order, stored)
 
     async def claim(
         self,
@@ -294,18 +351,23 @@ class PostgresBackend(BaseBackend):
         if limit <= 0 or not queues:
             return []
         self._marks[worker_id] = self._hearing
-        now = await self._now()
-        rows = await self._retrying(
-            self._queries.claim,
-            self._at(
-                now,
-                queues=list(dict.fromkeys(queues)),
-                limit=limit,
-                worker=worker_id,
-                lease=now + lease_seconds,
-                seconds=lease_seconds,
-            ),
-        )
+        self._listened.update(_noticed(queue) for queue in queues)
+        wanted = list(dict.fromkeys(queues))
+        for _ in range(2 if len(wanted) > 1 else 1):
+            now = await self._now()
+            rows = await self._retrying(
+                self._queries.claim,
+                self._at(
+                    now,
+                    queues=wanted,
+                    limit=limit,
+                    worker=worker_id,
+                    lease=now + lease_seconds,
+                    seconds=lease_seconds,
+                ),
+            )
+            if rows:
+                break
         return [job_from_row(row) for row in rows]
 
     async def heartbeat(
@@ -343,7 +405,7 @@ class PostgresBackend(BaseBackend):
         execution_status: ExecutionStatus = ExecutionStatus.FAILED,
     ) -> bool:
         parameters = await self._finishing(
-            job, execution_status, error, summary=error.summary, run_at=retry_at
+            job, execution_status, error, summary=_storable(error.summary), run_at=retry_at
         )
         if retry_at is None:
             return await self._changed(self._queries.fail, parameters)
@@ -495,20 +557,31 @@ class PostgresBackend(BaseBackend):
         jobs: Sequence[Job],
     ) -> list[Job] | None:
         now = await self._now()
-        due: set[str] = set()
-        async with self._transaction() as connection:
-            cursor = await connection.execute(
-                self._queries.advance_schedule,
-                {"name": name, "expected": expected, "next_run_at": next_run_at},
-            )
-            if cursor.rowcount != 1:
-                return None
-            stored = await self._insert(connection, jobs, now, due) if jobs else []
-            if stored:
-                await connection.execute(
-                    self._queries.record_schedule_run,
-                    {"now": now, "job_id": stored[-1].id, "name": name},
-                )
+        order = _lock_order(jobs)
+        ordered = [jobs[index] for index in order]
+        for attempt in range(RETRIES):
+            due: set[str] = set()
+            try:
+                async with self._transaction() as connection:
+                    cursor = await connection.execute(
+                        self._queries.advance_schedule,
+                        {"name": name, "expected": expected, "next_run_at": next_run_at},
+                    )
+                    if cursor.rowcount != 1:
+                        return None
+                    stored = _in_order(
+                        order, await self._insert(connection, ordered, now, due) if jobs else []
+                    )
+                    if stored:
+                        await connection.execute(
+                            self._queries.record_schedule_run,
+                            {"now": now, "job_id": stored[-1].id, "name": name},
+                        )
+                break
+            except RETRIED_ERRORS as error:
+                if attempt == RETRIES - 1:
+                    raise
+                logger.warning("retrying a postgres schedule firing after %s", error)
         await self._wake(due)
         return stored
 
@@ -548,35 +621,50 @@ class PostgresBackend(BaseBackend):
         return await _driven(connection, self._joining(connection, jobs))
 
     def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
+        joint = self._joint
+        if joint is None:
+            raise RuntimeError("call setup() before enqueueing inside a transaction")
         if connection not in self._joined:
-            rows = yield self._queries.table_exists, {"name": self._tables.jobs}
-            if not rows[0]["present"]:
+            meta = self._tables.within(joint.schema).meta
+            rows = yield joint.table_exists, {"name": meta}
+            if rows[0]["present"]:
+                rows = yield joint.instance, {}
+            if not rows or rows[0].get("value") != self._instance:
                 raise ConfigurationError(
-                    f"{self._tables.jobs} is not in the database of the connection "
-                    "passed as tx; enqueue through a connection to the database "
-                    "tinyjobs uses"
+                    f"the connection passed as tx does not reach the tinyjobs store this "
+                    f"app uses ({self._server()}, prefix {self._tables.prefix!r}); "
+                    "enqueue through a connection to that database"
                 )
             self._joined[connection] = True
         now = self._clock.now()
         due: set[str] = set()
+        order = _lock_order(jobs)
+        ordered = [jobs[index] for index in order]
         stored: list[Job] = []
         for start in range(0, len(jobs), ENQUEUE_BATCH):
-            batch = jobs[start : start + ENQUEUE_BATCH]
-            stored.extend((yield from self._inserting(batch, now, due)))
+            batch = ordered[start : start + ENQUEUE_BATCH]
+            stored.extend((yield from self._inserting(batch, now, due, joint)))
         if self._notify and due:
-            yield self._queries.notify, {
+            yield joint.notify, {
                 "channel": self._tables.channel,
                 "queues": sorted(due),
             }
-        return stored
+        return _in_order(order, stored)
 
-    def _inserting(self, jobs: Sequence[Job], now: float, due: set[str]) -> Steps[list[Job]]:
+    def _inserting(
+        self,
+        jobs: Sequence[Job],
+        now: float,
+        due: set[str],
+        queries: Queries | None = None,
+    ) -> Steps[list[Job]]:
+        queries = queries or self._queries
         resolved: dict[int, Job] = {}
-        pending = list(enumerate(jobs))
+        pending, copies = _firsts(jobs)
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
-            rows = yield self._queries.insert, self._at(now, **parameters)
+            rows = yield queries.insert, self._at(now, **parameters)
             inserted = {row["id"] for row in rows}
             due.update(row["queue"] for row in rows if row["due"])
             missing = [(index, job) for index, job in pending if job.id not in inserted]
@@ -585,7 +673,7 @@ class PostgresBackend(BaseBackend):
                     resolved[index] = job
             if not missing:
                 break
-            pending = yield from self._holders(missing, resolved)
+            pending = yield from self._holders(missing, resolved, queries)
             if not pending:
                 break
         else:
@@ -593,17 +681,23 @@ class PostgresBackend(BaseBackend):
                 "enqueue kept meeting dedup holders that finished before they could "
                 "be read; try again"
             )
+        for index, first in copies.items():
+            resolved[index] = resolved[first]
         return [resolved[index] for index in range(len(jobs))]
 
     def _holders(
-        self, missing: list[tuple[int, Job]], resolved: dict[int, Job]
+        self,
+        missing: list[tuple[int, Job]],
+        resolved: dict[int, Job],
+        queries: Queries | None = None,
     ) -> Steps[list[tuple[int, Job]]]:
-        rows = yield self._queries.by_ids, {"ids": [job.id for _, job in missing]}
+        queries = queries or self._queries
+        rows = yield queries.by_ids, {"ids": [job.id for _, job in missing]}
         existing = {row["id"]: job_from_row(row) for row in rows}
         keys = [job.dedup_key for _, job in missing if job.id not in existing and job.dedup_key]
         holders: dict[str, Job] = {}
         if keys:
-            rows = yield self._queries.active_by_keys, {"keys": keys}
+            rows = yield queries.active_by_keys, {"keys": keys}
             holders = {row["dedup_key"]: job_from_row(row) for row in rows}
         retry = []
         for index, job in missing:
@@ -626,8 +720,8 @@ class PostgresBackend(BaseBackend):
             job,
             now,
             execution_status=str(execution_status),
-            error_type=error.type if error else None,
-            traceback=error.traceback if error else None,
+            error_type=_storable(error.type) if error else None,
+            traceback=_storable(error.traceback) if error else None,
             **extra,
         )
 
@@ -798,6 +892,43 @@ async def _begin(transaction: psycopg.AsyncTransaction) -> None:
         if transaction.status is psycopg.AsyncTransaction.Status.ACTIVE:
             await transaction.__aexit__(type(error), error, error.__traceback__)
         raise
+
+
+def _lock_order(jobs: Sequence[Job]) -> list[int]:
+    return sorted(
+        range(len(jobs)),
+        key=lambda index: (jobs[index].dedup_key is None, jobs[index].dedup_key or "", jobs[index].id),
+    )
+
+
+def _firsts(jobs: Sequence[Job]) -> tuple[list[tuple[int, Job]], dict[int, int]]:
+    seen: dict[tuple[str, str], int] = {}
+    firsts: list[tuple[int, Job]] = []
+    copies: dict[int, int] = {}
+    for index, job in enumerate(jobs):
+        marks = [("id", job.id)] + ([("key", job.dedup_key)] if job.dedup_key else [])
+        earlier = next((seen[mark] for mark in marks if mark in seen), None)
+        if earlier is None:
+            seen.update((mark, index) for mark in marks)
+            firsts.append((index, job))
+        else:
+            copies[index] = earlier
+    return firsts, copies
+
+
+def _in_order(order: list[int], stored: list[Job]) -> list[Job]:
+    placed: list[Job | None] = [None] * len(stored)
+    for position, index in enumerate(order):
+        placed[index] = stored[position]
+    return placed
+
+
+def _noticed(queue: str) -> str:
+    return queue[:NOTICE_CHARACTERS]
+
+
+def _storable(text: str) -> str:
+    return text.replace("\x00", "\\x00")
 
 
 def _connection_of(tx: Any) -> Any:

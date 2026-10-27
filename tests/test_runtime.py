@@ -1442,6 +1442,31 @@ class CollectedElsewhereTests(unittest.TestCase):
 
 
 class KeptTaskTests(unittest.TestCase):
+    def test_a_task_that_swallowed_a_cancel_is_cancelled_again_at_wind_down(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def stubborn() -> None:
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                seen.append("swallowed")
+            try:
+                await asyncio.sleep(30)
+            finally:
+                seen.append("ended")
+
+        task = loop.create_task(stubborn())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        started = time.monotonic()
+        runtime._finish_tasks(loop, time.monotonic() + 0.3)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["swallowed", "ended"])
+        self.assertLess(time.monotonic() - started, 2)
+
     def test_a_hand_back_submitted_as_the_loop_closes_still_runs(self):
         runner = LoopRunner()
         loop = runner.own_loop()

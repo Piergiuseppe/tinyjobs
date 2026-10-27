@@ -9,9 +9,12 @@ SERVER = "extract(epoch FROM statement_timestamp())::double precision"
 
 NOW = "%(now)s::double precision"
 
+NOTICE_CHARACTERS = 1000
+
 
 class Queries:
     def __init__(self, tables: Tables, following: bool) -> None:
+        self.schema = tables.schema
         jobs, executions = tables.jobs, tables.executions
         schedules, meta = tables.schedules, tables.meta
         columns = job_columns()
@@ -234,7 +237,7 @@ class Queries:
         """
 
         self.notify = (
-            "SELECT count(pg_notify(%(channel)s, queue)) AS sent "
+            f"SELECT count(pg_notify(%(channel)s, left(queue, {NOTICE_CHARACTERS}))) AS sent "
             "FROM unnest(%(queues)s::text[]) AS woken (queue)"
         )
 
@@ -359,3 +362,18 @@ class Queries:
         )
 
         self.table_exists = "SELECT to_regclass(%(name)s) IS NOT NULL AS present"
+
+        self.instance = f"SELECT value FROM {meta} WHERE key = 'instance'"
+
+        self.placement = """
+            SELECT n.nspname AS schema,
+                   bool_and(pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned,
+                   count(*) AS tables
+              FROM pg_class AS c
+              JOIN pg_namespace AS n ON n.oid = c.relnamespace
+             WHERE c.oid = ANY(ARRAY[
+                       to_regclass(%(jobs)s), to_regclass(%(executions)s),
+                       to_regclass(%(schedules)s), to_regclass(%(meta)s)
+                   ]::oid[])
+             GROUP BY n.nspname
+        """

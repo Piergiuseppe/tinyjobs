@@ -450,6 +450,14 @@ class EagerTests(DjangoTestCase):
         self.assertEqual(result.return_value, 10)
 
 
+class EagerDatabaseTests(DjangoTestCase):
+    options = {"eager": True, "database": "default"}
+
+    def test_eager_mode_ignores_the_database_and_still_runs_the_task(self):
+        result = self.tasks.double.enqueue(6)
+        self.assertEqual((result.status, result.return_value), ("SUCCESSFUL", 12))
+
+
 class CommandTests(DjangoTestCase):
     def call(self, *arguments: str) -> str:
         from django.core.management import call_command

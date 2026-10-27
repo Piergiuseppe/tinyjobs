@@ -557,12 +557,15 @@ database tinyjobs uses, or the enqueue raises `ConfigurationError`. In Django, a
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
 A worker that cannot record a job's outcome because the server went away keeps trying for as long as
-its lease lasts, so a restart or a failover shorter than that does not run finished jobs again.
+its lease is sure to last, two thirds of it by default, so a restart or a failover shorter than that
+does not run finished jobs again.
 
 Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every statement
 times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
-`pg_stat_activity`. Behind PgBouncer use session pooling. A transaction left open for hours anywhere
-on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18 are tested.
+`pg_stat_activity`. The tables must belong to the connecting role or one of its roles. Behind
+PgBouncer use session pooling. A transaction left open for hours anywhere
+on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18 are supported, and CI
+tests 14 and 18.
 
 ## Other backends
 

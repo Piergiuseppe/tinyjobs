@@ -252,7 +252,10 @@ class Worker:
             return
         try:
             attempt = await self._app.execution.execute(
-                self._app.bind(job), task, self._executors, patience=self._lease_seconds
+                self._app.bind(job),
+                task,
+                self._executors,
+                patience=max(self._lease_seconds - self._beat_seconds, 0.0),
             )
         except ExecutorClosedError:
             await self._hand_back_unstarted(job)
@@ -313,10 +316,13 @@ class Worker:
         )
         await self._app.backend.hand_back(job, delay)
 
+    @property
+    def _beat_seconds(self) -> float:
+        return max(self._lease_seconds / 3.0, 1.0)
+
     async def _heartbeat_loop(self) -> None:
-        interval = max(self._lease_seconds / 3.0, 1.0)
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(self._beat_seconds)
             job_ids = list({job_id for job_id, _ in self._inflight})
             if not job_ids:
                 continue

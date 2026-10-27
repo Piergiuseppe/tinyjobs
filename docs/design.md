@@ -793,7 +793,10 @@ Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>
 `setup` reads the stored schema version first and creates nothing when it matches, so a fleet
 starting at once costs one `SELECT` each. Otherwise it takes a transaction-scoped advisory lock,
 waits for it at most five seconds, and checks again under it. A store written by a newer release is
-refused and left alone.
+refused and left alone. Setup then checks that all four tables sit in one schema and belong to the
+connecting role or a role it is a member of, so tables another role created ahead of time, perhaps
+with a trigger on them, are refused rather than used. It also reads the store's random instance id,
+written into the meta table when the tables are created.
 
 `id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
 ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
@@ -823,8 +826,10 @@ never writes one that ends too soon.
 ### Waking workers
 
 Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
-`pg_notify` on a channel named after the prefix with the queue as payload, at most once per queue
-every 50 ms; a burst sends one notification and a trailing one. Each worker process holds one extra
+`pg_notify` with the queue as payload, cut to its first 1,000 characters so it stays under
+Postgres's limit, at most once per queue every 50 ms; a burst sends one notification and a trailing
+one. The channel is `tinyjobs_` and a hash of the schema and the prefix, which always fits in a
+channel name and never lets two stores share one. Each worker process holds one extra
 connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
 unless it claimed since. A lost listening connection is reopened within a second, and every reopen
 wakes the workers once, since notifications sent meanwhile are gone. Polling stays as the fallback, so
@@ -845,11 +850,15 @@ async connections, by the caller's async connection on the caller's loop, and by
 connection in the caller's thread. A sync enqueue therefore never crosses to the backend's loop with
 a connection that belongs to another thread. The notification goes inside the same transaction, and
 Postgres delivers it only at commit, so a worker never wakes for a job it cannot see yet; a rollback
-takes both. The first use of a connection checks that the jobs table is visible on it and raises
-`ConfigurationError` when it is not, which catches a connection to the wrong database.
+takes both. On the caller's connection every table is named with the schema setup found it in, so
+the caller's `search_path` or a temporary table of the same name cannot divert the job. The first use
+of a connection reads the instance id through it and raises `ConfigurationError` when it differs,
+which catches a connection to another database, even one holding tinyjobs tables of its own.
 
 Dedup keys work inside the transaction as outside: a second enqueue with a held key returns the
-holder, including one written earlier in the same transaction. A holder written by another
+holder, including one written earlier in the same transaction. Jobs sharing a key inside one call
+become one job before anything is written. Every call inserts its jobs in key order, so two bulk
+enqueues racing on the same keys wait for each other instead of deadlocking. A holder written by another
 transaction that has not committed makes the insert wait for it, as any unique index does. Eager
 mode refuses `tx=`, because it would run the job before the transaction could commit, and so does
 every backend that cannot join one.
@@ -865,8 +874,9 @@ Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_conne
 listening one. Every connection is set to read committed, a 30 second `statement_timeout` and a one
 minute `idle_in_transaction_session_timeout`, is named `tinyjobs` in `pg_stat_activity` unless the
 URL names it, and keeps TCP keepalives on. A connection beyond the minimum closes after five idle
-minutes, and every connection is replaced after half an hour. Deadlocks and serialization failures are retried three times with a warning. A fork leaves the
-parent's connections alone: the child opens its own.
+minutes, and every connection is replaced after half an hour. Deadlocks and serialization
+failures are retried three times with a warning, except inside the caller's transaction, which only
+the caller can retry. A fork leaves the parent's connections alone: the child opens its own.
 
 ### Where the limits are
 
@@ -877,7 +887,8 @@ parent's connections alone: the child opens its own.
   jobs table bloats until it ends.
 - **`statement_timeout` bounds every call.** A purge or a claim that needs longer than 30 seconds
   fails; raise it with `statement_timeout=` or turn it off with `None`.
-- **Supported versions are the ones the community supports**, 14 to 18 today, each tested.
+- **Supported versions are the ones the community supports**, 14 to 18 today. CI runs the suite
+  on 14 and 18.
 
 ---
 

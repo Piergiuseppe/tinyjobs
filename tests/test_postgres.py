@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 import unittest
+import urllib.parse
 import uuid
 from contextlib import suppress
 from unittest import mock
@@ -15,6 +16,7 @@ from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
 from tinyjobs.runtime import run_on
 from tinyjobs.testing import BackendContract
+from tinyjobs.models import ExecutionError
 from tinyjobs.testing.contract import ERROR, make_job
 from tests.support import (
     LoopBoundAppCases,
@@ -37,6 +39,16 @@ try:
     from tinyjobs.backends.postgres import PostgresBackend
 except ImportError:
     PostgresBackend = None
+
+
+def url_for(*, dbname: str | None = None, user: str | None = None, password: str | None = None) -> str:
+    parts = urllib.parse.urlsplit(POSTGRES_URL)
+    place = parts.hostname + (f":{parts.port}" if parts.port else "")
+    who = user or parts.username or ""
+    secret = password if user else parts.password
+    signed = f"{who}:{secret}@" if secret else f"{who}@" if who else ""
+    path = f"/{dbname}" if dbname else parts.path
+    return parts._replace(netloc=signed + place, path=path).geturl()
 
 
 def new_prefix() -> str:
@@ -162,12 +174,12 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         holder = await self.claimed_one(dedup_key="invoice:1")
         real = self.backend._holders
 
-        def finishing_first(missing, resolved):
+        def finishing_first(missing, resolved, queries=None):
             yield (
                 f"UPDATE \"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s RETURNING id",
                 {"id": holder.id},
             )
-            return (yield from real(missing, resolved))
+            return (yield from real(missing, resolved, queries))
 
         with mock.patch.object(self.backend, "_holders", finishing_first):
             entered = await self.enqueue(dedup_key="invoice:1")
@@ -177,7 +189,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_holders_that_keep_vanishing_end_in_an_error(self):
         await self.enqueue(dedup_key="invoice:1")
 
-        def vanished(missing, resolved):
+        def vanished(missing, resolved, queries=None):
             return missing
             yield
 
@@ -329,6 +341,146 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated, 200)
         self.assertGreaterEqual(hot, 150)
 
+    async def test_bulk_enqueues_take_dedup_keys_in_one_order(self):
+        keys = [f"key:{n:03d}" for n in range(200)]
+        batches = []
+        real = self.backend._insert
+
+        async def recorded(connection, jobs, now, due):
+            batches.append([job.dedup_key for job in jobs])
+            return await real(connection, jobs, now, due)
+
+        jobs = [make_job(dedup_key=key) for key in reversed(keys)]
+        with mock.patch.object(self.backend, "_insert", recorded):
+            stored = await self.backend.enqueue_many(jobs)
+        self.assertEqual(batches, [keys])
+        self.assertEqual([job.dedup_key for job in stored], list(reversed(keys)))
+        self.assertEqual([job.id for job in stored], [job.id for job in jobs])
+
+    async def test_one_call_with_a_key_twice_stores_one_job_even_if_it_finishes_at_once(self):
+        def unreachable(*args):
+            raise AssertionError("a key repeated inside one call needs no holder lookup")
+            yield
+
+        first, second, third = (make_job(dedup_key="shared") for _ in range(3))
+        with mock.patch.object(self.backend, "_holders", unreachable):
+            stored = await self.backend.enqueue_many([first, make_job(), second, third])
+        self.assertEqual({stored[0].id, stored[2].id, stored[3].id}, {first.id})
+        self.assertEqual((await self.backend.counts_by_status())["queued"], 2)
+
+    async def test_bulk_enqueues_racing_on_the_same_keys_never_deadlock(self):
+        racers = [await self.make_backend(self.clock) for _ in range(4)]
+        for backend in racers:
+            await backend.setup()
+            self.addAsyncCleanup(backend.close)
+        keys = [f"key:{n:03d}" for n in range(200)]
+
+        async def burst(position: int) -> None:
+            order = keys if position % 2 else list(reversed(keys))
+            await racers[position].enqueue_many([make_job(dedup_key=key) for key in order])
+
+        with self.assertNoLogs("tinyjobs.postgres", "WARNING"):
+            for _ in range(15):
+                await asyncio.gather(*(burst(position) for position in range(4)))
+                await sql(f'UPDATE "{self.prefix}_jobs" SET status = \'cancelled\' WHERE status = \'queued\'')
+
+    async def test_a_failure_message_with_a_nul_byte_is_stored(self):
+        job = await self.claimed_one()
+        error = ExecutionError(type="ValueError", message="bad frame \x00\x01", traceback="tb \x00")
+        self.assertTrue(await self.backend.fail(job, error, None))
+        stored = await self.stored(job)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertIn("bad frame \\x00", stored.last_error)
+        [execution] = await self.backend.executions(job.id)
+        self.assertEqual(execution.traceback, "tb \\x00")
+
+    async def test_an_empty_claim_over_several_queues_looks_twice(self):
+        statements = []
+        real = self.backend._retrying
+
+        async def counted(query, parameters, **options):
+            statements.append(query)
+            return await real(query, parameters, **options)
+
+        with mock.patch.object(self.backend, "_retrying", counted):
+            await self.claim(queues=("a", "b"))
+            await self.claim(queues=("a",))
+        self.assertEqual(len(statements), 3)
+
+    async def test_a_claim_over_several_queues_finds_jobs_another_claim_left(self):
+        for queue in ("a", "b", "c"):
+            await self.enqueue(queue=queue)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await holder.execute(
+                f'SELECT id FROM "{self.prefix}_jobs" WHERE queue <> %(queue)s FOR UPDATE',
+                {"queue": "c"},
+            )
+            real = self.backend._retrying
+            calls = []
+
+            async def released_after_first(query, parameters, **options):
+                rows = await real(query, parameters, **options)
+                calls.append(len(rows))
+                if len(calls) == 1:
+                    await holder.rollback()
+                return rows
+
+            await holder.execute(
+                f'SELECT id FROM "{self.prefix}_jobs" WHERE queue = %(queue)s FOR UPDATE',
+                {"queue": "c"},
+            )
+            with mock.patch.object(self.backend, "_retrying", released_after_first):
+                claimed = await self.claim(limit=3, queues=("a", "b", "c"))
+        self.assertEqual(calls, [0, 3])
+        self.assertEqual(len(claimed), 3)
+
+    async def test_notices_on_queues_nobody_waits_for_are_not_kept(self):
+        await self.claim(queues=("default",))
+        for n in range(50):
+            self.backend._hear(f"noise-{n}")
+        self.backend._hear("default")
+        self.assertEqual(set(self.backend._heard), {"default"})
+
+    async def test_setup_can_be_tried_again_after_the_server_was_unreachable(self):
+        backend = PostgresBackend.from_url(
+            "postgresql://postgres@127.0.0.1:1/tinyjobs_test",
+            prefix=self.prefix,
+            clock=self.clock,
+            pool_timeout=0.5,
+        )
+        self.addAsyncCleanup(backend.close)
+        with self.assertRaises(PoolTimeout):
+            await backend.setup()
+        backend._conninfo = POSTGRES_URL
+        await backend.setup()
+        job = await backend.enqueue(make_job())
+        self.assertEqual((await backend.get(job.id)).id, job.id)
+
+    async def test_tables_split_across_schemas_by_the_search_path_are_refused(self):
+        shadow = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE SCHEMA "{shadow}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA "{shadow}" CASCADE')
+        await sql(f'CREATE TABLE "{shadow}"."{self.prefix}_jobs" (id text)')
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, clock=self.clock,
+            options=f"-c search_path={shadow},public",
+        )
+        self.addAsyncCleanup(backend.close)
+        with self.assertRaisesRegex(ConfigurationError, "more than one schema"):
+            await backend.setup()
+
+    async def test_tables_owned_by_a_role_outside_the_users_reach_are_refused(self):
+        role = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f"CREATE ROLE \"{role}\" LOGIN PASSWORD 'tinyjobs'")
+        self.addAsyncCleanup(sql, f'DROP ROLE "{role}"')
+        for table in ("jobs", "executions", "schedules", "meta"):
+            await sql(f'GRANT SELECT ON "{self.prefix}_{table}" TO "{role}"')
+        stranger = url_for(user=role, password="tinyjobs")
+        backend = PostgresBackend.from_url(stranger, prefix=self.prefix, clock=self.clock)
+        self.addAsyncCleanup(backend.close)
+        with self.assertRaisesRegex(ConfigurationError, "not a member of"):
+            await backend.setup()
+
     async def test_a_failed_wake_up_still_stores_the_job(self):
         self.backend._queries.notify = "SELECT this_is_not_sql("
         job = await self.enqueue()
@@ -437,6 +589,20 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
 @requires_postgres
 class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
+    def test_a_statement_timeout_that_would_switch_the_guard_off_is_refused(self):
+        for timeout in (0.0004, 0.0, -1.0, float("nan")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ConfigurationError, "statement_timeout"):
+                    PostgresBackend.from_url(POSTGRES_URL, statement_timeout=timeout)
+
+    def test_every_schema_and_prefix_pair_gets_its_own_channel_postgres_accepts(self):
+        from tinyjobs.backends.postgres.schema import Tables
+
+        longest = Tables("p" * 40, "s" * 40)
+        self.assertLessEqual(len(longest.channel.encode()), 63)
+        self.assertNotEqual(Tables("c", "a_b").channel, Tables("b_c", "a").channel)
+        self.assertNotEqual(Tables("jobs").channel, Tables("jobs", "public").channel)
+
     def test_names_that_are_not_plain_identifiers_are_refused(self):
         for options in (
             {"prefix": "Jobs"},
@@ -1514,13 +1680,71 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.005)
         self.assertLess(ran.pop() - committed, 0.3)
 
-    async def test_a_connection_that_cannot_see_the_tables_is_refused(self):
-        async with await self.connect(options="-c search_path=nowhere") as connection:
-            with self.assertRaisesRegex(ConfigurationError, "not in the database"):
+    async def other_database(self) -> str:
+        name = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE DATABASE "{name}"')
+        self.addAsyncCleanup(sql, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        return url_for(dbname=name)
+
+    async def test_a_connection_to_another_database_is_refused(self):
+        elsewhere = await self.other_database()
+        async with await psycopg.AsyncConnection.connect(elsewhere) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "does not reach"):
                 await self.app.asend("x.task", tx=connection)
             await connection.rollback()
-            with self.assertRaisesRegex(ConfigurationError, "not in the database"):
+        twin = TinyJobs(elsewhere, prefix=self.prefix)
+        await twin.ready()
+        await twin.aclose()
+        async with await psycopg.AsyncConnection.connect(elsewhere) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "does not reach"):
                 await self.app.asend("x.task", tx=connection)
+            await connection.rollback()
+
+    async def test_a_search_path_or_a_temporary_table_cannot_divert_the_job(self):
+        shadow = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE SCHEMA "{shadow}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA "{shadow}" CASCADE')
+        await sql(f'CREATE TABLE "{shadow}"."{self.prefix}_jobs" (LIKE "{self.prefix}_jobs" INCLUDING ALL)')
+        await sql(f'CREATE TABLE "{shadow}"."{self.prefix}_meta" (LIKE "{self.prefix}_meta" INCLUDING ALL)')
+        await sql(
+            f'INSERT INTO "{shadow}"."{self.prefix}_meta" SELECT * FROM "{self.prefix}_meta"'
+        )
+        sent = []
+        async with await self.connect(options=f"-c search_path={shadow}") as connection:
+            async with connection.transaction():
+                sent.append(await self.app.asend("x.task", tx=connection))
+        async with await self.connect(options="-c search_path=nowhere") as connection:
+            async with connection.transaction():
+                sent.append(await self.app.asend("x.task", tx=connection))
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    f'CREATE TEMPORARY TABLE "{self.prefix}_jobs" (LIKE "{self.prefix}_jobs" INCLUDING ALL)'
+                )
+                sent.append(await self.app.asend("x.task", tx=connection))
+        for job in sent:
+            self.assertIsNotNone(await self.app.aget(job.id))
+        self.assertEqual(await sql(f'SELECT count(*) FROM "{shadow}"."{self.prefix}_jobs"'), [(0,)])
+
+    async def test_the_longest_names_still_wake_workers_and_join_transactions(self):
+        schema, prefix = "s" * 40, "p" * 40
+        self.addAsyncCleanup(drop, prefix, schema)
+        app = TinyJobs(POSTGRES_URL, prefix=prefix, schema=schema)
+        self.addAsyncCleanup(app.aclose)
+        await app.ready()
+        ran = await self.idle_worker(app, poll_minimum=5.0, poll_maximum=5.0)
+        self.assertLess(await self.latency(app, ran), 0.3)
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                job = await app.asend("timed", tx=connection)
+        self.assertIsNotNone(await app.aget(job.id))
+
+    async def test_a_very_long_queue_name_does_not_abort_the_callers_transaction(self):
+        queue = "q" * 9000
+        async with await self.connect() as connection:
+            async with connection.transaction():
+                job = await self.app.asend("x.task", tx=connection, queue=queue)
+        self.assertEqual((await self.app.aget(job.id)).queue, queue)
 
     async def test_the_table_check_runs_once_per_connection(self):
         async with await self.connect() as connection:

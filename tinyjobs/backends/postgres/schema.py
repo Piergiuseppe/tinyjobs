@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import zlib
 
@@ -26,8 +27,26 @@ class Tables:
         self.executions = f'{qualify}"{prefix}_executions"'
         self.schedules = f'{qualify}"{prefix}_schedules"'
         self.meta = f'{qualify}"{prefix}_meta"'
-        self.channel = f"{prefix}_jobs" if schema is None else f"{schema}_{prefix}_jobs"
-        self.lock = zlib.crc32(f"tinyjobs:{schema or ''}:{prefix}".encode())
+        named = f"{schema or ''}:{prefix}".encode()
+        self.channel = f"tinyjobs_{hashlib.sha256(named).hexdigest()[:24]}"
+        self.lock = zlib.crc32(b"tinyjobs:" + named)
+
+    def within(self, schema: str) -> "Tables":
+        placed = Tables.__new__(Tables)
+        placed.__dict__.update(self.__dict__)
+        qualify = '"' + schema.replace('"', '""') + '".'
+        placed.schema = schema
+        placed.jobs = f'{qualify}"{self.prefix}_jobs"'
+        placed.executions = f'{qualify}"{self.prefix}_executions"'
+        placed.schedules = f'{qualify}"{self.prefix}_schedules"'
+        placed.meta = f'{qualify}"{self.prefix}_meta"'
+        return placed
+
+    def instance(self) -> str:
+        return f"""
+            INSERT INTO {self.meta} (key, value) VALUES ('instance', gen_random_uuid()::text)
+            ON CONFLICT (key) DO NOTHING
+        """
 
     def index(self, name: str) -> str:
         return f'"{self.prefix}_{name}"'
@@ -135,5 +154,6 @@ class Tables:
             INSERT INTO {self.meta} (key, value) VALUES ('last_purge_at', '0')
             ON CONFLICT (key) DO NOTHING
             """,
+            self.instance(),
         ]
         return tuple(statements)

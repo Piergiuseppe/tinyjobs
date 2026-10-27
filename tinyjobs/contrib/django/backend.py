@@ -61,7 +61,7 @@ class TinyJobsBackend(BaseTaskBackend):
             )
         job = self.app.send(
             task.module_path, normalize_json(args), normalize_json(kwargs),
-            tx=None if self.database is None else joined_connection(self.database),
+            tx=self._transaction(),
             **self._options_for(task),
         )
         executions = self.app.executions(job.id) if job.attempts else []
@@ -114,6 +114,11 @@ class TinyJobsBackend(BaseTaskBackend):
             return self._succeeded(result, value)
         finally:
             await sync_to_async(close_old_connections)()
+
+    def _transaction(self) -> Any:
+        if self.database is None or self.app.eager:
+            return None
+        return joined_connection(self.database)
 
     def _options_for(self, task: Task) -> dict[str, Any]:
         return {

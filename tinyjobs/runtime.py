@@ -57,6 +57,7 @@ EXITING_MESSAGE = (
 )
 
 STOP_SECONDS = 5.0
+INSIST_SECONDS = 0.5
 FORK_PAUSE_SECONDS = 0.1
 FORK_ACK_SECONDS = 1.0
 LOOP_THREAD_PREFIX = "tinyjobs-loop"
@@ -841,6 +842,7 @@ def _finish_tasks(
     loop: asyncio.AbstractEventLoop, deadline: float, *, spare: bool = False
 ) -> None:
     asked: set[asyncio.Task] = set()
+    insisted = False
     loop.run_until_complete(asyncio.sleep(0))
     while pending := {
         task
@@ -853,6 +855,12 @@ def _finish_tasks(
             for task in pending
             if task not in asked and (left <= 0 or not _is_kept(task))
         ]
+        if not fresh and left <= 0 and not insisted:
+            insisted = True
+            for task in pending:
+                task.cancel()
+            loop.run_until_complete(asyncio.wait(pending, timeout=INSIST_SECONDS))
+            continue
         if not fresh and left <= 0:
             logger.warning(
                 "%d task(s) ignored cancellation; closing the loop without them: %s",

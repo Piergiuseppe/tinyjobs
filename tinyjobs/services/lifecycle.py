@@ -41,7 +41,10 @@ class JobLifecycleService:
         self, job: Job, encoded: bytes | None, *, patience: float = 0.0
     ) -> bool:
         return await self._persisting(
-            job, partial(self._backend.complete, job, encoded), patience
+            job,
+            partial(self._backend.complete, job, encoded),
+            ExecutionStatus.SUCCESS,
+            patience,
         )
 
     async def fail(
@@ -49,13 +52,19 @@ class JobLifecycleService:
     ) -> tuple[bool, bool]:
         details = self._describe(error)
         retry_at = self._retry_at(job, task, error)
-        write = partial(
-            self._backend.fail, job, details, retry_at, self._execution_status(error)
+        status = self._execution_status(error)
+        write = partial(self._backend.fail, job, details, retry_at, status)
+        return (
+            await self._persisting(job, write, status, patience),
+            retry_at is not None,
         )
-        return await self._persisting(job, write, patience), retry_at is not None
 
     async def _persisting(
-        self, job: Job, write: Callable[[], Awaitable[bool]], patience: float
+        self,
+        job: Job,
+        write: Callable[[], Awaitable[bool]],
+        status: ExecutionStatus,
+        patience: float,
     ) -> bool:
         transient = getattr(self._backend, "transient_errors", ())
         deadline = time.monotonic() + patience
@@ -79,17 +88,15 @@ class JobLifecycleService:
                 continue
             if applied or not interrupted:
                 return applied
-            return await self._recorded_before(job)
+            return await self._recorded_before(job, status)
 
-    async def _recorded_before(self, job: Job) -> bool:
-        for execution in await self._backend.executions(job.id):
-            if (
-                execution.attempt == job.attempts
-                and execution.worker_id == job.worker_id
-                and execution.status is not ExecutionStatus.RUNNING
-            ):
-                return True
-        return False
+    async def _recorded_before(self, job: Job, status: ExecutionStatus) -> bool:
+        return any(
+            execution.attempt == job.attempts
+            and execution.worker_id == job.worker_id
+            and execution.status is status
+            for execution in await self._backend.executions(job.id)
+        )
 
     def _retry_at(
         self, job: Job, task: "Task", error: BaseException
