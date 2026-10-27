@@ -41,16 +41,21 @@ class ExecutionService:
         self._clock = clock
 
     async def execute(
-        self, job: Job, task: "Task", executors: ExecutorResolver
+        self,
+        job: Job,
+        task: "Task",
+        executors: ExecutorResolver,
+        *,
+        patience: float = 0.0,
     ) -> Attempt:
         token = current_job.set(job)
         try:
-            return await self._attempt(job, task, executors)
+            return await self._attempt(job, task, executors, patience)
         finally:
             current_job.reset(token)
 
     async def _attempt(
-        self, job: Job, task: "Task", executors: ExecutorResolver
+        self, job: Job, task: "Task", executors: ExecutorResolver, patience: float
     ) -> Attempt:
         await self._hooks.started(job)
         started = self._clock.monotonic()
@@ -61,13 +66,15 @@ class ExecutionService:
         except (asyncio.CancelledError, ExecutorClosedError):
             raise
         except BaseException as error:
-            recorded, will_retry = await self._lifecycle.fail(job, task, error)
+            recorded, will_retry = await self._lifecycle.fail(
+                job, task, error, patience=patience
+            )
             if not recorded:
                 return Attempt(error, will_retry, recorded=False)
             await self._hooks.failed(job, error, will_retry)
             return Attempt(error, will_retry)
         duration = self._clock.monotonic() - started
-        if not await self._lifecycle.complete(job, encoded):
+        if not await self._lifecycle.complete(job, encoded, patience=patience):
             return Attempt(recorded=False)
         await self._hooks.succeeded(job, result, duration)
         return Attempt()

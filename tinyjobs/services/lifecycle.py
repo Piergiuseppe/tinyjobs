@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import time
 import traceback as traceback_module
-from typing import Any, TYPE_CHECKING
+from functools import partial
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
@@ -12,6 +16,11 @@ from .serialization import SerializationService
 
 if TYPE_CHECKING:
     from ..task import Task
+
+FIRST_RETRY_SECONDS = 0.25
+LONGEST_RETRY_SECONDS = 4.0
+
+logger = logging.getLogger("tinyjobs.worker")
 
 
 class JobLifecycleService:
@@ -28,18 +37,59 @@ class JobLifecycleService:
     async def succeed(self, job: Job, task: "Task", result: Any) -> bool:
         return await self.complete(job, self.encode_result(job, task, result))
 
-    async def complete(self, job: Job, encoded: bytes | None) -> bool:
-        return await self._backend.complete(job, encoded)
+    async def complete(
+        self, job: Job, encoded: bytes | None, *, patience: float = 0.0
+    ) -> bool:
+        return await self._persisting(
+            job, partial(self._backend.complete, job, encoded), patience
+        )
 
     async def fail(
-        self, job: Job, task: "Task", error: BaseException
+        self, job: Job, task: "Task", error: BaseException, *, patience: float = 0.0
     ) -> tuple[bool, bool]:
         details = self._describe(error)
         retry_at = self._retry_at(job, task, error)
-        applied = await self._backend.fail(
-            job, details, retry_at, self._execution_status(error)
+        write = partial(
+            self._backend.fail, job, details, retry_at, self._execution_status(error)
         )
-        return applied, retry_at is not None
+        return await self._persisting(job, write, patience), retry_at is not None
+
+    async def _persisting(
+        self, job: Job, write: Callable[[], Awaitable[bool]], patience: float
+    ) -> bool:
+        transient = getattr(self._backend, "transient_errors", ())
+        deadline = time.monotonic() + patience
+        delay = FIRST_RETRY_SECONDS
+        interrupted = False
+        while True:
+            try:
+                applied = await write()
+            except transient as error:
+                if time.monotonic() + delay > deadline:
+                    raise
+                logger.warning(
+                    "could not record the outcome of job %s (%s); trying again in %gs",
+                    job.id,
+                    error,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, LONGEST_RETRY_SECONDS)
+                interrupted = True
+                continue
+            if applied or not interrupted:
+                return applied
+            return await self._recorded_before(job)
+
+    async def _recorded_before(self, job: Job) -> bool:
+        for execution in await self._backend.executions(job.id):
+            if (
+                execution.attempt == job.attempts
+                and execution.worker_id == job.worker_id
+                and execution.status is not ExecutionStatus.RUNNING
+            ):
+                return True
+        return False
 
     def _retry_at(
         self, job: Job, task: "Task", error: BaseException

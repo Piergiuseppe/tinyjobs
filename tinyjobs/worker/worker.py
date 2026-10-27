@@ -252,7 +252,7 @@ class Worker:
             return
         try:
             attempt = await self._app.execution.execute(
-                self._app.bind(job), task, self._executors
+                self._app.bind(job), task, self._executors, patience=self._lease_seconds
             )
         except ExecutorClosedError:
             await self._hand_back_unstarted(job)

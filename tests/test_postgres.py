@@ -1368,6 +1368,42 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await sql(query, {"name": name}), [(0,)])
 
 
+    async def test_a_success_survives_the_server_dropping_every_connection(self):
+        name = f"tinyjobs-{uuid.uuid4().hex[:8]}"
+        app = TinyJobs(POSTGRES_URL, prefix=self.prefix, application_name=name)
+        self.addAsyncCleanup(app.aclose)
+        ran = []
+
+        @app.task(name="dropping")
+        def dropping() -> None:
+            ran.append(1)
+
+        job = await dropping.aenqueue()
+        backend = app.backend
+        original = backend.complete
+        dropped = []
+
+        async def after_a_drop(*args, **kwargs):
+            if not dropped:
+                dropped.append(1)
+                await sql(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE application_name = %(name)s",
+                    {"name": name},
+                )
+            return await original(*args, **kwargs)
+
+        backend.complete = after_a_drop
+        worker = app.worker(concurrency=1, scheduler=False, poll_maximum=0.05)
+        runner = asyncio.create_task(worker.start())
+        deadline = time.monotonic() + 15
+        while (await job.arefresh()).status is not JobStatus.SUCCESS:
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.05)
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+        self.assertEqual((ran, job.attempts), ([1], 1))
+
     async def connect(self, **options):
         return await psycopg.AsyncConnection.connect(POSTGRES_URL, **options)
 

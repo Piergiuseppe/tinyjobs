@@ -1293,6 +1293,105 @@ class BackendOutageTests(WorkerTestCase):
         self.assertIsNone(stored.last_error)
         self.assertIn("could not record the outcome", "\n".join(logs.output))
 
+    async def flaky_store(self, method: str, failures: int, *, lost_reply: bool = False):
+        await self.app.ready()
+        backend = self.app.backend
+        original = getattr(backend, method)
+        calls = []
+
+        async def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) <= failures:
+                if lost_reply:
+                    await original(*args, **kwargs)
+                raise ConnectionError("store unreachable")
+            return await original(*args, **kwargs)
+
+        setattr(backend, method, flaky)
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        self.addCleanup(setattr, backend, method, original)
+        return calls
+
+    async def test_a_success_survives_an_outage_shorter_than_the_lease(self):
+        @self.app.task
+        def handler():
+            self.calls.append("ran")
+
+        job = await handler.aenqueue()
+        calls = await self.flaky_store("complete", 2)
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            await self.settle(self.make_worker(), [job])
+        stored = await self.app.aget(job.id)
+        self.assertEqual((self.calls, stored.status, stored.attempts), (["ran"], JobStatus.SUCCESS, 1))
+        self.assertEqual(len(calls), 3)
+        self.assertIn("trying again", "\n".join(logs.output))
+
+    async def test_a_success_whose_reply_was_lost_still_counts_as_recorded(self):
+        succeeded = []
+
+        @self.app.task
+        def handler():
+            return None
+
+        self.app.on_job_success(lambda job, result, duration: succeeded.append(job.id))
+        job = await handler.aenqueue()
+        await self.flaky_store("complete", 1, lost_reply=True)
+        with self.assertLogs("tinyjobs.worker", "INFO") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertEqual((await self.app.aget(job.id)).status, JobStatus.SUCCESS)
+        self.assertNotIn("no longer held", "\n".join(logs.output))
+        self.assertEqual(succeeded, [job.id])
+
+    async def test_a_failure_survives_an_outage_shorter_than_the_lease(self):
+        @self.app.task
+        def handler():
+            raise ValueError("bad input")
+
+        job = await handler.aenqueue()
+        calls = await self.flaky_store("fail", 1)
+        await self.settle(self.make_worker(), [job])
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, len(calls)), (JobStatus.FAILED, 2))
+        self.assertIn("bad input", stored.last_error)
+
+    async def test_an_error_the_backend_does_not_call_transient_is_not_retried(self):
+        @self.app.task
+        def handler():
+            return None
+
+        job = await handler.aenqueue()
+        await self.app.ready()
+        backend = self.app.backend
+        original = backend.complete
+        calls = []
+
+        async def broken(*args, **kwargs):
+            calls.append(1)
+            raise ValueError("not a connection problem")
+
+        backend.complete = broken
+        self.addCleanup(setattr, backend, "complete", original)
+        with self.assertLogs("tinyjobs.worker", "ERROR"):
+            await self.run_briefly(self.make_worker(), 0.5)
+        self.assertEqual(calls, [1])
+        self.assertIs((await self.app.aget(job.id)).status, JobStatus.RUNNING)
+
+    async def test_an_outage_longer_than_the_lease_gives_up_and_leaves_it_to_the_reaper(self):
+        @self.app.task
+        def handler():
+            return None
+
+        job = await handler.aenqueue()
+        calls = await self.flaky_store("complete", 1000)
+        started = time.monotonic()
+        with self.assertLogs("tinyjobs.worker", "ERROR") as logs:
+            await self.run_briefly(self.make_worker(lease_seconds=1.0), 2.0)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertGreater(len(calls), 1)
+        self.assertIn("could not record the outcome", "\n".join(logs.output))
+        self.assertIs((await self.app.aget(job.id)).status, JobStatus.RUNNING)
+
 
 class HookTests(WorkerTestCase):
     async def test_start_and_success_see_the_job_the_result_and_the_duration(self):

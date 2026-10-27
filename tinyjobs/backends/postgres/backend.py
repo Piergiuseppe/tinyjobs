@@ -68,6 +68,7 @@ Steps = Generator[tuple[str, dict[str, Any]], list[dict[str, Any]], T]
 
 
 class PostgresBackend(BaseBackend):
+    transient_errors = (psycopg.OperationalError, PoolTimeout)
     capabilities = Capabilities(
         priority=True,
         delayed=True,

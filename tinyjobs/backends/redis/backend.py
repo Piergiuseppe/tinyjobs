@@ -43,6 +43,7 @@ T = TypeVar("T")
 
 
 class RedisBackend(BaseBackend):
+    transient_errors = (RedisConnectionError, RedisTimeoutError)
     capabilities = Capabilities(
         priority=True,
         delayed=True,
