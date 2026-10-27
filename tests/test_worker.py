@@ -1473,6 +1473,29 @@ class BackendOutageTests(WorkerTestCase):
         await self.run_briefly(self.make_worker(), 0.5)
         self.assertEqual(len(runs), 1)
 
+    async def test_a_recorded_job_stopped_inside_a_slow_hook_is_not_reported_unrecorded(self):
+        started = []
+
+        @self.app.task
+        def handler():
+            return None
+
+        async def slow(job, result, duration):
+            started.append(1)
+            await asyncio.sleep(30)
+
+        self.app.on_job_success(slow)
+        job = await handler.aenqueue()
+        worker = self.make_worker(shutdown_timeout=0.3)
+        runner = asyncio.create_task(worker.start())
+        while not started:
+            await asyncio.sleep(0.01)
+        with self.assertLogs("tinyjobs.worker", "INFO") as logs:
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertIs((await self.app.aget(job.id)).status, JobStatus.SUCCESS)
+        self.assertNotIn("before its outcome was recorded", "\n".join(logs.output))
+
     async def test_a_history_read_that_fails_once_is_tried_again(self):
         succeeded = []
 

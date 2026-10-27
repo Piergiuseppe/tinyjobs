@@ -556,7 +556,8 @@ with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
 ```
 
 `app.send(name, tx=connection)` and the async calls take it too. The connection must reach the
-database tinyjobs uses, not a copy of it, or the enqueue raises `ConfigurationError`. In Django, add
+database tinyjobs uses, not a copy of it, and the tables must belong to its role or to a role that
+holds its privileges, the same rule as below, or the enqueue raises `ConfigurationError`. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
 Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every
@@ -730,7 +731,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1273 tests, no test dependencies. The one that matters most is
+1281 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

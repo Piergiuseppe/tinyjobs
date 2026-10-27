@@ -9,6 +9,15 @@ SCHEMA_VERSION = 1
 
 NAME = re.compile(r"^[a-z_][a-z0-9_]{0,39}$")
 
+INDEXES = (
+    ("jobs_claim", "jobs", False),
+    ("jobs_by_status", "jobs", False),
+    ("jobs_by_queue", "jobs", False),
+    ("jobs_purge", "jobs", False),
+    ("jobs_dedup", "jobs", True),
+    ("executions_claim", "executions", True),
+)
+
 
 class Tables:
     def __init__(self, prefix: str, schema: str | None = None) -> None:
@@ -49,10 +58,10 @@ class Tables:
     def index(self, name: str) -> str:
         return f'"{self.prefix}_{name}"'
 
-    def ddl(self) -> tuple[str, ...]:
+    def ddl(self, *, schema_missing: bool) -> tuple[str, ...]:
         jobs, executions = self.jobs, self.executions
         statements = []
-        if self.requested:
+        if self.requested and schema_missing:
             statements.append(f'CREATE SCHEMA IF NOT EXISTS "{self.requested}"')
         statements += [
             f"""

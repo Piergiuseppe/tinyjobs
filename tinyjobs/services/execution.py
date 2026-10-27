@@ -48,10 +48,11 @@ class ExecutionService:
         *,
         held_until: Callable[[], float] | None = None,
         settling: Callable[[], None] | None = None,
+        settled: Callable[[], None] | None = None,
     ) -> Attempt:
         token = current_job.set(job)
         try:
-            return await self._attempt(job, task, executors, held_until, settling)
+            return await self._attempt(job, task, executors, held_until, settling, settled)
         finally:
             current_job.reset(token)
 
@@ -62,6 +63,7 @@ class ExecutionService:
         executors: ExecutorResolver,
         held_until: Callable[[], float] | None,
         settling: Callable[[], None] | None,
+        settled: Callable[[], None] | None,
     ) -> Attempt:
         await self._hooks.started(job)
         started = self._clock.monotonic()
@@ -77,6 +79,8 @@ class ExecutionService:
             recorded, will_retry = await self._lifecycle.fail(
                 job, task, error, held_until=held_until
             )
+            if settled is not None:
+                settled()
             if not recorded:
                 return Attempt(error, will_retry, recorded=False)
             await self._hooks.failed(job, error, will_retry)
@@ -84,7 +88,10 @@ class ExecutionService:
         duration = self._clock.monotonic() - started
         if settling is not None:
             settling()
-        if not await self._lifecycle.complete(job, encoded, held_until=held_until):
+        recorded = await self._lifecycle.complete(job, encoded, held_until=held_until)
+        if settled is not None:
+            settled()
+        if not recorded:
             return Attempt(recorded=False)
         await self._hooks.succeeded(job, result, duration)
         return Attempt()

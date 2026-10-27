@@ -807,19 +807,29 @@ owned by `pg_database_owner` counts as the database owner's. Postgres runs a tri
 view's function with the privileges of the role reading or writing the row, so a table owned by
 anyone else would let that role act as tinyjobs. Such tables are refused before a row is read, even
 when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
-someone else. With no tables yet, the schema they would be created in is checked the same way. Setup
+someone else. With no tables yet, the schema they would be created in is checked the same way, and
+created only when it does not exist, so a role that owns its schema needs no `CREATE` on the
+database. Setup
 then reads the stored schema version and creates nothing when it matches, so a fleet starting at
 once costs a few catalog reads and one `SELECT` each. Otherwise it takes a transaction-scoped
 advisory lock, waits for it at most five seconds, and checks again under it. A store written by a
-newer release is refused and left alone. From then on every statement names the tables with the
+newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
+an index of the right table, unique where it must be: `CREATE INDEX IF NOT EXISTS` skips a name
+another relation already holds, which would leave claims failing and dedup keys ignored, so setup
+names the missing index and stops instead. From then on every statement names the tables with the
 schema setup found them in, so a table of the same name created later earlier on a `search_path`
 cannot take the jobs, and tinyjobs' own connections run with `search_path` set to `pg_catalog,
 pg_temp`, so no function or operator someone created elsewhere is ever called. The statements that
 run on a caller's connection for `tx=` name every function, type and operator with `pg_catalog`, so
-the caller's `search_path` cannot change them either. Setup also reads the store's identity: a
+the caller's `search_path` cannot change them either. The caller may connect as another role, so
+the first time a connection is used for `tx=`, the ownership check runs again through it, against
+that role, before any row is read; a role the tables' owner does not answer to never writes
+through them. Setup also reads the store's identity: a
 random instance id written into the meta table when the tables are created, the database's oid and,
 when the role may read it, the cluster's system identifier. A copy made with `CREATE DATABASE ...
-TEMPLATE` or a restored dump keeps the instance id but not the other two.
+TEMPLATE` or a restored dump keeps the instance id but not the other two. A `tx=` connection whose
+identity differs makes tinyjobs read its own again on a connection of its own before refusing, so an
+app that rides through a move of the same store, such as a switchover to a replica, follows it.
 
 `id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
 ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
@@ -837,7 +847,8 @@ until it has enough. Each step reads a span of index entries per queue below the
 order, and either finds the highest level with a due job or skips every level the spans covered,
 since they hold each such level's oldest job; over several queues it skips only down to the highest
 of the spans' last entries. The span starts at one entry, doubles up to 128 while steps cross several
-levels, and drops back to one when a step stays inside one level or finds a due one. So the common
+levels, and drops back to one when it finds a due level, or when a span of at least eight entries
+stays inside one level. So the common
 claim reads one entry per queue, delayed jobs spread one per priority are skipped up to 128 per step,
 and a large delayed level costs one index descent instead of a scan.
 Over several queues, each level visits the queues in the order of their oldest due job, so a batch
@@ -913,11 +924,15 @@ minute `idle_in_transaction_session_timeout`, is named `tinyjobs` in `pg_stat_ac
 URL names it, and keeps TCP keepalives on. A connection beyond the minimum closes after five idle
 minutes, and every connection is replaced after half an hour. Deadlocks and serialization
 failures are retried three times with a warning, except inside the caller's transaction, which only
-the caller can retry. Before lending a connection, the pool reads what the server already sent on
-it without a round trip, under a microsecond, so connections a restart or `pg_terminate_backend`
-closed while idle are dropped instead of failing the next statement. A read that still loses its
-connection mid-flight, such as `get`, a listing or the clock, runs once more on a fresh one; writes
-do not, since the server may have applied them. A fork leaves the parent's connections alone: the
+the caller can retry. Before using a pooled connection, tinyjobs reads what the server already sent on
+it without a round trip, under a microsecond, and hands a closed one back to be replaced and takes
+the next at once. So the connections a restart or `pg_terminate_backend` closed while idle cost
+neither an error nor a wait: with eight of them dead, the next three statements took under a
+second together. A read that still loses its connection mid-flight, such as `get`, a listing or the
+clock, runs once more on a fresh one; writes do not, since the server may have applied them, and
+nothing is retried after waiting `pool_timeout` for a connection. Options the backend does not know
+and libpq does not either, such as a misspelled `max_conections=`, are refused when the app is built
+rather than surfacing as a pool that never opens. A fork leaves the parent's connections alone: the
 child opens its own.
 
 ### Where the limits are

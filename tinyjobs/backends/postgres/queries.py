@@ -13,6 +13,8 @@ NOTICE_CHARACTERS = 1000
 
 SPAN_LIMIT = 128
 
+SPAN_KEPT = 8
+
 
 def _qualified(kind: str) -> str:
     return kind if " " in kind or kind == "integer" else f"pg_catalog.{kind}"
@@ -20,12 +22,14 @@ def _qualified(kind: str) -> str:
 
 def trusting(owner: str) -> str:
     return f"""(
-        pg_has_role({owner}, current_user, 'USAGE')
-        OR ({owner} = to_regrole('pg_database_owner') AND pg_has_role(
-            (SELECT datdba FROM pg_database WHERE datname = current_database()),
-            current_user,
-            'USAGE'
-        ))
+        pg_catalog.pg_has_role({owner}, CURRENT_USER, 'USAGE')
+        OR ({owner} OPERATOR(pg_catalog.=) pg_catalog.to_regrole('pg_database_owner')
+            AND pg_catalog.pg_has_role(
+                (SELECT d.datdba FROM pg_catalog.pg_database AS d
+                  WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
+                CURRENT_USER,
+                'USAGE'
+            ))
     )"""
 
 
@@ -122,7 +126,7 @@ class Queries:
                             THEN seen.due ELSE seen.last END::bigint,
                        coalesce(seen.due >= seen.last, seen.last IS NULL),
                        CASE WHEN seen.due >= seen.last OR seen.last IS NULL THEN 1
-                            WHEN seen.top > seen.last OR levels.span = 1
+                            WHEN seen.top > seen.last OR levels.span < {SPAN_KEPT}
                             THEN least(levels.span * 2, {SPAN_LIMIT}) ELSE 1 END
                   FROM levels
                  CROSS JOIN LATERAL ({seen}) AS seen
@@ -441,14 +445,40 @@ class Queries:
             "FROM pg_catalog.pg_control_system()"
         )
 
-        self.located = """
-            SELECT EXISTS (
-                   SELECT FROM pg_catalog.pg_class AS c
+        self.located = f"""
+            SELECT pg_catalog.count(*) AS tables,
+                   pg_catalog.bool_or(c.relname OPERATOR(pg_catalog.=) %(meta)s) AS meta,
+                   COALESCE(pg_catalog.bool_and(
+                       {trusting("c.relowner")} AND {trusting("n.nspowner")}
+                   ), true) AS owned
+              FROM pg_catalog.pg_class AS c
+              JOIN pg_catalog.pg_namespace AS n
+                ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+             WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+               AND c.relname OPERATOR(pg_catalog.=) ANY (%(names)s::pg_catalog.name[])
+        """
+
+        self.misplaced_indexes = """
+            SELECT wanted.name
+              FROM ROWS FROM (
+                   pg_catalog.unnest(%(indexes)s::pg_catalog.text[]),
+                   pg_catalog.unnest(%(tables)s::pg_catalog.text[]),
+                   pg_catalog.unnest(%(uniques)s::pg_catalog.bool[])
+              ) AS wanted (name, owner, is_unique)
+             WHERE NOT EXISTS (
+                   SELECT FROM pg_catalog.pg_index AS i
+                     JOIN pg_catalog.pg_class AS ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid
+                     JOIN pg_catalog.pg_class AS tc ON tc.oid OPERATOR(pg_catalog.=) i.indrelid
                      JOIN pg_catalog.pg_namespace AS n
-                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+                       ON n.oid OPERATOR(pg_catalog.=) ic.relnamespace
                     WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
-                      AND c.relname OPERATOR(pg_catalog.=) %(table)s
-            ) AS present
+                      AND tc.relnamespace OPERATOR(pg_catalog.=) n.oid
+                      AND ic.relname OPERATOR(pg_catalog.=) wanted.name
+                      AND tc.relname OPERATOR(pg_catalog.=) wanted.owner
+                      AND i.indisunique OPERATOR(pg_catalog.=) wanted.is_unique
+                      AND i.indisvalid
+             )
+             ORDER BY wanted.name
         """
 
 

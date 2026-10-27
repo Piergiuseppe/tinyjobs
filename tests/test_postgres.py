@@ -308,6 +308,17 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             touched = plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
             self.assertLess(touched, 80)
 
+    async def claim_touches(self, queues: list[str]) -> int:
+        query, parameters = self.backend._claiming(self.clock.now(), queues, "explain", 1, 60.0)
+        async with self.backend._connection() as connection:
+            async with connection.transaction(force_rollback=True):
+                await connection.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+                cursor = await connection.execute(
+                    f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}", parameters
+                )
+                [[plan]] = (await cursor.fetchone()).values()
+        return plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
+
     async def test_due_jobs_are_claimed_past_many_delayed_higher_priorities(self):
         later = self.clock.now() + 3600
         delayed = [
@@ -318,20 +329,22 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await self.backend.enqueue_many(delayed)
         due = [await self.enqueue(priority=0, queue=q) for q in ("a", "b")]
         for queues in (["a"], ["a", "b"]):
-            query, parameters = self.backend._claiming(
-                self.clock.now(), queues, "explain", 1, 60.0
-            )
-            async with self.backend._connection() as connection:
-                async with connection.transaction(force_rollback=True):
-                    await connection.execute("SET LOCAL plan_cache_mode = force_custom_plan")
-                    cursor = await connection.execute(
-                        f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}", parameters
-                    )
-                    [[plan]] = (await cursor.fetchone()).values()
-            touched = plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
-            self.assertLess(touched, 2000)
+            self.assertLess(await self.claim_touches(queues), 2000)
         claimed = await self.claim(limit=10, queues=("a", "b"))
         self.assertCountEqual([job.id for job in claimed], [job.id for job in due])
+
+    async def test_delayed_levels_holding_a_few_jobs_each_are_skipped_in_spans(self):
+        later = self.clock.now() + 3600
+        delayed = [
+            make_job(priority=level, run_at=later + copy)
+            for level in range(1, 3001)
+            for copy in range(3)
+        ]
+        await self.backend.enqueue_many(delayed)
+        due = await self.enqueue(priority=0)
+        self.assertLess(await self.claim_touches(["default"]), 1000)
+        [claimed] = await self.claim(limit=10)
+        self.assertEqual(claimed.id, due.id)
 
     async def test_heartbeats_rewrite_rows_in_place(self):
         [(version,)] = await sql("SHOW server_version_num")
@@ -744,11 +757,11 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_connections_the_server_closed_while_idle_are_never_handed_out(self):
         name = f"tinyjobs-{uuid.uuid4().hex[:8]}"
         backend = PostgresBackend.from_url(
-            POSTGRES_URL, prefix=self.prefix, application_name=name, min_connections=3
+            POSTGRES_URL, prefix=self.prefix, application_name=name, min_connections=8
         )
         self.addAsyncCleanup(backend.close)
         await backend.setup()
-        await asyncio.gather(*(backend.get("missing") for _ in range(3)))
+        await asyncio.gather(*(backend.get("missing") for _ in range(8)))
         live = "SELECT count(*) FROM pg_stat_activity WHERE application_name = %(name)s"
         await sql(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -758,7 +771,9 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         while (await sql(live, {"name": name}))[0][0]:
             await asyncio.sleep(0.01)
         await asyncio.sleep(0.05)
+        started = time.monotonic()
         stored = [await backend.enqueue(make_job()) for _ in range(3)]
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual(len({job.id for job in stored}), 3)
 
     async def test_a_read_cut_off_by_a_lost_connection_is_read_again(self):
@@ -784,6 +799,86 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         failure = psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
         with self.assertRaises(psycopg.errors.QueryCanceled):
             await backend.get(job.id)
+
+    async def test_a_read_waits_for_the_pool_only_once(self):
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, max_connections=1, pool_timeout=0.3
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        async with backend._connection():
+            started = time.monotonic()
+            with self.assertRaises(PoolTimeout):
+                await backend.get("missing")
+            self.assertLess(time.monotonic() - started, 0.55)
+
+    async def test_a_misspelled_connection_option_is_refused_at_once(self):
+        with self.assertRaisesRegex(ConfigurationError, "max_conections"):
+            PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, max_conections=4)
+        PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, connect_timeout=5, prepare_threshold=None
+        )
+
+    async def test_a_relation_squatting_an_index_name_stops_setup(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        await sql(f'CREATE TABLE "{prefix}_jobs_dedup" (id int)')
+        self.addAsyncCleanup(sql, f'DROP TABLE IF EXISTS "{prefix}_jobs_dedup"')
+        squatted = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(squatted.close)
+        with self.assertRaisesRegex(ConfigurationError, f"{prefix}_jobs_dedup"):
+            await squatted.setup()
+
+    async def test_a_schema_the_role_owns_is_used_without_create_on_the_database(self):
+        role = await self.role()
+        schema = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{role}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        backend = PostgresBackend.from_url(
+            url_for(user=role, password="tinyjobs"), prefix=self.prefix, schema=schema
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        stored = await backend.enqueue(make_job())
+        self.assertEqual((await backend.get(stored.id)).id, stored.id)
+
+    async def test_tx_never_writes_through_tables_the_callers_role_does_not_trust(self):
+        owner = await self.role()
+        name = await self.database_owned_by(owner)
+        backend = PostgresBackend.from_url(
+            url_for(dbname=name, user=owner, password="tinyjobs"),
+            prefix=self.prefix,
+            schema="theirs",
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        async with await psycopg.AsyncConnection.connect(url_for(dbname=name)) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                await backend.aenqueue_in(connection, [make_job()])
+        with psycopg.Connection.connect(url_for(dbname=name)) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                backend.enqueue_in(connection, [make_job()])
+
+    async def test_tx_follows_the_store_when_its_cluster_changes_under_a_running_app(self):
+        instance, database, _ = self.backend._identity
+        self.backend._identity = (instance, "stale", "stale")
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            [joined] = await self.backend.aenqueue_in(connection, [make_job()])
+            await connection.commit()
+        self.assertEqual(self.backend._identity[:2], (instance, database))
+        self.backend._identity = (instance, "stale", "stale")
+        self.backend._joined.clear()
+        with psycopg.Connection.connect(POSTGRES_URL) as connection:
+            [synced] = self.backend.enqueue_in(connection, [make_job()])
+            connection.commit()
+        self.assertEqual(self.backend._identity[:2], (instance, database))
+        self.backend._identity = ("another", database, None)
+        self.backend._joined.clear()
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "does not reach"):
+                await self.backend.aenqueue_in(connection, [make_job()])
+        for job in (joined, synced):
+            self.assertIsNotNone(await self.backend.get(job.id))
 
     async def test_jobs_sharing_a_key_in_one_call_keep_the_first_one_given(self):
         given = [make_job(id="job-b", dedup_key="k"), make_job(id="job-a", dedup_key="k")]
