@@ -1,0 +1,36 @@
+:root {
+  --md-primary-fg-color: #14532d;
+  --md-primary-fg-color--light: #1f7a44;
+  --md-primary-fg-color--dark: #0d3b20;
+  --md-accent-fg-color: #16a34a;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #0f2a1c;
+  --md-primary-fg-color--light: #163d29;
+  --md-primary-fg-color--dark: #0a1d13;
+  --md-accent-fg-color: #4ade80;
+  --md-typeset-a-color: #4ade80;
+}
+
+.md-header__title {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset h2 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset .lead {
+  font-size: 1.25em;
+  line-height: 1.5;
+  color: var(--md-default-fg-color--light);
+}
