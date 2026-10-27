@@ -16,24 +16,53 @@ hooks:
 
 theme:
   name: material
+  icon:
+    logo: material/clock-fast
+    repo: fontawesome/brands/github
+  favicon: assets/favicon.svg
+  font:
+    text: Inter
+    code: JetBrains Mono
   features:
     - content.code.copy
+    - navigation.footer
     - navigation.sections
+    - navigation.tabs
     - navigation.top
     - search.highlight
+    - search.suggest
+    - toc.follow
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Light mode
 
+extra_css:
+  - stylesheets/extra.css
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Piergiuseppe/tinyjobs
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/tinyjobs/
+
+copyright: MIT licensed
+
 markdown_extensions:
+  - attr_list
   - admonition
   - tables
   - toc:
