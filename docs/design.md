@@ -51,11 +51,11 @@ Where we *can* help:
   submitting the same job three times.
 - **Attempt visibility.** Every attempt is recorded as an `Execution` row, so a duplicate run is
   visible after the fact rather than silent.
-- **Transactional enqueue, planned.** With the SQLite backend, `enqueue` will be able to join your
-  application's own transaction: if the transaction rolls back, the job is never created. This removes the classic
-  dual-write bug where a job starts running against a row that was never committed. It is a genuine
-  advantage of a database-backed queue over a broker-backed one; see
-  [Transactional enqueue](#transactional-enqueue) for the API and its one hard constraint.
+- **Transactional enqueue.** On Postgres, `enqueue` joins your application's own transaction: if
+  the transaction rolls back, the job is never created. This removes the classic dual-write bug where
+  a job starts running against a row that was never committed. It is a genuine advantage of a
+  database-backed queue over a broker-backed one; see [Transactional enqueue](#transactional-enqueue)
+  for the API, and for why SQLite does not have it yet.
 
 ---
 
@@ -548,8 +548,8 @@ app = TinyJobs("redis://localhost/0")   # after
 
 The URL scheme selects the backend. The core package never imports, references or knows the names of
 optional backends; it looks up the scheme in the entry point group and raises a helpful error
-(`pip install tinyjobs-postgres`) if nothing is registered for it. Bundled: `sqlite://`, `memory://`,
-and `redis://` behind the `redis` extra, imported only when a `redis://` URL is used.
+if nothing is registered for it. Bundled: `sqlite://`, `memory://`, `redis://` behind the `redis`
+extra and `postgres://` behind the `postgres` extra, each client imported only when its URL is used.
 
 ---
 
@@ -772,11 +772,112 @@ apps on two servers whose times differ by more than a second raises instead of m
 - **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
   pop would save the idle round trips but cannot express priorities across queues.
 - **No transactional enqueue, ever.** Redis shares no transaction with your database, so the
-  planned SQLite feature has no Redis counterpart.
+  Postgres feature has no Redis counterpart.
 - **A bounded pool that waits.** redis-py 8 caps its pool at 100 and raises `MaxConnectionsError` the
   moment a caller finds it full, which turned half of 200 concurrent `aenqueue()` calls into errors.
   The backend uses a blocking pool of the same size instead, so 400 concurrent requests to a FastAPI
   endpoint all succeeded, and a caller only fails after `pool_timeout`.
+
+---
+
+## The Postgres backend
+
+Bundled like Redis, behind the `postgres` extra (`psycopg` and `psycopg-pool`), and imported only
+when a `postgres://` or `postgresql://` URL is used. It runs on psycopg 3's async API with an
+`AsyncConnectionPool`, so it is `loop_bound` and the app routes every call onto its own loop.
+
+### Tables
+
+Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
+`<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
+`setup` reads the stored schema version first and creates nothing when it matches, so a fleet
+starting at once costs one `SELECT` each. Otherwise it takes a transaction-scoped advisory lock,
+waits for it at most five seconds, and checks again under it. A store written by a newer release is
+refused and left alone.
+
+`id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
+ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
+of 85 and an autovacuum tuned to run often: a job row is updated several times in its life, and the
+free space lets most of those updates stay on the same page. There is no index on the lease, so a
+heartbeat touches no indexed column and is a HOT update; the reaper scans the running jobs instead,
+which are few.
+
+### The claim
+
+A claim is one statement. A recursive query walks the priorities present in the wanted queues from
+the highest down, using the partial index on `(queue, priority DESC, run_at)` over queued jobs, and
+for each level takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first, until it has enough.
+The same statement marks them running, stamps the lease and opens their executions. Workers never
+wait on each other's rows. Walking levels rather than sorting matters when a backlog is not due: with
+50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER BY priority DESC, run_at`
+read 205 buffers per claim and the level walk 50.
+
+### Time
+
+As on Redis, every machine follows the server's clock: the backend reads `clock_timestamp()` on
+setup, every thirty seconds and after a connection error, and the statements that decide by time
+compare against the earlier of the caller's `now` and `statement_timestamp()`. A claim or a heartbeat
+stamps the later of the two lease ends. So a host on a stale reading never reaps a live lease and
+never writes one that ends too soon.
+
+### Waking workers
+
+Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
+`pg_notify` on a channel named after the prefix with the queue as payload, at most once per queue
+every 50 ms; a burst sends one notification and a trailing one. Each worker process holds one extra
+connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
+unless it claimed since. A lost listening connection is reopened within a second, and every reopen
+wakes the workers once, since notifications sent meanwhile are gone. Polling stays as the fallback, so
+`notify=False` or a dropped notification costs latency, never a job.
+
+### Joining the caller's transaction
+
+`tx=` takes the caller's psycopg connection or cursor, sync or async, and writes the job on it:
+
+```python
+with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+    connection.execute("INSERT INTO orders (id) VALUES (%s)", (42,))
+    send_receipt.with_options(tx=connection).enqueue(42)
+```
+
+The insert is written once as a generator of `(statement, parameters)` steps, driven by the pool's
+async connections, by the caller's async connection on the caller's loop, and by the caller's sync
+connection in the caller's thread. A sync enqueue therefore never crosses to the backend's loop with
+a connection that belongs to another thread. The notification goes inside the same transaction, and
+Postgres delivers it only at commit, so a worker never wakes for a job it cannot see yet; a rollback
+takes both. The first use of a connection checks that the jobs table is visible on it and raises
+`ConfigurationError` when it is not, which catches a connection to the wrong database.
+
+Dedup keys work inside the transaction as outside: a second enqueue with a held key returns the
+holder, including one written earlier in the same transaction. A holder written by another
+transaction that has not committed makes the insert wait for it, as any unique index does. Eager
+mode refuses `tx=`, because it would run the job before the transaction could commit, and so does
+every backend that cannot join one.
+
+In Django, `OPTIONS = {"url": ..., "database": "default"}` enqueues through that database's own
+connection, so a task enqueued inside `transaction.atomic()` is written in its transaction, and a
+rolled-back savepoint takes its tasks with it. `aenqueue` runs in the thread that holds the
+transaction, through `sync_to_async(thread_sensitive=True)`.
+
+### Connections
+
+Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_connections=`), plus the
+listening one. Every connection is set to read committed, a 30 second `statement_timeout` and a one
+minute `idle_in_transaction_session_timeout`, is named `tinyjobs` in `pg_stat_activity` unless the
+URL names it, and keeps TCP keepalives on. A connection beyond the minimum closes after five idle
+minutes, and every connection is replaced after half an hour. Deadlocks and serialization failures are retried three times with a warning. A fork leaves the
+parent's connections alone: the child opens its own.
+
+### Where the limits are
+
+- **Behind PgBouncer, session pooling only.** Each connection is configured once when opened, and
+  the listener needs a session of its own. Transaction pooling would lose both.
+- **A held snapshot stops the cleanup.** A transaction left open anywhere on the server, or a
+  replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
+  jobs table bloats until it ends.
+- **`statement_timeout` bounds every call.** A purge or a claim that needs longer than 30 seconds
+  fails; raise it with `statement_timeout=` or turn it off with `None`.
+- **Supported versions are the ones the community supports**, 14 to 18 today, each tested.
 
 ---
 
@@ -1407,23 +1508,29 @@ reaching for it.
 The dual-write bug is old and common: you commit a row, enqueue a job about it, and the enqueue
 succeeds while the commit rolls back, or the worker claims the job a millisecond before the commit
 lands and finds nothing there. A broker-backed queue cannot fix this, because the broker and your
-database have no transaction in common. A database-backed queue can. This is planned, not in 0.7
-yet; the shape it will take:
+database have no transaction in common. A database-backed queue can, and on Postgres tinyjobs does:
 
 ```python
-with app.transaction() as tx:
-    tx.execute("INSERT INTO documents (id, name) VALUES (?, ?)", (123, "contract.pdf"))
-    generate_pdf.enqueue(123, tx=tx)
+with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+    connection.execute("INSERT INTO documents (id, name) VALUES (%s, %s)", (123, "contract.pdf"))
+    generate_pdf.with_options(tx=connection).enqueue(123)
 # both committed, or neither
 ```
 
-tinyjobs owns the connection and hands it to you, rather than borrowing one of yours. That is what
-lets it guarantee the settings this whole design rests on (WAL, `busy_timeout`, `BEGIN IMMEDIATE`)
-instead of inheriting whatever an ORM happened to configure. Passing `tx=` to a backend whose
-`Capabilities.transactional_enqueue` is `False` will raise at enqueue time, not silently degrade;
-until the feature lands every backend reports `False`.
+`tx=` goes on `with_options`, `app.send` and `app.asend`, and takes the connection or a cursor the
+caller already has, sync or async, which is the one an ORM or a request handler holds. Borrowing it
+rather than handing one out is what makes the job part of a transaction tinyjobs did not start; the
+settings the claim relies on live on tinyjobs's own pool, and an insert needs none of them. How the
+Postgres backend joins it is in
+[Joining the caller's transaction](#joining-the-callers-transaction). `tx=` on a backend whose
+`Capabilities.transactional_enqueue` is `False` raises `UnsupportedCapabilityError` at enqueue time,
+and so does eager mode.
 
-Until then, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
+SQLite does not have it yet. The jobs table would have to live in the same file as your data:
+SQLite documents that transactions spanning `ATTACH`ed databases are not atomic when `journal_mode`
+is WAL, and WAL is not negotiable here, since it is what lets readers work while a worker writes.
+
+Until it does, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
 made while the same context holds an open `backend.transaction()` on the same database file is
 refused at once: it would run on another connection and wait for the write lock that transaction
 holds. Make the call after the block, or from `transaction.on_commit` in Django. An asyncio task
@@ -1435,20 +1542,6 @@ there the enqueue waits for the lock and fails after `busy_timeout`. Inside the 
 are refused because they would end the transaction early, and a
 transaction SQLite ends by itself, as `INSERT OR ROLLBACK` does, makes the block raise when it exits,
 since every statement after that point committed on its own.
-
-**The constraint, stated plainly: the `jobs` table must live in the same SQLite file as your data.**
-There is no way around it. SQLite documents that transactions spanning `ATTACH`ed databases are not
-atomic when `journal_mode` is WAL, and WAL is not negotiable here. It is what lets readers work while
-a worker writes. So transactional enqueue means pointing tinyjobs at your application database
-(`TinyJobs("sqlite:///app.db")`) and letting its tables sit alongside yours. If you would rather keep
-the queue in a file of its own, you keep that separation and give up this one feature; everything else
-is unaffected.
-
-Joining a connection your ORM already owns, via something like `app.using(django_connection)`, is the
-natural next step and is deliberately **not** in v1. Designing an ORM integration before there is a
-real ORM to test it against produces an API shaped by imagination, and v1.0 freezes it. The hook it
-would attach to is `transaction()`, which the SQLite backend already has and the protocol will gain
-with transactional enqueue.
 
 ### Task discovery
 
@@ -1658,16 +1751,16 @@ Result storage, `memory://` backend and the conformance suite, eager and drain t
 `tinyjobs stats` / `check`.
 
 **Next**
-Transactional enqueue (`app.transaction()`, `enqueue(tx=)`), the process executor and
-`isolated=True`, a result size cap and TTL, structured log fields.
+Transactional enqueue on SQLite, the process executor and `isolated=True`, a result size cap and
+TTL, structured log fields.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
 protocol is a compatibility promise.
 
 **Beyond**
-`app.using(conn)` to join an ORM's own transaction, designed against a real Django or SQLAlchemy
-application rather than against a guess. A Postgres backend. `--processes N`, if running one worker per core under a supervisor turns out to be the
+Joining a SQLAlchemy session's transaction, designed against a real application rather than against a
+guess. `--processes N`, if running one worker per core under a supervisor turns out to be the
 friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
 file). Chains and groups only if usage demands them. They are where task queues usually go to become
 frameworks.

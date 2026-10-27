@@ -13,7 +13,7 @@ That's the whole setup. No broker, no result backend, no daemon. The queue is a 
 Celery is the right tool for a lot of systems, but it asks for a Redis or RabbitMQ instance before it
 will run a single job. This is for the projects that never needed that: a Django app that sends
 emails, a scraper with a nightly refresh, a CLI that offloads slow work. When you outgrow SQLite you
-switch the URL to Redis and your task code doesn't change.
+switch the URL to Postgres or Redis and your task code doesn't change.
 
 Requires Python 3.12 or newer.
 
@@ -343,7 +343,8 @@ python manage.py tinyjobs worker
 
 `manage.py tinyjobs` takes every `tinyjobs` command, such as `worker`, `jobs`, `stats` and `check`,
 against the configured backend, with `--backend` to pick a `TASKS` alias other than `default`.
-`OPTIONS` takes the arguments of `TinyJobs(...)`: a `redis://` URL, `"eager": True` for tests.
+`OPTIONS` takes the arguments of `TinyJobs(...)`: a `postgresql://` or `redis://` URL, `"eager": True`
+for tests.
 Queues, priorities, `run_after`, async tasks, `takes_context` and `get_result()` all work, and the
 `task_enqueued`, `task_started` and `task_finished` signals fire. A result shows its `run_after`
 until the job is first picked up.
@@ -351,8 +352,12 @@ until the job is first picked up.
 Tasks are found by their import path, and only inside your `INSTALLED_APPS`: a job can never make
 the worker import code your project does not already trust, and enqueueing a task defined elsewhere
 raises `InvalidTask`. Django has no retries, so a failed task
-stays failed. Enqueue from inside a transaction with `transaction.on_commit`, or the worker may run
-before the row it needs is committed.
+stays failed.
+
+On Postgres, `"database": "default"` in `OPTIONS` makes every enqueue join that database's
+transaction, so a task enqueued inside `transaction.atomic()` exists only if the block commits. On
+SQLite and Redis, enqueue from `transaction.on_commit`, or the worker may run before the row it needs
+is committed.
 
 ## Testing your tasks
 
@@ -395,7 +400,8 @@ and drain. A failing task is recorded on the job, not raised, as it would be in 
 | Crash recovery | leases plus heartbeats, so a killed worker's jobs come back |
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
 | Attempt history | every attempt is a row, with its traceback and timings |
-| Multi-worker | multiple processes over one SQLite file, or machines over one Redis |
+| Multi-worker | multiple processes over one SQLite file, or machines over one Postgres or Redis |
+| Transactional enqueue | on Postgres, a job commits or rolls back with your own transaction |
 | Async throughout | the backend protocol is `async`, with a sync facade for ordinary code |
 | Cancellation | before a job starts; cooperative after |
 | Retention | old terminal jobs are pruned so the database stops growing |
@@ -444,12 +450,12 @@ built-in exponential backoff. arq is asyncio-only and in maintenance mode, with 
 [Celery](https://docs.celeryq.dev) and [Dramatiq](https://dramatiq.io) need a broker; Celery is
 still the answer for RabbitMQ routing, workflows and large fleets.
 
-On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the better fit today: async,
-with cron and retries, and jobs that can be deferred inside your own transaction. In Django,
+On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the closest: async, with cron,
+retries, `LISTEN`/`NOTIFY` and jobs deferred inside your own transaction, but Postgres only. tinyjobs
+does the same on Postgres and keeps SQLite and Redis behind one API. In Django,
 [django-tasks-db](https://github.com/RealOrangeOne/django-tasks-db) keeps `django.tasks` tasks in
 your database through the ORM, so an enqueue can share your transaction, and
 [django-q2](https://github.com/GDay/django-q2) can use the ORM as its broker and has cron schedules.
-tinyjobs keeps the queue out of your database, so it cannot share a transaction yet.
 
 As of October 2026, from each project's documentation.
 
@@ -512,13 +518,51 @@ its default snapshots lost the whole queue; with `appendonly yes` the same crash
 the jobs that were running came back once their leases expired. A restart, graceful or not, is
 otherwise harmless: workers log the outage, back off, and carry on.
 
-Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like on SQLite, and
-transactional enqueue, once it lands, will be SQLite only. All keys share one hash slot (`{prefix}`), so it runs on a
+Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like on SQLite, and a job
+cannot join your database's transaction. All keys share one hash slot (`{prefix}`), so it runs on a
 single Redis or a primary with replicas, not spread across a cluster.
 
 Each process holds at most 100 connections (`max_connections=`). A burst beyond that waits for a free
 one rather than failing, and gives up with redis-py's `ConnectionError` after `pool_timeout=` seconds
 (20).
+
+## Postgres
+
+```bash
+pip install 'tinyjobs[postgres]'
+```
+
+```python
+app = TinyJobs("postgresql://app@localhost/shop")
+app = TinyJobs("postgresql://app@localhost/shop", prefix="billing", schema="jobs")
+```
+
+The same tasks, workers, cron, hooks, `stats` and `check` again. The tables (`tinyjobs_jobs`,
+`tinyjobs_executions`, `tinyjobs_schedules`, `tinyjobs_meta`) are created on first connect, and any
+number of processes can start at once. Every machine keeps the server's time, as on Redis. An idle
+worker is woken by `LISTEN`/`NOTIFY` and starts a new job in a few milliseconds instead of at its next
+poll; `notify=False` turns that off.
+
+**Enqueue inside your own transaction.** Pass your psycopg connection or cursor, sync or async, as
+`tx`. The job commits or rolls back with everything else, and workers only hear of it at commit:
+
+```python
+with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+    connection.execute("INSERT INTO orders (id) VALUES (%s)", (42,))
+    send_receipt.with_options(tx=connection).enqueue(42)
+```
+
+`app.send(name, tx=connection)` and the async calls take it too. The connection must reach the
+database tinyjobs uses, or the enqueue raises `ConfigurationError`. In Django, add
+`"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
+
+A worker that cannot record a job's outcome because the server went away keeps trying for as long as
+its lease lasts, so a restart or a failover shorter than that does not run finished jobs again.
+
+Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every statement
+times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
+`pg_stat_activity`. Behind PgBouncer use session pooling. A transaction left open for hours anywhere
+on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18 are tested.
 
 ## Other backends
 
@@ -527,13 +571,13 @@ The core package doesn't know about third-party backends. It looks an unknown UR
 
 ```toml
 [project.entry-points."tinyjobs.backends"]
-postgres = "tinyjobs_postgres:PostgresBackend.from_url"
+mysql = "tinyjobs_mysql:MySQLBackend.from_url"
 ```
 
 Backends declare what they support (`priority`, `delayed`, `dedup`, ...) and asking for something
 unsupported raises when you enqueue rather than failing quietly later. The protocol is `async`, and
-`tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite and
-Redis run. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130 lines if
+`tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite,
+Postgres and Redis run. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130 lines if
 you want a template.
 
 ## Measured
@@ -577,6 +621,14 @@ Redis was measured with the same kind of harness, on a laptop with Redis 7.4 in 
 over four workers of eight slots in 2.1 seconds, against 4 seconds on SQLite, each run exactly once.
 Twelve `SIGKILL`s on workers during 4,000 jobs left none lost; 43 came back through an expired lease,
 and 2 applied their side effect twice. Claiming stays at 0.7 ms with 200,000 jobs queued.
+
+Postgres 17 was measured the same way on the same laptop: 20,000 jobs over four workers of eight slots
+in 2.1 seconds, each run exactly once, and 6,850 enqueues a second from 24 threads. An idle worker
+polling every five seconds started a new job 6.6 ms after it was sent (p95 8.4 ms). Claiming stays at
+0.23 ms with 200,000 jobs queued. Twelve `SIGKILL`s on workers during 4,000 jobs left none lost and
+none run twice; 88 came back through an expired lease. Postgres stopped three times during 6,000
+jobs, once cleanly and twice with `-m immediate`, down three seconds each: the workers carried on,
+and nothing was lost or ran twice.
 
 Two machines sharing one Redis were measured too: a laptop and a Linux VPS 52 ms apart, two workers
 of eight slots on each, a `SIGKILL` on one of them every 25 to 30 seconds, 3,000 jobs a run. With the
@@ -631,15 +683,16 @@ v0.7.2. Working and measured, but young. What's in:
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
 - a Redis backend, `pip install 'tinyjobs[redis]'`
+- a Postgres backend, `pip install 'tinyjobs[postgres]'`, with `LISTEN`/`NOTIFY` wake-ups
+- transactional enqueue on Postgres, also through Django's `transaction.atomic()`
 - the backend plugin seam and its contract suite
 - `app.lifespan()` and `app.serve()` for FastAPI and Starlette, with an embedded worker
 - a `django.tasks` backend and `manage.py tinyjobs`
 
 What's not in yet:
 
-- transactional enqueue, where a job is only created if your own transaction commits
+- transactional enqueue on SQLite
 - a process executor for CPU-bound work
-- a Postgres backend
 
 Upgrading from 0.6: stop every 0.6 worker before starting 0.7. The first 0.7 process migrates the
 store, and from then on a 0.6 process refuses to start against it. 0.7 also needs Python 3.12 or
@@ -673,7 +726,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1025 tests, no test dependencies. The one that matters most is
+1225 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 
@@ -682,13 +735,16 @@ tinyjobs in turn, during a send, an enqueue, a start, a close, a drain, a transa
 after each one checks that no lock is held, no transaction is open and no job is stuck running. The
 other fires a real `SIGALRM` every 20 µs to 1.5 ms while calls run.
 
-The Redis tests skip unless they have a server and the client library, and the FastAPI ones
-unless `fastapi` and `httpx` are installed:
+The Postgres and Redis tests skip unless they have a server and the client library, and the FastAPI
+ones unless `fastapi` and `httpx` are installed:
 
 ```bash
 docker run -d -p 6379:6379 redis:7.4-alpine
-pip install -e '.[redis]' fastapi httpx
-TINYJOBS_REDIS_URL=redis://localhost:6379/0 python -m unittest discover -s tests -t .
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=tinyjobs postgres:17-alpine
+pip install -e '.[redis,postgres]' fastapi httpx
+export TINYJOBS_REDIS_URL=redis://localhost:6379/0
+export TINYJOBS_POSTGRES_URL=postgresql://postgres:tinyjobs@localhost:5432/postgres
+python -m unittest discover -s tests -t .
 ```
 
 ## License
