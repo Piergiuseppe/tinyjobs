@@ -616,7 +616,7 @@ jobs per second was chosen as a comfortable rate to hold for ten hours, not as a
 
 ## Status
 
-v0.7.2. Working and measured, but young. What's in:
+v0.7.3. Working and measured, but young. What's in:
 
 - task registry, `enqueue`, `app.send`
 - SQLite backend, atomic claim, leases, reaper

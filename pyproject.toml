@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tinyjobs"
-version = "0.7.2"
+version = "0.7.3"
 description = "Background jobs and cron for Python, on SQLite, with zero dependencies"
 readme = "README.md"
 requires-python = ">=3.12"
