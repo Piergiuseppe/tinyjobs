@@ -46,12 +46,14 @@ class Tables:
             """,
             f"""
             CREATE TABLE IF NOT EXISTS {jobs} (
-                id               text PRIMARY KEY,
+                id               text COLLATE "C" PRIMARY KEY,
                 task             text NOT NULL,
                 payload          bytea NOT NULL,
                 codec            text NOT NULL,
-                queue            text NOT NULL DEFAULT 'default',
-                status           text NOT NULL,
+                queue            text COLLATE "C" NOT NULL DEFAULT 'default',
+                status           text COLLATE "C" NOT NULL CHECK (
+                                     status IN ('queued', 'running', 'success', 'failed', 'cancelled')
+                                 ),
                 priority         integer NOT NULL DEFAULT 0,
                 attempts         integer NOT NULL DEFAULT 0,
                 max_attempts     integer NOT NULL DEFAULT 1,
@@ -62,20 +64,22 @@ class Tables:
                 finished_at      double precision,
                 lease_expires_at double precision,
                 worker_id        text,
-                dedup_key        text,
+                dedup_key        text COLLATE "C",
                 result           bytea,
                 last_error       text
+            ) WITH (
+                fillfactor = 85,
+                autovacuum_vacuum_scale_factor = 0.01,
+                autovacuum_vacuum_threshold = 1000,
+                autovacuum_vacuum_insert_scale_factor = 0.05,
+                autovacuum_analyze_scale_factor = 0.02,
+                autovacuum_vacuum_cost_delay = 1
             )
             """,
             f"""
             CREATE INDEX IF NOT EXISTS {self.index("jobs_claim")}
                 ON {jobs} (queue, priority DESC, run_at ASC)
                 WHERE status = 'queued'
-            """,
-            f"""
-            CREATE INDEX IF NOT EXISTS {self.index("jobs_lease")}
-                ON {jobs} (lease_expires_at)
-                WHERE status = 'running'
             """,
             f"""
             CREATE INDEX IF NOT EXISTS {self.index("jobs_by_status")}
@@ -98,7 +102,7 @@ class Tables:
             f"""
             CREATE TABLE IF NOT EXISTS {executions} (
                 id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                job_id      text NOT NULL REFERENCES {jobs} (id) ON DELETE CASCADE,
+                job_id      text COLLATE "C" NOT NULL REFERENCES {jobs} (id) ON DELETE CASCADE,
                 attempt     integer NOT NULL,
                 claim       integer NOT NULL,
                 status      text NOT NULL,
@@ -107,7 +111,7 @@ class Tables:
                 finished_at double precision,
                 error_type  text,
                 traceback   text
-            )
+            ) WITH (fillfactor = 90)
             """,
             f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}

@@ -3,26 +3,29 @@ from __future__ import annotations
 from .records import JOB_COLUMNS, JOB_TYPES, job_columns
 from .schema import Tables
 
-SERVER = "extract(epoch FROM clock_timestamp())::double precision"
+READING = "SELECT extract(epoch FROM clock_timestamp())::double precision AS now"
 
-HORIZON = f"CASE WHEN %(following)s THEN least(%(now)s, {SERVER}) ELSE %(now)s END"
+SERVER = "extract(epoch FROM statement_timestamp())::double precision"
 
-LEASE_END = (
-    f"CASE WHEN %(following)s THEN greatest(%(lease)s, {SERVER} + %(seconds)s) "
-    f"ELSE %(lease)s END"
-)
+NOW = "%(now)s::double precision"
 
 
 class Queries:
-    def __init__(self, tables: Tables) -> None:
+    def __init__(self, tables: Tables, following: bool) -> None:
         jobs, executions = tables.jobs, tables.executions
         schedules, meta = tables.schedules, tables.meta
         columns = job_columns()
+        horizon = f"least({NOW}, {SERVER})" if following else NOW
+        lease_end = (
+            f"greatest(%(lease)s::double precision, {SERVER} + %(seconds)s::double precision)"
+            if following
+            else "%(lease)s::double precision"
+        )
         arrays = ", ".join(
             f"%({column})s::{kind}[]" for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
         )
 
-        self.server_time = f"SELECT {SERVER} AS now"
+        self.server_time = READING
 
         self.insert = f"""
             WITH incoming AS (
@@ -33,14 +36,9 @@ class Queries:
                 INSERT INTO {jobs} ({columns})
                 SELECT {columns} FROM incoming ORDER BY position
                 ON CONFLICT DO NOTHING
-                RETURNING id, queue, run_at
-            ),
-            woken AS (
-                SELECT count(pg_notify(%(channel)s, queue)) AS sent
-                  FROM (SELECT DISTINCT queue FROM inserted
-                         WHERE %(notify)s AND run_at <= %(now)s) AS due
+                RETURNING id, queue, run_at <= {horizon} AS due
             )
-            SELECT inserted.id FROM inserted, woken
+            SELECT id, queue, due FROM inserted
         """
 
         self.by_ids = f"SELECT {columns} FROM {jobs} WHERE id = ANY(%(ids)s::text[])"
@@ -51,18 +49,48 @@ class Queries:
         """
 
         self.claim = f"""
-            WITH picked AS (
-                SELECT candidate.id, candidate.priority, candidate.run_at
+            WITH RECURSIVE levels (priority) AS (
+                SELECT max(top.priority)
                   FROM unnest(%(queues)s::text[]) AS wanted (name)
                  CROSS JOIN LATERAL (
-                       SELECT id, priority, run_at FROM {jobs}
+                       SELECT priority FROM {jobs}
                         WHERE status = 'queued' AND queue = wanted.name
-                          AND run_at <= %(now)s
-                        ORDER BY priority DESC, run_at ASC
+                        ORDER BY priority DESC
+                        LIMIT 1
+                 ) AS top
+                UNION ALL
+                SELECT (
+                       SELECT max(lower.priority)
+                         FROM unnest(%(queues)s::text[]) AS wanted (name)
+                        CROSS JOIN LATERAL (
+                              SELECT priority FROM {jobs}
+                               WHERE status = 'queued' AND queue = wanted.name
+                                 AND priority < levels.priority
+                               ORDER BY priority DESC
+                               LIMIT 1
+                        ) AS lower
+                  )
+                  FROM levels
+                 WHERE levels.priority IS NOT NULL
+            ),
+            picked AS (
+                SELECT due.id
+                  FROM levels
+                 CROSS JOIN LATERAL (
+                       SELECT candidate.id, candidate.run_at
+                         FROM unnest(%(queues)s::text[]) AS wanted (name)
+                        CROSS JOIN LATERAL (
+                              SELECT id, run_at FROM {jobs}
+                               WHERE status = 'queued' AND queue = wanted.name
+                                 AND priority = levels.priority AND run_at <= {horizon}
+                               ORDER BY run_at ASC
+                               LIMIT %(limit)s
+                               FOR UPDATE SKIP LOCKED
+                        ) AS candidate
+                        ORDER BY candidate.run_at ASC
                         LIMIT %(limit)s
-                        FOR UPDATE SKIP LOCKED
-                 ) AS candidate
-                 ORDER BY candidate.priority DESC, candidate.run_at ASC
+                 ) AS due
+                 WHERE levels.priority IS NOT NULL
                  LIMIT %(limit)s
             ),
             claimed AS (
@@ -71,7 +99,7 @@ class Queries:
                        worker_id = %(worker)s,
                        attempts = job.attempts + 1,
                        claims = job.claims + 1,
-                       lease_expires_at = {LEASE_END}
+                       lease_expires_at = {lease_end}
                   FROM picked
                  WHERE job.id = picked.id AND job.status = 'queued'
                 RETURNING {job_columns("job")}
@@ -79,7 +107,7 @@ class Queries:
             opened AS (
                 INSERT INTO {executions}
                        (job_id, attempt, claim, status, worker_id, started_at)
-                SELECT id, attempts, claims, 'running', %(worker)s, %(now)s FROM claimed
+                SELECT id, attempts, claims, 'running', %(worker)s, {NOW} FROM claimed
                 ON CONFLICT (job_id, claim) DO UPDATE
                    SET status = 'running', worker_id = excluded.worker_id,
                        started_at = excluded.started_at, finished_at = NULL,
@@ -89,7 +117,7 @@ class Queries:
         """
 
         self.heartbeat = f"""
-            UPDATE {jobs} SET lease_expires_at = {LEASE_END}
+            UPDATE {jobs} SET lease_expires_at = {lease_end}
              WHERE status = 'running'
                AND (%(worker)s::text IS NULL OR worker_id = %(worker)s)
                AND id = ANY(%(ids)s::text[])
@@ -202,35 +230,43 @@ class Queries:
                     WHERE holder.dedup_key = target.dedup_key
                       AND holder.status IN ('queued', 'running')
                )
-            RETURNING id, queue, run_at
+            RETURNING id, queue, run_at <= {horizon} AS due
         """
 
-        self.notify = "SELECT pg_notify(%(channel)s, %(queue)s)"
+        self.notify = (
+            "SELECT count(pg_notify(%(channel)s, queue)) AS sent "
+            "FROM unnest(%(queues)s::text[]) AS woken (queue)"
+        )
 
         self.reap = f"""
             WITH expired AS (
                 SELECT id FROM {jobs}
-                 WHERE status = 'running' AND lease_expires_at < {HORIZON}
+                 WHERE status = 'running' AND lease_expires_at < {horizon}
                  FOR UPDATE SKIP LOCKED
             ),
             reaped AS (
                 UPDATE {jobs} AS job
                    SET status = CASE WHEN job.attempts < job.max_attempts
                                      THEN 'queued' ELSE 'failed' END,
-                       run_at = %(now)s,
+                       run_at = {horizon},
                        finished_at = CASE WHEN job.attempts < job.max_attempts
-                                          THEN NULL ELSE %(now)s END,
+                                          THEN NULL ELSE {horizon} END,
                        lease_expires_at = NULL, worker_id = NULL, hand_backs = 0,
                        last_error = %(message)s
                   FROM expired
                  WHERE job.id = expired.id AND job.status = 'running'
-                RETURNING job.id
+                RETURNING job.id, job.queue, job.status
             ),
             lost AS (
-                UPDATE {executions} SET status = 'lost', finished_at = %(now)s
-                 WHERE status = 'running' AND job_id IN (SELECT id FROM reaped)
+                UPDATE {executions} AS execution
+                   SET status = 'lost', finished_at = {horizon}
+                  FROM reaped
+                 WHERE execution.job_id = reaped.id AND execution.status = 'running'
             )
-            SELECT count(*) AS reaped FROM reaped
+            SELECT count(*) AS reaped,
+                   coalesce(array_agg(DISTINCT queue) FILTER (WHERE status = 'queued'), '{{}}')
+                       AS queues
+              FROM reaped
         """
 
         self.get = f"SELECT {columns} FROM {jobs} WHERE id = %(id)s"
@@ -282,7 +318,7 @@ class Queries:
                  WHERE id IN (
                        SELECT id FROM {jobs}
                         WHERE status = %(status)s AND finished_at IS NOT NULL
-                          AND finished_at < %(cutoff)s
+                          AND finished_at < %(cutoff)s - ({NOW} - {horizon})
                         ORDER BY finished_at
                         LIMIT %(batch)s
                         FOR UPDATE SKIP LOCKED

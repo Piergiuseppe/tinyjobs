@@ -1472,6 +1472,117 @@ class KeptTaskTests(unittest.TestCase):
             with self.subTest(steps=steps), self.assertRaises(RuntimeError):
                 outcome.result(0)
 
+    def cleaning_up(self, loop: asyncio.AbstractEventLoop, seen: list[str]) -> asyncio.Task:
+        async def cleaning() -> None:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                seen.append("cancelled")
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    seen.append("cancelled while cleaning up")
+                raise
+
+        task = loop.create_task(cleaning())
+        loop.run_until_complete(asyncio.sleep(0))
+        return task
+
+    def test_a_task_its_caller_cancelled_is_not_cancelled_again_as_the_loop_winds_down(self):
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        runtime._finish_tasks(loop, time.monotonic() + 1)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_a_task_the_wind_down_cancelled_is_not_cancelled_again_by_its_caller(self):
+        import types
+
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        loop.call_soon(runtime._cancel_task, types.SimpleNamespace(task=task))
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(task)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_a_task_whose_outcome_is_abandoned_while_it_winds_down_is_cancelled_once(self):
+        import concurrent.futures
+
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        outcome = concurrent.futures.Future()
+        outcome.cancel()
+        runtime._abandon(loop, task, outcome)
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(task)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_tasks_a_resident_owns_are_left_to_its_close_whoever_closes_first(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        seen: list[str] = []
+
+        class Resident:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.stop = asyncio.Event()
+                self.task: asyncio.Task | None = None
+
+            async def start(self) -> None:
+                with runtime.spared_until_close():
+                    self.task = asyncio.create_task(self.serve())
+
+            async def serve(self) -> None:
+                try:
+                    await self.stop.wait()
+                    seen.append(f"{self.name} stopped by its close")
+                except asyncio.CancelledError:
+                    seen.append(f"{self.name} cancelled")
+                    raise
+
+            async def close(self) -> None:
+                self.stop.set()
+                await self.task
+
+        residents = [Resident("first"), Resident("second")]
+        for resident in residents:
+            asyncio.run_coroutine_threadsafe(resident.start(), loop).result(5)
+            runner.keep(loop, resident)
+        runner.close_here()
+        self.assertEqual(
+            seen, ["first stopped by its close", "second stopped by its close"]
+        )
+
+    def test_a_spared_task_no_resident_ends_is_still_cancelled(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        seen: list[str] = []
+
+        async def forever() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                seen.append("cancelled")
+                raise
+
+        async def start() -> None:
+            with runtime.spared_until_close():
+                asyncio.create_task(forever())
+
+        asyncio.run_coroutine_threadsafe(start(), loop).result(5)
+        runner.close_here()
+        self.assertEqual(seen, ["cancelled"])
+
     def test_other_work_submitted_as_the_loop_closes_is_refused(self):
         runner = LoopRunner()
         loop = runner.own_loop()

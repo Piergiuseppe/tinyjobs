@@ -13,10 +13,10 @@ import os
 import threading
 import time
 import weakref
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from functools import partial
 from queue import SimpleQueue
-from typing import Any, Callable, Coroutine, TypeVar
+from typing import Any, Callable, Coroutine, Iterator, TypeVar
 
 from .exceptions import (
     AppClosedError,
@@ -89,6 +89,7 @@ _watched: dict[weakref.ref, list[Any]] = {}
 _closing: set[threading.Thread] = set()
 _kept: "weakref.WeakSet[asyncio.Task]" = weakref.WeakSet()
 _keeping: contextvars.ContextVar[bool] = contextvars.ContextVar("tinyjobs_keeping", default=False)
+_sparing: contextvars.ContextVar[bool] = contextvars.ContextVar("tinyjobs_sparing", default=False)
 _inbox: SimpleQueue = SimpleQueue()
 _fork_marks: dict[int, int] = {}
 _after_fork_actions: dict[int, Any] = {}
@@ -565,7 +566,12 @@ def _cancel(request: _Request) -> bool:
 
 def _cancel_task(request: _Request) -> None:
     if request.task is not None:
-        request.task.cancel()
+        _cancel_once(request.task)
+
+
+def _cancel_once(task: asyncio.Task) -> None:
+    if not task.cancelling():
+        task.cancel()
 
 
 def _settle_request(
@@ -789,11 +795,12 @@ class LoopRunner:
         _ending.add(loop)
         _resting.discard(loop)
         deadline = time.monotonic() + STOP_SECONDS
-        _finish_tasks(loop, deadline)
+        _finish_tasks(loop, deadline, spare=True)
         for resident in residents:
             with suppress(Exception):
                 loop.run_until_complete(resident.close())
-            _finish_tasks(loop, deadline)
+            _finish_tasks(loop, deadline, spare=True)
+        _finish_tasks(loop, deadline)
         loop.close()
         self._settle_left(loop)
 
@@ -821,10 +828,25 @@ class LoopRunner:
         self._paused, self._keep_serving = None, False
 
 
-def _finish_tasks(loop: asyncio.AbstractEventLoop, deadline: float) -> None:
+@contextmanager
+def spared_until_close() -> Iterator[None]:
+    token = _sparing.set(True)
+    try:
+        yield
+    finally:
+        _sparing.reset(token)
+
+
+def _finish_tasks(
+    loop: asyncio.AbstractEventLoop, deadline: float, *, spare: bool = False
+) -> None:
     asked: set[asyncio.Task] = set()
     loop.run_until_complete(asyncio.sleep(0))
-    while pending := asyncio.all_tasks(loop):
+    while pending := {
+        task
+        for task in asyncio.all_tasks(loop)
+        if not (spare and task.get_context().get(_sparing, False))
+    }:
         left = deadline - time.monotonic()
         fresh = [
             task
@@ -839,7 +861,7 @@ def _finish_tasks(loop: asyncio.AbstractEventLoop, deadline: float) -> None:
             )
             return
         for task in fresh:
-            task.cancel()
+            _cancel_once(task)
             asked.add(task)
         loop.run_until_complete(asyncio.wait(pending, timeout=max(left, 0)))
         loop.run_until_complete(asyncio.sleep(0))
@@ -897,7 +919,7 @@ def _abandon(
 ) -> None:
     if outcome.cancelled():
         with suppress(RuntimeError):
-            loop.call_soon_threadsafe(task.cancel)
+            loop.call_soon_threadsafe(_cancel_once, task)
 
 
 def _stop(loop: asyncio.AbstractEventLoop) -> None:
