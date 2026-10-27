@@ -27,7 +27,7 @@ from tinyjobs.backends.sqlite import connection as connection_module
 from tinyjobs.backends.sqlite.connection import ConnectionPool
 from tinyjobs.status import ExecutionStatus
 from tinyjobs.testing import BackendContract
-from tinyjobs.testing.contract import ERROR
+from tinyjobs.testing.contract import ERROR, START
 
 from tests.support import interrupt_repeatedly
 
@@ -56,6 +56,14 @@ class SQLiteContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             [(e.status, e.worker_id, e.error_type) for e in history],
             [(ExecutionStatus.RUNNING, "worker-b", None)],
         )
+
+    async def test_a_job_retried_before_any_claim_is_due_from_when_it_was_sent(self):
+        job = await self.enqueue(run_at=START + 3600, created_at=START)
+        self.assertTrue(await self.backend.cancel(job.id))
+        self.clock.advance(10)
+        self.assertTrue(await self.backend.requeue(job.id))
+        self.assertEqual((await self.stored(job)).run_at, START)
+        self.assertEqual(len(await self.claim()), 1)
 
 
 class SQLiteWithoutReturningContractTests(SQLiteContractTests):

@@ -220,7 +220,7 @@ def race_open_and_close(case: unittest.TestCase, app: TinyJobs, seconds: float =
 FORK_WITHOUT_WARNING = """
 import gc, os, sys, time, warnings
 from tinyjobs import TinyJobs
-app = TinyJobs(sys.argv[1]).start()
+app = TinyJobs(sys.argv[1], **dict(arg.split("=", 1) for arg in sys.argv[2:])).start()
 app.send("t")
 before = app.counts().get("queued", 0)
 descriptors = len(os.listdir("/dev/fd"))
@@ -257,12 +257,12 @@ app.close()
 """
 
 
-def fork_without_warning(case: unittest.TestCase, url: str) -> None:
+def fork_without_warning(case: unittest.TestCase, url: str, *options: str) -> None:
     import subprocess
     import sys
 
     finished = subprocess.run(
-        [sys.executable, "-c", FORK_WITHOUT_WARNING, url],
+        [sys.executable, "-c", FORK_WITHOUT_WARNING, url, *options],
         capture_output=True,
         text=True,
         timeout=60,

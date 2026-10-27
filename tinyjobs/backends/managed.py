@@ -198,6 +198,11 @@ class ManagedBackend:
         method = getattr(self._inner, "hand_back", self._inner.release)
         return await self._forward(method, job, delay)
 
+    async def follow_clock(self) -> None:
+        method = getattr(self._inner, "follow_clock", None)
+        if method is not None:
+            await self._forward(method)
+
     async def cancel(self, job_id: str) -> bool:
         return await self._forward(self._inner.cancel, job_id)
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import fields
 
 from ..backends.base import Backend
-from ..clock import Clock
+from ..clock import Clock, FollowingClock
 from ..exceptions import UnsupportedCapabilityError
-from ..ids import new_job_id
+from ..ids import JobIdGenerator
 from ..models import Job, JobPayload
 from ..options import EnqueueOptions
 from ..registry import TaskRegistry
@@ -27,6 +27,7 @@ class DispatchService:
         self._clock = clock
         self._default_queue = default_queue
         self._registry = registry
+        self._ids = JobIdGenerator()
 
     async def dispatch_by_name(
         self, name: str, payload: JobPayload, options: EnqueueOptions
@@ -34,9 +35,16 @@ class DispatchService:
         return await self._backend.enqueue(self.prepare(name, payload, options))
 
     def prepare(
-        self, name: str, payload: JobPayload, options: EnqueueOptions
+        self,
+        name: str,
+        payload: JobPayload,
+        options: EnqueueOptions,
+        *,
+        due_at: float | None = None,
     ) -> Job:
-        return self.build(name, payload, self._with_task_defaults(name, options))
+        return self.build(
+            name, payload, self._with_task_defaults(name, options), due_at=due_at
+        )
 
     def _with_task_defaults(
         self, name: str, options: EnqueueOptions
@@ -49,7 +57,12 @@ class DispatchService:
         )
 
     def build(
-        self, name: str, payload: JobPayload, options: EnqueueOptions
+        self,
+        name: str,
+        payload: JobPayload,
+        options: EnqueueOptions,
+        *,
+        due_at: float | None = None,
     ) -> Job:
         self._verify_capabilities(options)
         now = self._clock.now()
@@ -57,7 +70,7 @@ class DispatchService:
             payload, options.codec
         )
         return Job(
-            id=new_job_id(),
+            id=self._ids(now if isinstance(self._clock, FollowingClock) else None),
             task=name,
             payload=encoded,
             codec=codec_name,
@@ -66,7 +79,9 @@ class DispatchService:
             priority=options.priority or 0,
             attempts=0,
             max_attempts=options.max_attempts or 1,
-            run_at=options.scheduled_for(now),
+            run_at=(
+                options.scheduled_for(self._clock, now) if due_at is None else due_at
+            ),
             created_at=now,
             dedup_key=options.key,
         )

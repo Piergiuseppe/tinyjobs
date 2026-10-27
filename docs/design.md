@@ -728,8 +728,35 @@ All keys sit under `{prefix}`, which by default is `{tinyjobs}`:
 | `counts`, `queued_tasks` | hashes | counters kept by `enter` and `leave`, so `stats` is O(queues) |
 | `schedule:<name>`, `schedules` | hash, set | cron state; firing compares `next_run_at` and swaps it |
 
-Times come from the worker's clock, as on SQLite, never from Redis's. That keeps one notion of time
-across backends and lets the contract suite drive Redis with a `FrozenClock`.
+Every machine keeps Redis's time. The app's default clock is a `FollowingClock`: once the backend
+has read Redis's `TIME`, `now()` is that reading plus the time elapsed since, counted on a clock that
+never steps and keeps counting through a suspend (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on
+macOS). A step of the wall clock therefore changes nothing, whether it lands between two calls or
+during a reading. The backend reads `TIME` again on its first call after thirty seconds, after a
+connection error, and when the wall clock and the elapsed clock disagree by half a second. Only the
+`TIME` command itself is timed, on a connection already taken from the pool and opened. A reading
+whose round trip took more than half a second only renews the reading held when the two agree
+within half that round trip plus a quarter of a second; when they do not, it is taken, and either
+way the next try waits a second. An older reading never replaces a newer one. Without this a host an hour ahead reaped every live lease the others held.
+
+A host can still be on a stale reading for a moment: after a failover to a node whose clock differs,
+until its next reading, or during a suspend its elapsed clock did not count. Leases do not depend on
+it. A following host marks its `now` with a `~`, and for it the scripts read `TIME` themselves: the
+reaper takes the earlier of the two, so it never reaps by a time ahead of Redis's, and a claim or a
+heartbeat stamps the later of the two lease ends, so no lease is written to end before Redis says it
+should. Everything else written in that moment, a delayed `run_at` or a cron slot, is off by the
+stale reading until the next one, at most thirty seconds later; the app also reads again before it
+builds a job whenever a reading is due. The one thing a following host cannot survive is Redis's own
+time jumping ahead, as after a failover to a node whose clock is ahead: every lease stamped before
+the jump by more than its length looks expired and is reaped, so its job runs again, or fails when it
+has no attempts left. Redis's nodes therefore stay on NTP.
+
+Instants the caller supplies, a `run_at` and `Retry(at=...)`, are read on the local wall clock and
+moved by the difference between the two. A clock the caller passes, `FrozenClock` or any object with
+`now()` and `monotonic()`, is used as it is and never follows, which is how the contract suite drives
+Redis by hand. With the default clock job ids take their time from Redis's too, so listings put the
+newest job first whichever host sent it; with any other clock they take the wall clock. Readings due at the same moment share one round trip, and a clock shared by
+apps on two servers whose times differ by more than a second raises instead of mixing them.
 
 ### Where the limits are
 
@@ -1047,7 +1074,8 @@ Two escapes from the default policy, raised from inside a task:
 
 Jobs that exhaust their attempts stay in the store as `FAILED` with the full traceback of every
 attempt. `tinyjobs jobs retry <id>` resets the counter and requeues, giving you a dead letter queue without a
-second queue to operate. A retry is refused while another active job holds the same dedup key.
+second queue to operate. A retry is refused while another active job holds the same dedup key. A retried
+job is due at once; one cancelled before any worker took it keeps its place from when it was sent.
 
 ---
 

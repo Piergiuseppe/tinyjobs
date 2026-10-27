@@ -35,7 +35,16 @@ def build_result(
     value: Any = None,
 ) -> TaskResult:
     result = TaskResult(
-        task=stored(task, priority=job.priority, queue_name=job.queue),
+        task=stored(
+            task,
+            priority=job.priority,
+            queue_name=job.queue,
+            run_after=(
+                moment(job.run_at)
+                if job.claims == 0 and job.run_at != job.created_at
+                else None
+            ),
+        ),
         id=job.id,
         status=STATUSES[job.status],
         enqueued_at=moment(job.created_at),
@@ -52,7 +61,9 @@ def build_result(
     return result
 
 
-def record_failure(result: TaskResult, error: BaseException, traceback: str) -> None:
+def record_failure(
+    result: TaskResult, error: BaseException, traceback: str, finished: float
+) -> None:
     kind = type(error)
     result.errors.append(
         TaskError(
@@ -61,13 +72,13 @@ def record_failure(result: TaskResult, error: BaseException, traceback: str) -> 
         )
     )
     object.__setattr__(result, "status", TaskResultStatus.FAILED)
-    object.__setattr__(result, "finished_at", timezone.now())
+    object.__setattr__(result, "finished_at", moment(finished))
 
 
-def record_success(result: TaskResult, value: Any) -> None:
+def record_success(result: TaskResult, value: Any, finished: float) -> None:
     object.__setattr__(result, "_return_value", value)
     object.__setattr__(result, "status", TaskResultStatus.SUCCESSFUL)
-    object.__setattr__(result, "finished_at", timezone.now())
+    object.__setattr__(result, "finished_at", moment(finished))
 
 
 def errors_of(job: Job, executions: Sequence[Execution]) -> list[TaskError]:

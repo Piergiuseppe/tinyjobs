@@ -118,6 +118,9 @@ class BaseBackend(ABC):
     async def close(self) -> None:
         return None
 
+    async def follow_clock(self) -> None:
+        return None
+
     @abstractmethod
     async def enqueue(self, job: Job) -> Job: ...
 

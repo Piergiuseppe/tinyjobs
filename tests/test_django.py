@@ -124,6 +124,69 @@ class EnqueueTests(DjangoTestCase):
         self.assertEqual(self.drain(), 0)
         self.assertEqual(self.backend.get_result(result.id).status, "READY")
 
+    def test_run_after_is_reported_on_the_clock_the_job_keeps(self):
+        import time
+        from unittest import mock
+
+        from django.utils import timezone
+
+        clock = self.backend.app.clock
+        with (
+            mock.patch.object(clock, "now", lambda: time.time() + 900),
+            mock.patch.object(clock, "from_wall", lambda instant: instant + 900),
+        ):
+            result = self.tasks.double.using(
+                run_after=timezone.now() + timedelta(hours=1)
+            ).enqueue(2)
+        waited = result.task.run_after - result.enqueued_at
+        self.assertAlmostEqual(waited.total_seconds(), 3600, delta=1)
+
+    def test_a_delayed_result_read_back_still_says_when_it_runs(self):
+        from django.utils import timezone
+
+        result = self.tasks.double.using(
+            run_after=timezone.now() + timedelta(hours=1)
+        ).enqueue(2)
+        found = self.backend.get_result(result.id)
+        self.assertEqual(found.task.run_after, result.task.run_after)
+
+    def test_a_result_handed_back_has_no_run_after_it_was_not_given(self):
+        result = self.tasks.double.enqueue(2)
+        app = self.backend.app
+
+        async def hand_back() -> None:
+            [job] = await app.backend.claim(
+                worker_id="w", queues=["default"], limit=1, lease_seconds=30.0
+            )
+            await app.backend.hand_back(job, 0.0)
+
+        app.run_sync(hand_back, name="hand back")
+        self.assertIsNone(self.backend.get_result(result.id).task.run_after)
+
+    def test_a_run_after_in_the_past_is_still_reported(self):
+        from django.utils import timezone
+
+        past = timezone.now() - timedelta(minutes=5)
+        result = self.tasks.double.using(run_after=past).enqueue(2)
+        found = self.backend.get_result(result.id)
+        self.assertAlmostEqual(
+            found.task.run_after.timestamp(), past.timestamp(), delta=0.001
+        )
+
+    def test_a_result_due_at_once_has_no_run_after(self):
+        result = self.tasks.double.enqueue(2)
+        self.assertIsNone(self.backend.get_result(result.id).task.run_after)
+
+    def test_a_result_retried_before_any_claim_has_no_run_after(self):
+        from django.utils import timezone
+
+        result = self.tasks.double.using(
+            run_after=timezone.now() + timedelta(hours=1)
+        ).enqueue(2)
+        self.backend.app.cancel(result.id)
+        self.assertTrue(self.backend.app.retry(result.id))
+        self.assertIsNone(self.backend.get_result(result.id).task.run_after)
+
     def test_aenqueue_works_from_async_code(self):
         import asyncio
 
@@ -296,6 +359,27 @@ class ExecutionTests(DjangoTestCase):
             seen,
             [("enqueued", "READY"), ("started", "RUNNING"), ("finished", "SUCCESSFUL")],
         )
+
+    def test_a_finished_task_is_stamped_by_the_app_clock_not_by_django(self):
+        from datetime import timedelta
+        from unittest import mock
+
+        from django.tasks.signals import task_finished
+        from django.utils import timezone
+
+        finished = []
+
+        def receiver(sender, task_result, **kwargs):
+            finished.append(task_result)
+
+        task_finished.connect(receiver)
+        self.addCleanup(task_finished.disconnect, receiver)
+        self.tasks.double.enqueue(1)
+        later = timezone.now() + timedelta(hours=1)
+        with mock.patch("tinyjobs.contrib.django.results.timezone.now", return_value=later):
+            self.drain()
+        [result] = finished
+        self.assertLess(result.finished_at - result.started_at, timedelta(minutes=1))
 
 
 class ResolutionTests(DjangoTestCase):

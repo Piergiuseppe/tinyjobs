@@ -345,7 +345,8 @@ python manage.py tinyjobs worker
 against the configured backend, with `--backend` to pick a `TASKS` alias other than `default`.
 `OPTIONS` takes the arguments of `TinyJobs(...)`: a `redis://` URL, `"eager": True` for tests.
 Queues, priorities, `run_after`, async tasks, `takes_context` and `get_result()` all work, and the
-`task_enqueued`, `task_started` and `task_finished` signals fire.
+`task_enqueued`, `task_started` and `task_finished` signals fire. A result shows its `run_after`
+until the job is first picked up.
 
 Tasks are found by their import path, and only inside your `INSTALLED_APPS`: a job can never make
 the worker import code your project does not already trust, and enqueueing a task defined elsewhere
@@ -388,7 +389,7 @@ and drain. A failing task is recorded on the job, not raised, as it would be in 
 | Async and sync tasks | `async def` runs on the worker's event loop, `def` in a thread pool |
 | Retries | exponential backoff with jitter, per-exception policy, `Retry` and `Abandon` |
 | Cron | `cron="*/15 * * * *"`, timezones and DST, misfire and overlap policies, in every worker |
-| Delayed jobs | `delay=60` or `run_at=<datetime>` |
+| Delayed jobs | `delay=60` or `run_at=<datetime>` (a naive one is local time) |
 | Priorities and queues | integers, highest first; workers subscribe to a subset |
 | Timeouts | hard for async tasks, soft for threaded sync ones (see below) |
 | Crash recovery | leases plus heartbeats, so a killed worker's jobs come back |
@@ -495,7 +496,16 @@ app = TinyJobs("redis://localhost:6379/0", prefix="billing")    # several apps o
 
 Nothing else changes: the same tasks, workers, cron, hooks, `stats` and `check`. Every state change
 is one Lua script, so a claim is as atomic as on SQLite, and any number of workers on any number of
-machines can share the queue. It passes the same contract suite as SQLite.
+machines can share the queue. With the default clock every machine keeps Redis's time, so their own
+clocks need not agree; a `run_at` or `Retry(at=...)` you pass is read on the local clock and moved
+onto Redis's. A `clock=` you pass yourself is used as it is, and must then agree across machines.
+Leases hold even while a machine still runs on an old reading: the scripts never reap by a time
+ahead of Redis's and never stamp a lease from one behind it. Keep the Redis server and its replicas
+on NTP: after a failover to a node whose clock is ahead by more than a lease, every running job looks
+abandoned and runs again, or fails when it has no attempts left. When upgrading from 0.7.0, which
+used each machine's own clock, stop or upgrade every 0.7.0 process, workers and senders alike, before
+starting the new workers if their clocks drift from Redis's by more than a lease, and grant `TIME`
+to a Redis user restricted by ACLs. It passes the same contract suite as SQLite.
 
 **Turn persistence on.** Redis keeps the queue in memory. Killed with `SIGKILL` mid-run, a Redis on
 its default snapshots lost the whole queue; with `appendonly yes` the same crash lost nothing, and
@@ -565,6 +575,14 @@ Redis was measured with the same kind of harness, on a laptop with Redis 7.4 in 
 over four workers of eight slots in 2.1 seconds, against 4 seconds on SQLite, each run exactly once.
 Twelve `SIGKILL`s on workers during 4,000 jobs left none lost; 43 came back through an expired lease,
 and 2 applied their side effect twice. Claiming stays at 0.7 ms with 200,000 jobs queued.
+
+Two machines sharing one Redis were measured too: a laptop and a Linux VPS 52 ms apart, two workers
+of eight slots on each, a `SIGKILL` on one of them every 25 to 30 seconds, 3,000 jobs a run. With the
+laptop's clock set five minutes behind and the VPS's fifteen minutes ahead, all 3,000 succeeded and
+none applied its side effect twice; the 23 attempts cut short by the kills were picked up again. With
+both clocks right the result was the same, but for one job killed between its side effect and its
+completion. The same skewed run on 0.7.0, which still used each machine's own clock, ran 492 jobs
+twice and failed 2, because the VPS took the laptop's live jobs for dead.
 
 Cron was measured on its own. Ten thousand schedules all due on the same minute fire in about a
 second from one scheduler, roughly 110 microseconds each. With four workers racing for them, 2,000
@@ -653,7 +671,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-947 tests, no test dependencies. The one that matters most is
+1025 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

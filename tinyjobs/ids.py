@@ -21,13 +21,13 @@ class JobIdGenerator:
         self._last_milliseconds = -1
         self._counter = 0
 
-    def __call__(self) -> str:
-        milliseconds, counter = self._next_position()
+    def __call__(self, at: float | None = None) -> str:
+        milliseconds, counter = self._next_position(time.time() if at is None else at)
         return str(uuid.UUID(bytes=self._compose(milliseconds, counter)))
 
-    def _next_position(self) -> tuple[int, int]:
+    def _next_position(self, at: float) -> tuple[int, int]:
         with self._guard:
-            now = int(time.time() * 1000)
+            now = int(at * 1000)
             if now > self._last_milliseconds:
                 self._last_milliseconds = now
                 self._counter = secrets.randbits(COUNTER_BITS) & COUNTER_SEED_MAX

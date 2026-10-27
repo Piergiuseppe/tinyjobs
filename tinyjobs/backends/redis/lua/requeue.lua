@@ -5,7 +5,10 @@ end
 if dedup_holder(job) then
   return 0
 end
-transition(job, 'queued', { run_at = NOW, attempts = '0', claims = claim_of(job) },
+local claims = claim_of(job)
+transition(job, 'queued', {
+  run_at = tonumber(claims) == 0 and job.created_at or NOW, attempts = '0', claims = claims,
+},
   { 'finished_at', 'lease_expires_at', 'worker_id', 'last_error' })
 hold_dedup(job)
 return 1

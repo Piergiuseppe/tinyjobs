@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 
 class TinyJobsError(Exception):
     pass
@@ -66,7 +68,9 @@ class ExecutorClosedError(AppClosedError):
 
 
 class Retry(TinyJobsError):
-    def __init__(self, in_: float | None = None, at: float | None = None) -> None:
+    def __init__(
+        self, in_: float | None = None, at: float | datetime | None = None
+    ) -> None:
         if in_ is not None and at is not None:
             raise ValueError("Retry accepts either in_ or at, not both")
         super().__init__(f"retry in {in_}s" if in_ is not None else f"retry at {at}")

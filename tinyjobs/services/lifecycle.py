@@ -4,7 +4,7 @@ import traceback as traceback_module
 from typing import Any, TYPE_CHECKING
 
 from ..backends.base import Backend
-from ..clock import Clock
+from ..clock import Clock, epoch, from_wall
 from ..exceptions import Retry
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
@@ -49,7 +49,7 @@ class JobLifecycleService:
         ):
             return None
         if isinstance(error, Retry) and error.at is not None:
-            return error.at
+            return from_wall(self._clock, epoch(error.at))
         delay = task.retry_policy.delay_for(job.attempts, error)
         return self._clock.now() + delay
 

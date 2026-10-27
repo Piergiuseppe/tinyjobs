@@ -114,7 +114,8 @@ class SchedulingService:
             self._dispatch.prepare(
                 task.name,
                 JobPayload(),
-                EnqueueOptions(run_at=run_at, key=schedule.dedup_key),
+                EnqueueOptions(key=schedule.dedup_key),
+                due_at=run_at,
             )
             for run_at in firing.run_at
         ]

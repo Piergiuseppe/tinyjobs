@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Sequence
+import asyncio
+import inspect
+from typing import Any, Awaitable, Sequence, TypeVar
 
 from redis.asyncio import BlockingConnectionPool, Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from ...clock import Clock
+from ...clock import Clock, FollowingClock, elapsed
 from ...models import (
     Execution,
     ExecutionError,
@@ -35,6 +39,8 @@ SCHEMA_VERSION = 2
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
 
+T = TypeVar("T")
+
 
 class RedisBackend(BaseBackend):
     capabilities = Capabilities(
@@ -56,7 +62,9 @@ class RedisBackend(BaseBackend):
         clock: Clock | None = None,
     ) -> None:
         self._client = client
-        self._clock = clock or Clock()
+        self._clock = FollowingClock() if clock is None else clock
+        self._reading = asyncio.Lock()
+        self._read = False
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -113,8 +121,8 @@ class RedisBackend(BaseBackend):
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
-        now = self._clock.now()
-        claimed = await self._scripts.run(
+        now = await self._now()
+        claimed = await self._script(
             "claim", now, worker_id, number(now + lease_seconds), limit, *queues
         )
         return [job_from_flat(flat) for flat in claimed]
@@ -126,8 +134,8 @@ class RedisBackend(BaseBackend):
         worker_id: str | None = None,
     ) -> None:
         if job_ids:
-            now = self._clock.now()
-            await self._scripts.run(
+            now = await self._now()
+            await self._script(
                 "heartbeat",
                 now,
                 number(now + lease_seconds),
@@ -169,7 +177,7 @@ class RedisBackend(BaseBackend):
         )
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
-        run_at = number(self._clock.now() + delay)
+        run_at = number(await self._now() + delay)
         return bool(
             await self._run(
                 "release", job.id, job.worker_id or "", job.claims, run_at
@@ -177,7 +185,7 @@ class RedisBackend(BaseBackend):
         )
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
-        run_at = number(self._clock.now() + delay)
+        run_at = number(await self._now() + delay)
         return bool(
             await self._run(
                 "hand_back", job.id, job.worker_id or "", job.claims, run_at
@@ -258,7 +266,7 @@ class RedisBackend(BaseBackend):
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         if not policy.enabled:
             return None
-        if not await self._scripts.run(
+        if not await self._script(
             "claim_sweep", now, number(now - policy.interval)
         ):
             return None
@@ -274,7 +282,11 @@ class RedisBackend(BaseBackend):
                     break
         return removed
 
+    async def follow_clock(self) -> None:
+        await self._now()
+
     async def schedules(self) -> list[ScheduleState]:
+        await self._now()
         names = sorted(await self._client.smembers(self._keys("schedules")))
         pipeline = self._client.pipeline(transaction=False)
         for name in names:
@@ -310,7 +322,73 @@ class RedisBackend(BaseBackend):
         return await self._resolve(jobs, ids)
 
     async def _run(self, name: str, *arguments: Any) -> Any:
-        return await self._scripts.run(name, self._clock.now(), *arguments)
+        return await self._script(name, await self._now(), *arguments)
+
+    async def _script(self, name: str, now: float, *arguments: Any) -> Any:
+        following = isinstance(self._clock, FollowingClock)
+        return await self._forgetting(
+            self._scripts.run(name, now, *arguments, following=following)
+        )
+
+    async def _now(self) -> float:
+        clock = self._clock
+        if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
+            async with self._reading:
+                if not self._read or clock.due():
+                    clock.follow(*await self._forgetting(self._timed()), self._server())
+                    self._read = True
+        return clock.now()
+
+    async def _timed(self) -> tuple[float, float, float]:
+        client = self._client
+        await client.initialize()
+        if client.connection is not None:
+            async with client._single_conn_lock:
+                connection = client.connection
+                if connection is None:
+                    raise RedisConnectionError("the Redis client was closed")
+                await connection.connect()
+                return await self._timed_on(connection)
+        pool = client.connection_pool
+        connection = await _acquire(pool)
+        try:
+            return await self._timed_on(connection)
+        finally:
+            await pool.release(connection)
+
+    async def _timed_on(self, connection: Any) -> tuple[float, float, float]:
+        try:
+            await connection.check_health()
+            started = elapsed()
+            seconds, microseconds = await self._time(connection)
+            return seconds + microseconds / 1_000_000, started, elapsed()
+        except BaseException:
+            await connection.disconnect()
+            raise
+
+    async def _time(self, connection: Any) -> tuple[int, int]:
+        await connection.send_command("TIME", check_health=False)
+        seconds, microseconds = await connection.read_response()
+        return int(seconds), int(microseconds)
+
+    async def _forgetting(self, call: Awaitable[T]) -> T:
+        try:
+            return await call
+        except (RedisConnectionError, RedisTimeoutError):
+            if isinstance(self._clock, FollowingClock):
+                self._clock.forget()
+            raise
+
+    def _server(self) -> str:
+        pool = self._client.connection_pool
+        settings = pool.connection_kwargs
+        service = getattr(pool, "service_name", None)
+        place = (
+            f"sentinel {service}"
+            if service
+            else settings.get("path") or f"{settings.get('host')}:{settings.get('port')}"
+        )
+        return f"redis {place} db {settings.get('db', 0)}"
 
     async def _resolve(self, jobs: Sequence[Job], ids: Sequence[bytes]) -> list[Job]:
         resolved = []
@@ -348,6 +426,13 @@ class RedisBackend(BaseBackend):
         if queue is not None:
             return self._keys("index", "queue", queue)
         return self._keys("index", "all")
+
+
+async def _acquire(pool: Any) -> Any:
+    named = inspect.signature(pool.get_connection).parameters.get("command_name")
+    if named is not None and named.default is inspect.Parameter.empty:
+        return await pool.get_connection("TIME")
+    return await pool.get_connection()
 
 
 def _due(first: list[tuple[bytes, float]], now: float) -> float | None:

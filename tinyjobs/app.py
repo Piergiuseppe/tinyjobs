@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 from .backends.base import Backend
 from .backends.loader import load_backend
 from .backends.managed import ManagedBackend
-from .clock import Clock
+from .clock import Clock, FollowingClock
 from .codecs import CodecRegistry
 from .exceptions import AppClosedError, BackendNotReadyError, ConfigurationError
 from .models import Job, JobPayload, Page, ScheduleState, Stats
@@ -99,7 +99,7 @@ class TinyJobs:
         self._default_queue = default_queue
         self._retention = retention or RetentionPolicy()
         self._eager = eager
-        self._clock = clock or Clock()
+        self._clock = FollowingClock() if clock is None else clock
         self._codecs = CodecRegistry(default=default_codec, allow_pickle=allow_pickle)
         self._registry = TaskRegistry()
         self._serialization = SerializationService(self._codecs)
@@ -211,6 +211,9 @@ class TinyJobs:
         if self._closed:
             raise AppClosedError(CLOSED_MESSAGE)
         await self._connect()
+        clock = self._clock
+        if isinstance(clock, FollowingClock) and clock.following and clock.due():
+            await self.backend.follow_clock()
 
     async def ready(self) -> None:
         await settled()

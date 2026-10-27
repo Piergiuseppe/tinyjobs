@@ -38,7 +38,8 @@ class Scripts:
             for name in NAMES
         }
 
-    async def run(self, name: str, now: float, *arguments: Any) -> Any:
-        return await self._scripts[name](
-            keys=[self._root], args=[repr(float(now)), *arguments]
-        )
+    async def run(
+        self, name: str, now: float, *arguments: Any, following: bool = False
+    ) -> Any:
+        stamp = ("~" if following else "") + repr(float(now))
+        return await self._scripts[name](keys=[self._root], args=[stamp, *arguments])

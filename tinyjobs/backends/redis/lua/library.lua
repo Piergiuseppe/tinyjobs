@@ -1,7 +1,43 @@
 local PREFIX = KEYS[1]
-local NOW = ARGV[1]
+local FOLLOWING = string.sub(ARGV[1], 1, 1) == '~'
+local NOW = FOLLOWING and string.sub(ARGV[1], 2) or ARGV[1]
+local SERVER = nil
+if FOLLOWING then
+  if redis.replicate_commands then
+    redis.replicate_commands()
+  end
+  local time = redis.call('TIME')
+  SERVER = tonumber(time[1]) + tonumber(time[2]) / 1000000
+end
 local ACTIVE = { queued = true, running = true }
 local TERMINAL = { success = true, failed = true, cancelled = true }
+
+local function moment(value)
+  return string.format('%.6f', value)
+end
+
+local HORIZON = NOW
+if FOLLOWING and SERVER < tonumber(NOW) then
+  HORIZON = moment(SERVER)
+end
+
+local function no_later(instant)
+  if tonumber(HORIZON) < tonumber(NOW) then
+    return moment(tonumber(instant) - (tonumber(NOW) - tonumber(HORIZON)))
+  end
+  return instant
+end
+
+local function lease_until(expires)
+  if not FOLLOWING then
+    return expires
+  end
+  local floor = SERVER + tonumber(expires) - tonumber(NOW)
+  if floor > tonumber(expires) then
+    return moment(floor)
+  end
+  return expires
+end
 
 local function key(...)
   return PREFIX .. ':' .. table.concat({ ... }, ':')
@@ -84,7 +120,7 @@ local function enter(job)
   if status == 'queued' then
     adjust(key('queued_tasks'), job.task, 1)
     redis.call('ZADD', key('queued', job.queue), job.run_at, job.id)
-    if tonumber(job.run_at) <= tonumber(NOW) then
+    if tonumber(job.run_at) <= tonumber(HORIZON) then
       redis.call('ZADD', key('ready', job.queue), -tonumber(job.priority), ready_member(job))
     else
       redis.call('ZADD', key('waiting', job.queue), job.run_at, job.id)

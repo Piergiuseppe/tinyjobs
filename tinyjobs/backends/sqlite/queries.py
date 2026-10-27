@@ -103,7 +103,8 @@ CANCEL_JOB = """
 
 REQUEUE_JOB = """
     UPDATE jobs
-       SET status = 'queued', run_at = ?, attempts = 0,
+       SET status = 'queued', run_at = CASE WHEN claims = 0 THEN created_at ELSE ? END,
+           attempts = 0,
            finished_at = NULL,
            lease_expires_at = NULL, worker_id = NULL, last_error = NULL
      WHERE id = ? AND status IN ('failed', 'cancelled')

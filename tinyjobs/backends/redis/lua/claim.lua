@@ -1,9 +1,9 @@
-local worker, lease_expires_at, limit = ARGV[2], ARGV[3], tonumber(ARGV[4])
+local worker, lease_expires_at, limit = ARGV[2], lease_until(ARGV[3]), tonumber(ARGV[4])
 local PROMOTE_BATCH = 100
 local candidates = {}
 for index = 5, #ARGV do
   local queue = ARGV[index]
-  local due = redis.call('ZRANGEBYSCORE', key('waiting', queue), '-inf', NOW, 'LIMIT', 0, PROMOTE_BATCH)
+  local due = redis.call('ZRANGEBYSCORE', key('waiting', queue), '-inf', HORIZON, 'LIMIT', 0, PROMOTE_BATCH)
   for _, id in ipairs(due) do
     local job = load(id)
     redis.call('ZREM', key('waiting', queue), id)

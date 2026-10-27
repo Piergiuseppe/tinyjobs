@@ -146,10 +146,12 @@ class TinyJobsBackend(BaseTaskBackend):
         return result
 
     def _failed(self, result: TaskResult, error: BaseException) -> None:
-        record_failure(result, error, "".join(traceback.format_exception(error)))
+        record_failure(
+            result, error, "".join(traceback.format_exception(error)), self.app.clock.now()
+        )
         task_finished.send(type(self), task_result=result)
 
     def _succeeded(self, result: TaskResult, value: Any) -> Any:
-        record_success(result, value)
+        record_success(result, value, self.app.clock.now())
         task_finished.send(type(self), task_result=result)
         return value
