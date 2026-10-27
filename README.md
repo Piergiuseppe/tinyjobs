@@ -538,26 +538,29 @@ you want a template.
 
 ## Measured
 
-Ten hours of steady load on an Apple silicon laptop: three worker processes, eight slots each, one
-SQLite file, a deliberate 25 jobs per second.
+Ten hours of steady load on a shared four-core ARM Linux VPS, run twice side by side on 0.7.0: once
+on one SQLite file and once on Redis 7.4. Each run had its own container capped at 1.25 CPUs and
+1.5 GB, three worker processes of eight slots, a deliberate 25 jobs per second, a graceful restart
+every fifteen minutes and a `SIGKILL` every twenty.
 
 ```
-892,825 jobs        24.8/s sustained, zero enqueue failures
-68 worker restarts  39 by SIGTERM, 29 by SIGKILL, zero unexpected deaths
+SQLite   897,300 jobs   24.9/s sustained, zero enqueue failures
+Redis    881,375 jobs   24.5/s sustained, zero enqueue failures
+each     68 worker restarts, 39 by SIGTERM, 29 by SIGKILL, zero unexpected deaths
 ```
 
-Sampled once a minute for the whole run, comparing the first hour against the last:
+Sampled once a minute for the whole run, comparing the medians of the first hour and the last:
 
-| | hour 0 | hour 9 |
-| --- | --- | --- |
-| worker RSS | 26.8 MB | 26.6 MB |
-| threads per worker | 10 | 10 |
-| open file descriptors | 47 | 47 |
-| database on disk | 22 MB | 23 MB |
-| end-to-end p95 | 405 ms | 406 ms |
+| | SQLite hour 0 | SQLite hour 9 | Redis hour 0 | Redis hour 9 |
+| --- | --- | --- | --- | --- |
+| worker RSS | 37.1 MB | 37.3 MB | 41.6 MB | 42.1 MB |
+| threads per worker | 12 | 12 | 12 | 13 |
+| open file descriptors | 12 | 12 | 17 | 17 |
+| store size | 39 MB | 42 MB | 43 MB | 47 MB |
+| end-to-end p95 | 402 ms | 399 ms | 392 ms | 403 ms |
 
-Nothing drifted. The p95 at hour nine is one millisecond off the p95 at hour zero, and the file
-descriptor count was the same 47 in all 595 samples.
+Nothing drifted. The store size is the database file on SQLite and Redis `used_memory` on Redis;
+with retention on, both stayed within a few MB for ten hours. The SQLite workers had 12 file descriptors open in all 597 samples.
 
 A separate burst harness pushes the other end: 2,398 enqueues per second from 24 threads, 572 jobs
 per second end-to-end with six workers, and a crash recovery check that kills every worker while 48
@@ -565,8 +568,7 @@ jobs are mid-flight and confirms all 48 come back and finish. Some of them run t
 at-least-once means; the check is that each one applied its side effect once, because the handlers
 are idempotent.
 
-That run predates the built-in retention, so the harness did the pruning. Retention has since been
-measured on its own, same harness with the library doing the work: with it off the database climbed
+Retention was also measured on its own, with the burst harness: with it off the database climbed
 from 4.7 to 10.2 MB in three minutes and kept going, and with it on the same curve flattened at 6.9
 MB and stayed there. Under a `SIGKILL` on a worker every thirty seconds it moved 0.6% across eight
 minutes.
