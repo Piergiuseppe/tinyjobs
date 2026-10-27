@@ -81,7 +81,10 @@ class JobLifecycleService:
         interrupted = False
         while True:
             try:
+                if interrupted:
+                    return await write() or await self._recorded_before(job, status)
                 applied = await write()
+                return applied
             except transient as error:
                 if deadline is None:
                     deadline = held_until() if held_until else 0.0
@@ -98,20 +101,18 @@ class JobLifecycleService:
                 await asyncio.sleep(pause)
                 delay = min(delay * 2, LONGEST_RETRY_SECONDS)
                 interrupted = True
-                continue
-            if applied or not interrupted:
-                return applied
-            return await self._recorded_before(job, status)
 
     async def _recorded_before(self, job: Job, status: ExecutionStatus) -> bool:
         history = await self._backend.executions(job.id)
+        if all(execution.claim is not None for execution in history):
+            history = [execution for execution in history if execution.claim == job.claims]
         if not history:
             return False
-        latest = history[-1]
+        mine = history[-1]
         return (
-            latest.attempt == job.attempts
-            and latest.worker_id == job.worker_id
-            and latest.status is status
+            mine.attempt == job.attempts
+            and mine.worker_id == job.worker_id
+            and mine.status is status
         )
 
     def _retry_at(

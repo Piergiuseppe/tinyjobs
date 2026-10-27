@@ -470,8 +470,11 @@ A backend may also declare `transient_errors`, the exception types that mean the
 reached. When `complete` or `fail` raises one, the worker writes again after 0.25 s, doubling up to
 4 s, until a second before its lease would run out, where the last try lands. Every outcome write
 checks that the worker still holds that claim, so a write repeated after its reply was lost changes
-nothing, and the worker then reads the job's newest execution to learn whether the first one landed.
-Redis and Postgres declare theirs; SQLite does not, and is never retried.
+nothing, and the worker then reads the execution of its own claim to learn whether the first one
+landed; that read is retried the same way. A job whose task returned but whose outcome is still
+being written when the worker shuts down is not handed back to the queue: its lease runs out and the
+reaper decides, so `max_attempts` still holds. Redis and Postgres declare theirs; SQLite does not,
+and is never retried.
 
 ### The contract a backend must honour
 
@@ -797,19 +800,26 @@ when a `postgres://` or `postgresql://` URL is used. It runs on psycopg 3's asyn
 
 Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
 `<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
-`setup` reads the stored schema version first and creates nothing when it matches, so a fleet
-starting at once costs one `SELECT` each. Otherwise it takes a transaction-scoped advisory lock,
-waits for it at most five seconds, and checks again under it. A store written by a newer release is
-refused and left alone. Setup then checks that all four tables sit in one schema, and that the
-tables and the schema belong to the connecting role, to a role that holds its privileges, or to the
-database owner. Postgres runs a trigger with the privileges of the role that writes the row, so a
-table owned by anyone else would let that role act as tinyjobs; such tables are refused rather than
-used, even when tinyjobs connects as a superuser or was made a member of their owner. From then on
-every statement names the tables with the schema setup found them in, so a table of the same name
-created later earlier on a `search_path` cannot take the jobs. Setup also reads the store's
-identity: a random instance id written into the meta table when the tables are created, the
-database's oid and the cluster's system identifier. A copy made with `CREATE DATABASE ... TEMPLATE`
-or a restored dump keeps the instance id but not the other two.
+Before `setup` reads any of them it finds them in the catalog, along the schemas the connection's
+`search_path` named when the pool opened, and checks that all four sit in one schema and that the
+tables and the schema belong to the connecting role or to a role that holds its privileges; a schema
+owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a
+view's function with the privileges of the role reading or writing the row, so a table owned by
+anyone else would let that role act as tinyjobs. Such tables are refused before a row is read, even
+when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
+someone else. With no tables yet, the schema they would be created in is checked the same way. Setup
+then reads the stored schema version and creates nothing when it matches, so a fleet starting at
+once costs a few catalog reads and one `SELECT` each. Otherwise it takes a transaction-scoped
+advisory lock, waits for it at most five seconds, and checks again under it. A store written by a
+newer release is refused and left alone. From then on every statement names the tables with the
+schema setup found them in, so a table of the same name created later earlier on a `search_path`
+cannot take the jobs, and tinyjobs' own connections run with `search_path` set to `pg_catalog,
+pg_temp`, so no function or operator someone created elsewhere is ever called. The statements that
+run on a caller's connection for `tx=` name every function, type and operator with `pg_catalog`, so
+the caller's `search_path` cannot change them either. Setup also reads the store's identity: a
+random instance id written into the meta table when the tables are created, the database's oid and,
+when the role may read it, the cluster's system identifier. A copy made with `CREATE DATABASE ...
+TEMPLATE` or a restored dump keeps the instance id but not the other two.
 
 `id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
 ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
@@ -822,14 +832,24 @@ which are few.
 
 A claim is one statement. A recursive query walks the priorities present in the wanted queues from
 the highest down, using the partial index on `(queue, priority DESC, run_at)` over queued jobs, and
-for each level takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first, until it has enough.
+for each level that holds a due job takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first,
+until it has enough. Each step reads a span of index entries per queue below the last level, in index
+order, and either finds the highest level with a due job or skips every level the spans covered,
+since they hold each such level's oldest job; over several queues it skips only down to the highest
+of the spans' last entries. The span starts at one entry, doubles up to 128 while steps cross several
+levels, and drops back to one when a step stays inside one level or finds a due one. So the common
+claim reads one entry per queue, delayed jobs spread one per priority are skipped up to 128 per step,
+and a large delayed level costs one index descent instead of a scan.
 Over several queues, each level visits the queues in the order of their oldest due job, so a batch
 can take a queue's newer jobs before another queue's next one, and the next claim starts from that
 other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
 job that nobody is taking. The same statement marks them running, stamps the lease and opens their
 executions. Workers never wait on each other's rows. Walking levels rather than sorting matters when
 a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
-BY priority DESC, run_at` read 205 buffers per claim and the level walk 50.
+BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
+delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
+due one, a walk of one level per step read 100,000 buffers and took 57 ms per claim, the spans 1,200
+buffers and 4 ms.
 
 ### Time
 
@@ -893,7 +913,12 @@ minute `idle_in_transaction_session_timeout`, is named `tinyjobs` in `pg_stat_ac
 URL names it, and keeps TCP keepalives on. A connection beyond the minimum closes after five idle
 minutes, and every connection is replaced after half an hour. Deadlocks and serialization
 failures are retried three times with a warning, except inside the caller's transaction, which only
-the caller can retry. A fork leaves the parent's connections alone: the child opens its own.
+the caller can retry. Before lending a connection, the pool reads what the server already sent on
+it without a round trip, under a microsecond, so connections a restart or `pg_terminate_backend`
+closed while idle are dropped instead of failing the next statement. A read that still loses its
+connection mid-flight, such as `get`, a listing or the clock, runs once more on a fresh one; writes
+do not, since the server may have applied them. A fork leaves the parent's connections alone: the
+child opens its own.
 
 ### Where the limits are
 
@@ -1126,8 +1151,9 @@ leave its job `running` for the hour its lease lasts. The claim runs on tinyjobs
 caller's, so this holds when the caller's loop ends with the claim in flight (`asyncio.run`
 returning, Ctrl-C under it) and when the process exits: that loop finishes such claims before it
 stops, including a hand-back sent while that loop is being closed. Closing it cancels every other task
-at once and waits five seconds at most: a task that keeps ignoring cancellation is logged and left
-behind, so the close never hangs. At exit SQLite runs only the calls
+at once and waits five seconds at most, and half a second more for a task that swallowed the cancel,
+which is cancelled once again: a task that keeps ignoring cancellation is logged and left behind, so
+the close never hangs. At exit SQLite runs only the calls
 that return jobs (complete, fail, release, hand back) on the loop thread once the interpreter refuses
 new work to its executor; a claim is refused, so a worker still running stops instead of claiming
 jobs it cannot start. A job whose job threads were already shut down is handed back without using an
@@ -1495,7 +1521,8 @@ parameter called `queue`, `priority` or `key`, none of which are exotic names, t
 be swallowed as an option, or the option would land in their function. The bug would surface as a job
 running in the wrong queue, or a `TypeError` far from its cause. Separating them costs seven
 characters and removes the failure mode entirely. `with_options` returns a lightweight view and never
-mutates the task, so it is safe to build per call site.
+mutates the task, so it is safe to build per call site. A priority must fit in 32 bits, from -2³¹ to
+2³¹ - 1, which every backend stores exactly; anything else raises `ValueError` at enqueue.
 
 `enqueue` performs no work: it serializes the arguments, writes one row, returns. `job.id` and
 `job.status` are available immediately.

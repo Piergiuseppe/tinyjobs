@@ -155,7 +155,7 @@ MARK_EXECUTIONS_LOST = """
 """
 
 SELECT_EXECUTIONS = """
-    SELECT id, job_id, attempt, status, worker_id, started_at,
+    SELECT id, job_id, attempt, claim, status, worker_id, started_at,
            finished_at, error_type, traceback
       FROM executions WHERE job_id = ? ORDER BY claim ASC
 """

@@ -21,6 +21,7 @@ class Tables:
                 )
         self.prefix = prefix
         self.schema = schema
+        self.requested = schema
         qualify = f'"{schema}".' if schema else ""
         self.jobs = f'{qualify}"{prefix}_jobs"'
         self.executions = f'{qualify}"{prefix}_executions"'
@@ -51,8 +52,8 @@ class Tables:
     def ddl(self) -> tuple[str, ...]:
         jobs, executions = self.jobs, self.executions
         statements = []
-        if self.schema:
-            statements.append(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+        if self.requested:
+            statements.append(f'CREATE SCHEMA IF NOT EXISTS "{self.requested}"')
         statements += [
             f"""
             CREATE TABLE IF NOT EXISTS {self.meta} (

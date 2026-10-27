@@ -1715,6 +1715,36 @@ class KeptTaskTests(unittest.TestCase):
         )
 
 
+    def test_a_task_that_keeps_ignoring_cancellation_is_insisted_on_once_per_close(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        started = threading.Event()
+
+        class Resident:
+            async def close(self) -> None:
+                return None
+
+        async def stubborn() -> None:
+            started.set()
+            while True:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(10)
+
+        for _ in range(3):
+            runner.keep(loop, Resident())
+        runtime.submit(loop, stubborn(), "stubborn")
+        self.assertTrue(started.wait(5))
+        with (
+            mock.patch.object(runtime, "STOP_SECONDS", 0.3),
+            self.assertLogs("tinyjobs.runtime", "WARNING"),
+        ):
+            began = time.monotonic()
+            runner.close_here()
+            while not loop.is_closed() and time.monotonic() - began < 10:
+                time.sleep(0.01)
+        self.assertLess(time.monotonic() - began, 0.3 + runtime.INSIST_SECONDS + 0.5)
+
     def test_other_tasks_are_cancelled_while_a_kept_task_outlasts_the_close(self):
         runner = LoopRunner()
         loop = runner.own_loop()

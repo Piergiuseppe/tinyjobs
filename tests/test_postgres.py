@@ -176,7 +176,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
         def finishing_first(missing, resolved):
             yield (
-                f"UPDATE \"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s RETURNING id",
+                f"UPDATE public.\"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s RETURNING id",
                 {"id": holder.id},
             )
             return (yield from real(missing, resolved))
@@ -307,6 +307,31 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 [[plan]] = (await cursor.fetchone()).values()
             touched = plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
             self.assertLess(touched, 80)
+
+    async def test_due_jobs_are_claimed_past_many_delayed_higher_priorities(self):
+        later = self.clock.now() + 3600
+        delayed = [
+            make_job(priority=level, queue=queue, run_at=later)
+            for level in range(1, 5001)
+            for queue in ("a", "b")
+        ]
+        await self.backend.enqueue_many(delayed)
+        due = [await self.enqueue(priority=0, queue=q) for q in ("a", "b")]
+        for queues in (["a"], ["a", "b"]):
+            query, parameters = self.backend._claiming(
+                self.clock.now(), queues, "explain", 1, 60.0
+            )
+            async with self.backend._connection() as connection:
+                async with connection.transaction(force_rollback=True):
+                    await connection.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+                    cursor = await connection.execute(
+                        f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}", parameters
+                    )
+                    [[plan]] = (await cursor.fetchone()).values()
+            touched = plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
+            self.assertLess(touched, 2000)
+        claimed = await self.claim(limit=10, queues=("a", "b"))
+        self.assertCountEqual([job.id for job in claimed], [job.id for job in due])
 
     async def test_heartbeats_rewrite_rows_in_place(self):
         [(version,)] = await sql("SHOW server_version_num")
@@ -577,6 +602,188 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             [joined] = await backend.aenqueue_in(connection, [make_job()])
             await connection.commit()
         self.assertEqual((await backend.get(joined.id)).id, joined.id)
+
+    async def trap_schema(self) -> str:
+        schema = f"tj_trap_{uuid.uuid4().hex[:10]}"
+        await sql(f'CREATE SCHEMA "{schema}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA "{schema}" CASCADE')
+        await sql(f'CREATE TABLE "{schema}".calls (what text)')
+        await sql(f'GRANT INSERT ON "{schema}".calls TO PUBLIC')
+        await sql(f'GRANT USAGE ON SCHEMA "{schema}" TO PUBLIC')
+        return schema
+
+    async def calls(self, schema: str) -> list[str]:
+        return [what for (what,) in await sql(f'SELECT what FROM "{schema}".calls')]
+
+    async def test_functions_and_operators_planted_on_the_search_path_never_run(self):
+        trap = await self.trap_schema()
+        await sql(
+            f'CREATE FUNCTION "{trap}".unnest(text[]) RETURNS SETOF text LANGUAGE sql AS '
+            f"$$ INSERT INTO \"{trap}\".calls VALUES ('unnest'); SELECT pg_catalog.unnest($1) $$"
+        )
+        await sql(
+            f'CREATE FUNCTION "{trap}".at_most(double precision, double precision) '
+            f"RETURNS boolean LANGUAGE sql AS $$ INSERT INTO \"{trap}\".calls VALUES ('<='); "
+            "SELECT $1 OPERATOR(pg_catalog.<=) $2 $$"
+        )
+        await sql(
+            f'CREATE OPERATOR "{trap}".<= (LEFTARG = double precision, '
+            f'RIGHTARG = double precision, FUNCTION = "{trap}".at_most)'
+        )
+        await sql(
+            f'CREATE FUNCTION "{trap}".same(text, text) RETURNS boolean LANGUAGE sql AS '
+            f"$$ INSERT INTO \"{trap}\".calls VALUES ('='); SELECT $1 OPERATOR(pg_catalog.=) $2 $$"
+        )
+        await sql(
+            f'CREATE OPERATOR "{trap}".= (LEFTARG = text, RIGHTARG = text, '
+            f'FUNCTION = "{trap}".same)'
+        )
+        path = f"-c search_path={trap},pg_catalog,public"
+        backend = await self.set_up_as(None, options=path)
+        job = await backend.enqueue(make_job(queue="a", dedup_key="k"))
+        await backend.enqueue(make_job(queue="b", dedup_key="k"))
+        [claimed] = await backend.claim(
+            worker_id="w", queues=["a", "b"], limit=5, lease_seconds=30.0
+        )
+        self.assertTrue(await backend.complete(claimed, None))
+        await backend.reap_expired()
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, options=path) as connection:
+            await backend.aenqueue_in(connection, [make_job(dedup_key="t"), make_job(dedup_key="t")])
+            await connection.commit()
+        self.assertEqual(claimed.id, job.id)
+        self.assertEqual(await self.calls(trap), [])
+
+    async def test_a_meta_table_another_role_planted_is_never_read(self):
+        squatter = await self.role()
+        schema = await self.trap_schema()
+        await sql(f'GRANT CREATE ON SCHEMA "{schema}" TO "{squatter}"')
+        prefix = new_prefix()
+        async with await psycopg.AsyncConnection.connect(
+            url_for(user=squatter, password="tinyjobs"), autocommit=True
+        ) as connection:
+            await connection.execute(
+                f'CREATE FUNCTION "{schema}".leak() RETURNS TABLE (key text, value text) '
+                f"LANGUAGE sql AS $$ INSERT INTO \"{schema}\".calls VALUES ('read'); "
+                "SELECT 'schema_version'::text, '1'::text $$"
+            )
+            await connection.execute(
+                f'CREATE VIEW "{schema}"."{prefix}_meta" AS SELECT * FROM "{schema}".leak()'
+            )
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, schema=schema)
+        self.addAsyncCleanup(backend.close)
+        with self.assertRaisesRegex(ConfigurationError, "does not hold"):
+            await backend.setup()
+        self.assertEqual(await self.calls(schema), [])
+
+    async def database_owned_by(self, owner: str) -> str:
+        name = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE DATABASE "{name}" OWNER "{owner}"')
+        self.addAsyncCleanup(sql, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        return name
+
+    async def test_a_database_owner_without_the_users_privileges_is_not_trusted(self):
+        owner = await self.role()
+        name = await self.database_owned_by(owner)
+        theirs = PostgresBackend.from_url(
+            url_for(dbname=name, user=owner, password="tinyjobs"),
+            prefix=self.prefix,
+            schema="theirs",
+        )
+        self.addAsyncCleanup(theirs.close)
+        await theirs.setup()
+        mine = PostgresBackend.from_url(
+            url_for(dbname=name), prefix=self.prefix, schema="theirs"
+        )
+        self.addAsyncCleanup(mine.close)
+        with self.assertRaisesRegex(ConfigurationError, "does not hold"):
+            await mine.setup()
+
+    async def test_a_role_that_may_not_read_the_cluster_id_still_sets_up_and_joins(self):
+        owner = await self.role()
+        name = await self.database_owned_by(owner)
+        async with await psycopg.AsyncConnection.connect(url_for(dbname=name), autocommit=True) as admin:
+            await admin.execute("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC")
+        theirs = url_for(dbname=name, user=owner, password="tinyjobs")
+        backend = PostgresBackend.from_url(theirs, prefix=self.prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        async with await psycopg.AsyncConnection.connect(theirs) as connection:
+            [joined] = await backend.aenqueue_in(connection, [make_job()])
+            await connection.commit()
+        self.assertEqual((await backend.get(joined.id)).id, joined.id)
+
+    async def test_an_empty_dedup_key_is_a_key_like_any_other(self):
+        with mock.patch.object(
+            PostgresBackend, "_holders", autospec=True, side_effect=PostgresBackend._holders
+        ) as holders:
+            first, second = await self.backend.enqueue_many(
+                [make_job(id="first", dedup_key=""), make_job(id="second", dedup_key="")]
+            )
+        holders.assert_not_called()
+        later = await self.backend.enqueue(make_job(id="third", dedup_key=""))
+        self.assertEqual([first.id, second.id, later.id], ["first", "first", "first"])
+
+    async def test_a_close_during_a_wake_up_leaves_no_wake_up_behind(self):
+        backend = await self.open()
+        original = backend._send
+
+        async def slow(queues):
+            await asyncio.sleep(0.05)
+            await original(queues)
+
+        await backend.enqueue(make_job(queue="a"))
+        backend._send = slow
+        enqueue = asyncio.ensure_future(
+            backend.enqueue_many([make_job(queue="a"), make_job(queue="b")])
+        )
+        await asyncio.sleep(0.03)
+        await backend.close()
+        await enqueue
+        self.assertIsNone(backend._waking)
+
+    async def test_connections_the_server_closed_while_idle_are_never_handed_out(self):
+        name = f"tinyjobs-{uuid.uuid4().hex[:8]}"
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, application_name=name, min_connections=3
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        await asyncio.gather(*(backend.get("missing") for _ in range(3)))
+        live = "SELECT count(*) FROM pg_stat_activity WHERE application_name = %(name)s"
+        await sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE application_name = %(name)s",
+            {"name": name},
+        )
+        while (await sql(live, {"name": name}))[0][0]:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        stored = [await backend.enqueue(make_job()) for _ in range(3)]
+        self.assertEqual(len({job.id for job in stored}), 3)
+
+    async def test_a_read_cut_off_by_a_lost_connection_is_read_again(self):
+        backend = await self.open()
+        job = await backend.enqueue(make_job())
+        original = backend._rows
+        raised: list[Exception] = []
+
+        async def losing(*args, **kwargs):
+            if not raised:
+                raised.append(failure)
+                raise failure
+            return await original(*args, **kwargs)
+
+        backend._rows = losing
+        for failure in (
+            psycopg.errors.AdminShutdown("terminating connection"),
+            psycopg.OperationalError("server closed the connection unexpectedly"),
+        ):
+            raised.clear()
+            self.assertEqual((await backend.get(job.id)).id, job.id)
+        raised.clear()
+        failure = psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+        with self.assertRaises(psycopg.errors.QueryCanceled):
+            await backend.get(job.id)
 
     async def test_jobs_sharing_a_key_in_one_call_keep_the_first_one_given(self):
         given = [make_job(id="job-b", dedup_key="k"), make_job(id="job-a", dedup_key="k")]

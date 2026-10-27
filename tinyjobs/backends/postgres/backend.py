@@ -5,8 +5,10 @@ import hashlib
 import logging
 import time
 import weakref
+from dataclasses import dataclass
+from functools import partial
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
-from typing import Any, AsyncIterator, Awaitable, Generator, Sequence, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Sequence, TypeVar
 
 import psycopg
 from psycopg import errors
@@ -46,6 +48,8 @@ DEFAULT_POOL_TIMEOUT = 20.0
 DEFAULT_STATEMENT_TIMEOUT = 30.0
 SHORTEST_STATEMENT_SECONDS = 0.001
 LONGEST_STATEMENT_SECONDS = (2**31 - 1) / 1000
+SAFE_SEARCH_PATH = "pg_catalog, pg_temp"
+TABLE_KINDS = ("jobs", "executions", "schedules", "meta")
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
 MAX_IDLE_SECONDS = 300.0
@@ -62,6 +66,8 @@ ENQUEUE_BATCH = 1000
 INSERT_ROUNDS = 50
 RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure)
 RETRIES = 3
+READS_TO_SEE_A_CLOSE = 2
+LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
 
 logger = logging.getLogger("tinyjobs.postgres")
@@ -124,6 +130,7 @@ class PostgresBackend(BaseBackend):
         self._connection_options = connection_options
         self._joined: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
         self._unplaced = self._queries
+        self._schemas: list[str] | None = None
         self._identity: tuple[Any, ...] | None = None
         self._channel: str | None = None
         self._statement_timeout = statement_timeout
@@ -147,6 +154,7 @@ class PostgresBackend(BaseBackend):
             open=False,
             kwargs=_connection_kwargs(self._conninfo, self._connection_options),
             configure=self._configure,
+            check=_alive,
             name="tinyjobs",
         )
 
@@ -159,49 +167,71 @@ class PostgresBackend(BaseBackend):
     async def setup(self) -> None:
         await self._open()
         async with self._connection() as connection:
-            stored = await self._stored_version(connection)
-        if stored != SCHEMA_VERSION:
+            placed = await self._placed(connection)
+            stored = await self._stored_version(connection, placed) if placed.meta else None
+        if placed.tables != len(TABLE_KINDS) or stored != SCHEMA_VERSION:
             await self._create()
-        await self._place()
+        async with self._connection() as connection:
+            placed = await self._placed(connection)
+            if placed.tables != len(TABLE_KINDS):
+                raise ConfigurationError(
+                    f"some tinyjobs tables for prefix {self._tables.prefix!r} are missing "
+                    f"although the meta table records schema version {SCHEMA_VERSION}; "
+                    "restore them or drop the rest so setup creates them again"
+                )
+            queries = placed.queries
+            rows = await _fetch(connection, queries.identity, {})
+            if not rows:
+                await connection.execute(placed.within.instance(), {})
+                rows = await _fetch(connection, queries.identity, {})
+            cluster = await _fetch(connection, queries.cluster_readable, {})
+            if cluster[0]["readable"]:
+                cluster = await _fetch(connection, queries.cluster, {})
+        self._identity = _identity_of(rows[0], cluster[0].get("cluster"))
+        self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
+        self._queries = queries
         await self._now()
 
-    async def _place(self) -> None:
+    async def _placed(self, connection: psycopg.AsyncConnection) -> "_Placement":
         tables = self._tables
-        names = {
-            "jobs": tables.jobs,
-            "executions": tables.executions,
-            "schedules": tables.schedules,
-            "meta": tables.meta,
-        }
-        async with self._connection() as connection:
-            placed = await _fetch(connection, self._unplaced.placement, names)
-            if len(placed) > 1:
+        schemas = [tables.requested] if tables.requested else list(self._schemas or ())
+        found = await _fetch(
+            connection,
+            self._unplaced.placement,
+            {
+                "names": [f"{tables.prefix}_{kind}" for kind in TABLE_KINDS],
+                "schemas": schemas,
+            },
+        )
+        if found:
+            if len({row["schema"] for row in found}) > 1:
                 raise ConfigurationError(
                     f"the tinyjobs tables for prefix {tables.prefix!r} resolve to more "
                     "than one schema on this connection's search_path; pass schema= "
                     "to name the one to use"
                 )
-            if not placed or placed[0]["tables"] != len(names):
+            schema, count = found[0]["schema"], len(found)
+            owned = all(row["owned"] for row in found)
+            meta = any(row["name"] == f"{tables.prefix}_meta" for row in found)
+        else:
+            meta = False
+            schema = schemas[0] if schemas else None
+            if schema is None:
                 raise ConfigurationError(
-                    f"some tinyjobs tables for prefix {tables.prefix!r} are missing "
-                    f"although {tables.meta} records schema version {SCHEMA_VERSION}; "
-                    "restore them or drop the rest so setup creates them again"
+                    "no schema on this connection's search_path exists to create the "
+                    "tinyjobs tables in; pass schema= or fix the search_path"
                 )
-            if not placed[0]["owned"]:
-                raise ConfigurationError(
-                    f"the tinyjobs tables for prefix {tables.prefix!r} or their schema "
-                    "belong to a role that does not hold the connecting user's "
-                    "privileges; tinyjobs only uses tables owned by its own role, a role "
-                    "that has its privileges, or the database owner"
-                )
-            queries = Queries(tables.within(placed[0]["schema"]), self._following)
-            rows = await _fetch(connection, queries.identity, {})
-            if not rows:
-                await connection.execute(tables.instance())
-                rows = await _fetch(connection, queries.identity, {})
-        self._identity = _identity_of(rows[0])
-        self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
-        self._queries = queries
+            kept = await _fetch(connection, self._unplaced.schema_trust, {"schema": schema})
+            owned, count = all(row["owned"] for row in kept), 0
+        if not owned:
+            raise ConfigurationError(
+                f"the tinyjobs tables for prefix {tables.prefix!r} or their schema "
+                f"{schema!r} belong to a role that does not hold the connecting user's "
+                "privileges; tinyjobs only uses tables and schemas owned by its own role "
+                "or by a role that has its privileges, so pass schema= with one it owns"
+            )
+        within = tables.within(schema)
+        return _Placement(within, Queries(within, self._following), count, meta)
 
     async def _create(self) -> None:
         async with self._transaction() as connection:
@@ -211,7 +241,8 @@ class PostgresBackend(BaseBackend):
             await connection.execute(
                 "SELECT pg_advisory_xact_lock(%(key)s)", {"key": self._tables.lock}
             )
-            stored = await self._stored_version(connection)
+            placed = await self._placed(connection)
+            stored = await self._stored_version(connection, placed) if placed.meta else None
             if stored is not None and stored > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"postgres schema version {stored} is newer than this tinyjobs "
@@ -219,8 +250,8 @@ class PostgresBackend(BaseBackend):
                 )
             if stored == SCHEMA_VERSION:
                 return
-            for statement in self._tables.ddl():
-                await connection.execute(statement)
+            for statement in placed.within.ddl():
+                await connection.execute(statement, {})
 
     async def _open(self) -> None:
         failed = self._opening
@@ -474,7 +505,7 @@ class PostgresBackend(BaseBackend):
         return bool(rows)
 
     async def get(self, job_id: str) -> Job | None:
-        rows = await self._rows(self._queries.get, {"id": job_id})
+        rows = await self._lookup(self._queries.get, {"id": job_id})
         return job_from_row(rows[0]) if rows else None
 
     async def list(
@@ -497,7 +528,7 @@ class PostgresBackend(BaseBackend):
             conditions.append("id < %(cursor)s")
             parameters["cursor"] = cursor
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = await self._rows(
+        rows = await self._lookup(
             f"{self._queries.listed}{where} ORDER BY id DESC LIMIT %(limit)s", parameters
         )
         jobs = [job_from_row(row) for row in rows[:limit]]
@@ -505,7 +536,7 @@ class PostgresBackend(BaseBackend):
         return Page(items=jobs, cursor=next_cursor)
 
     async def executions(self, job_id: str) -> list[Execution]:
-        rows = await self._rows(self._queries.executions, {"id": job_id})
+        rows = await self._lookup(self._queries.executions, {"id": job_id})
         return [execution_from_row(row) for row in rows]
 
     async def reap_expired(self) -> int:
@@ -517,16 +548,11 @@ class PostgresBackend(BaseBackend):
         return rows[0]["reaped"]
 
     async def counts_by_status(self) -> dict[str, int]:
-        rows = await self._rows(self._queries.count_by_status, {})
+        rows = await self._lookup(self._queries.count_by_status, {})
         return {row["status"]: row["total"] for row in rows}
 
     async def stats(self, now: float) -> Stats:
-        queries = self._queries
-        async with self._connection() as connection:
-            counted = await _fetch(connection, queries.count_by_queue, {})
-            oldest = await _fetch(connection, queries.oldest_due_by_queue, {"now": now})
-            expired = await _fetch(connection, queries.count_expired, {"now": now})
-            queued = await _fetch(connection, queries.queued_by_task, {})
+        counted, oldest, expired, queued = await _again(partial(self._counted, now))
         counts: dict[str, dict[str, int]] = {}
         for row in counted:
             counts.setdefault(row["queue"], {})[row["status"]] = row["total"]
@@ -538,6 +564,16 @@ class PostgresBackend(BaseBackend):
             expired_leases=expired[0]["total"],
             queued_tasks={row["task"]: row["total"] for row in queued},
         )
+
+    async def _counted(self, now: float) -> list[list[dict[str, Any]]]:
+        queries = self._queries
+        async with self._connection() as connection:
+            return [
+                await _fetch(connection, queries.count_by_queue, {}),
+                await _fetch(connection, queries.oldest_due_by_queue, {"now": now}),
+                await _fetch(connection, queries.count_expired, {"now": now}),
+                await _fetch(connection, queries.queued_by_task, {}),
+            ]
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         if not policy.enabled:
@@ -564,7 +600,7 @@ class PostgresBackend(BaseBackend):
 
     async def schedules(self) -> list[ScheduleState]:
         await self._now()
-        rows = await self._rows(self._queries.schedules, {})
+        rows = await self._lookup(self._queries.schedules, {})
         return [schedule_from_row(row) for row in rows]
 
     async def register_schedules(self, states: Sequence[ScheduleState]) -> None:
@@ -667,8 +703,14 @@ class PostgresBackend(BaseBackend):
             identity = None
             if rows[0]["present"]:
                 rows = yield queries.identity, {}
-                identity = _identity_of(rows[0]) if rows else None
-            if identity != self._identity:
+                if rows:
+                    [readable] = yield queries.cluster_readable, {}
+                    cluster = None
+                    if readable["readable"]:
+                        [read] = yield queries.cluster, {}
+                        cluster = read["cluster"]
+                    identity = _identity_of(rows[0], cluster)
+            if not _same_store(self._identity, identity):
                 raise ConfigurationError(
                     f"the connection passed as tx does not reach the tinyjobs store this "
                     f"app uses ({self._server()}, prefix {self._tables.prefix!r}); "
@@ -728,7 +770,11 @@ class PostgresBackend(BaseBackend):
         queries = self._queries
         rows = yield queries.by_ids, {"ids": [job.id for _, job in missing]}
         existing = {row["id"]: job_from_row(row) for row in rows}
-        keys = [job.dedup_key for _, job in missing if job.id not in existing and job.dedup_key]
+        keys = [
+            job.dedup_key
+            for _, job in missing
+            if job.id not in existing and job.dedup_key is not None
+        ]
         holders: dict[str, Job] = {}
         if keys:
             rows = yield queries.active_by_keys, {"keys": keys}
@@ -783,6 +829,9 @@ class PostgresBackend(BaseBackend):
                 logger.warning("retrying a postgres statement after %s", error)
         raise AssertionError("unreachable")
 
+    async def _lookup(self, query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return await _again(partial(self._rows, query, parameters))
+
     async def _rows(
         self, query: str, parameters: dict[str, Any], *, rows: bool = True
     ) -> list[dict[str, Any]]:
@@ -812,6 +861,15 @@ class PostgresBackend(BaseBackend):
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
         timeout = self._statement_timeout
         statement = "0" if timeout is None else f"{int(timeout * 1000)}ms"
+        if self._schemas is None:
+            cursor = await connection.execute(
+                "SELECT pg_catalog.current_schemas(false)::pg_catalog.text[] AS schemas"
+            )
+            self._schemas = (await cursor.fetchone())["schemas"]
+        await connection.execute(
+            "SELECT pg_catalog.set_config('search_path', %(path)s, false)",
+            {"path": SAFE_SEARCH_PATH},
+        )
         await connection.execute(
             "SELECT set_config('default_transaction_isolation', 'read committed', false), "
             "set_config('statement_timeout', %(statement)s, false), "
@@ -833,7 +891,7 @@ class PostgresBackend(BaseBackend):
             for queue in quiet:
                 self._woken[queue] = moment
             await self._send(quiet)
-        if self._waiting and self._waking is None:
+        if self._waiting and self._waking is None and not self._closed:
             self._waking = asyncio.create_task(self._wake_later(), name="tinyjobs-postgres-wake")
 
     async def _wake_later(self) -> None:
@@ -859,13 +917,10 @@ class PostgresBackend(BaseBackend):
         except WAKE_ERRORS as error:
             logger.debug("could not wake workers on %s: %s", ", ".join(queues), error)
 
-    async def _stored_version(self, connection: psycopg.AsyncConnection) -> int | None:
-        present = await _fetch(
-            connection, self._unplaced.table_exists, {"name": self._tables.meta}
-        )
-        if not present[0]["present"]:
-            return None
-        rows = await _fetch(connection, self._unplaced.schema_version, {})
+    async def _stored_version(
+        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    ) -> int | None:
+        rows = await _fetch(connection, placed.queries.schema_version, {})
         return int(rows[0]["value"]) if rows else None
 
     async def _now(self) -> float:
@@ -873,7 +928,7 @@ class PostgresBackend(BaseBackend):
         if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
             async with self._reading:
                 if not self._read or clock.due():
-                    clock.follow(*await self._forgetting(self._timed()), self._server())
+                    clock.follow(*await self._forgetting(_again(self._timed)), self._server())
                     self._read = True
         return clock.now()
 
@@ -902,6 +957,21 @@ class PostgresBackend(BaseBackend):
             settings = {}
         place = settings.get("host") or "local socket"
         return f"postgres {place}:{settings.get('port', 5432)} db {settings.get('dbname', '')}"
+
+
+async def _alive(connection: psycopg.AsyncConnection) -> None:
+    for _ in range(READS_TO_SEE_A_CLOSE):
+        connection.pgconn.consume_input()
+
+
+async def _again(call: Callable[[], Awaitable[T]]) -> T:
+    try:
+        return await call()
+    except psycopg.OperationalError as error:
+        if error.sqlstate is not None and error.sqlstate not in LOST_STATES:
+            raise
+        logger.debug("reading again on a fresh connection after %s", error)
+        return await call()
 
 
 def _connection_kwargs(conninfo: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -939,7 +1009,7 @@ def _firsts(jobs: Sequence[Job]) -> tuple[list[tuple[int, Job]], dict[int, int]]
     firsts: list[tuple[int, Job]] = []
     copies: dict[int, int] = {}
     for index, job in enumerate(jobs):
-        marks = [("id", job.id)] + ([("key", job.dedup_key)] if job.dedup_key else [])
+        marks = [("id", job.id)] + ([("key", job.dedup_key)] if job.dedup_key is not None else [])
         earlier = next((seen[mark] for mark in marks if mark in seen), None)
         if earlier is None:
             seen.update((mark, index) for mark in marks)
@@ -960,8 +1030,22 @@ def _in_order(
     return placed
 
 
-def _identity_of(row: dict[str, Any]) -> tuple[Any, ...]:
-    return (row["instance"], row["database"], row["cluster"])
+@dataclass(frozen=True, slots=True)
+class _Placement:
+    within: Tables
+    queries: Queries
+    tables: int
+    meta: bool
+
+
+def _identity_of(row: dict[str, Any], cluster: str | None) -> tuple[Any, ...]:
+    return (row["instance"], row["database"], cluster)
+
+
+def _same_store(mine: tuple[Any, ...], theirs: tuple[Any, ...] | None) -> bool:
+    if theirs is None or mine[:2] != theirs[:2]:
+        return False
+    return mine[2] is None or theirs[2] is None or mine[2] == theirs[2]
 
 
 def _noticed(queue: str) -> str:

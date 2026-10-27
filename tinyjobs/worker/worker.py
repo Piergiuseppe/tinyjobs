@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from contextlib import suppress
+from functools import partial
 from typing import TYPE_CHECKING, Sequence
 
 from ..exceptions import (
@@ -75,6 +76,7 @@ class Worker:
         self._handle_signals = handle_signals
         self._inflight: dict[tuple[str, int], Job] = {}
         self._held_until: dict[tuple[str, int], float] = {}
+        self._settling: set[tuple[str, int]] = set()
         self._running: set[asyncio.Task] = set()
         self._releases: set[asyncio.Future] = set()
         self._finished = threading.Event()
@@ -221,6 +223,15 @@ class Worker:
             self._inflight.pop((job.id, job.claims), None)
             self._held_until.pop((job.id, job.claims), None)
             self._capacity.set()
+            settled = (job.id, job.claims) in self._settling
+            self._settling.discard((job.id, job.claims))
+            if task.cancelled() and settled:
+                logger.warning(
+                    "job %s ended before its outcome was recorded; the reaper takes "
+                    "it back once its lease expires",
+                    job.id,
+                )
+                return
             if task.cancelled():
                 self._release_later(job)
                 return
@@ -264,6 +275,7 @@ class Worker:
                 self._executors,
                 held_until=lambda: self._held_until.get((job.id, job.claims), 0.0)
                 - LEASE_MARGIN_SECONDS,
+                settling=partial(self._settling.add, (job.id, job.claims)),
             )
         except ExecutorClosedError:
             await self._hand_back_unstarted(job)

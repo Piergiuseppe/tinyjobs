@@ -1418,6 +1418,87 @@ class BackendOutageTests(WorkerTestCase):
         self.assertEqual(failures, [1])
         self.assertIn("no longer held", "\n".join(logs.output))
 
+    async def test_a_recorded_failure_stays_recorded_when_its_retry_has_already_started(self):
+        failures, runs = [], []
+
+        @self.app.task(max_attempts=3)
+        async def handler():
+            runs.append(1)
+            if len(runs) == 1:
+                raise Retry(in_=0)
+            await asyncio.sleep(3)
+
+        self.app.on_job_failure(lambda job, error, will_retry: failures.append(job.attempts))
+        await handler.aenqueue()
+        await self.flaky_store("fail", 1, lost_reply=True)
+        with self.assertLogs("tinyjobs.worker", "INFO") as logs:
+            await self.run_briefly(self.make_worker(), 1.0)
+        self.assertEqual(failures, [1])
+        self.assertNotIn("no longer held", "\n".join(logs.output))
+        self.assertEqual(len(runs), 2)
+
+    async def test_a_finished_job_stopped_while_its_outcome_waits_is_not_put_back(self):
+        runs = []
+
+        @self.app.task(max_attempts=1)
+        def handler():
+            runs.append(1)
+
+        job = await handler.aenqueue()
+        await self.app.ready()
+        backend = self.app.backend
+        original = backend.complete
+        back = {"at": float("inf")}
+
+        async def flaky(*args, **kwargs):
+            if time.monotonic() < back["at"]:
+                raise ConnectionError("store unreachable")
+            return await original(*args, **kwargs)
+
+        backend.complete = flaky
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        self.addCleanup(setattr, backend, "complete", original)
+        worker = self.make_worker(shutdown_timeout=1.0)
+        runner = asyncio.create_task(worker.start())
+        while not runs:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        back["at"] = time.monotonic() + 0.9
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertIn("reaper takes it back", "\n".join(logs.output))
+        self.assertIs((await self.app.aget(job.id)).status, JobStatus.RUNNING)
+        await self.run_briefly(self.make_worker(), 0.5)
+        self.assertEqual(len(runs), 1)
+
+    async def test_a_history_read_that_fails_once_is_tried_again(self):
+        succeeded = []
+
+        @self.app.task
+        def handler():
+            return None
+
+        self.app.on_job_success(lambda job, result, duration: succeeded.append(job.id))
+        job = await handler.aenqueue()
+        await self.flaky_store("complete", 1, lost_reply=True)
+        backend = self.app.backend
+        executions = backend.executions
+        reads = []
+
+        async def blip(*args, **kwargs):
+            reads.append(1)
+            if len(reads) == 1:
+                raise ConnectionError("store unreachable")
+            return await executions(*args, **kwargs)
+
+        backend.executions = blip
+        self.addCleanup(setattr, backend, "executions", executions)
+        with self.assertNoLogs("tinyjobs.worker", "ERROR"):
+            await self.settle(self.make_worker(), [job])
+        self.assertEqual(succeeded, [job.id])
+
     async def test_the_retry_window_ends_before_the_lease_can_run_out(self):
         @self.app.task
         def handler():

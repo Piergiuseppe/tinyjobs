@@ -120,6 +120,7 @@ def execution_from_row(row: Mapping[str, Any]) -> Execution:
         finished_at=row["finished_at"],
         error_type=row["error_type"],
         traceback=row["traceback"],
+        claim=row["claim"],
     )
 
 

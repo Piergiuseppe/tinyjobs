@@ -561,10 +561,10 @@ database tinyjobs uses, not a copy of it, or the enqueue raises `ConfigurationEr
 
 Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every
 statement times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
-`pg_stat_activity`. The tables and their schema must belong to the connecting role, a role that
-holds its privileges, or the database owner. Behind PgBouncer use session pooling. A transaction
-left open for hours anywhere on the server stops autovacuum from cleaning the jobs table. Postgres
-14 to 18 are supported, and CI tests 14 and 18.
+`pg_stat_activity`. The tables and their schema must belong to the connecting role or a role that
+holds its privileges; otherwise pass `schema=` with one it owns. Behind PgBouncer use session
+pooling. A transaction left open for hours anywhere on the server stops autovacuum from cleaning the
+jobs table. Postgres 14 to 18 are supported, and CI tests 14 and 18.
 
 ## Other backends
 
@@ -730,7 +730,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1259 tests, no test dependencies. The one that matters most is
+1273 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

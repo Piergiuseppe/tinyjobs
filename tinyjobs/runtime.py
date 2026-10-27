@@ -14,6 +14,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from functools import partial
 from queue import SimpleQueue
 from typing import Any, Callable, Coroutine, Iterator, TypeVar
@@ -670,7 +671,7 @@ class LoopRunner:
     def close_here(self) -> None:
         loop, thread = self._take_own()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=STOP_SECONDS)
+            thread.join(timeout=STOP_SECONDS + INSIST_SECONDS)
 
     def _take_own(self) -> tuple[asyncio.AbstractEventLoop | None, Any]:
         with self._guard:
@@ -798,12 +799,13 @@ class LoopRunner:
         _ending.add(loop)
         _resting.discard(loop)
         deadline = time.monotonic() + STOP_SECONDS
-        _finish_tasks(loop, deadline, spare=True)
+        finishing = _Finishing()
+        _finish_tasks(loop, deadline, spare=True, finishing=finishing)
         for resident in residents:
             with suppress(Exception):
                 loop.run_until_complete(resident.close())
-            _finish_tasks(loop, deadline, spare=True)
-        _finish_tasks(loop, deadline)
+            _finish_tasks(loop, deadline, spare=True, finishing=finishing)
+        _finish_tasks(loop, deadline, finishing=finishing)
         loop.close()
         self._settle_left(loop)
 
@@ -840,12 +842,22 @@ def spared_until_close() -> Iterator[None]:
         _sparing.reset(token)
 
 
+@dataclass
+class _Finishing:
+    asked: set[asyncio.Task] = field(default_factory=set)
+    overdue: dict[asyncio.Task, float] = field(default_factory=dict)
+    insisted: set[asyncio.Task] = field(default_factory=set)
+
+
 def _finish_tasks(
-    loop: asyncio.AbstractEventLoop, deadline: float, *, spare: bool = False
+    loop: asyncio.AbstractEventLoop,
+    deadline: float,
+    *,
+    spare: bool = False,
+    finishing: _Finishing | None = None,
 ) -> None:
-    asked: set[asyncio.Task] = set()
-    overdue: dict[asyncio.Task, float] = {}
-    insisted = False
+    state = _Finishing() if finishing is None else finishing
+    asked, overdue = state.asked, state.overdue
     loop.run_until_complete(asyncio.sleep(0))
     while pending := {
         task
@@ -863,11 +875,12 @@ def _finish_tasks(
             for task in pending
             if task not in asked and (left <= 0 or not _is_kept(task))
         ]
-        if not fresh and left <= 0 and not insisted:
-            insisted = True
-            for task in pending:
+        stubborn = pending - state.insisted
+        if not fresh and left <= 0 and stubborn:
+            state.insisted |= stubborn
+            for task in stubborn:
                 task.cancel()
-            loop.run_until_complete(asyncio.wait(pending, timeout=INSIST_SECONDS))
+            loop.run_until_complete(asyncio.wait(stubborn, timeout=INSIST_SECONDS))
             continue
         if not fresh and left <= 0:
             logger.warning(

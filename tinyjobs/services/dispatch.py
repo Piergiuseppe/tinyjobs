@@ -12,6 +12,8 @@ from ..registry import TaskRegistry
 from ..status import JobStatus
 from .serialization import SerializationService
 
+PRIORITY_LIMIT = 2**31
+
 
 class DispatchService:
     def __init__(
@@ -65,6 +67,12 @@ class DispatchService:
         due_at: float | None = None,
     ) -> Job:
         self._verify_capabilities(options)
+        priority = options.priority or 0
+        if not -PRIORITY_LIMIT <= priority < PRIORITY_LIMIT:
+            raise ValueError(
+                f"priority must be between {-PRIORITY_LIMIT} and {PRIORITY_LIMIT - 1}, "
+                f"not {priority}"
+            )
         now = self._clock.now()
         encoded, codec_name = self._serialization.encode_payload(
             payload, options.codec
@@ -76,7 +84,7 @@ class DispatchService:
             codec=codec_name,
             queue=options.queue or self._default_queue,
             status=JobStatus.QUEUED,
-            priority=options.priority or 0,
+            priority=priority,
             attempts=0,
             max_attempts=options.max_attempts or 1,
             run_at=(

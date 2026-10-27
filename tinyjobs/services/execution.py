@@ -47,10 +47,11 @@ class ExecutionService:
         executors: ExecutorResolver,
         *,
         held_until: Callable[[], float] | None = None,
+        settling: Callable[[], None] | None = None,
     ) -> Attempt:
         token = current_job.set(job)
         try:
-            return await self._attempt(job, task, executors, held_until)
+            return await self._attempt(job, task, executors, held_until, settling)
         finally:
             current_job.reset(token)
 
@@ -60,6 +61,7 @@ class ExecutionService:
         task: "Task",
         executors: ExecutorResolver,
         held_until: Callable[[], float] | None,
+        settling: Callable[[], None] | None,
     ) -> Attempt:
         await self._hooks.started(job)
         started = self._clock.monotonic()
@@ -70,6 +72,8 @@ class ExecutionService:
         except (asyncio.CancelledError, ExecutorClosedError):
             raise
         except BaseException as error:
+            if settling is not None:
+                settling()
             recorded, will_retry = await self._lifecycle.fail(
                 job, task, error, held_until=held_until
             )
@@ -78,6 +82,8 @@ class ExecutionService:
             await self._hooks.failed(job, error, will_retry)
             return Attempt(error, will_retry)
         duration = self._clock.monotonic() - started
+        if settling is not None:
+            settling()
         if not await self._lifecycle.complete(job, encoded, held_until=held_until):
             return Attempt(recorded=False)
         await self._hooks.succeeded(job, result, duration)

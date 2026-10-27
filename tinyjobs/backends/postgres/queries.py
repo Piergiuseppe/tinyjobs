@@ -3,13 +3,30 @@ from __future__ import annotations
 from .records import JOB_COLUMNS, JOB_TYPES, job_columns
 from .schema import Tables
 
-READING = "SELECT extract(epoch FROM clock_timestamp())::double precision AS now"
+READING = "SELECT extract(epoch FROM pg_catalog.clock_timestamp())::double precision AS now"
 
-SERVER = "extract(epoch FROM statement_timestamp())::double precision"
+SERVER = "extract(epoch FROM pg_catalog.statement_timestamp())::double precision"
 
 NOW = "%(now)s::double precision"
 
 NOTICE_CHARACTERS = 1000
+
+SPAN_LIMIT = 128
+
+
+def _qualified(kind: str) -> str:
+    return kind if " " in kind or kind == "integer" else f"pg_catalog.{kind}"
+
+
+def trusting(owner: str) -> str:
+    return f"""(
+        pg_has_role({owner}, current_user, 'USAGE')
+        OR ({owner} = to_regrole('pg_database_owner') AND pg_has_role(
+            (SELECT datdba FROM pg_database WHERE datname = current_database()),
+            current_user,
+            'USAGE'
+        ))
+    )"""
 
 
 class Queries:
@@ -25,30 +42,35 @@ class Queries:
             else "%(lease)s::double precision"
         )
         arrays = ", ".join(
-            f"%({column})s::{kind}[]" for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
+            f"pg_catalog.unnest(%({column})s::{_qualified(kind)}[])"
+            for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
         )
 
         self.server_time = READING
 
         self.insert = f"""
             WITH incoming AS (
-                SELECT * FROM unnest({arrays}) WITH ORDINALITY
+                SELECT * FROM ROWS FROM ({arrays}) WITH ORDINALITY
                     AS incoming ({columns}, position)
             ),
             inserted AS (
                 INSERT INTO {jobs} ({columns})
                 SELECT {columns} FROM incoming ORDER BY position
                 ON CONFLICT DO NOTHING
-                RETURNING id, queue, run_at <= {horizon} AS due
+                RETURNING id, queue, run_at OPERATOR(pg_catalog.<=) {horizon} AS due
             )
             SELECT id, queue, due FROM inserted
         """
 
-        self.by_ids = f"SELECT {columns} FROM {jobs} WHERE id = ANY(%(ids)s::text[])"
+        self.by_ids = (
+            f"SELECT {columns} FROM {jobs} "
+            "WHERE id OPERATOR(pg_catalog.=) ANY(%(ids)s::pg_catalog.text[])"
+        )
 
         self.active_by_keys = f"""
             SELECT {columns} FROM {jobs}
-             WHERE dedup_key = ANY(%(keys)s::text[]) AND status IN ('queued', 'running')
+             WHERE dedup_key OPERATOR(pg_catalog.=) ANY(%(keys)s::pg_catalog.text[])
+               AND status OPERATOR(pg_catalog.=) ANY(ARRAY['queued', 'running']::pg_catalog.text[])
         """
 
         def taking(picked: str) -> str:
@@ -77,32 +99,44 @@ class Queries:
             SELECT {columns} FROM claimed ORDER BY priority DESC, run_at ASC
             """
 
-        levels = f"""
-            levels (priority) AS (
-                SELECT max(top.priority)
-                  FROM unnest(%(queues)s::text[]) AS wanted (name)
-                 CROSS JOIN LATERAL (
-                       SELECT priority FROM {jobs}
-                        WHERE status = 'queued' AND queue = wanted.name
-                        ORDER BY priority DESC
-                        LIMIT 1
-                 ) AS top
+        def chunk(queue: str) -> str:
+            return f"""
+                SELECT max(priority) FILTER (WHERE run_at <= {horizon}) AS due,
+                       CASE WHEN count(*) = levels.span THEN min(priority) END AS last,
+                       max(priority) AS top
+                  FROM (
+                       SELECT priority, run_at FROM {jobs}
+                        WHERE status = 'queued' AND queue = {queue}
+                          AND priority < levels.priority
+                        ORDER BY priority DESC, run_at ASC
+                        LIMIT levels.span
+                  ) AS chunk
+            """
+
+        def levels(seen: str) -> str:
+            return f"""
+            levels (priority, due, span) AS (
+                SELECT 2147483648::bigint, false, 1
                 UNION ALL
-                SELECT (
-                       SELECT max(lower.priority)
-                         FROM unnest(%(queues)s::text[]) AS wanted (name)
-                        CROSS JOIN LATERAL (
-                              SELECT priority FROM {jobs}
-                               WHERE status = 'queued' AND queue = wanted.name
-                                 AND priority < levels.priority
-                               ORDER BY priority DESC
-                               LIMIT 1
-                        ) AS lower
-                  )
+                SELECT CASE WHEN seen.due >= seen.last OR seen.last IS NULL
+                            THEN seen.due ELSE seen.last END::bigint,
+                       coalesce(seen.due >= seen.last, seen.last IS NULL),
+                       CASE WHEN seen.due >= seen.last OR seen.last IS NULL THEN 1
+                            WHEN seen.top > seen.last OR levels.span = 1
+                            THEN least(levels.span * 2, {SPAN_LIMIT}) ELSE 1 END
                   FROM levels
+                 CROSS JOIN LATERAL ({seen}) AS seen
                  WHERE levels.priority IS NOT NULL
             )
-        """
+            """
+
+        one_queue = levels(chunk("%(queue)s"))
+
+        many_queues = levels(f"""
+            SELECT max(each.due) AS due, max(each.last) AS last, max(each.top) AS top
+              FROM unnest(%(queues)s::text[]) AS wanted (name)
+             CROSS JOIN LATERAL ({chunk("wanted.name")}) AS each
+        """)
 
         def oldest_first(queue: str) -> str:
             return f"""
@@ -115,18 +149,18 @@ class Queries:
             """
 
         self.claim_one_queue = taking(f"""
-            {levels},
+            {one_queue},
             picked AS (
                 SELECT due.id
                   FROM levels
                  CROSS JOIN LATERAL ({oldest_first("%(queue)s")}) AS due
-                 WHERE levels.priority IS NOT NULL
+                 WHERE levels.due
                  LIMIT %(limit)s
             )
         """)
 
         self.claim_many_queues = taking(f"""
-            {levels},
+            {many_queues},
             picked AS (
                 SELECT due.id
                   FROM levels
@@ -144,7 +178,7 @@ class Queries:
                         ORDER BY head.run_at, wanted.position
                  ) AS ready
                  CROSS JOIN LATERAL ({oldest_first("ready.name")}) AS due
-                 WHERE levels.priority IS NOT NULL
+                 WHERE levels.due
                  LIMIT %(limit)s
             )
         """)
@@ -267,8 +301,9 @@ class Queries:
         """
 
         self.notify = (
-            f"SELECT count(pg_notify(%(channel)s, left(queue, {NOTICE_CHARACTERS}))) AS sent "
-            "FROM unnest(%(queues)s::text[]) AS woken (queue)"
+            "SELECT pg_catalog.count(pg_catalog.pg_notify("
+            f"%(channel)s, pg_catalog.left(queue, {NOTICE_CHARACTERS}))) AS sent "
+            "FROM pg_catalog.unnest(%(queues)s::pg_catalog.text[]) AS woken (queue)"
         )
 
         self.reap = f"""
@@ -307,7 +342,7 @@ class Queries:
         self.listed = f"SELECT {columns} FROM {jobs} "
 
         self.executions = f"""
-            SELECT id, job_id, attempt, status, worker_id, started_at,
+            SELECT id, job_id, attempt, claim, status, worker_id, started_at,
                    finished_at, error_type, traceback
               FROM {executions} WHERE job_id = %(id)s ORDER BY claim ASC
         """
@@ -389,45 +424,47 @@ class Queries:
             f"SELECT value FROM {meta} WHERE key = 'schema_version'"
         )
 
-        self.table_exists = "SELECT to_regclass(%(name)s) IS NOT NULL AS present"
-
         self.identity = f"""
-            SELECT stored.value AS instance, here.oid::text AS database,
-                   CASE WHEN has_function_privilege('pg_control_system()', 'EXECUTE')
-                        THEN (SELECT system_identifier::text FROM pg_control_system())
-                   END AS cluster
-              FROM {meta} AS stored, pg_database AS here
-             WHERE stored.key = 'instance' AND here.datname = current_database()
+            SELECT stored.value AS instance, here.oid::pg_catalog.text AS database
+              FROM {meta} AS stored, pg_catalog.pg_database AS here
+             WHERE stored.key OPERATOR(pg_catalog.=) 'instance'
+               AND here.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
         """
+
+        self.cluster_readable = (
+            "SELECT pg_catalog.has_function_privilege("
+            "'pg_catalog.pg_control_system()', 'EXECUTE') AS readable"
+        )
+
+        self.cluster = (
+            "SELECT system_identifier::pg_catalog.text AS cluster "
+            "FROM pg_catalog.pg_control_system()"
+        )
 
         self.located = """
             SELECT EXISTS (
-                   SELECT FROM pg_class AS c
-                     JOIN pg_namespace AS n ON n.oid = c.relnamespace
-                    WHERE n.nspname = %(schema)s AND c.relname = %(table)s
+                   SELECT FROM pg_catalog.pg_class AS c
+                     JOIN pg_catalog.pg_namespace AS n
+                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+                    WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                      AND c.relname OPERATOR(pg_catalog.=) %(table)s
             ) AS present
         """
 
-        self.placement = """
-            WITH trusted AS (
-                SELECT owner
-                  FROM pg_database AS here,
-                       LATERAL (VALUES (here.datdba), (to_regrole('pg_database_owner'))) AS kept (owner)
-                 WHERE here.datname = current_database()
-            )
-            SELECT n.nspname AS schema,
-                   bool_and(
-                       (c.relowner IN (SELECT owner FROM trusted)
-                        OR pg_has_role(c.relowner, current_user, 'USAGE'))
-                       AND (n.nspowner IN (SELECT owner FROM trusted)
-                            OR pg_has_role(n.nspowner, current_user, 'USAGE'))
-                   ) AS owned,
-                   count(*) AS tables
+
+        self.placement = f"""
+            SELECT DISTINCT ON (c.relname)
+                   c.relname::text AS name, n.nspname::text AS schema,
+                   {trusting("c.relowner")} AND {trusting("n.nspowner")} AS owned
               FROM pg_class AS c
               JOIN pg_namespace AS n ON n.oid = c.relnamespace
-             WHERE c.oid = ANY(ARRAY[
-                       to_regclass(%(jobs)s), to_regclass(%(executions)s),
-                       to_regclass(%(schedules)s), to_regclass(%(meta)s)
-                   ]::oid[])
-             GROUP BY n.nspname
+             WHERE c.relname = ANY(%(names)s::name[])
+               AND n.nspname = ANY(%(schemas)s::name[])
+             ORDER BY c.relname, array_position(%(schemas)s::name[], n.nspname)
+        """
+
+        self.schema_trust = f"""
+            SELECT {trusting("n.nspowner")} AS owned
+              FROM pg_namespace AS n
+             WHERE n.nspname = %(schema)s
         """

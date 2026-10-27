@@ -180,6 +180,16 @@ class EnqueueTests(BackendTestCase):
         self.assertEqual(payload.args, (7,))
         self.assertEqual(payload.kwargs, {"reason": "test"})
 
+    def test_a_priority_every_backend_can_store_is_required(self):
+        for priority in (2**31, -(2**31) - 1):
+            with self.subTest(priority=priority):
+                with self.assertRaisesRegex(ValueError, "priority must be between"):
+                    self.handler.with_options(priority=priority).enqueue(7)
+        for priority in (2**31 - 1, -(2**31)):
+            with self.subTest(priority=priority):
+                job = self.handler.with_options(priority=priority).enqueue(7)
+                self.assertEqual(self.app.get(job.id).priority, priority)
+
     def test_wrong_arguments_fail_at_enqueue_time(self):
         with self.assertRaises(TypeError):
             self.handler.enqueue()
