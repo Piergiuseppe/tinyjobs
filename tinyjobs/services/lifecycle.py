@@ -38,24 +38,33 @@ class JobLifecycleService:
         return await self.complete(job, self.encode_result(job, task, result))
 
     async def complete(
-        self, job: Job, encoded: bytes | None, *, patience: float = 0.0
+        self,
+        job: Job,
+        encoded: bytes | None,
+        *,
+        held_until: Callable[[], float] | None = None,
     ) -> bool:
         return await self._persisting(
             job,
             partial(self._backend.complete, job, encoded),
             ExecutionStatus.SUCCESS,
-            patience,
+            held_until,
         )
 
     async def fail(
-        self, job: Job, task: "Task", error: BaseException, *, patience: float = 0.0
+        self,
+        job: Job,
+        task: "Task",
+        error: BaseException,
+        *,
+        held_until: Callable[[], float] | None = None,
     ) -> tuple[bool, bool]:
         details = self._describe(error)
         retry_at = self._retry_at(job, task, error)
         status = self._execution_status(error)
         write = partial(self._backend.fail, job, details, retry_at, status)
         return (
-            await self._persisting(job, write, status, patience),
+            await self._persisting(job, write, status, held_until),
             retry_at is not None,
         )
 
@@ -64,25 +73,29 @@ class JobLifecycleService:
         job: Job,
         write: Callable[[], Awaitable[bool]],
         status: ExecutionStatus,
-        patience: float,
+        held_until: Callable[[], float] | None,
     ) -> bool:
         transient = getattr(self._backend, "transient_errors", ())
-        deadline = time.monotonic() + patience
         delay = FIRST_RETRY_SECONDS
+        deadline: float | None = None
         interrupted = False
         while True:
             try:
                 applied = await write()
             except transient as error:
-                if time.monotonic() + delay > deadline:
+                if deadline is None:
+                    deadline = held_until() if held_until else 0.0
+                left = deadline - time.monotonic()
+                if left <= 0:
                     raise
+                pause = min(delay, left)
                 logger.warning(
-                    "could not record the outcome of job %s (%s); trying again in %gs",
+                    "could not record the outcome of job %s (%s); trying again in %.2gs",
                     job.id,
                     error,
-                    delay,
+                    pause,
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(pause)
                 delay = min(delay * 2, LONGEST_RETRY_SECONDS)
                 interrupted = True
                 continue
@@ -91,11 +104,14 @@ class JobLifecycleService:
             return await self._recorded_before(job, status)
 
     async def _recorded_before(self, job: Job, status: ExecutionStatus) -> bool:
-        return any(
-            execution.attempt == job.attempts
-            and execution.worker_id == job.worker_id
-            and execution.status is status
-            for execution in await self._backend.executions(job.id)
+        history = await self._backend.executions(job.id)
+        if not history:
+            return False
+        latest = history[-1]
+        return (
+            latest.attempt == job.attempts
+            and latest.worker_id == job.worker_id
+            and latest.status is status
         )
 
     def _retry_at(

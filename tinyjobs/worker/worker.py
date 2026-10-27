@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from contextlib import suppress
 from typing import TYPE_CHECKING, Sequence
 
@@ -25,6 +26,8 @@ from .signals import ShutdownWatcher
 
 if TYPE_CHECKING:
     from ..app import TinyJobs
+
+LEASE_MARGIN_SECONDS = 1.0
 
 logger = logging.getLogger("tinyjobs.worker")
 
@@ -71,6 +74,7 @@ class Worker:
         self._id = worker_id or new_worker_id()
         self._handle_signals = handle_signals
         self._inflight: dict[tuple[str, int], Job] = {}
+        self._held_until: dict[tuple[str, int], float] = {}
         self._running: set[asyncio.Task] = set()
         self._releases: set[asyncio.Future] = set()
         self._finished = threading.Event()
@@ -178,12 +182,14 @@ class Worker:
                 self._capacity.clear()
                 await self._wait_for(self._capacity)
                 continue
+            asked = time.monotonic()
             jobs = await self._claim(capacity)
             if not jobs:
                 await self._idle(self._interval.next())
                 continue
             self._interval.reset()
             for job in jobs:
+                self._held_until[job.id, job.claims] = asked + self._lease_seconds
                 self._launch(job)
 
     async def _claim(self, capacity: int) -> list[Job]:
@@ -213,6 +219,7 @@ class Worker:
         def done(task: asyncio.Task) -> None:
             self._running.discard(task)
             self._inflight.pop((job.id, job.claims), None)
+            self._held_until.pop((job.id, job.claims), None)
             self._capacity.set()
             if task.cancelled():
                 self._release_later(job)
@@ -255,7 +262,8 @@ class Worker:
                 self._app.bind(job),
                 task,
                 self._executors,
-                patience=max(self._lease_seconds - self._beat_seconds, 0.0),
+                held_until=lambda: self._held_until.get((job.id, job.claims), 0.0)
+                - LEASE_MARGIN_SECONDS,
             )
         except ExecutorClosedError:
             await self._hand_back_unstarted(job)
@@ -323,13 +331,18 @@ class Worker:
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._beat_seconds)
-            job_ids = list({job_id for job_id, _ in self._inflight})
+            beaten = list(self._inflight)
+            job_ids = list({job_id for job_id, _ in beaten})
             if not job_ids:
                 continue
+            asked = time.monotonic()
             try:
                 await self._app.backend.heartbeat(
                     job_ids, self._lease_seconds, worker_id=self._id
                 )
+                for key in beaten:
+                    if key in self._held_until:
+                        self._held_until[key] = asked + self._lease_seconds
             except AppClosedError:
                 return
             except Exception:

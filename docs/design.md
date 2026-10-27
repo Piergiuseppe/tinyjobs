@@ -466,6 +466,13 @@ core does the looping. And since the protocol freezes at v1.0, a seam that is no
 be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
 `enqueue()`) so that simple backends get the correct behaviour for free.
 
+A backend may also declare `transient_errors`, the exception types that mean the store could not be
+reached. When `complete` or `fail` raises one, the worker writes again after 0.25 s, doubling up to
+4 s, until a second before its lease would run out, where the last try lands. Every outcome write
+checks that the worker still holds that claim, so a write repeated after its reply was lost changes
+nothing, and the worker then reads the job's newest execution to learn whether the first one landed.
+Redis and Postgres declare theirs; SQLite does not, and is never retried.
+
 ### The contract a backend must honour
 
 The signatures are the easy part. These invariants are what an implementation is actually promising,
@@ -793,10 +800,16 @@ Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>
 `setup` reads the stored schema version first and creates nothing when it matches, so a fleet
 starting at once costs one `SELECT` each. Otherwise it takes a transaction-scoped advisory lock,
 waits for it at most five seconds, and checks again under it. A store written by a newer release is
-refused and left alone. Setup then checks that all four tables sit in one schema and belong to the
-connecting role or a role it is a member of, so tables another role created ahead of time, perhaps
-with a trigger on them, are refused rather than used. It also reads the store's random instance id,
-written into the meta table when the tables are created.
+refused and left alone. Setup then checks that all four tables sit in one schema, and that the
+tables and the schema belong to the connecting role, to a role that holds its privileges, or to the
+database owner. Postgres runs a trigger with the privileges of the role that writes the row, so a
+table owned by anyone else would let that role act as tinyjobs; such tables are refused rather than
+used, even when tinyjobs connects as a superuser or was made a member of their owner. From then on
+every statement names the tables with the schema setup found them in, so a table of the same name
+created later earlier on a `search_path` cannot take the jobs. Setup also reads the store's
+identity: a random instance id written into the meta table when the tables are created, the
+database's oid and the cluster's system identifier. A copy made with `CREATE DATABASE ... TEMPLATE`
+or a restored dump keeps the instance id but not the other two.
 
 `id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
 ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
@@ -810,10 +823,13 @@ which are few.
 A claim is one statement. A recursive query walks the priorities present in the wanted queues from
 the highest down, using the partial index on `(queue, priority DESC, run_at)` over queued jobs, and
 for each level takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first, until it has enough.
-The same statement marks them running, stamps the lease and opens their executions. Workers never
-wait on each other's rows. Walking levels rather than sorting matters when a backlog is not due: with
-50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER BY priority DESC, run_at`
-read 205 buffers per claim and the level walk 50.
+Over several queues, each level visits the queues in the order of their oldest due job, so a batch
+can take a queue's newer jobs before another queue's next one, and the next claim starts from that
+other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
+job that nobody is taking. The same statement marks them running, stamps the lease and opens their
+executions. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
+BY priority DESC, run_at` read 205 buffers per claim and the level walk 50.
 
 ### Time
 
@@ -828,8 +844,9 @@ never writes one that ends too soon.
 Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
 `pg_notify` with the queue as payload, cut to its first 1,000 characters so it stays under
 Postgres's limit, at most once per queue every 50 ms; a burst sends one notification and a trailing
-one. The channel is `tinyjobs_` and a hash of the schema and the prefix, which always fits in a
-channel name and never lets two stores share one. Each worker process holds one extra
+one. The channel is `tinyjobs_` and a hash of the instance id, which always fits in a channel name.
+So every spelling of one store, by `schema=` or by `search_path`, shares one channel, and two stores
+never do. Each worker process holds one extra
 connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
 unless it claimed since. A lost listening connection is reopened within a second, and every reopen
 wakes the workers once, since notifications sent meanwhile are gone. Polling stays as the fallback, so
@@ -850,18 +867,18 @@ async connections, by the caller's async connection on the caller's loop, and by
 connection in the caller's thread. A sync enqueue therefore never crosses to the backend's loop with
 a connection that belongs to another thread. The notification goes inside the same transaction, and
 Postgres delivers it only at commit, so a worker never wakes for a job it cannot see yet; a rollback
-takes both. On the caller's connection every table is named with the schema setup found it in, so
-the caller's `search_path` or a temporary table of the same name cannot divert the job. The first use
-of a connection reads the instance id through it and raises `ConfigurationError` when it differs,
-which catches a connection to another database, even one holding tinyjobs tables of its own.
+takes both. The tables are named with their schema here too, so the caller's `search_path` or a
+temporary table of the same name cannot divert the job. The first use of a connection reads the
+store's identity through it and raises `ConfigurationError` when it differs, which catches a
+connection to another database, even one holding tinyjobs tables of its own or a copy of this one.
 
 Dedup keys work inside the transaction as outside: a second enqueue with a held key returns the
 holder, including one written earlier in the same transaction. Jobs sharing a key inside one call
-become one job before anything is written. Every call inserts its jobs in key order, so two bulk
-enqueues racing on the same keys wait for each other instead of deadlocking. A holder written by another
-transaction that has not committed makes the insert wait for it, as any unique index does. Eager
-mode refuses `tx=`, because it would run the job before the transaction could commit, and so does
-every backend that cannot join one.
+become one job before anything is written, and the first one given is the one stored. Every call
+inserts its jobs in key order, so two bulk enqueues racing on the same keys wait for each other
+instead of deadlocking. A holder written by another transaction that has not committed makes the
+insert wait for it, as any unique index does. Eager mode refuses `tx=`, because it would run the job
+before the transaction could commit, and so does every backend that cannot join one.
 
 In Django, `OPTIONS = {"url": ..., "database": "default"}` enqueues through that database's own
 connection, so a task enqueued inside `transaction.atomic()` is written in its transaction, and a

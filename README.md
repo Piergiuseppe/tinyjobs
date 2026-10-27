@@ -474,8 +474,11 @@ RETURNING *;
 ```
 
 Claiming a job takes a lease. The worker refreshes it while the job runs, and if the worker dies the
-lease expires and another worker picks the job up. On SQLite older than 3.35 the same claim runs as
-two statements inside `BEGIN IMMEDIATE`.
+lease expires and another worker picks the job up. On Redis and Postgres, a worker that cannot
+record a job's outcome because the server went away keeps trying until a second before its lease
+would run out, so a restart or a failover that ends by then does not run the finished job again,
+unless the worker is shut down first and its `shutdown_timeout` ends the wait. On SQLite older than
+3.35 the same claim runs as two statements inside `BEGIN IMMEDIATE`.
 
 Because it's just SQLite, you can read the queue with anything:
 
@@ -553,19 +556,15 @@ with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
 ```
 
 `app.send(name, tx=connection)` and the async calls take it too. The connection must reach the
-database tinyjobs uses, or the enqueue raises `ConfigurationError`. In Django, add
+database tinyjobs uses, not a copy of it, or the enqueue raises `ConfigurationError`. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
-A worker that cannot record a job's outcome because the server went away keeps trying for as long as
-its lease is sure to last, two thirds of it by default, so a restart or a failover shorter than that
-does not run finished jobs again.
-
-Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every statement
-times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
-`pg_stat_activity`. The tables must belong to the connecting role or one of its roles. Behind
-PgBouncer use session pooling. A transaction left open for hours anywhere
-on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18 are supported, and CI
-tests 14 and 18.
+Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every
+statement times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
+`pg_stat_activity`. The tables and their schema must belong to the connecting role, a role that
+holds its privileges, or the database owner. Behind PgBouncer use session pooling. A transaction
+left open for hours anywhere on the server stops autovacuum from cleaning the jobs table. Postgres
+14 to 18 are supported, and CI tests 14 and 18.
 
 ## Other backends
 
@@ -651,9 +650,11 @@ standalone scheduler in ten minutes left no gap and no duplicate.
 FastAPI was measured under uvicorn in Docker, with the worker embedded. 3,000 jobs through one
 process on SQLite and 4,000 through `--workers 4` each ran exactly once, and cron fired once in each
 of 13 minutes across the four processes. Three API containers on one Redis took 5,638 jobs while one
-was `SIGKILL`ed; the eight it was running came back on the others when their leases expired, and none
-ran twice. An 8-second Redis outage turned enqueues into 500s while it lasted, then everything
-resumed; the one job that finished during it ran again. `docker stop` waited only for the jobs in flight, 1.5 seconds.
+was `SIGKILL`ed; the eight it was running came back on the others when their leases expired, and
+none ran twice. An 8-second Redis outage turned enqueues into 500s while it lasted, then everything
+resumed; the one job that finished during it ran again, which no longer happens: with the outcome
+retried, a job finishing as an 8-second outage began was recorded once. `docker stop` waited only
+for the jobs in flight, 1.5 seconds.
 
 Sharing the process costs the API little: `/ping` p95 went from 2.1 ms to 12.9 ms under eight
 CPU-bound `def` tasks, and back to 1.6 ms with the worker moved out. Six `async def` tasks calling
@@ -729,7 +730,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1225 tests, no test dependencies. The one that matters most is
+1259 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import weakref
@@ -43,6 +44,8 @@ DEFAULT_MIN_CONNECTIONS = 1
 DEFAULT_MAX_CONNECTIONS = 10
 DEFAULT_POOL_TIMEOUT = 20.0
 DEFAULT_STATEMENT_TIMEOUT = 30.0
+SHORTEST_STATEMENT_SECONDS = 0.001
+LONGEST_STATEMENT_SECONDS = (2**31 - 1) / 1000
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
 MAX_IDLE_SECONDS = 300.0
@@ -94,10 +97,12 @@ class PostgresBackend(BaseBackend):
         notify: bool = True,
         **connection_options: Any,
     ) -> None:
-        if statement_timeout is not None and not statement_timeout >= 0.001:
+        if statement_timeout is not None and not (
+            SHORTEST_STATEMENT_SECONDS <= statement_timeout <= LONGEST_STATEMENT_SECONDS
+        ):
             raise ConfigurationError(
-                f"statement_timeout must be None or at least 0.001 seconds, "
-                f"not {statement_timeout!r}"
+                f"statement_timeout must be None or between {SHORTEST_STATEMENT_SECONDS} "
+                f"and {LONGEST_STATEMENT_SECONDS:g} seconds, not {statement_timeout!r}"
             )
         self._conninfo = conninfo
         self._tables = Tables(prefix, schema)
@@ -118,8 +123,9 @@ class PostgresBackend(BaseBackend):
         self._listening: asyncio.Task | None = None
         self._connection_options = connection_options
         self._joined: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
-        self._instance: str | None = None
-        self._joint: Queries | None = None
+        self._unplaced = self._queries
+        self._identity: tuple[Any, ...] | None = None
+        self._channel: str | None = None
         self._statement_timeout = statement_timeout
         self._pool_timeout = pool_timeout
         self._opening: asyncio.Future[None] | None = None
@@ -168,25 +174,34 @@ class PostgresBackend(BaseBackend):
             "meta": tables.meta,
         }
         async with self._connection() as connection:
-            placed = await _fetch(connection, self._queries.placement, names)
-            if len(placed) != 1 or placed[0]["tables"] != len(names):
+            placed = await _fetch(connection, self._unplaced.placement, names)
+            if len(placed) > 1:
                 raise ConfigurationError(
                     f"the tinyjobs tables for prefix {tables.prefix!r} resolve to more "
                     "than one schema on this connection's search_path; pass schema= "
                     "to name the one to use"
                 )
+            if not placed or placed[0]["tables"] != len(names):
+                raise ConfigurationError(
+                    f"some tinyjobs tables for prefix {tables.prefix!r} are missing "
+                    f"although {tables.meta} records schema version {SCHEMA_VERSION}; "
+                    "restore them or drop the rest so setup creates them again"
+                )
             if not placed[0]["owned"]:
                 raise ConfigurationError(
-                    f"the tinyjobs tables for prefix {tables.prefix!r} belong to a role "
-                    "the connecting user is not a member of; tinyjobs only uses tables "
-                    "its own role owns"
+                    f"the tinyjobs tables for prefix {tables.prefix!r} or their schema "
+                    "belong to a role that does not hold the connecting user's "
+                    "privileges; tinyjobs only uses tables owned by its own role, a role "
+                    "that has its privileges, or the database owner"
                 )
-            rows = await _fetch(connection, self._queries.instance, {})
+            queries = Queries(tables.within(placed[0]["schema"]), self._following)
+            rows = await _fetch(connection, queries.identity, {})
             if not rows:
                 await connection.execute(tables.instance())
-                rows = await _fetch(connection, self._queries.instance, {})
-        self._instance = rows[0]["value"]
-        self._joint = Queries(tables.within(placed[0]["schema"]), self._following)
+                rows = await _fetch(connection, queries.identity, {})
+        self._identity = _identity_of(rows[0])
+        self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
+        self._queries = queries
 
     async def _create(self) -> None:
         async with self._transaction() as connection:
@@ -208,6 +223,11 @@ class PostgresBackend(BaseBackend):
                 await connection.execute(statement)
 
     async def _open(self) -> None:
+        failed = self._opening
+        if failed is not None and failed.done() and not self._closed and (
+            failed.cancelled() or failed.exception() is not None
+        ):
+            self._opening, self._spent = None, self._pool.closed
         if self._opening is None:
             if self._closed:
                 raise PoolClosed(f"the pool {self._pool.name!r} is closed")
@@ -259,7 +279,7 @@ class PostgresBackend(BaseBackend):
     async def wait_for_jobs(
         self, *, worker_id: str, queues: Sequence[str], timeout: float
     ) -> None:
-        if not self._notify or self._closed:
+        if not self._notify or self._closed or self._channel is None:
             await asyncio.sleep(timeout)
             return
         if self._listening is None:
@@ -291,7 +311,7 @@ class PostgresBackend(BaseBackend):
                 async with await psycopg.AsyncConnection.connect(
                     self._conninfo, **options
                 ) as connection:
-                    await connection.execute(f'LISTEN "{self._tables.channel}"')
+                    await connection.execute(f'LISTEN "{self._channel}"')
                     self._hear(None)
                     async for notice in connection.notifies():
                         self._hear(notice.payload)
@@ -319,17 +339,16 @@ class PostgresBackend(BaseBackend):
             return []
         now = await self._now()
         due: set[str] = set()
-        order = _lock_order(jobs)
-        ordered = [jobs[index] for index in order]
+        ordered, places, copies = _lock_order(jobs)
         for attempt in range(RETRIES):
             try:
-                if len(jobs) <= ENQUEUE_BATCH:
+                if len(ordered) <= ENQUEUE_BATCH:
                     async with self._connection() as connection:
                         stored = await self._insert(connection, ordered, now, due)
                 else:
                     async with self._transaction() as connection:
                         stored = []
-                        for start in range(0, len(jobs), ENQUEUE_BATCH):
+                        for start in range(0, len(ordered), ENQUEUE_BATCH):
                             batch = ordered[start : start + ENQUEUE_BATCH]
                             stored.extend(await self._insert(connection, batch, now, due))
                 break
@@ -338,7 +357,7 @@ class PostgresBackend(BaseBackend):
                     raise
                 logger.warning("retrying a postgres enqueue after %s", error)
         await self._wake(due)
-        return _in_order(order, stored)
+        return _in_order(places, copies, len(jobs), stored)
 
     async def claim(
         self,
@@ -353,22 +372,34 @@ class PostgresBackend(BaseBackend):
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
-        for _ in range(2 if len(wanted) > 1 else 1):
-            now = await self._now()
-            rows = await self._retrying(
-                self._queries.claim,
-                self._at(
-                    now,
-                    queues=wanted,
-                    limit=limit,
-                    worker=worker_id,
-                    lease=now + lease_seconds,
-                    seconds=lease_seconds,
-                ),
-            )
-            if rows:
-                break
+        now = await self._now()
+        rows = await self._retrying(
+            *self._claiming(now, wanted, worker_id, limit, lease_seconds)
+        )
         return [job_from_row(row) for row in rows]
+
+    def _claiming(
+        self,
+        now: float,
+        wanted: list[str],
+        worker_id: str,
+        limit: int,
+        lease_seconds: float,
+    ) -> tuple[str, dict[str, Any]]:
+        query = (
+            self._queries.claim_one_queue
+            if len(wanted) == 1
+            else self._queries.claim_many_queues
+        )
+        return query, self._at(
+            now,
+            queues=wanted,
+            queue=wanted[0],
+            limit=limit,
+            worker=worker_id,
+            lease=now + lease_seconds,
+            seconds=lease_seconds,
+        )
 
     async def heartbeat(
         self,
@@ -466,7 +497,9 @@ class PostgresBackend(BaseBackend):
             conditions.append("id < %(cursor)s")
             parameters["cursor"] = cursor
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = await self._rows(self._queries.list.format(where=where), parameters)
+        rows = await self._rows(
+            f"{self._queries.listed}{where} ORDER BY id DESC LIMIT %(limit)s", parameters
+        )
         jobs = [job_from_row(row) for row in rows[:limit]]
         next_cursor = jobs[-1].id if len(rows) > limit and jobs else None
         return Page(items=jobs, cursor=next_cursor)
@@ -557,8 +590,7 @@ class PostgresBackend(BaseBackend):
         jobs: Sequence[Job],
     ) -> list[Job] | None:
         now = await self._now()
-        order = _lock_order(jobs)
-        ordered = [jobs[index] for index in order]
+        ordered, places, copies = _lock_order(jobs)
         for attempt in range(RETRIES):
             due: set[str] = set()
             try:
@@ -570,7 +602,10 @@ class PostgresBackend(BaseBackend):
                     if cursor.rowcount != 1:
                         return None
                     stored = _in_order(
-                        order, await self._insert(connection, ordered, now, due) if jobs else []
+                        places,
+                        copies,
+                        len(jobs),
+                        await self._insert(connection, ordered, now, due) if jobs else [],
                     )
                     if stored:
                         await connection.execute(
@@ -621,15 +656,19 @@ class PostgresBackend(BaseBackend):
         return await _driven(connection, self._joining(connection, jobs))
 
     def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
-        joint = self._joint
-        if joint is None:
+        queries = self._queries
+        if self._identity is None:
             raise RuntimeError("call setup() before enqueueing inside a transaction")
         if connection not in self._joined:
-            meta = self._tables.within(joint.schema).meta
-            rows = yield joint.table_exists, {"name": meta}
+            rows = yield queries.located, {
+                "schema": queries.schema,
+                "table": f"{self._tables.prefix}_meta",
+            }
+            identity = None
             if rows[0]["present"]:
-                rows = yield joint.instance, {}
-            if not rows or rows[0].get("value") != self._instance:
+                rows = yield queries.identity, {}
+                identity = _identity_of(rows[0]) if rows else None
+            if identity != self._identity:
                 raise ConfigurationError(
                     f"the connection passed as tx does not reach the tinyjobs store this "
                     f"app uses ({self._server()}, prefix {self._tables.prefix!r}); "
@@ -638,29 +677,27 @@ class PostgresBackend(BaseBackend):
             self._joined[connection] = True
         now = self._clock.now()
         due: set[str] = set()
-        order = _lock_order(jobs)
-        ordered = [jobs[index] for index in order]
+        ordered, places, copies = _lock_order(jobs)
         stored: list[Job] = []
-        for start in range(0, len(jobs), ENQUEUE_BATCH):
+        for start in range(0, len(ordered), ENQUEUE_BATCH):
             batch = ordered[start : start + ENQUEUE_BATCH]
-            stored.extend((yield from self._inserting(batch, now, due, joint)))
+            stored.extend((yield from self._inserting(batch, now, due)))
         if self._notify and due:
-            yield joint.notify, {
-                "channel": self._tables.channel,
+            yield queries.notify, {
+                "channel": self._channel,
                 "queues": sorted(due),
             }
-        return _in_order(order, stored)
+        return _in_order(places, copies, len(jobs), stored)
 
     def _inserting(
         self,
         jobs: Sequence[Job],
         now: float,
         due: set[str],
-        queries: Queries | None = None,
     ) -> Steps[list[Job]]:
-        queries = queries or self._queries
+        queries = self._queries
         resolved: dict[int, Job] = {}
-        pending, copies = _firsts(jobs)
+        pending = list(enumerate(jobs))
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
@@ -673,7 +710,7 @@ class PostgresBackend(BaseBackend):
                     resolved[index] = job
             if not missing:
                 break
-            pending = yield from self._holders(missing, resolved, queries)
+            pending = yield from self._holders(missing, resolved)
             if not pending:
                 break
         else:
@@ -681,17 +718,14 @@ class PostgresBackend(BaseBackend):
                 "enqueue kept meeting dedup holders that finished before they could "
                 "be read; try again"
             )
-        for index, first in copies.items():
-            resolved[index] = resolved[first]
         return [resolved[index] for index in range(len(jobs))]
 
     def _holders(
         self,
         missing: list[tuple[int, Job]],
         resolved: dict[int, Job],
-        queries: Queries | None = None,
     ) -> Steps[list[tuple[int, Job]]]:
-        queries = queries or self._queries
+        queries = self._queries
         rows = yield queries.by_ids, {"ids": [job.id for _, job in missing]}
         existing = {row["id"]: job_from_row(row) for row in rows}
         keys = [job.dedup_key for _, job in missing if job.id not in existing and job.dedup_key]
@@ -786,7 +820,7 @@ class PostgresBackend(BaseBackend):
         )
 
     async def _wake(self, queues: set[str]) -> None:
-        if not self._notify or not queues:
+        if not self._notify or not queues or self._closed or self._channel is None:
             return
         moment = time.monotonic()
         quiet = [
@@ -819,7 +853,7 @@ class PostgresBackend(BaseBackend):
         try:
             await self._rows(
                 self._queries.notify,
-                {"channel": self._tables.channel, "queues": list(queues)},
+                {"channel": self._channel, "queues": list(queues)},
                 rows=False,
             )
         except WAKE_ERRORS as error:
@@ -827,11 +861,11 @@ class PostgresBackend(BaseBackend):
 
     async def _stored_version(self, connection: psycopg.AsyncConnection) -> int | None:
         present = await _fetch(
-            connection, self._queries.table_exists, {"name": self._tables.meta}
+            connection, self._unplaced.table_exists, {"name": self._tables.meta}
         )
         if not present[0]["present"]:
             return None
-        rows = await _fetch(connection, self._queries.schema_version, {})
+        rows = await _fetch(connection, self._unplaced.schema_version, {})
         return int(rows[0]["value"]) if rows else None
 
     async def _now(self) -> float:
@@ -894,11 +928,10 @@ async def _begin(transaction: psycopg.AsyncTransaction) -> None:
         raise
 
 
-def _lock_order(jobs: Sequence[Job]) -> list[int]:
-    return sorted(
-        range(len(jobs)),
-        key=lambda index: (jobs[index].dedup_key is None, jobs[index].dedup_key or "", jobs[index].id),
-    )
+def _lock_order(jobs: Sequence[Job]) -> tuple[list[Job], list[int], dict[int, int]]:
+    firsts, copies = _firsts(jobs)
+    firsts.sort(key=lambda pair: (pair[1].dedup_key is None, pair[1].dedup_key or "", pair[1].id))
+    return [job for _, job in firsts], [index for index, _ in firsts], copies
 
 
 def _firsts(jobs: Sequence[Job]) -> tuple[list[tuple[int, Job]], dict[int, int]]:
@@ -916,11 +949,19 @@ def _firsts(jobs: Sequence[Job]) -> tuple[list[tuple[int, Job]], dict[int, int]]
     return firsts, copies
 
 
-def _in_order(order: list[int], stored: list[Job]) -> list[Job]:
-    placed: list[Job | None] = [None] * len(stored)
-    for position, index in enumerate(order):
-        placed[index] = stored[position]
+def _in_order(
+    places: list[int], copies: dict[int, int], size: int, stored: list[Job]
+) -> list[Job]:
+    placed: list[Job | None] = [None] * size
+    for index, job in zip(places, stored):
+        placed[index] = job
+    for index, first in copies.items():
+        placed[index] = placed[first]
     return placed
+
+
+def _identity_of(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (row["instance"], row["database"], row["cluster"])
 
 
 def _noticed(queue: str) -> str:

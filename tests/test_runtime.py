@@ -1462,10 +1462,10 @@ class KeptTaskTests(unittest.TestCase):
         task.cancel()
         loop.run_until_complete(asyncio.sleep(0.01))
         started = time.monotonic()
-        runtime._finish_tasks(loop, time.monotonic() + 0.3)
+        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
         self.assertTrue(task.done())
         self.assertEqual(seen, ["swallowed", "ended"])
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, runtime.INSIST_SECONDS + 0.5)
 
     def test_a_hand_back_submitted_as_the_loop_closes_still_runs(self):
         runner = LoopRunner()

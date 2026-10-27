@@ -51,8 +51,34 @@ class Queries:
              WHERE dedup_key = ANY(%(keys)s::text[]) AND status IN ('queued', 'running')
         """
 
-        self.claim = f"""
-            WITH RECURSIVE levels (priority) AS (
+        def taking(picked: str) -> str:
+            return f"""
+            WITH RECURSIVE {picked},
+            claimed AS (
+                UPDATE {jobs} AS job
+                   SET status = 'running',
+                       worker_id = %(worker)s,
+                       attempts = job.attempts + 1,
+                       claims = job.claims + 1,
+                       lease_expires_at = {lease_end}
+                  FROM picked
+                 WHERE job.id = picked.id AND job.status = 'queued'
+                RETURNING {job_columns("job")}
+            ),
+            opened AS (
+                INSERT INTO {executions}
+                       (job_id, attempt, claim, status, worker_id, started_at)
+                SELECT id, attempts, claims, 'running', %(worker)s, {NOW} FROM claimed
+                ON CONFLICT (job_id, claim) DO UPDATE
+                   SET status = 'running', worker_id = excluded.worker_id,
+                       started_at = excluded.started_at, finished_at = NULL,
+                       error_type = NULL, traceback = NULL
+            )
+            SELECT {columns} FROM claimed ORDER BY priority DESC, run_at ASC
+            """
+
+        levels = f"""
+            levels (priority) AS (
                 SELECT max(top.priority)
                   FROM unnest(%(queues)s::text[]) AS wanted (name)
                  CROSS JOIN LATERAL (
@@ -75,49 +101,53 @@ class Queries:
                   )
                   FROM levels
                  WHERE levels.priority IS NOT NULL
-            ),
+            )
+        """
+
+        def oldest_first(queue: str) -> str:
+            return f"""
+                SELECT id FROM {jobs}
+                 WHERE status = 'queued' AND queue = {queue}
+                   AND priority = levels.priority AND run_at <= {horizon}
+                 ORDER BY run_at ASC
+                 LIMIT %(limit)s
+                 FOR UPDATE SKIP LOCKED
+            """
+
+        self.claim_one_queue = taking(f"""
+            {levels},
+            picked AS (
+                SELECT due.id
+                  FROM levels
+                 CROSS JOIN LATERAL ({oldest_first("%(queue)s")}) AS due
+                 WHERE levels.priority IS NOT NULL
+                 LIMIT %(limit)s
+            )
+        """)
+
+        self.claim_many_queues = taking(f"""
+            {levels},
             picked AS (
                 SELECT due.id
                   FROM levels
                  CROSS JOIN LATERAL (
-                       SELECT candidate.id, candidate.run_at
-                         FROM unnest(%(queues)s::text[]) AS wanted (name)
+                       SELECT wanted.name
+                         FROM unnest(%(queues)s::text[]) WITH ORDINALITY
+                              AS wanted (name, position)
                         CROSS JOIN LATERAL (
-                              SELECT id, run_at FROM {jobs}
+                              SELECT run_at FROM {jobs}
                                WHERE status = 'queued' AND queue = wanted.name
                                  AND priority = levels.priority AND run_at <= {horizon}
                                ORDER BY run_at ASC
-                               LIMIT %(limit)s
-                               FOR UPDATE SKIP LOCKED
-                        ) AS candidate
-                        ORDER BY candidate.run_at ASC
-                        LIMIT %(limit)s
-                 ) AS due
+                               LIMIT 1
+                        ) AS head
+                        ORDER BY head.run_at, wanted.position
+                 ) AS ready
+                 CROSS JOIN LATERAL ({oldest_first("ready.name")}) AS due
                  WHERE levels.priority IS NOT NULL
                  LIMIT %(limit)s
-            ),
-            claimed AS (
-                UPDATE {jobs} AS job
-                   SET status = 'running',
-                       worker_id = %(worker)s,
-                       attempts = job.attempts + 1,
-                       claims = job.claims + 1,
-                       lease_expires_at = {lease_end}
-                  FROM picked
-                 WHERE job.id = picked.id AND job.status = 'queued'
-                RETURNING {job_columns("job")}
-            ),
-            opened AS (
-                INSERT INTO {executions}
-                       (job_id, attempt, claim, status, worker_id, started_at)
-                SELECT id, attempts, claims, 'running', %(worker)s, {NOW} FROM claimed
-                ON CONFLICT (job_id, claim) DO UPDATE
-                   SET status = 'running', worker_id = excluded.worker_id,
-                       started_at = excluded.started_at, finished_at = NULL,
-                       error_type = NULL, traceback = NULL
             )
-            SELECT {columns} FROM claimed ORDER BY priority DESC, run_at ASC
-        """
+        """)
 
         self.heartbeat = f"""
             UPDATE {jobs} SET lease_expires_at = {lease_end}
@@ -274,9 +304,7 @@ class Queries:
 
         self.get = f"SELECT {columns} FROM {jobs} WHERE id = %(id)s"
 
-        self.list = (
-            f"SELECT {columns} FROM {jobs} {{where}} ORDER BY id DESC LIMIT %(limit)s"
-        )
+        self.listed = f"SELECT {columns} FROM {jobs} "
 
         self.executions = f"""
             SELECT id, job_id, attempt, status, worker_id, started_at,
@@ -363,11 +391,37 @@ class Queries:
 
         self.table_exists = "SELECT to_regclass(%(name)s) IS NOT NULL AS present"
 
-        self.instance = f"SELECT value FROM {meta} WHERE key = 'instance'"
+        self.identity = f"""
+            SELECT stored.value AS instance, here.oid::text AS database,
+                   CASE WHEN has_function_privilege('pg_control_system()', 'EXECUTE')
+                        THEN (SELECT system_identifier::text FROM pg_control_system())
+                   END AS cluster
+              FROM {meta} AS stored, pg_database AS here
+             WHERE stored.key = 'instance' AND here.datname = current_database()
+        """
+
+        self.located = """
+            SELECT EXISTS (
+                   SELECT FROM pg_class AS c
+                     JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %(schema)s AND c.relname = %(table)s
+            ) AS present
+        """
 
         self.placement = """
+            WITH trusted AS (
+                SELECT owner
+                  FROM pg_database AS here,
+                       LATERAL (VALUES (here.datdba), (to_regrole('pg_database_owner'))) AS kept (owner)
+                 WHERE here.datname = current_database()
+            )
             SELECT n.nspname AS schema,
-                   bool_and(pg_has_role(current_user, c.relowner, 'MEMBER')) AS owned,
+                   bool_and(
+                       (c.relowner IN (SELECT owner FROM trusted)
+                        OR pg_has_role(c.relowner, current_user, 'USAGE'))
+                       AND (n.nspowner IN (SELECT owner FROM trusted)
+                            OR pg_has_role(n.nspowner, current_user, 'USAGE'))
+                   ) AS owned,
                    count(*) AS tables
               FROM pg_class AS c
               JOIN pg_namespace AS n ON n.oid = c.relnamespace

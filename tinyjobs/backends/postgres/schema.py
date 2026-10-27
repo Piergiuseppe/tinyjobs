@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 import zlib
 
@@ -27,14 +26,12 @@ class Tables:
         self.executions = f'{qualify}"{prefix}_executions"'
         self.schedules = f'{qualify}"{prefix}_schedules"'
         self.meta = f'{qualify}"{prefix}_meta"'
-        named = f"{schema or ''}:{prefix}".encode()
-        self.channel = f"tinyjobs_{hashlib.sha256(named).hexdigest()[:24]}"
-        self.lock = zlib.crc32(b"tinyjobs:" + named)
+        self.lock = zlib.crc32(f"tinyjobs:{schema or ''}:{prefix}".encode())
 
     def within(self, schema: str) -> "Tables":
         placed = Tables.__new__(Tables)
         placed.__dict__.update(self.__dict__)
-        qualify = '"' + schema.replace('"', '""') + '".'
+        qualify = ('"' + schema.replace('"', '""') + '".').replace("%", "%%")
         placed.schema = schema
         placed.jobs = f'{qualify}"{self.prefix}_jobs"'
         placed.executions = f'{qualify}"{self.prefix}_executions"'

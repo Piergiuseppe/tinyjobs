@@ -1386,6 +1386,38 @@ class BackendOutageTests(WorkerTestCase):
         self.assertEqual(succeeded, [])
         self.assertIn("no longer held", "\n".join(logs.output))
 
+    async def test_an_earlier_attempt_with_the_same_number_is_not_taken_for_this_one(self):
+        failures = []
+
+        @self.app.task(max_attempts=1)
+        def handler():
+            raise ValueError("bad input")
+
+        self.app.on_job_failure(lambda job, error, will_retry: failures.append(job.attempts))
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(worker_id="host-a"), [job])
+        self.assertTrue(await self.app.aretry(job.id))
+        backend = self.app.backend
+        original = backend.fail
+        calls = []
+
+        async def cancelled_meanwhile(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                await self.app.acancel(job.id)
+                raise ConnectionError("store unreachable")
+            return await original(*args, **kwargs)
+
+        backend.fail = cancelled_meanwhile
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        self.addCleanup(setattr, backend, "fail", original)
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            await self.run_briefly(self.make_worker(worker_id="host-a"), 1.0)
+        self.assertEqual((await self.app.aget(job.id)).status, JobStatus.CANCELLED)
+        self.assertEqual(failures, [1])
+        self.assertIn("no longer held", "\n".join(logs.output))
+
     async def test_the_retry_window_ends_before_the_lease_can_run_out(self):
         @self.app.task
         def handler():
@@ -1398,13 +1430,42 @@ class BackendOutageTests(WorkerTestCase):
         windows = []
 
         async def watched(*args, **kwargs):
-            windows.append(kwargs.get("patience"))
+            windows.append(kwargs["held_until"]() - time.monotonic())
             return await real(*args, **kwargs)
 
         execution.execute = watched
         self.addCleanup(vars(execution).pop, "execute", None)
         await self.run_briefly(self.make_worker(lease_seconds=30.0), 0.5)
-        self.assertEqual(windows, [20.0])
+        self.assertEqual(len(windows), 1)
+        self.assertAlmostEqual(windows[0], 29.0, delta=0.5)
+
+    async def test_an_outage_that_began_before_the_job_ended_is_waited_out_only_within_the_lease(self):
+        @self.app.task
+        async def handler():
+            await asyncio.sleep(2.5)
+
+        job = await handler.aenqueue()
+        await self.app.ready()
+        backend = self.app.backend
+        completes = []
+
+        async def unreachable(*args, **kwargs):
+            raise ConnectionError("store unreachable")
+
+        async def never_recorded(*args, **kwargs):
+            completes.append(1)
+            raise ConnectionError("store unreachable")
+
+        for method in ("complete", "heartbeat"):
+            self.addCleanup(setattr, backend, method, getattr(backend, method))
+        backend.complete = never_recorded
+        backend.heartbeat = unreachable
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        with self.assertLogs("tinyjobs.worker", "ERROR"):
+            await self.run_briefly(self.make_worker(lease_seconds=3.0), 4.5)
+        self.assertEqual((await self.app.aget(job.id)).status, JobStatus.RUNNING)
+        self.assertEqual(completes, [1])
 
     async def test_an_error_the_backend_does_not_call_transient_is_not_retried(self):
         @self.app.task
