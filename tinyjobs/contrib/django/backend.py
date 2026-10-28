@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
+from contextlib import nullcontext
 from typing import Any
 
 from asgiref.sync import sync_to_async
@@ -59,11 +60,12 @@ class TinyJobsBackend(BaseTaskBackend):
                 f"{task.module_path} is not in an app of INSTALLED_APPS, "
                 "so no worker would run it"
             )
-        job = self.app.send(
-            task.module_path, normalize_json(args), normalize_json(kwargs),
-            tx=self._transaction(),
-            **self._options_for(task),
-        )
+        with self._transaction() as tx:
+            job = self.app.send(
+                task.module_path, normalize_json(args), normalize_json(kwargs),
+                tx=tx,
+                **self._options_for(task),
+            )
         executions = self.app.executions(job.id) if job.attempts else []
         return self._announce(self._result(task, job, executions))
 
@@ -117,7 +119,7 @@ class TinyJobsBackend(BaseTaskBackend):
 
     def _transaction(self) -> Any:
         if self.database is None or self.app.eager:
-            return None
+            return nullcontext()
         return joined_connection(self.database)
 
     def _options_for(self, task: Task) -> dict[str, Any]:

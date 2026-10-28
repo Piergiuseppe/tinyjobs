@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 from ...app import TinyJobs
 from ...exceptions import ConfigurationError
@@ -20,7 +21,8 @@ def shared_app(
     return app
 
 
-def joined_connection(alias: str) -> Any:
+@contextmanager
+def joined_connection(alias: str) -> Iterator[Any]:
     from django.db import connections
 
     connection = connections[alias]
@@ -30,6 +32,7 @@ def joined_connection(alias: str) -> Any:
             "transactions"
         )
     connection.validate_thread_sharing()
+    connection.close_if_health_check_failed()
     connection.ensure_connection()
     import psycopg
 
@@ -39,4 +42,9 @@ def joined_connection(alias: str) -> Any:
             f"the database {alias!r} does not run on psycopg 3, so jobs cannot join "
             "its transactions"
         )
-    return raw
+    try:
+        yield raw
+    except psycopg.Error as error:
+        if not isinstance(error, (psycopg.DataError, psycopg.IntegrityError)):
+            connection.errors_occurred = True
+        raise

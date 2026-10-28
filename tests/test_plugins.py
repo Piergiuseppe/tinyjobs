@@ -81,6 +81,10 @@ class BackendResolutionTests(unittest.TestCase):
     def test_leading_whitespace_before_the_scheme_is_ignored(self):
         self.assertEqual(scheme_of(" \tsqlite:///jobs.db"), "sqlite")
 
+    def test_a_nul_before_the_scheme_is_not_taken_for_whitespace(self):
+        with self.assertRaises(UnknownBackendError):
+            scheme_of("\x00sqlite:///jobs.db")
+
     def test_the_entry_point_group_is_stable(self):
         self.assertEqual(ENTRY_POINT_GROUP, "tinyjobs.backends")
 

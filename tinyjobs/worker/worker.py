@@ -196,12 +196,7 @@ class Worker:
 
     async def _claim(self, capacity: int) -> list[Job]:
         try:
-            return await self._app.backend.claim(
-                worker_id=self._id,
-                queues=self._queues,
-                limit=capacity,
-                lease_seconds=self._lease_seconds,
-            )
+            return await self._claimed(capacity)
         except AppClosedError:
             logger.info("the app was closed; worker %s is stopping", self._id)
             self._request_stop()
@@ -210,6 +205,35 @@ class Worker:
             logger.exception("claim failed; backing off")
             await self._pause(self._interval.next())
             return []
+
+    async def _claimed(self, capacity: int) -> list[Job]:
+        claiming = asyncio.ensure_future(
+            self._app.backend.claim(
+                worker_id=self._id,
+                queues=self._queues,
+                limit=capacity,
+                lease_seconds=self._lease_seconds,
+            )
+        )
+        stopping = asyncio.ensure_future(self._stopping.wait())
+        try:
+            await asyncio.wait({claiming, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            if not claiming.done():
+                started = time.monotonic()
+                await asyncio.wait({claiming}, timeout=self._shutdown_timeout)
+                self._shutdown_timeout = max(
+                    0.0, self._shutdown_timeout - (time.monotonic() - started)
+                )
+            if not claiming.done():
+                logger.warning(
+                    "a claim was still waiting on the backend at shutdown; giving it up"
+                )
+                return []
+            return claiming.result()
+        finally:
+            for task in (claiming, stopping):
+                task.cancel()
+            await asyncio.gather(claiming, stopping, return_exceptions=True)
 
     def _launch(self, job: Job) -> None:
         self._inflight[job.id, job.claims] = job

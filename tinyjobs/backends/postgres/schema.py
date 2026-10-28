@@ -45,7 +45,6 @@ class Tables:
         self.schedules = f'{qualify}"{prefix}_schedules"'
         self.meta = f'{qualify}"{prefix}_meta"'
         self.lock = zlib.crc32(f"tinyjobs:{schema or ''}:{prefix}".encode())
-        self.rebuild_lock = zlib.crc32(f"tinyjobs-rebuild:{schema or ''}:{prefix}".encode())
 
     def within(self, schema: str) -> "Tables":
         placed = Tables.__new__(Tables)

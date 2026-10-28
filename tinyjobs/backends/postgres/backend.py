@@ -152,7 +152,10 @@ CLAIMING = """
      )
 """
 ENDING_CLAIM_MILLISECONDS = 1000
-FRESH = "SELECT pg_catalog.pg_stat_clear_snapshot()"
+ENDABLE = (
+    "SELECT pg_catalog.has_function_privilege("
+    "'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE') AS may"
+)
 PROBE_POOL_SECONDS = 1.0
 GHOST_SECONDS = 1.0
 SETTLE_SECONDS = 5.0
@@ -161,8 +164,8 @@ ENDING = (
     "WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s "
     "AND state_change OPERATOR(pg_catalog.=) %(seen)s"
 )
-REBUILDERS = """
-    SELECT pg_catalog.count(*) AS rebuilders
+HOLDERS = """
+    SELECT pg_catalog.count(*) AS holders
       FROM pg_catalog.pg_locks AS held
       JOIN pg_catalog.pg_stat_activity AS activity
         ON activity.pid OPERATOR(pg_catalog.=) held.pid
@@ -174,13 +177,19 @@ REBUILDERS = """
        AND held.classid OPERATOR(pg_catalog.=) %(high)s::pg_catalog.oid
        AND held.objid OPERATOR(pg_catalog.=) %(low)s::pg_catalog.oid
        AND held.objsubid OPERATOR(pg_catalog.=) 1
-       AND pg_catalog.pg_has_role(activity.usesysid, (
+       AND pg_catalog.pg_has_role(activity.usesysid, ({role}), 'MEMBER')
+"""
+REBUILDERS = HOLDERS.format(
+    role="""
            SELECT c.relowner FROM pg_catalog.pg_class AS c
              JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
             WHERE c.relname OPERATOR(pg_catalog.=) %(jobs)s::pg_catalog.name
               AND n.nspname OPERATOR(pg_catalog.=) %(schema)s::pg_catalog.name
-       ), 'MEMBER')
-"""
+       """
+)
+SETTERS = HOLDERS.format(
+    role="SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) CURRENT_USER"
+)
 JIT_AVAILABLE = "SELECT pg_catalog.pg_jit_available() AS available"
 UNCOMPILED = ("SELECT pg_catalog.set_config('jit', 'off', true)", {})
 KEPT_UNCOMPILED = (
@@ -282,6 +291,7 @@ class PostgresBackend(BaseBackend):
         self._marks: dict[str, int] = {}
         self._ghosts: dict[str, _Ghost] = {}
         self._swept = -math.inf
+        self._sweeping = asyncio.Lock()
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
         self._connection_options = connection_options
@@ -450,7 +460,11 @@ class PostgresBackend(BaseBackend):
         statistics = await _fetch(
             connection,
             self._unplaced.missing_statistics,
-            {"schema": schema, "statistics": [f"{prefix}_{name}" for name, _ in STATISTICS]},
+            {
+                "schema": schema,
+                "statistics": [f"{prefix}_{name}" for name, _ in STATISTICS],
+                "described": [f"{prefix}_{kind}" for _, kind in STATISTICS],
+            },
         )
         return indexes + statistics
 
@@ -469,7 +483,8 @@ class PostgresBackend(BaseBackend):
                 {"wait": f"{REBUILD_LOCK_SECONDS}s"},
             )
             placed = await self._placed(connection)
-            first = await self._lock_for_rebuild(connection, placed)
+            key = await self._rebuild_key(connection, placed)
+            first = await self._lock_for_rebuild(connection, placed, key)
             if first is None:
                 return skipped
             placed = await self._placed(connection)
@@ -531,20 +546,35 @@ class PostgresBackend(BaseBackend):
                     skipped.add(name)
         return skipped
 
-    async def _lock_for_rebuild(
+    async def _rebuild_key(
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    ) -> int:
+        rows = await _fetch(connection, placed.queries.identity, {})
+        if not rows:
+            await connection.execute(placed.within.instance(), {})
+            rows = await _fetch(connection, placed.queries.identity, {})
+        return _rebuild_key(rows[0]["instance"])
+
+    async def _lock_for_rebuild(
+        self, connection: psycopg.AsyncConnection, placed: "_Placement", key: int
     ) -> bool | None:
         deadline = time.monotonic() + REBUILD_LOCK_SECONDS
         waited = False
         while True:
             cursor = await connection.execute(
                 "SELECT pg_catalog.pg_try_advisory_lock(%(key)s) AS taken",
-                {"key": self._tables.rebuild_lock},
+                {"key": key},
             )
             taken = (await cursor.fetchone())["taken"]
             if taken and not waited:
                 return True
-            if not taken and not await self._rebuilders(connection, placed):
+            if not taken and not await self._lockers(
+                connection,
+                REBUILDERS,
+                key,
+                jobs=f"{self._tables.prefix}_jobs",
+                schema=placed.within.schema,
+            ):
                 return True
             if not await self._misplaced(connection, placed):
                 return None
@@ -553,21 +583,14 @@ class PostgresBackend(BaseBackend):
             waited = True
             await asyncio.sleep(REBUILD_LOCK_PAUSE)
 
-    async def _rebuilders(
-        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    async def _lockers(
+        self, connection: psycopg.AsyncConnection, query: str, key: int, **parameters: Any
     ) -> int:
-        key = self._tables.rebuild_lock % 2**64
+        key %= 2**64
         [row] = await _fetch(
-            connection,
-            REBUILDERS,
-            {
-                "high": key >> 32,
-                "low": key & 0xFFFFFFFF,
-                "jobs": f"{self._tables.prefix}_jobs",
-                "schema": placed.within.schema,
-            },
+            connection, query, {"high": key >> 32, "low": key & 0xFFFFFFFF, **parameters}
         )
-        return row["rebuilders"]
+        return row["holders"]
 
     async def _duplicates(
         self, connection: psycopg.AsyncConnection, name: str, jobs: str
@@ -636,6 +659,13 @@ class PostgresBackend(BaseBackend):
                 {"key": self._tables.lock},
             )
             if (await cursor.fetchone())["taken"]:
+                return
+            if not await self._lockers(connection, SETTERS, self._tables.lock):
+                logger.warning(
+                    "a session whose role cannot become this one holds the tinyjobs setup "
+                    "lock for prefix %r; creating the tables without it",
+                    self._tables.prefix,
+                )
                 return
             if time.monotonic() >= deadline:
                 logger.warning(
@@ -804,7 +834,14 @@ class PostgresBackend(BaseBackend):
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
         if self._ghosts:
-            await self._haunted()
+            try:
+                await self._haunted()
+            except (psycopg.Error, PoolTimeout) as error:
+                logger.warning(
+                    "could not hand back the jobs of postgres claims whose answer never arrived, "
+                    "trying again later: %s",
+                    error,
+                )
         now = await self._now()
         query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
         _LEFT.set(None)
@@ -828,10 +865,15 @@ class PostgresBackend(BaseBackend):
         return max(GHOST_SECONDS, min(ghost.lease for ghost in ghosts) / 3)
 
     async def _haunted(self) -> None:
-        if time.monotonic() - self._swept >= self._pause():
-            await self._exorcise()
+        if self._sweeping.locked() or time.monotonic() - self._swept < self._pause():
+            return
+        await self._exorcise()
 
     async def _exorcise(self) -> None:
+        async with self._sweeping:
+            await self._pass()
+
+    async def _pass(self) -> None:
         self._swept = time.monotonic()
         ghosts = list(self._ghosts.values())
         async with self._connection() as connection:
@@ -841,17 +883,28 @@ class PostgresBackend(BaseBackend):
                 keys = [_claim_key(ghost.token) % 2**64 for ghost in haunting]
                 async with _within(connection):
                     await connection.execute(UNROLED)
-                    await connection.execute(
-                        CLAIMING,
-                        {
-                            "pids": [ghost.backend[0] for ghost in haunting],
-                            "borns": [ghost.backend[1] for ghost in haunting],
-                            "highs": [key >> 32 for key in keys],
-                            "lows": [key & 0xFFFFFFFF for key in keys],
-                            "wait": ENDING_CLAIM_MILLISECONDS,
-                        },
-                    )
-                    await connection.execute(FRESH)
+                    [endable] = await _fetch(connection, ENDABLE, {})
+                    if endable["may"]:
+                        await connection.execute(
+                            CLAIMING,
+                            {
+                                "pids": [ghost.backend[0] for ghost in haunting],
+                                "borns": [ghost.backend[1] for ghost in haunting],
+                                "highs": [key >> 32 for key in keys],
+                                "lows": [key & 0xFFFFFFFF for key in keys],
+                                "wait": ENDING_CLAIM_MILLISECONDS,
+                            },
+                        )
+                    elif not all(ghost.warned for ghost in haunting):
+                        for ghost in haunting:
+                            ghost.warned = True
+                        logger.warning(
+                            "the postgres login role may not run pg_terminate_backend, so a claim "
+                            "whose answer never arrived is not ended while it runs; its jobs come "
+                            "back once it commits"
+                        )
+                async with _within(connection):
+                    await connection.execute(UNROLED)
                     seen = await _fetch(
                         connection, ALIVE, {"pids": sorted({ghost.backend[0] for ghost in haunting})}
                     )
@@ -1473,27 +1526,41 @@ class PostgresBackend(BaseBackend):
                 connection.working = self._working
 
     async def _working(self, pid: int, born: Any, quiet: float, patience: float) -> bool:
+        started = time.monotonic()
+        budget = max(patience - quiet, _silence(patience))
         probing = _PROBING.set(True)
         try:
-            verdict = await self._asked_pooled(pid, born, quiet, patience)
-            if verdict is None:
-                verdict = await self._asked_fresh(pid, born, quiet, patience)
+            verdict = await self._asked_pooled(
+                pid, born, quiet, patience, min(PROBE_POOL_SECONDS, budget)
+            )
+            left = budget - (time.monotonic() - started)
+            if verdict is None and left > 0:
+                last = left < PROBE_SECONDS + _silence(patience)
+                verdict = await self._asked_fresh(
+                    pid, born, quiet, patience, left if last else PROBE_SECONDS
+                )
         finally:
             _PROBING.reset(probing)
+        quiet += time.monotonic() - started
         return quiet < patience if verdict is None else verdict
 
     async def _asked_pooled(
-        self, pid: int, born: Any, quiet: float, patience: float
+        self,
+        pid: int,
+        born: Any,
+        quiet: float,
+        patience: float,
+        seconds: float = PROBE_POOL_SECONDS,
     ) -> bool | None:
         if not self._pool.get_stats().get("pool_available"):
             return None
         try:
-            probe = await self._pool.getconn(timeout=PROBE_POOL_SECONDS)
+            probe = await self._pool.getconn(timeout=seconds)
         except (PoolTimeout, PoolClosed, psycopg.Error):
             return None
         seen: list[dict[str, Any] | None] = []
         try:
-            async with asyncio.timeout(PROBE_POOL_SECONDS) as limit, _within(probe):
+            async with asyncio.timeout(seconds) as limit, _within(probe):
                 await probe.execute(UNROLED)
                 return await _asking(probe, pid, born, quiet, patience, seen, limit)
         except (TimeoutError, psycopg.Error):
@@ -1502,16 +1569,21 @@ class PostgresBackend(BaseBackend):
             await self._pool.putconn(probe)
 
     async def _asked_fresh(
-        self, pid: int, born: Any, quiet: float, patience: float
+        self,
+        pid: int,
+        born: Any,
+        quiet: float,
+        patience: float,
+        seconds: float = PROBE_SECONDS,
     ) -> bool | None:
         seen: list[dict[str, Any] | None] = []
         try:
-            async with asyncio.timeout(PROBE_SECONDS):
+            async with asyncio.timeout(seconds) as limit:
                 async with await psycopg.AsyncConnection.connect(
                     self._conninfo, **self._direct_options()
                 ) as probe:
                     await probe.execute(PROBING, {"path": SAFE_SEARCH_PATH})
-                    return await _asking(probe, pid, born, quiet, patience, seen)
+                    return await _asking(probe, pid, born, quiet, patience, seen, limit)
         except (TimeoutError, psycopg.Error):
             return False if seen else None
 
@@ -1632,6 +1704,8 @@ def _check_held(connection: Any) -> None:
 
 
 def _parsed(conninfo: str) -> dict[str, Any]:
+    if "\x00" in conninfo:
+        raise ConfigurationError("the postgres url is not valid: it holds a NUL character")
     try:
         parsed = conninfo_to_dict(conninfo)
     except psycopg.ProgrammingError as error:
@@ -1805,6 +1879,16 @@ class _Ghost:
     lease: float
     seen: tuple[Any] | None = None
     stale: bool = False
+    warned: bool = False
+
+
+def _silence(patience: float) -> float:
+    return min(SILENCE_SECONDS, max(SHORTEST_SILENCE_SECONDS, patience / 3))
+
+
+def _rebuild_key(instance: str) -> int:
+    digest = hashlib.sha256(f"tinyjobs-rebuild:{instance}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 def _claim_key(token: str) -> int:
@@ -1927,7 +2011,9 @@ class _Answering(psycopg.AsyncConnection):
                     "but its answer never arrived, or it cannot be reached; the connection was "
                     "closed"
                 )
-            ready = await _ready(self.pgconn.socket, state, silence)
+            left = patience - (time.monotonic() - self.heard)
+            wait = min(silence, left) if left > 0 else silence
+            ready = await _ready(self.pgconn.socket, state, wait)
         self.heard = time.monotonic()
         return ready
 

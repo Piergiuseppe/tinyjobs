@@ -824,18 +824,21 @@ database. Setup
 then reads the stored schema version and creates nothing when it matches, so a fleet starting at
 once costs a few catalog reads and one `SELECT` each. Otherwise it takes a transaction-scoped
 advisory lock and checks again under it. Any role that may connect can take an advisory lock, so
-one held for five seconds is waited out rather than obeyed: setup creates the tables without it, and
+one held by a session whose role cannot become setup's own is not waited for, and one held for five
+seconds is waited out rather than obeyed: setup creates the tables without it, and
 a concurrent creation it then trips over sends it round again, up to three times. Between the
 `CREATE` statements and the rows the meta table is seeded with, setup checks the placement and the
 owners once more in the same transaction, so a table another role creates in the gap is caught
 before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
 newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
-a valid index of the right table, unique where it must be, and that the statistics below exist. One that is
+a valid index of the right table, unique where it must be, and that the statistics below exist on
+the jobs table, so an object of that name another role made first stops setup instead. One that is
 missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
-of its own and under a session advisory lock, so workers keep claiming and enqueueing while it
-builds; other setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing
-it, unless the lock is held by a session whose role cannot become the tables' owner, which is
-never a setup and is not waited for, and do not wait on the table again for what it left: a plain index is kept for the next setup
+of its own and under a session advisory lock keyed by the store's instance id, which only roles
+that can read the meta table know, so workers keep claiming and enqueueing while it builds; other
+setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing it, unless the
+lock is held by a session whose role cannot become the tables' owner, which is never a setup and
+is not waited for, and do not wait on the table again for what it left: a plain index is kept for the next setup
 with a warning and a unique one stops setup with the reason. The executions
 index claims insert against is the exception: claims cannot run without it, so it is built in one
 plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
@@ -917,9 +920,10 @@ executions, and it stamps a random token of its own and takes a transaction advi
 from it, which only that claim's transaction can hold. A claim that ends without its answer, from a
 lost connection, a server that stopped answering or a cancelled call, even one cancelled again
 while it gives up, may still commit later, so tinyjobs keeps its token, its lease, its worker and
-the backend it was sent on, named by process id and start time, in memory. Each pass over them,
-as the login role, first ends the backend if it holds the claim's lock, so a claim still running
-takes nothing, then reads `pg_stat_activity` and runs one `UPDATE` that hands back the running jobs
+the backend it was sent on, named by process id and start time, in memory. Passes over them run
+one at a time. Each, as the login role, first ends the backend if it holds the claim's lock, so a
+claim still running takes nothing, unless the role may not run `pg_terminate_backend`, which is
+logged once and leaves the claim to commit, then reads `pg_stat_activity` and runs one `UPDATE` that hands back the running jobs
 carrying those tokens, without counting the attempt and with their executions removed. A token is
 forgotten once that `UPDATE` hands back its jobs, or when its backend, as read before the `UPDATE`,
 is gone, belongs to another role, or has gone idle since the first pass saw it, since a backend
@@ -928,7 +932,8 @@ pass may still receive a claim delayed on the way, or be idle in PgBouncer's poo
 until the backend changes state or goes. Passes run before a claim and on a heartbeat, at most once
 a second while some backend is busy or unseen, when a wait for jobs is also cut to a second, and
 once every third of the lease while all sit idle. Closing runs passes for up to five seconds while
-some backend is busy, so a claim still running there is ended too. No timing is guessed, and no
+some backend is busy, so a claim still running there is ended too. A pass that fails is logged and
+tried again later, and never fails the claim it runs before. No timing is guessed, and no
 backend that might serve someone else is ended: only the holder of the claim's own lock. A process
 without such tokens runs no extra statement; the lock costs a claim about 3 µs. A process that dies
 loses its tokens, like any jobs it held: their leases expire. Workers never wait on each other's rows. Walking levels rather than sorting matters when
@@ -1020,11 +1025,13 @@ another, and uses only `pg_catalog` operators whatever the url's `search_path`. 
 gone, the call raises `OperationalError`, which the worker treats like a lost connection. If the
 backend has been blocked sending to us for those ten seconds, or has waited five minutes for bytes
 from us with nothing moving on our side, an answer lost on its way or a request stuck in a proxy,
-tinyjobs ends that backend first, so nothing it was doing takes effect afterwards, then raises. A
+tinyjobs ends that backend first, so nothing it was doing takes effect afterwards, then raises;
+a login role that may not run `pg_terminate_backend` raises without ending it. A
 server that cannot be asked within ten seconds is not taken for gone, since a PgBouncer whose
 server slots this pool already holds looks the same: the call waits for those five minutes of
 silence, then raises. A claim waits half its lease instead, asking after silences of a third of
-that, between one and ten seconds, so its worker moves on well inside the lease. With
+that, between one and ten seconds, and no question nor wait between them runs past that half: with
+the server cut off, a claim leased for 6, 30 and 60 seconds gave up after 3.0, 15.0 and 30.0. With
 no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
 when the server has taken no new connection for half its lease is given up too, and settled like
 any claim without its answer: it is ended if still running, and its jobs come back without the
@@ -1275,7 +1282,9 @@ point where `timeout=` is introduced, not in a footnote.
 ### Graceful shutdown
 
 On `SIGTERM` (or the first `SIGINT`), the worker stops claiming, keeps heartbeating in-flight jobs,
-and waits up to `--shutdown-timeout` for them to finish. Anything still running is released back to
+and waits up to `--shutdown-timeout` for them to finish. A claim still waiting on the backend shares
+that wait: jobs it brings back in time run like the others, and one that has not answered by then is
+given up. Anything still running is released back to
 `QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. A
 second `SIGINT` exits at once and lets the leases lapse.
 

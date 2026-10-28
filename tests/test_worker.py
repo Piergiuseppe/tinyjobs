@@ -1084,6 +1084,53 @@ class ShutdownTests(WorkerTestCase):
         self.assertEqual(self.calls, ["finished"])
         self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
 
+    async def test_a_claim_the_backend_never_answers_does_not_outlast_the_shutdown_timeout(self):
+        await self.app.ready()
+        claimed = asyncio.Event()
+        given_up: list[bool] = []
+
+        async def stuck(**_):
+            claimed.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                given_up.append(True)
+                raise
+
+        worker = self.make_worker(shutdown_timeout=0.5)
+        with mock.patch.object(self.app.backend, "claim", stuck):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(claimed.wait(), 5)
+            started = time.monotonic()
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=5)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(given_up, [True])
+
+    async def test_a_claim_answering_during_the_shutdown_timeout_still_runs_its_jobs(self):
+        @self.app.task
+        async def handler():
+            self.calls.append("finished")
+
+        job = await handler.aenqueue()
+        claim = self.app.backend.claim
+        stopping = asyncio.Event()
+
+        async def slow(**options):
+            await stopping.wait()
+            await asyncio.sleep(0.2)
+            return await claim(**options)
+
+        worker = self.make_worker(shutdown_timeout=5.0)
+        with mock.patch.object(self.app.backend, "claim", slow):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.sleep(0.1)
+            worker.stop()
+            stopping.set()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertEqual(self.calls, ["finished"])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+
     async def test_a_graceful_stop_keeps_heartbeating_the_jobs_it_waits_for(self):
         @self.app.task
         async def handler():

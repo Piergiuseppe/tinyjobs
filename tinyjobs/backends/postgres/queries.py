@@ -635,13 +635,19 @@ class Queries:
 
         self.missing_statistics = """
             SELECT wanted.name, false AS on_its_table
-              FROM pg_catalog.unnest(%(statistics)b::pg_catalog.text[]) AS wanted (name)
+              FROM ROWS FROM (
+                   pg_catalog.unnest(%(statistics)b::pg_catalog.text[]),
+                   pg_catalog.unnest(%(described)b::pg_catalog.text[])
+              ) AS wanted (name, owner)
              WHERE NOT EXISTS (
                    SELECT FROM pg_catalog.pg_statistic_ext AS x
                      JOIN pg_catalog.pg_namespace AS n
                        ON n.oid OPERATOR(pg_catalog.=) x.stxnamespace
+                     JOIN pg_catalog.pg_class AS tc ON tc.oid OPERATOR(pg_catalog.=) x.stxrelid
                     WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                      AND tc.relnamespace OPERATOR(pg_catalog.=) n.oid
                       AND x.stxname OPERATOR(pg_catalog.=) wanted.name
+                      AND tc.relname OPERATOR(pg_catalog.=) wanted.owner
              )
         """
 

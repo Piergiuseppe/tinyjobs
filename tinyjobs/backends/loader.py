@@ -7,7 +7,6 @@ from ..exceptions import UnknownBackendError
 
 ENTRY_POINT_GROUP = "tinyjobs.backends"
 SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
-LEADING = "".join(map(chr, range(33)))
 
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
 _BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
@@ -50,7 +49,7 @@ def available_schemes() -> list[str]:
 
 
 def _scheme(url: str) -> str:
-    found = SCHEME.match(url.lstrip(LEADING))
+    found = SCHEME.match(url.lstrip())
     return found.group(0).lower() if found else ""
 
 

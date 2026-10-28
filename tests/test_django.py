@@ -596,6 +596,36 @@ class TransactionTests(unittest.TestCase):
                 1 / 0
         self.assertIsNone(self.stored(result))
 
+    def dropped_by_the_server(self):
+        from django.db import connections
+
+        self.tasks.double.enqueue(1)
+        wrapper = connections["pg"]
+        wrapper.close_at = None
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(%s)", [wrapper.connection.info.backend_pid]
+            )
+        return wrapper
+
+    def test_a_connection_the_server_dropped_is_replaced_after_the_request(self):
+        from django.db import close_old_connections
+
+        wrapper = self.dropped_by_the_server()
+        with self.assertRaises(psycopg.OperationalError):
+            self.tasks.double.enqueue(2)
+        self.assertTrue(wrapper.errors_occurred)
+        close_old_connections()
+        result = self.tasks.double.enqueue(3)
+        self.assertIsNotNone(self.stored(result))
+
+    def test_a_health_check_replaces_a_dropped_connection_before_enqueueing(self):
+        wrapper = self.dropped_by_the_server()
+        wrapper.health_check_enabled = True
+        wrapper.health_check_done = False
+        result = self.tasks.double.enqueue(2)
+        self.assertIsNotNone(self.stored(result))
+
     def test_a_connection_from_another_thread_is_refused_as_django_refuses_it(self):
         from django.db import DatabaseError, connections
 
