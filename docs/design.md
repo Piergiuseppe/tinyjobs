@@ -912,23 +912,20 @@ Over several queues, each level visits the queues in the order of their oldest d
 can take a queue's newer jobs before another queue's next one, and the next claim starts from that
 other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
 job that nobody is taking. The same statement marks them running, stamps the lease and opens their
-executions, and it stamps a random token of its own; it takes nothing unless it also takes a
-transaction advisory lock derived from that token and finds no revocation of the token in the meta
-table. A claim that ends without its answer, from a lost connection, a server that stopped answering
-or a cancelled call, even one cancelled again while it gives up, is settled before the worker's next
-claim and when the backend closes. tinyjobs first records the token as revoked, so the claim, if it
-reaches the server later, takes nothing. It then looks, as the login role, at the backend the claim
-was sent on, named by process id and start time. If that backend holds a snapshot older than the
-revocation's transaction, which works with `track_activities` off too, the claim may be in flight
-without seeing it: tinyjobs ends the backend only if it holds the claim's lock, which no other
-session can hold, and checks again a second later. Otherwise the claim has
-committed, failed or will take nothing, and tinyjobs hands back exactly the jobs carrying its
-token, without counting the attempt, so a lease is never left to expire on jobs a worker never
-received. An idle backend is never ended, since PgBouncer may have handed it to another client. A
-revocation is deleted once its backend is gone or has changed state since it was written, checked
-by setup, by the retention sweep and every thirty seconds while one is left. The lock and the
-revocation lookup, one primary key probe, cost a claim about 5 µs: 248 against 243 µs median over
-five runs of 2,800 claims. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+executions, and it stamps a random token of its own. A claim that ends without its answer, from a
+lost connection, a server that stopped answering or a cancelled call, even one cancelled again
+while it gives up, may still commit later, so tinyjobs keeps its token, its worker and the backend
+it was sent on, named by process id and start time, in memory. While it keeps any, at most once a
+second, before a claim, on a heartbeat, every second of a wait for jobs and for up to five seconds
+when the backend closes, one `UPDATE` hands back the running jobs carrying those tokens, without
+counting the attempt and with their executions removed, so a claim that commits late gives its
+jobs back within a second while its worker claims or waits, and by its next heartbeat otherwise,
+both inside the lease. A token is forgotten only when its backend is gone, read as the login role
+from `pg_stat_activity` before that `UPDATE`, so the `UPDATE` sees whatever the backend committed;
+a backend that is alive or hidden from the login role keeps its token, which costs nothing but
+that one statement a second. No timing is guessed and no backend is ended to settle a claim. The
+claim itself carries nothing for this, and a process without such tokens runs no extra statement.
+A process that dies loses its tokens, like any jobs it held: their leases expire. Workers never wait on each other's rows. Walking levels rather than sorting matters when
 a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
 BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
 delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
@@ -995,14 +992,20 @@ transaction, through `sync_to_async(thread_sensitive=True)`.
 
 Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_connections=`), plus the
 listening one. Every pooled connection is set to read committed, a 30 second `statement_timeout` and
-a one minute `idle_in_transaction_session_timeout`; every connection,
+a one minute `idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
+trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
+call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
+instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements,
+within the caller's transaction or one of its own on an autocommit connection, and puts the caller's
+value back after them; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
 TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
 after `pool_timeout`, two seconds at least. A pooled statement is never cut short while bytes move
 in either direction or while the server is still working on it, waiting on a lock, a synchronous
 standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
 waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
-server, on a fresh connection, what the statement's backend is doing. The question names the
+server what the statement's backend is doing, on an idle pooled connection when the pool has one,
+waiting at most a second for it, and otherwise on a fresh connection. The question names the
 backend by its process id and start time, so a reused id is never taken for it, runs as the login
 role, which sees its own sessions even when the url or `ALTER ROLE ... SET role` switches to
 another, and uses only `pg_catalog` operators whatever the url's `search_path`. If the backend is
@@ -1013,10 +1016,10 @@ tinyjobs ends that backend first, so nothing it was doing takes effect afterward
 server that cannot be asked within ten seconds is not taken for gone, since a PgBouncer whose
 server slots this pool already holds looks the same: the call waits for those five minutes of
 silence, then raises. A claim waits half its lease instead, asking after silences of a third of
-that, between one and ten seconds, so its jobs go back to the queue before the lease runs out. With
+that, between one and ten seconds, so its worker moves on well inside the lease. With
 no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
 when the server has taken no new connection for half its lease is given up too, and settled like
-any claim without its answer: its jobs come back without the attempt counted. Cancelling a call bounds
+any claim without its answer: once it commits, its jobs come back without the attempt counted. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle

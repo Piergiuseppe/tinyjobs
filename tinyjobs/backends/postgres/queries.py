@@ -219,8 +219,6 @@ class Queries:
             WITH RECURSIVE {picked},
             chosen AS (
                 SELECT ARRAY(SELECT id FROM picked) AS ids
-                 WHERE NOT EXISTS (SELECT FROM {meta} WHERE key = 'revoked ' || %(token)s)
-                   AND pg_catalog.pg_try_advisory_xact_lock(%(key)s::bigint)
             ),
             claimed AS (
                 UPDATE {jobs} AS job
@@ -404,34 +402,13 @@ class Queries:
             SELECT count(*) AS changed FROM changed
         """
 
-        self.revoke = f"""
-            INSERT INTO {meta} (key, value)
-            VALUES (
-                'revoked ' || %(token)s,
-                pg_catalog.jsonb_build_object(
-                    'pid', %(pid)s::integer, 'born', %(born)s::timestamptz, 'at', {SERVER},
-                    'xid', pg_catalog.pg_current_xact_id()::text::bigint %% 4294967296
-                )::text
-            )
-            ON CONFLICT (key) DO UPDATE SET value = {meta}.value
-            RETURNING value
-        """
-
-        self.revocations = (
-            f"SELECT key, value FROM {meta} WHERE pg_catalog.starts_with(key, 'revoked ')"
-        )
-
-        self.forget_revocations = (
-            f"DELETE FROM {meta} WHERE key = ANY(%(keys)s::text[]) "
-            "AND pg_catalog.starts_with(key, 'revoked ')"
-        )
-
         self.unclaim = f"""
             WITH changed AS (
                 UPDATE {jobs}
                    SET status = 'queued', attempts = attempts - 1, lease_expires_at = NULL,
                        worker_id = NULL, claim_token = NULL
-                 WHERE status = 'running' AND worker_id = %(worker)s AND claim_token = %(token)s
+                 WHERE status = 'running' AND worker_id = ANY(%(workers)s::text[])
+                   AND claim_token = ANY(%(tokens)s::text[])
                 RETURNING id, claims, queue
             ),
             forgotten AS (

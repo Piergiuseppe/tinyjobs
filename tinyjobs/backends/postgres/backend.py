@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
-import json
 import inspect
 import logging
 import math
 import re
 import secrets
-import selectors
+import select
 import time
 import weakref
 from contextlib import (
@@ -28,7 +27,6 @@ import psycopg
 from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
 
 from ...clock import Clock, FollowingClock, elapsed
@@ -117,52 +115,27 @@ RUNNING = (
 _LEFT: contextvars.ContextVar[tuple[int, Any] | None] = contextvars.ContextVar(
     "tinyjobs_postgres_left", default=None
 )
-STILL_RUNNING = """
-    SELECT backend_xmin IS NOT NULL
-           AND pg_catalog.age(backend_xmin) OPERATOR(pg_catalog.>=)
-               pg_catalog.age(%(xid)s::pg_catalog.text::pg_catalog.xid)
-           AND state IS DISTINCT FROM 'idle in transaction'
-           AND state IS DISTINCT FROM 'idle in transaction (aborted)' AS running
-      FROM pg_catalog.pg_stat_activity
-     WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s
-"""
-SETTLED = """
-    SELECT marker.key
-      FROM pg_catalog.jsonb_to_recordset(%(markers)s::pg_catalog.jsonb)
-           AS marker (key pg_catalog.text, pid integer, born pg_catalog.timestamptz,
-                      at double precision)
-     WHERE NOT EXISTS (
-           SELECT FROM pg_catalog.pg_stat_activity AS activity
-            WHERE activity.pid OPERATOR(pg_catalog.=) marker.pid
-              AND (activity.backend_start IS NULL
-                   OR activity.backend_start OPERATOR(pg_catalog.=) marker.born
-                      AND (activity.state_change IS NULL
-                           OR pg_catalog.date_part('epoch', activity.state_change)
-                              OPERATOR(pg_catalog.<=) marker.at))
-     )
-"""
-HOLDING = """
-    SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) AS ended
-      FROM pg_catalog.pg_locks
-     WHERE locktype OPERATOR(pg_catalog.=) 'advisory' AND granted
-       AND database OPERATOR(pg_catalog.=) (
-           SELECT oid FROM pg_catalog.pg_database
-            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
-       )
-       AND classid OPERATOR(pg_catalog.=) %(high)s::pg_catalog.oid
-       AND objid OPERATOR(pg_catalog.=) %(low)s::pg_catalog.oid
-       AND objsubid OPERATOR(pg_catalog.=) 1
-       AND pid OPERATOR(pg_catalog.=) %(pid)s
-"""
-ENDING_CLAIM_MILLISECONDS = 1000
-RECHECK_SECONDS = 1.0
-SWEEP_SECONDS = 30.0
+_PROBING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tinyjobs_postgres_probing", default=False
+)
+ALIVE = (
+    "SELECT pid, backend_start FROM pg_catalog.pg_stat_activity "
+    "WHERE pid OPERATOR(pg_catalog.=) ANY(%(pids)s::integer[])"
+)
+PROBE_POOL_SECONDS = 1.0
+GHOST_SECONDS = 1.0
 SETTLE_SECONDS = 5.0
 ENDING = (
     "SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) FROM pg_catalog.pg_stat_activity "
     "WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s "
     "AND state_change OPERATOR(pg_catalog.=) %(seen)s"
 )
+JIT_AVAILABLE = "SELECT pg_catalog.pg_jit_available() AS available"
+UNCOMPILED = (
+    "SELECT pg_catalog.current_setting('jit') AS jit, "
+    "pg_catalog.set_config('jit', 'off', true) AS off"
+)
+RECOMPILED = "SELECT pg_catalog.set_config('jit', %(jit)s, true) AS jit"
 ENQUEUE_BATCH = 1000
 ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
@@ -245,8 +218,7 @@ class PostgresBackend(BaseBackend):
         self._listened: set[str] = set()
         self._hearing = 0
         self._marks: dict[str, int] = {}
-        self._unclaimed: dict[str, _Unclaimed] = {}
-        self._revoking = False
+        self._ghosts: dict[str, _Ghost] = {}
         self._swept = -math.inf
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
@@ -255,6 +227,7 @@ class PostgresBackend(BaseBackend):
         self._unplaced = self._queries
         self._schemas: list[str] | None = None
         self._identity: tuple[Any, ...] | None = None
+        self._compiling = False
         self._channel: str | None = None
         self._statement_timeout = statement_timeout
         self._pool_timeout = pool_timeout
@@ -341,11 +314,14 @@ class PostgresBackend(BaseBackend):
             cluster = await _fetch(connection, queries.cluster_readable, {})
             if cluster[0]["readable"]:
                 cluster = await _fetch(connection, queries.cluster, {})
+            async with _within(connection):
+                await connection.execute("SELECT pg_catalog.set_config('jit', 'on', true)")
+                [compiling] = await _fetch(connection, JIT_AVAILABLE, {})
+        self._compiling = compiling["available"]
         self._identity = _identity_of(rows[0], cluster[0].get("cluster"))
         self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
         self._queries = queries
         await self._now()
-        await self._sweep()
 
     async def _placed(self, connection: psycopg.AsyncConnection) -> "_Placement":
         tables = self._tables
@@ -643,18 +619,21 @@ class PostgresBackend(BaseBackend):
             await asyncio.wait({listening})
         for event in self._waiters:
             event.set()
-        if self._unclaimed:
+        if self._ghosts:
             with suppress(psycopg.Error, PoolTimeout, PoolClosed, TimeoutError):
                 async with asyncio.timeout(SETTLE_SECONDS):
-                    while self._unclaimed:
-                        await self._unlease()
-                        if self._unclaimed:
-                            await asyncio.sleep(RECHECK_SECONDS)
+                    while True:
+                        await self._exorcise()
+                        if not self._ghosts:
+                            break
+                        await asyncio.sleep(GHOST_SECONDS)
         await self._pool.close()
 
     async def wait_for_jobs(
         self, *, worker_id: str, queues: Sequence[str], timeout: float
     ) -> None:
+        if self._ghosts:
+            timeout = min(timeout, GHOST_SECONDS)
         if not self._notify or self._closed or self._channel is None:
             await asyncio.sleep(timeout)
             return
@@ -744,10 +723,8 @@ class PostgresBackend(BaseBackend):
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
-        if self._unclaimed:
-            await self._unlease()
-        if self._revoking and time.monotonic() - self._swept >= SWEEP_SECONDS:
-            await self._sweep()
+        if self._ghosts:
+            await self._haunted()
         now = await self._now()
         query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
         _LEFT.set(None)
@@ -757,81 +734,44 @@ class PostgresBackend(BaseBackend):
         except BaseException as error:
             if _unanswered(error):
                 token = parameters["token"]
-                self._unclaimed[token] = _Unclaimed(worker_id, token, _LEFT.get())
+                self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get())
+                self._swept = -math.inf
             raise
         finally:
             _PATIENCE.reset(patience)
         return [job_from_row(row) for row in rows]
 
-    async def _unlease(self) -> None:
-        for entry in list(self._unclaimed.values()):
-            if time.monotonic() < entry.due:
-                continue
-            async with self._connection() as connection:
-                if entry.backend is not None:
-                    if await self._still_running(connection, entry):
-                        entry.due = time.monotonic() + RECHECK_SECONDS
-                        continue
-                rows = await _fetch(
-                    connection,
-                    self._queries.unclaim,
-                    {"worker": entry.worker_id, "token": entry.token},
-                )
-            del self._unclaimed[entry.token]
-            if rows:
-                logger.warning(
-                    "handed back %d job(s) a postgres claim leased to %s although its answer "
-                    "never arrived",
-                    len(rows),
-                    entry.worker_id,
-                )
-                await self._wake({row["queue"] for row in rows})
+    async def _haunted(self) -> None:
+        if time.monotonic() - self._swept >= GHOST_SECONDS:
+            await self._exorcise()
 
-    async def _still_running(self, connection: psycopg.AsyncConnection, entry: _Unclaimed) -> bool:
-        pid, born = entry.backend
-        if entry.revoked is None:
-            [revoked] = await _fetch(
-                connection, self._queries.revoke, {"token": entry.token, "pid": pid, "born": born}
-            )
-            entry.revoked = _revocation(revoked["value"]).get("xid")
-            self._revoking = True
-        async with connection.transaction():
-            await connection.execute(UNROLED)
-            rows = await _fetch(
-                connection, STILL_RUNNING, {"pid": pid, "born": born, "xid": entry.revoked}
-            )
-            if rows and rows[0]["running"]:
-                key = _claim_key(entry.token) % 2**64
-                await connection.execute(
-                    HOLDING,
-                    {
-                        "pid": pid,
-                        "high": key >> 32,
-                        "low": key & 0xFFFFFFFF,
-                        "wait": ENDING_CLAIM_MILLISECONDS,
-                    },
-                )
-        return bool(rows) and rows[0]["running"] is not False
-
-    async def _sweep(self) -> None:
+    async def _exorcise(self) -> None:
         self._swept = time.monotonic()
+        ghosts = list(self._ghosts.values())
         async with self._connection() as connection:
-            rows = await _fetch(connection, self._queries.revocations, {})
-            markers = [
-                {"key": row["key"], **_revocation(row["value"])}
-                for row in rows
-                if _revocation(row["value"])
-            ]
-            settled: list[dict[str, Any]] = []
-            if markers:
-                async with connection.transaction():
+            pids = sorted({ghost.backend[0] for ghost in ghosts if ghost.backend is not None})
+            seen: list[dict[str, Any]] = []
+            if pids:
+                async with _within(connection):
                     await connection.execute(UNROLED)
-                    settled = await _fetch(connection, SETTLED, {"markers": Jsonb(markers)})
-            if settled:
-                await connection.execute(
-                    self._queries.forget_revocations, {"keys": [row["key"] for row in settled]}
-                )
-        self._revoking = len(rows) > len(settled)
+                    seen = await _fetch(connection, ALIVE, {"pids": pids})
+            rows = await _fetch(
+                connection,
+                self._queries.unclaim,
+                {
+                    "workers": sorted({ghost.worker_id for ghost in ghosts}),
+                    "tokens": [ghost.token for ghost in ghosts],
+                },
+            )
+        for ghost in ghosts:
+            if _laid(ghost, seen):
+                self._ghosts.pop(ghost.token, None)
+        if rows:
+            logger.warning(
+                "handed back %d job(s) a postgres claim leased although its answer never arrived",
+                len(rows),
+            )
+            await self._wake({row["queue"] for row in rows})
 
     def _claiming(
         self,
@@ -856,7 +796,6 @@ class PostgresBackend(BaseBackend):
             lease=now + lease_seconds,
             seconds=lease_seconds,
             token=token,
-            key=_claim_key(token),
         )
 
     async def heartbeat(
@@ -867,6 +806,9 @@ class PostgresBackend(BaseBackend):
     ) -> None:
         if not job_ids:
             return
+        if self._ghosts:
+            with suppress(psycopg.Error, PoolTimeout):
+                await self._haunted()
         now = await self._now()
         await self._retrying(
             self._queries.heartbeat,
@@ -1011,7 +953,6 @@ class PostgresBackend(BaseBackend):
         )
         if not won:
             return None
-        await self._sweep()
         removed = 0
         for status, cutoff in policy.horizons(now).items():
             while removed < policy.maximum_per_sweep:
@@ -1103,14 +1044,14 @@ class PostgresBackend(BaseBackend):
         _check_held(connection)
         with self._refusing():
             try:
-                with _atomic(connection, jobs):
+                with _atomic(connection, jobs, self._compiling):
                     return _stepped(connection, self._joining(connection, jobs))
             except _Elsewhere as elsewhere:
                 with psycopg.Connection.connect(self._conninfo, **self._direct_options()) as own:
                     for statement, parameters in self._settings():
                         own.execute(statement, parameters)
                     self._settle(_stepped(own, self._identifying()), elsewhere.identity)
-                with _atomic(connection, jobs):
+                with _atomic(connection, jobs, self._compiling):
                     return _stepped(connection, self._joining(connection, jobs))
 
     async def aenqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
@@ -1123,7 +1064,7 @@ class PostgresBackend(BaseBackend):
         _check_held(connection)
         with self._refusing():
             try:
-                async with _atomic(connection, jobs):
+                async with _atomic(connection, jobs, self._compiling):
                     return await _driven(connection, self._joining(connection, jobs))
             except _Elsewhere as elsewhere:
                 async with await psycopg.AsyncConnection.connect(
@@ -1132,7 +1073,7 @@ class PostgresBackend(BaseBackend):
                     for statement, parameters in self._settings():
                         await own.execute(statement, parameters)
                     self._settle(await _driven(own, self._identifying()), elsewhere.identity)
-                async with _atomic(connection, jobs):
+                async with _atomic(connection, jobs, self._compiling):
                     return await _driven(connection, self._joining(connection, jobs))
 
     @contextmanager
@@ -1165,6 +1106,9 @@ class PostgresBackend(BaseBackend):
                 "meta": f"{prefix}_meta",
             },
         )
+        compiling = self._compiling
+        if compiling:
+            [kept] = yield UNCOMPILED, {}
         if connection not in self._joined:
             [found] = yield guard
             identity = None
@@ -1186,6 +1130,8 @@ class PostgresBackend(BaseBackend):
                 "channel": self._channel,
                 "queues": sorted(due),
             }
+        if compiling:
+            yield RECOMPILED, {"jit": kept["jit"]}
         return _in_order(places, copies, len(jobs), stored)
 
     def _identifying(self) -> Steps[tuple[Any, ...] | None]:
@@ -1232,6 +1178,7 @@ class PostgresBackend(BaseBackend):
                 "SELECT set_config('default_transaction_isolation', 'read committed', false), "
                 "set_config('statement_timeout', %(statement)s, false), "
                 "set_config('idle_in_transaction_session_timeout', %(idle)s, false), "
+                "set_config('jit', 'off', false), "
                 "pg_catalog.pg_backend_pid() AS pid, (SELECT backend_start FROM "
                 "pg_catalog.pg_stat_get_activity(pg_catalog.pg_backend_pid())) AS born",
                 {"statement": statement, "idle": f"{IDLE_IN_TRANSACTION_SECONDS}s"},
@@ -1376,10 +1323,7 @@ class PostgresBackend(BaseBackend):
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[psycopg.AsyncConnection]:
-        async with self._connection() as connection, AsyncExitStack() as stack:
-            transaction = psycopg.AsyncTransaction(connection)
-            await _begin(transaction)
-            stack.push_async_exit(transaction)
+        async with self._connection() as connection, _within(connection):
             yield connection
 
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
@@ -1394,7 +1338,7 @@ class PostgresBackend(BaseBackend):
             row = await cursor.fetchone()
             born = row["born"]
             if born is None:
-                async with connection.transaction():
+                async with _within(connection):
                     await connection.execute(UNROLED)
                     born = (await (await connection.execute(BORN)).fetchone())["born"]
             if born is not None:
@@ -1402,29 +1346,47 @@ class PostgresBackend(BaseBackend):
                 connection.working = self._working
 
     async def _working(self, pid: int, born: Any, quiet: float, patience: float) -> bool:
-        row: dict[str, Any] | None = None
+        probing = _PROBING.set(True)
+        try:
+            verdict = await self._asked_pooled(pid, born, quiet, patience)
+            if verdict is None:
+                verdict = await self._asked_fresh(pid, born, quiet, patience)
+        finally:
+            _PROBING.reset(probing)
+        return quiet < patience if verdict is None else verdict
+
+    async def _asked_pooled(
+        self, pid: int, born: Any, quiet: float, patience: float
+    ) -> bool | None:
+        if not self._pool.get_stats().get("pool_available"):
+            return None
+        try:
+            probe = await self._pool.getconn(timeout=PROBE_POOL_SECONDS)
+        except (PoolTimeout, PoolClosed, psycopg.Error):
+            return None
+        seen: list[dict[str, Any] | None] = []
+        try:
+            async with asyncio.timeout(PROBE_SECONDS), _within(probe):
+                await probe.execute(UNROLED)
+                return await _asking(probe, pid, born, quiet, patience, seen)
+        except (TimeoutError, psycopg.Error):
+            return False if seen else None
+        finally:
+            await self._pool.putconn(probe)
+
+    async def _asked_fresh(
+        self, pid: int, born: Any, quiet: float, patience: float
+    ) -> bool | None:
+        seen: list[dict[str, Any] | None] = []
         try:
             async with asyncio.timeout(PROBE_SECONDS):
                 async with await psycopg.AsyncConnection.connect(
                     self._conninfo, **self._direct_options()
                 ) as probe:
                     await probe.execute(PROBING, {"path": SAFE_SEARCH_PATH})
-                    cursor = await probe.execute(RUNNING, {"pid": pid, "born": born})
-                    row = await cursor.fetchone()
-                    if row is None or _busy(row, quiet, patience):
-                        return row is not None
-                    cursor = await probe.execute(
-                        ENDING,
-                        {
-                            "pid": pid,
-                            "born": born,
-                            "seen": row["state_change"],
-                            "wait": ENDING_MILLISECONDS,
-                        },
-                    )
-                    return await cursor.fetchone() is None
+                    return await _asking(probe, pid, born, quiet, patience, seen)
         except (TimeoutError, psycopg.Error):
-            return row is None and quiet < patience
+            return False if seen else None
 
     async def _wake(self, queues: set[str]) -> None:
         if not self._notify or not queues or self._closed or self._channel is None:
@@ -1627,6 +1589,15 @@ def _settled(future: asyncio.Future[Any]) -> None:
         future.exception()
 
 
+@asynccontextmanager
+async def _within(connection: psycopg.AsyncConnection) -> AsyncIterator[None]:
+    async with AsyncExitStack() as stack:
+        transaction = psycopg.AsyncTransaction(connection)
+        await _begin(transaction)
+        stack.push_async_exit(transaction)
+        yield
+
+
 async def _begin(transaction: psycopg.AsyncTransaction) -> None:
     try:
         await transaction.__aenter__()
@@ -1700,24 +1671,20 @@ def _in_order(
 
 
 @dataclass(slots=True)
-class _Unclaimed:
+class _Ghost:
     worker_id: str
     token: str
     backend: tuple[int, Any] | None
-    revoked: int | None = None
-    due: float = -math.inf
 
 
-def _claim_key(token: str) -> int:
-    return int(token[:16], 16) - 2**63
-
-
-def _revocation(value: str) -> dict[str, Any]:
-    try:
-        marker = json.loads(value)
-    except ValueError:
-        return {}
-    return marker if isinstance(marker, dict) else {}
+def _laid(ghost: _Ghost, seen: list[dict[str, Any]]) -> bool:
+    if ghost.backend is None:
+        return True
+    pid, born = ghost.backend
+    return not any(
+        row["pid"] == pid and (row["backend_start"] is None or row["backend_start"] == born)
+        for row in seen
+    )
 
 
 def _unanswered(error: BaseException) -> bool:
@@ -1777,7 +1744,9 @@ class _Answering(psycopg.AsyncConnection):
         try:
             return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
-            if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
+            if _PROBING.get():
+                self.pgconn.finish()
+            elif self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 try:
                     await self._given_up(gen)
                 finally:
@@ -1799,6 +1768,10 @@ class _Answering(psycopg.AsyncConnection):
             raise psycopg.OperationalError("connection socket closed") from error
 
     async def _answer(self, state: int, silence: float, patience: float) -> int:
+        ready = _ready_now(self.pgconn.socket, state) if state & waiting.WAIT_W else 0
+        if ready:
+            self.heard = time.monotonic()
+            return ready
         ready = await _ready(self.pgconn.socket, state, silence)
         while not ready:
             quiet = time.monotonic() - self.heard
@@ -1835,17 +1808,18 @@ def _busy(row: dict[str, Any], quiet: float, patience: float) -> bool:
 
 
 def _ready_now(fileno: int, state: int) -> int:
-    wanted = (selectors.EVENT_READ if state & waiting.WAIT_R else 0) | (
-        selectors.EVENT_WRITE if state & waiting.WAIT_W else 0
+    poller = select.poll()
+    poller.register(
+        fileno,
+        (select.POLLIN if state & waiting.WAIT_R else 0)
+        | (select.POLLOUT if state & waiting.WAIT_W else 0),
     )
-    with selectors.DefaultSelector() as selector:
-        selector.register(fileno, wanted)
-        events = selector.select(0)
     seen = 0
-    for _, mask in events:
+    for _, mask in poller.poll(0):
         seen |= mask
-    return (waiting.READY_R if seen & selectors.EVENT_READ else 0) | (
-        waiting.READY_W if seen & selectors.EVENT_WRITE else 0
+    broken = seen & (select.POLLERR | select.POLLHUP | select.POLLNVAL)
+    return (waiting.READY_R if state & waiting.WAIT_R and seen & select.POLLIN or broken else 0) | (
+        waiting.READY_W if state & waiting.WAIT_W and seen & select.POLLOUT or broken else 0
     )
 
 
@@ -1880,13 +1854,15 @@ class _Elsewhere(Exception):
         self.identity = identity
 
 
-def _atomic(connection: Any, jobs: Sequence[Job]) -> Any:
+def _atomic(connection: Any, jobs: Sequence[Job], compiling: bool) -> Any:
     if (
-        _split(jobs)
+        (compiling or _split(jobs))
         and connection.autocommit
         and connection._pipeline is None
         and connection.info.transaction_status == pq.TransactionStatus.IDLE
     ):
+        if isinstance(connection, psycopg.AsyncConnection):
+            return _within(connection)
         return connection.transaction()
     return nullcontext()
 
@@ -1949,6 +1925,25 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
                     await connection.wait(checking._execute_gen(*guard))
                 await connection.wait(cursor._execute_gen(query, parameters))
             rows = await cursor.fetchall()
+
+
+async def _asking(
+    probe: psycopg.AsyncConnection,
+    pid: int,
+    born: Any,
+    quiet: float,
+    patience: float,
+    seen: list[dict[str, Any] | None],
+) -> bool:
+    row = await (await probe.execute(RUNNING, {"pid": pid, "born": born})).fetchone()
+    seen.append(row)
+    if row is None or _busy(row, quiet, patience):
+        return row is not None
+    cursor = await probe.execute(
+        ENDING,
+        {"pid": pid, "born": born, "seen": row["state_change"], "wait": ENDING_MILLISECONDS},
+    )
+    return await cursor.fetchone() is None
 
 
 async def _fetch(
