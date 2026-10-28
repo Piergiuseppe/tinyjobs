@@ -11,7 +11,7 @@ import time
 import unittest
 import urllib.parse
 import uuid
-from contextlib import asynccontextmanager, nullcontext, suppress
+from contextlib import asynccontextmanager, closing, nullcontext, suppress
 from unittest import mock
 
 import tinyjobs.clock
@@ -1323,8 +1323,10 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(live.close)
         await live.setup()
         await sql(f'DROP INDEX "{prefix}_jobs_by_status"')
-        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, autocommit=True) as stuck:
-            await stuck.execute("SELECT pg_advisory_lock(%s)", [postgres_backend._rebuild_key(live._identity[0])])
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as stuck:
+            await stuck.execute(
+                f"SELECT FROM \"{prefix}_meta\" WHERE key = 'instance' FOR UPDATE"
+            )
             starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
             self.addAsyncCleanup(starting.close)
             with (
@@ -1340,18 +1342,23 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ConfigurationError, "another setup"):
                     await asyncio.wait_for(again.setup(), 5)
 
-    async def test_a_rebuild_lock_held_by_a_role_that_cannot_own_the_tables_is_ignored(self):
+    async def test_a_role_that_can_only_read_the_meta_table_cannot_hold_rebuilds_up(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
         live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
         self.addAsyncCleanup(live.close)
         await live.setup()
         await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
-        stranger = await self.role()
+        reader = await self.role()
+        await sql(f'GRANT SELECT ON "{prefix}_meta" TO "{reader}"')
         async with await psycopg.AsyncConnection.connect(
-            signed_in_as(POSTGRES_URL, stranger), autocommit=True
-        ) as squatting:
-            await squatting.execute("SELECT pg_advisory_lock(%s)", [postgres_backend._rebuild_key(live._identity[0])])
+            signed_in_as(POSTGRES_URL, reader)
+        ) as reading:
+            await reading.execute(f'SELECT * FROM "{prefix}_meta"')
+            for strength in ("UPDATE", "KEY SHARE"):
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    await reading.execute(f'SELECT * FROM "{prefix}_meta" FOR {strength}')
+                await reading.rollback()
             starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
             self.addAsyncCleanup(starting.close)
             started = time.monotonic()
@@ -1888,13 +1895,14 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         for autocommit, piped, count in itertools.product((False, True), (False, True), (1, batch + 1)):
             with self.subTest(autocommit=autocommit, piped=piped, count=count):
                 ran: list[str] = []
-                with Racing.connect(url_for(dbname=name), autocommit=autocommit) as connection:
+                racing = Racing.connect(url_for(dbname=name), autocommit=autocommit)
+                with closing(racing) as connection:
                     connection.add_notice_handler(lambda notice: ran.append(notice.message_primary))
                     connection.execute(f'SET ROLE "{owner}"')
                     backend.enqueue_in(connection, [make_job()])
-                    with connection.pipeline() if piped else nullcontext():
-                        connection.racing = True
-                        with suppress(psycopg.Error, ConfigurationError):
+                    with suppress(psycopg.Error, ConfigurationError):
+                        with connection.pipeline() if piped else nullcontext():
+                            connection.racing = True
                             backend.enqueue_in(connection, [make_job() for _ in range(count)])
                     for reset in resets:
                         reset.join()
@@ -4383,6 +4391,113 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertLess(time.monotonic() - started, 1.8)
                 frozen.clear()
+
+    async def cut_off_claims(self, connections: int, warm: bool):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        proxy = stalling_proxy()
+        url, frozen = await proxy.__aenter__()
+        self.addAsyncCleanup(proxy.__aexit__, None, None, None)
+        backend = PostgresBackend.from_url(
+            url,
+            prefix=prefix,
+            min_connections=connections,
+            max_connections=connections,
+            notify=False,
+        )
+        self.addAsyncCleanup(backend.close)
+        self.addAsyncCleanup(frozen.clear)
+        await backend.setup()
+        await backend.enqueue(make_job())
+        await backend.claim(worker_id="w", queues=["nothing"], limit=1, lease_seconds=6.0)
+        if warm:
+
+            async def used() -> None:
+                async with backend._connection() as connection:
+                    await connection.execute("SELECT pg_catalog.pg_sleep(0.2)")
+
+            await asyncio.gather(*(used() for _ in range(connections)))
+        frozen.set()
+        return backend
+
+    async def claimed_within(self, backend: PostgresBackend, lease: float) -> float:
+        started = time.monotonic()
+        with self.assertRaises(psycopg.OperationalError):
+            await asyncio.wait_for(
+                backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=lease),
+                40,
+            )
+        return time.monotonic() - started
+
+    async def test_a_claim_after_a_ghost_sweeps_within_half_its_lease(self):
+        backend = await self.cut_off_claims(3, warm=True)
+        self.assertLess(await self.claimed_within(backend, 6.0), 4)
+        self.assertEqual(len(backend._ghosts), 1)
+        self.assertLess(await self.claimed_within(backend, 6.0), 4)
+
+    async def test_a_claim_after_a_ghost_waits_for_the_pool_within_half_its_lease(self):
+        backend = await self.cut_off_claims(2, warm=False)
+        self.assertLess(await self.claimed_within(backend, 6.0), 4)
+        self.assertEqual(len(backend._ghosts), 1)
+        self.assertLess(await self.claimed_within(backend, 6.0), 4)
+
+    async def test_a_claim_reading_a_due_clock_gives_up_within_half_its_lease(self):
+        backend = await self.cut_off_claims(2, warm=False)
+        backend._forget()
+        self.assertTrue(backend._clock.due())
+        self.assertLess(await self.claimed_within(backend, 6.0), 4)
+        self.assertEqual(backend._ghosts, {})
+
+    async def test_a_claim_waits_for_another_clock_reading_within_half_its_lease(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, notify=False)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        await backend.enqueue(make_job())
+        backend._forget()
+        async with backend._reading:
+            self.assertLess(await self.claimed_within(backend, 2.0), 1.5)
+        [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=2)
+        self.assertEqual(job.attempts, 1)
+
+    async def test_a_sweep_left_without_answers_leaves_the_claim_time_to_run(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, notify=False)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        stored = await backend.enqueue(make_job())
+        backend._ghosts["ab" * 16] = postgres_backend._Ghost("w", "ab" * 16, None, 2.0)
+        swept: list[float] = []
+
+        async def unanswered() -> None:
+            started = time.monotonic()
+            await asyncio.sleep(max(0.0, postgres_backend._left()))
+            swept.append(time.monotonic() - started)
+            raise psycopg.OperationalError("the postgres server did not answer")
+
+        backend._pass = unanswered
+        started = time.monotonic()
+        [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=2)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(job.id, stored.id)
+        self.assertEqual(len(swept), 1)
+        self.assertAlmostEqual(swept[0], 0.5, delta=0.2)
+        backend._ghosts.clear()
+
+    async def test_a_cancelled_claim_lets_go_within_half_its_lease(self):
+        backend = await self.cut_off_claims(2, warm=False)
+        claiming = asyncio.create_task(
+            backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=2.0)
+        )
+        await asyncio.sleep(0.8)
+        cancelled = time.monotonic()
+        claiming.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(claiming, 20)
+        self.assertLess(time.monotonic() - cancelled, 0.6)
+        self.assertEqual(len(backend._ghosts), 1)
 
     async def test_a_slow_claim_given_up_for_want_of_connections_gives_its_jobs_back(self):
         prefix = new_prefix()

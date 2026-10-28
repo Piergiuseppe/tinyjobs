@@ -216,11 +216,16 @@ class Worker:
             )
         )
         stopping = asyncio.ensure_future(self._stopping.wait())
+        forced = asyncio.ensure_future(self._forced.wait())
         try:
             await asyncio.wait({claiming, stopping}, return_when=asyncio.FIRST_COMPLETED)
             if not claiming.done():
                 started = time.monotonic()
-                await asyncio.wait({claiming}, timeout=self._shutdown_timeout)
+                await asyncio.wait(
+                    {claiming, forced},
+                    timeout=self._shutdown_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 self._shutdown_timeout = max(
                     0.0, self._shutdown_timeout - (time.monotonic() - started)
                 )
@@ -231,9 +236,9 @@ class Worker:
                 return []
             return claiming.result()
         finally:
-            for task in (claiming, stopping):
+            for task in (claiming, stopping, forced):
                 task.cancel()
-            await asyncio.gather(claiming, stopping, return_exceptions=True)
+            await asyncio.gather(claiming, stopping, forced, return_exceptions=True)
 
     def _launch(self, job: Job) -> None:
         self._inflight[job.id, job.claims] = job

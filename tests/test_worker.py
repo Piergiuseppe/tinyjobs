@@ -1107,6 +1107,25 @@ class ShutdownTests(WorkerTestCase):
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertEqual(given_up, [True])
 
+    async def test_a_second_signal_gives_up_a_claim_still_waiting_at_once(self):
+        await self.app.ready()
+        claimed = asyncio.Event()
+
+        async def stuck(**_):
+            claimed.set()
+            await asyncio.Event().wait()
+
+        worker = self.make_worker(shutdown_timeout=10.0)
+        with mock.patch.object(self.app.backend, "claim", stuck):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(claimed.wait(), 5)
+            started = time.monotonic()
+            worker.stop()
+            await asyncio.sleep(0.1)
+            worker._request_force()
+            await asyncio.wait_for(runner, timeout=15)
+        self.assertLess(time.monotonic() - started, 2)
+
     async def test_a_claim_answering_during_the_shutdown_timeout_still_runs_its_jobs(self):
         @self.app.task
         async def handler():

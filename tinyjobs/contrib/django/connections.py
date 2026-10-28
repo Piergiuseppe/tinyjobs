@@ -42,9 +42,5 @@ def joined_connection(alias: str) -> Iterator[Any]:
             f"the database {alias!r} does not run on psycopg 3, so jobs cannot join "
             "its transactions"
         )
-    try:
+    with connection.wrap_database_errors:
         yield raw
-    except psycopg.Error as error:
-        if not isinstance(error, (psycopg.DataError, psycopg.IntegrityError)):
-            connection.errors_occurred = True
-        raise

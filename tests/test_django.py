@@ -609,11 +609,12 @@ class TransactionTests(unittest.TestCase):
         return wrapper
 
     def test_a_connection_the_server_dropped_is_replaced_after_the_request(self):
-        from django.db import close_old_connections
+        from django.db import OperationalError, close_old_connections
 
         wrapper = self.dropped_by_the_server()
-        with self.assertRaises(psycopg.OperationalError):
+        with self.assertRaises(OperationalError) as caught:
             self.tasks.double.enqueue(2)
+        self.assertIsInstance(caught.exception.__cause__, psycopg.OperationalError)
         self.assertTrue(wrapper.errors_occurred)
         close_old_connections()
         result = self.tasks.double.enqueue(3)

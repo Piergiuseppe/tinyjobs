@@ -96,8 +96,8 @@ ENDING_MILLISECONDS = 5000
 WAIT_INTERVAL = 0.1
 UNKNOWN_STATES = frozenset({None, "disabled"})
 IN_TRANSIT_SECONDS = 300.0
-_PATIENCE: contextvars.ContextVar[float] = contextvars.ContextVar(
-    "tinyjobs_postgres_patience", default=math.inf
+_DEADLINE: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "tinyjobs_postgres_deadline", default=math.inf
 )
 UNROLED = "SELECT pg_catalog.set_config('role', 'none', true)"
 PROBING = (
@@ -179,14 +179,6 @@ HOLDERS = """
        AND held.objsubid OPERATOR(pg_catalog.=) 1
        AND pg_catalog.pg_has_role(activity.usesysid, ({role}), 'MEMBER')
 """
-REBUILDERS = HOLDERS.format(
-    role="""
-           SELECT c.relowner FROM pg_catalog.pg_class AS c
-             JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-            WHERE c.relname OPERATOR(pg_catalog.=) %(jobs)s::pg_catalog.name
-              AND n.nspname OPERATOR(pg_catalog.=) %(schema)s::pg_catalog.name
-       """
-)
 SETTERS = HOLDERS.format(
     role="SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) CURRENT_USER"
 )
@@ -472,19 +464,29 @@ class PostgresBackend(BaseBackend):
         prefix = self._tables.prefix
         unique = {f"{prefix}_{name}" for name, _, is_unique in INDEXES if is_unique}
         skipped: set[str] = set()
-        async with await psycopg.AsyncConnection.connect(
-            self._conninfo, **self._direct_options()
-        ) as connection:
+        async with (
+            await psycopg.AsyncConnection.connect(
+                self._conninfo, **self._direct_options()
+            ) as connection,
+            await psycopg.AsyncConnection.connect(
+                self._conninfo, **self._direct_options()
+            ) as holding,
+        ):
             for statement, parameters in self._settings():
                 await connection.execute(statement, parameters)
+                await holding.execute(statement, parameters)
             await connection.execute(
                 "SELECT pg_catalog.set_config('statement_timeout', '0', false), "
                 "pg_catalog.set_config('lock_timeout', %(wait)s, false)",
                 {"wait": f"{REBUILD_LOCK_SECONDS}s"},
             )
+            await holding.execute(
+                "SELECT pg_catalog.set_config('idle_in_transaction_session_timeout', '0', false)"
+            )
             placed = await self._placed(connection)
-            key = await self._rebuild_key(connection, placed)
-            first = await self._lock_for_rebuild(connection, placed, key)
+            if not await _fetch(connection, placed.queries.identity, {}):
+                await connection.execute(placed.within.instance(), {})
+            first = await self._lock_for_rebuild(connection, holding, placed)
             if first is None:
                 return skipped
             placed = await self._placed(connection)
@@ -546,35 +548,17 @@ class PostgresBackend(BaseBackend):
                     skipped.add(name)
         return skipped
 
-    async def _rebuild_key(
-        self, connection: psycopg.AsyncConnection, placed: "_Placement"
-    ) -> int:
-        rows = await _fetch(connection, placed.queries.identity, {})
-        if not rows:
-            await connection.execute(placed.within.instance(), {})
-            rows = await _fetch(connection, placed.queries.identity, {})
-        return _rebuild_key(rows[0]["instance"])
-
     async def _lock_for_rebuild(
-        self, connection: psycopg.AsyncConnection, placed: "_Placement", key: int
+        self,
+        connection: psycopg.AsyncConnection,
+        holding: psycopg.AsyncConnection,
+        placed: "_Placement",
     ) -> bool | None:
         deadline = time.monotonic() + REBUILD_LOCK_SECONDS
         waited = False
         while True:
-            cursor = await connection.execute(
-                "SELECT pg_catalog.pg_try_advisory_lock(%(key)s) AS taken",
-                {"key": key},
-            )
-            taken = (await cursor.fetchone())["taken"]
+            taken = await _held(holding, placed.within.meta)
             if taken and not waited:
-                return True
-            if not taken and not await self._lockers(
-                connection,
-                REBUILDERS,
-                key,
-                jobs=f"{self._tables.prefix}_jobs",
-                schema=placed.within.schema,
-            ):
                 return True
             if not await self._misplaced(connection, placed):
                 return None
@@ -833,30 +817,38 @@ class PostgresBackend(BaseBackend):
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
-        if self._ghosts:
-            try:
-                await self._haunted()
-            except (psycopg.Error, PoolTimeout) as error:
-                logger.warning(
-                    "could not hand back the jobs of postgres claims whose answer never arrived, "
-                    "trying again later: %s",
-                    error,
-                )
-        now = await self._now()
-        query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
-        _LEFT.set(None)
-        patience = _PATIENCE.set(lease_seconds / 2)
+        started = time.monotonic()
+        deadline = _DEADLINE.set(started + lease_seconds / 2)
         try:
-            rows = await self._retrying(query, parameters)
-        except BaseException as error:
-            if _unanswered(error):
-                token = parameters["token"]
-                self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get(), lease_seconds)
-                self._swept = -math.inf
-            raise
+            if self._ghosts:
+                await self._swept_within(started + lease_seconds / 4)
+            now = await self._now()
+            query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
+            _LEFT.set(None)
+            try:
+                rows = await self._retrying(query, parameters)
+            except BaseException as error:
+                if _unanswered(error):
+                    token = parameters["token"]
+                    self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get(), lease_seconds)
+                    self._swept = -math.inf
+                raise
         finally:
-            _PATIENCE.reset(patience)
+            _DEADLINE.reset(deadline)
         return [job_from_row(row) for row in rows]
+
+    async def _swept_within(self, deadline: float) -> None:
+        sweep = _DEADLINE.set(min(_DEADLINE.get(), deadline))
+        try:
+            await self._haunted()
+        except (psycopg.Error, PoolTimeout) as error:
+            logger.warning(
+                "could not hand back the jobs of postgres claims whose answer never arrived, "
+                "trying again later: %s",
+                error,
+            )
+        finally:
+            _DEADLINE.reset(sweep)
 
     def _pause(self) -> float:
         ghosts = self._ghosts.values()
@@ -1495,7 +1487,7 @@ class PostgresBackend(BaseBackend):
 
     async def _live(self) -> psycopg.AsyncConnection:
         for _ in range(self._sizes[1]):
-            connection = await self._pool.getconn()
+            connection = await self._pool.getconn(timeout=self._waited())
             if _alive(connection):
                 return connection
             await self._pool.putconn(connection)
@@ -1636,11 +1628,17 @@ class PostgresBackend(BaseBackend):
     async def _now(self) -> float:
         clock = self._clock
         if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
-            async with self._reading:
+            async with _taken(self._reading):
                 if not self._read or clock.due():
                     clock.follow(*await self._forgetting(_again(self._timed)), self._server())
                     self._read = True
         return clock.now()
+
+    def _waited(self) -> float:
+        left = _left()
+        if left <= 0:
+            raise PoolTimeout("the claim spent half its lease before it could get a connection")
+        return min(self._pool_timeout, left)
 
     async def _timed(self) -> tuple[float, float, float]:
         async with self._connection() as connection:
@@ -1886,9 +1884,17 @@ def _silence(patience: float) -> float:
     return min(SILENCE_SECONDS, max(SHORTEST_SILENCE_SECONDS, patience / 3))
 
 
-def _rebuild_key(instance: str) -> int:
-    digest = hashlib.sha256(f"tinyjobs-rebuild:{instance}".encode()).digest()
-    return int.from_bytes(digest[:8], "big", signed=True)
+async def _held(holding: psycopg.AsyncConnection, meta: str) -> bool:
+    await holding.execute("BEGIN")
+    try:
+        await holding.execute(
+            f"SELECT FROM {meta} WHERE key OPERATOR(pg_catalog.=) 'instance' FOR UPDATE NOWAIT",
+            {},
+        )
+    except errors.LockNotAvailable:
+        await holding.execute("ROLLBACK")
+        return False
+    return True
 
 
 def _claim_key(token: str) -> int:
@@ -1911,6 +1917,26 @@ def _laid(ghost: _Ghost, seen: list[dict[str, Any]]) -> bool:
         return True
     ghost.stale = row["state"] == "idle" and row["state_change"] == ghost.seen[0]
     return False
+
+
+def _left() -> float:
+    return _DEADLINE.get() - time.monotonic()
+
+
+@asynccontextmanager
+async def _taken(lock: asyncio.Lock) -> AsyncIterator[None]:
+    left = _left()
+    try:
+        async with asyncio.timeout(None if left == math.inf else max(0.0, left)):
+            await lock.acquire()
+    except TimeoutError:
+        raise psycopg.OperationalError(
+            "the claim spent half its lease waiting for another call to read the server clock"
+        ) from None
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _unanswered(error: BaseException) -> bool:
@@ -1982,7 +2008,7 @@ class _Answering(psycopg.AsyncConnection):
 
     async def _heard(self, gen: Any) -> Any:
         self.heard = time.monotonic()
-        patience = min(IN_TRANSIT_SECONDS, _PATIENCE.get())
+        patience = min(IN_TRANSIT_SECONDS, max(0.0, _left()))
         silence = min(SILENCE_SECONDS, max(SHORTEST_SILENCE_SECONDS, patience / 3))
         try:
             state = next(gen)
@@ -2018,9 +2044,10 @@ class _Answering(psycopg.AsyncConnection):
         return ready
 
     async def _given_up(self, gen: Any) -> None:
-        await self._try_cancel(timeout=CANCEL_SECONDS)
+        if _left() > 0:
+            await self._try_cancel(timeout=min(CANCEL_SECONDS, _left()))
         try:
-            async with asyncio.timeout(CANCEL_SECONDS):
+            async with asyncio.timeout(max(0.0, min(CANCEL_SECONDS, _left()))):
                 with suppress(psycopg.Error, OSError):
                     await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
         except TimeoutError:

@@ -834,11 +834,9 @@ newer release is refused and left alone. Every setup then checks that each tinyj
 a valid index of the right table, unique where it must be, and that the statistics below exist on
 the jobs table, so an object of that name another role made first stops setup instead. One that is
 missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
-of its own and under a session advisory lock keyed by the store's instance id, which only roles
-that can read the meta table know, so workers keep claiming and enqueueing while it builds; other
-setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing it, unless the
-lock is held by a session whose role cannot become the tables' owner, which is never a setup and
-is not waited for, and do not wait on the table again for what it left: a plain index is kept for the next setup
+of its own while a second one holds the meta table's instance row `FOR UPDATE`, a lock only roles
+that may write that table can take, so workers keep claiming and enqueueing while it builds; other
+setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing it, and do not wait on the table again for what it left: a plain index is kept for the next setup
 with a warning and a unique one stops setup with the reason. The executions
 index claims insert against is the exception: claims cannot run without it, so it is built in one
 plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
@@ -1031,7 +1029,12 @@ server that cannot be asked within ten seconds is not taken for gone, since a Pg
 server slots this pool already holds looks the same: the call waits for those five minutes of
 silence, then raises. A claim waits half its lease instead, asking after silences of a third of
 that, between one and ten seconds, and no question nor wait between them runs past that half: with
-the server cut off, a claim leased for 6, 30 and 60 seconds gave up after 3.0, 15.0 and 30.0. With
+the server cut off, a claim leased for 6, 30 and 60 seconds gave up after 3.0, 15.0 and 30.0. That
+half covers the whole claim: the sweep of earlier unanswered claims, which gets a quarter of the
+lease so one that hears nothing leaves the claim the rest, the clock reading or the wait for another
+call's, every wait for a pooled connection, and the cancel request and the wait after it when the
+claim is cancelled. With a 6 second lease and the server cut off, the claim after a lost answer gave
+up after 3.0 seconds rather than 40, and one due to read the clock after 3.0 rather than 321. With
 no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
 when the server has taken no new connection for half its lease is given up too, and settled like
 any claim without its answer: it is ended if still running, and its jobs come back without the
