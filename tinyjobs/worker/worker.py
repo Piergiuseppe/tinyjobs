@@ -228,8 +228,8 @@ class Worker:
                 return
             if task.cancelled() and settled is False:
                 logger.warning(
-                    "job %s ended before its outcome was recorded; the reaper takes "
-                    "it back once its lease expires",
+                    "job %s ended while its outcome was being recorded; if it was not, "
+                    "the reaper takes it back once its lease expires",
                     job.id,
                 )
                 return

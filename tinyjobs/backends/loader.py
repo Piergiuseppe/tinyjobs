@@ -8,10 +8,21 @@ from ..exceptions import UnknownBackendError
 ENTRY_POINT_GROUP = "tinyjobs.backends"
 
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
+_BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
 
 
-def register_builtin(scheme: str, factory: Callable[..., Any]) -> None:
+def register_builtin(
+    scheme: str, factory: Callable[..., Any], check: Callable[..., None] | None = None
+) -> None:
     _BUILTIN_FACTORIES[scheme] = factory
+    if check is not None:
+        _BUILTIN_CHECKS[scheme] = check
+
+
+def check_options(url: str, options: dict[str, Any]) -> None:
+    check = _BUILTIN_CHECKS.get(urlsplit(url).scheme)
+    if check is not None:
+        check(**options)
 
 
 def scheme_of(url: str) -> str:

@@ -153,6 +153,11 @@ class Tables:
                 last_job_id text
             )
             """,
+        ]
+        return tuple(statements)
+
+    def seeds(self) -> tuple[str, ...]:
+        return (
             f"""
             INSERT INTO {self.meta} (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
             ON CONFLICT (key) DO NOTHING
@@ -162,5 +167,4 @@ class Tables:
             ON CONFLICT (key) DO NOTHING
             """,
             self.instance(),
-        ]
-        return tuple(statements)
+        )

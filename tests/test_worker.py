@@ -1494,7 +1494,7 @@ class BackendOutageTests(WorkerTestCase):
             worker.stop()
             await asyncio.wait_for(runner, timeout=10)
         self.assertIs((await self.app.aget(job.id)).status, JobStatus.SUCCESS)
-        self.assertNotIn("before its outcome was recorded", "\n".join(logs.output))
+        self.assertNotIn("while its outcome was being recorded", "\n".join(logs.output))
 
     async def test_a_history_read_that_fails_once_is_tried_again(self):
         succeeded = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import signal
 import sys
@@ -8,7 +9,7 @@ import time
 import unittest
 import urllib.parse
 import uuid
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from unittest import mock
 
 import tinyjobs.clock
@@ -37,6 +38,7 @@ try:
     import psycopg.sql
 
     from tinyjobs.backends.postgres import PostgresBackend
+    from tinyjobs.backends.postgres.schema import Tables
 except ImportError:
     PostgresBackend = None
 
@@ -259,7 +261,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(late.setup(), 3)
             await writer.rollback()
 
-    async def test_creating_the_store_gives_up_behind_a_lock_held_too_long(self):
+    async def test_creating_the_store_goes_ahead_past_a_lock_held_too_long(self):
         from tinyjobs.backends.postgres import backend as module
 
         await drop(self.prefix)
@@ -271,10 +273,13 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             )
             started = time.monotonic()
             with mock.patch.object(module, "SETUP_LOCK_SECONDS", 0.2):
-                with self.assertRaises(errors.LockNotAvailable):
+                with self.assertLogs("tinyjobs.postgres", "WARNING") as logs:
                     await held.setup()
             self.assertLess(time.monotonic() - started, 3)
+            self.assertIn("without it", "\n".join(logs.output))
             await holder.rollback()
+        stored = await held.enqueue(make_job())
+        self.assertEqual((await held.get(stored.id)).id, stored.id)
 
     async def test_ids_list_in_byte_order_whatever_the_database_collation(self):
         for job_id in ("B-1", "a-1", "_-1"):
@@ -335,14 +340,17 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
     async def test_delayed_levels_holding_a_few_jobs_each_are_skipped_in_spans(self):
         later = self.clock.now() + 3600
-        delayed = [
-            make_job(priority=level, run_at=later + copy)
-            for level in range(1, 3001)
-            for copy in range(3)
-        ]
-        await self.backend.enqueue_many(delayed)
+        levels = 0
+        for copies in (3, 8, 16):
+            delayed = [
+                make_job(priority=levels + level, run_at=later + copy)
+                for level in range(1, 1501)
+                for copy in range(copies)
+            ]
+            levels += 1500
+            await self.backend.enqueue_many(delayed)
         due = await self.enqueue(priority=0)
-        self.assertLess(await self.claim_touches(["default"]), 1000)
+        self.assertLess(await self.claim_touches(["default"]), 6000)
         [claimed] = await self.claim(limit=10)
         self.assertEqual(claimed.id, due.id)
 
@@ -815,9 +823,16 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_a_misspelled_connection_option_is_refused_at_once(self):
         with self.assertRaisesRegex(ConfigurationError, "max_conections"):
             PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, max_conections=4)
+        with self.assertRaisesRegex(ConfigurationError, "cursor_factory"):
+            PostgresBackend.from_url(
+                POSTGRES_URL, prefix=self.prefix, cursor_factory=psycopg.ClientCursor
+            )
+        with self.assertRaisesRegex(ConfigurationError, "max_conections"):
+            TinyJobs(POSTGRES_URL, prefix=self.prefix, max_conections=4)
         PostgresBackend.from_url(
             POSTGRES_URL, prefix=self.prefix, connect_timeout=5, prepare_threshold=None
         )
+        TinyJobs(POSTGRES_URL, prefix=self.prefix, max_connections=4, sslmode="disable")
 
     async def test_a_relation_squatting_an_index_name_stops_setup(self):
         prefix = new_prefix()
@@ -879,6 +894,220 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 await self.backend.aenqueue_in(connection, [make_job()])
         for job in (joined, synced):
             self.assertIsNotNone(await self.backend.get(job.id))
+
+    async def test_a_tx_refusal_does_not_wait_for_the_apps_own_pool(self):
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, max_connections=1, pool_timeout=2.0
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        instance, _, _ = backend._identity
+        async with backend._connection():
+            backend._identity = ("another", "stale", None)
+            async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+                started = time.monotonic()
+                with self.assertRaisesRegex(ConfigurationError, "does not reach"):
+                    await backend.aenqueue_in(connection, [make_job()])
+                self.assertLess(time.monotonic() - started, 1.5)
+
+    async def test_tx_works_on_connections_whose_cursors_bind_raw(self):
+        async with await psycopg.AsyncConnection.connect(
+            POSTGRES_URL, cursor_factory=psycopg.AsyncRawCursor
+        ) as connection:
+            [joined] = await self.backend.aenqueue_in(connection, [make_job()])
+            await connection.commit()
+        with psycopg.Connection.connect(POSTGRES_URL, cursor_factory=psycopg.RawCursor) as connection:
+            [synced] = self.backend.enqueue_in(connection, [make_job()])
+            connection.commit()
+        for job in (joined, synced):
+            self.assertIsNotNone(await self.backend.get(job.id))
+
+    async def test_a_session_the_server_closed_while_idle_is_written_again(self):
+        await self.enqueue()
+        original = self.backend._rows
+        raised: list[Exception] = []
+
+        async def closing(*args, **kwargs):
+            if not raised:
+                raised.append(failure)
+                raise failure
+            return await original(*args, **kwargs)
+
+        failure = psycopg.errors.IdleSessionTimeout("terminating connection due to idle-session timeout")
+        self.backend._rows = closing
+        with self.assertLogs("tinyjobs.postgres", "WARNING"):
+            [claimed] = await self.claim()
+        self.assertEqual(claimed.status, JobStatus.RUNNING)
+
+    async def test_a_meta_table_planted_while_setup_creates_the_store_is_never_written(self):
+        role = await self.role()
+        await sql(f'GRANT CREATE ON SCHEMA public TO "{role}"')
+        self.addAsyncCleanup(sql, f'REVOKE CREATE ON SCHEMA public FROM "{role}"')
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        original = Tables.ddl
+
+        def planting(tables, **options):
+            with psycopg.Connection.connect(POSTGRES_URL, autocommit=True) as attacker:
+                attacker.execute(f'SET ROLE "{role}"')
+                attacker.execute(
+                    f'CREATE TABLE public."{prefix}_meta" (key text PRIMARY KEY, value text NOT NULL)'
+                )
+                attacker.execute(f'GRANT ALL ON public."{prefix}_meta" TO PUBLIC')
+            return original(tables, **options)
+
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(backend.close)
+        with mock.patch.object(Tables, "ddl", planting):
+            with self.assertRaisesRegex(ConfigurationError, "does not hold"):
+                await backend.setup()
+        self.assertEqual(await sql(f'SELECT count(*) FROM public."{prefix}_meta"'), [(0,)])
+
+    async def test_tx_checks_the_role_on_every_call(self):
+        owner = await self.role()
+        name = await self.database_owned_by(owner)
+        backend = PostgresBackend.from_url(
+            url_for(dbname=name, user=owner, password="tinyjobs"),
+            prefix=self.prefix,
+            schema="theirs",
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        async with await psycopg.AsyncConnection.connect(url_for(dbname=name)) as connection:
+            await connection.execute(f'SET ROLE "{owner}"')
+            await backend.aenqueue_in(connection, [make_job()])
+            await connection.execute("RESET ROLE")
+            with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                await backend.aenqueue_in(connection, [make_job()])
+
+    async def store_with_owner_code(self) -> tuple[PostgresBackend, str, str]:
+        owner = await self.role()
+        name = await self.database_owned_by(owner)
+        backend = PostgresBackend.from_url(
+            url_for(dbname=name, user=owner, password="tinyjobs"),
+            prefix=self.prefix,
+            schema="theirs",
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        jobs = f'theirs."{self.prefix}_jobs"'
+        with psycopg.Connection.connect(
+            url_for(dbname=name, user=owner, password="tinyjobs"), autocommit=True
+        ) as planter:
+            planter.execute(
+                "CREATE FUNCTION theirs.fired() RETURNS trigger LANGUAGE plpgsql AS "
+                "$$BEGIN RAISE WARNING 'owner code ran as %', current_user; RETURN NULL; END$$"
+            )
+            planter.execute(
+                "CREATE FUNCTION theirs.planned() RETURNS integer LANGUAGE plpgsql IMMUTABLE AS "
+                "$$BEGIN RAISE WARNING 'owner code ran as %', current_user; RETURN 1; END$$"
+            )
+            for timing in ("BEFORE", "AFTER"):
+                planter.execute(
+                    f"CREATE TRIGGER {timing.lower()}_statement {timing} INSERT ON {jobs} "
+                    "FOR EACH STATEMENT EXECUTE FUNCTION theirs.fired()"
+                )
+            planter.execute(f"ALTER TABLE {jobs} ADD COLUMN planted integer DEFAULT theirs.planned()")
+        return backend, name, owner
+
+    async def test_a_role_change_never_runs_the_tables_owners_code(self):
+        from tinyjobs.backends.postgres import backend as module
+
+        backend, name, owner = await self.store_with_owner_code()
+        factories = (
+            (psycopg.Cursor, psycopg.AsyncCursor),
+            (psycopg.ClientCursor, psycopg.AsyncClientCursor),
+            (psycopg.RawCursor, psycopg.AsyncRawCursor),
+        )
+        modes = ((False, True), (True, True), (False, False))
+        for (sync_factory, async_factory), autocommit, (piped, pipelined) in itertools.product(
+            factories, (False, True), modes
+        ):
+            with self.subTest(
+                sync_factory.__name__, autocommit=autocommit, piped=piped, pipelined=pipelined
+            ), mock.patch.object(module, "PIPELINED", pipelined):
+                ran: list[str] = []
+                with psycopg.Connection.connect(
+                    url_for(dbname=name), autocommit=autocommit, cursor_factory=sync_factory
+                ) as connection, connection.pipeline() if piped else nullcontext():
+                    connection.add_notice_handler(lambda notice: ran.append(notice.message_primary))
+                    with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                        backend.enqueue_in(connection, [make_job()])
+                    self.assertEqual(ran, [])
+                    connection.rollback()
+                    connection.execute(f'SET ROLE "{owner}"')
+                    backend.enqueue_in(connection, [make_job()])
+                    self.assertIn(f"owner code ran as {owner}", ran)
+                    connection.execute("RESET ROLE")
+                    ran.clear()
+                    with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                        backend.enqueue_in(connection, [make_job()])
+                    self.assertEqual(ran, [])
+                async with await psycopg.AsyncConnection.connect(
+                    url_for(dbname=name), autocommit=autocommit, cursor_factory=async_factory
+                ) as connection:
+                    connection.add_notice_handler(lambda notice: ran.append(notice.message_primary))
+                    async with connection.pipeline() if piped else nullcontext():
+                        with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                            await backend.aenqueue_in(connection, [make_job()])
+                        self.assertEqual(ran, [])
+                        await connection.rollback()
+                        await connection.execute(f'SET ROLE "{owner}"')
+                        await backend.aenqueue_in(connection, [make_job()])
+                        self.assertIn(f"owner code ran as {owner}", ran)
+                        await connection.execute("RESET ROLE")
+                        ran.clear()
+                        with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                            await backend.aenqueue_in(connection, [make_job()])
+                        self.assertEqual(ran, [])
+
+    async def test_tx_writes_behind_statements_the_caller_pipelined(self):
+        table = f'"{self.prefix}_orders"'
+        await sql(f"CREATE TABLE {table} (id integer PRIMARY KEY)")
+        self.addAsyncCleanup(sql, f"DROP TABLE {table}")
+        stored = []
+        with psycopg.Connection.connect(POSTGRES_URL) as connection:
+            with connection.pipeline():
+                for order in (1, 2):
+                    connection.execute(f"INSERT INTO {table} VALUES (%s)", (order,))
+                    stored.extend(self.backend.enqueue_in(connection, [make_job()]))
+            connection.commit()
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            async with connection.pipeline():
+                for order in (3, 4):
+                    await connection.execute(f"INSERT INTO {table} VALUES (%s)", (order,))
+                    stored.extend(await self.backend.aenqueue_in(connection, [make_job()]))
+            await connection.commit()
+        self.assertEqual(await sql(f"SELECT id FROM {table} ORDER BY id"), [(1,), (2,), (3,), (4,)])
+        for job in stored:
+            self.assertIsNotNone(await self.backend.get(job.id))
+
+    async def test_a_tx_identity_check_gives_up_after_the_statement_timeout(self):
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, statement_timeout=1)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        meta = f'"{backend._queries.schema}"."{self.prefix}_meta"'
+        backend._identity = ("another", "stale", None)
+        caller = psycopg.Connection.connect(POSTGRES_URL)
+        self.addCleanup(caller.close)
+        caller.execute(f"SELECT FROM {meta}")
+        locker = await psycopg.AsyncConnection.connect(POSTGRES_URL)
+        self.addAsyncCleanup(locker.close)
+        await locker.execute("SET lock_timeout = '4s'")
+        locking = asyncio.ensure_future(
+            locker.execute(f"LOCK TABLE {meta} IN ACCESS EXCLUSIVE MODE")
+        )
+        await asyncio.sleep(0.2)
+        started = time.monotonic()
+        try:
+            with self.assertRaises((psycopg.errors.QueryCanceled, ConfigurationError)):
+                await asyncio.to_thread(backend.enqueue_in, caller, [make_job()])
+            self.assertLess(time.monotonic() - started, 3)
+        finally:
+            caller.rollback()
+            with suppress(psycopg.Error):
+                await locking
+            await locker.rollback()
 
     async def test_jobs_sharing_a_key_in_one_call_keep_the_first_one_given(self):
         given = [make_job(id="job-b", dedup_key="k"), make_job(id="job-a", dedup_key="k")]
@@ -2208,7 +2437,7 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                 job = await self.app.asend("x.task", tx=connection, queue=queue)
         self.assertEqual((await self.app.aget(job.id)).queue, queue)
 
-    async def test_the_table_check_runs_once_per_connection(self):
+    async def test_the_store_identity_is_read_once_per_connection(self):
         async with await self.connect() as connection:
             with mock.patch.object(
                 psycopg.AsyncCursor, "execute", autospec=True, side_effect=psycopg.AsyncCursor.execute
@@ -2217,7 +2446,8 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                 await self.app.asend("x.task", tx=connection)
             await connection.commit()
         queries = [str(call.args[1]) for call in executed.call_args_list]
-        self.assertEqual(sum("pg_class" in query for query in queries), 1)
+        self.assertEqual(sum("'instance'" in query for query in queries), 1)
+        self.assertEqual(sum("pg_class" in query for query in queries), 2)
 
     async def test_a_sync_connection_is_refused_by_the_async_calls(self):
         with psycopg.connect(POSTGRES_URL) as connection:

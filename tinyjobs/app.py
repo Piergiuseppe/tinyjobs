@@ -14,7 +14,7 @@ from functools import partial
 from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
-from .backends.loader import load_backend
+from .backends.loader import check_options, load_backend
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .codecs import CodecRegistry
@@ -99,6 +99,7 @@ class TinyJobs:
         eager: bool = False,
         **backend_options: Any,
     ) -> None:
+        check_options(url, backend_options)
         self._url = url
         self._backend_options = backend_options
         self._default_queue = default_queue

@@ -13,7 +13,7 @@ NOTICE_CHARACTERS = 1000
 
 SPAN_LIMIT = 128
 
-SPAN_KEPT = 8
+REFUSAL = "tinyjobs refuses tables whose owner lacks the privileges of the current role"
 
 
 def _qualified(kind: str) -> str:
@@ -126,7 +126,7 @@ class Queries:
                             THEN seen.due ELSE seen.last END::bigint,
                        coalesce(seen.due >= seen.last, seen.last IS NULL),
                        CASE WHEN seen.due >= seen.last OR seen.last IS NULL THEN 1
-                            WHEN seen.top > seen.last OR levels.span < {SPAN_KEPT}
+                            WHEN seen.top > seen.last OR levels.span < {SPAN_LIMIT}
                             THEN least(levels.span * 2, {SPAN_LIMIT}) ELSE 1 END
                   FROM levels
                  CROSS JOIN LATERAL ({seen}) AS seen
@@ -448,9 +448,10 @@ class Queries:
         self.located = f"""
             SELECT pg_catalog.count(*) AS tables,
                    pg_catalog.bool_or(c.relname OPERATOR(pg_catalog.=) %(meta)s) AS meta,
-                   COALESCE(pg_catalog.bool_and(
+                   CASE WHEN COALESCE(pg_catalog.bool_and(
                        {trusting("c.relowner")} AND {trusting("n.nspowner")}
-                   ), true) AS owned
+                   ), true) THEN true
+                   ELSE pg_catalog.concat('{REFUSAL}')::pg_catalog.bool END AS owned
               FROM pg_catalog.pg_class AS c
               JOIN pg_catalog.pg_namespace AS n
                 ON n.oid OPERATOR(pg_catalog.=) c.relnamespace

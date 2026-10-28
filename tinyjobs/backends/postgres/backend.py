@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
+import math
 import time
 import weakref
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from functools import cache, partial
-from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Sequence, TypeVar
+from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
 
 import psycopg
 from psycopg import errors, pq
@@ -31,7 +33,7 @@ from ...retention import RetentionPolicy
 from ...runtime import spared_until_close
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
-from .queries import NOTICE_CHARACTERS, Queries
+from .queries import NOTICE_CHARACTERS, REFUSAL, Queries
 from .records import (
     JOB_COLUMNS,
     execution_from_row,
@@ -52,6 +54,9 @@ SAFE_SEARCH_PATH = "pg_catalog, pg_temp"
 TABLE_KINDS = ("jobs", "executions", "schedules", "meta")
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
+SETUP_LOCK_PAUSE = 0.05
+SETUP_ATTEMPTS = 3
+CREATION_RACES = (errors.UniqueViolation, errors.DuplicateTable, errors.DuplicateObject)
 MAX_IDLE_SECONDS = 300.0
 MAX_LIFETIME_SECONDS = 1800.0
 NOTIFY_SECONDS = 0.05
@@ -64,17 +69,18 @@ KEEPALIVES = {
 }
 ENQUEUE_BATCH = 1000
 INSERT_ROUNDS = 50
-RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure)
+RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.IdleSessionTimeout)
 RETRIES = 3
 READS_TO_SEE_A_CLOSE = 2
-PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "cursor_factory", "context"})
+PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
+PIPELINED = psycopg.Pipeline.is_supported()
 
 logger = logging.getLogger("tinyjobs.postgres")
 
 T = TypeVar("T")
-Steps = Generator[tuple[str, dict[str, Any]], list[dict[str, Any]], T]
+Steps = Generator[tuple[Any, ...], list[dict[str, Any]], T]
 
 
 class PostgresBackend(BaseBackend):
@@ -111,13 +117,7 @@ class PostgresBackend(BaseBackend):
                 f"statement_timeout must be None or between {SHORTEST_STATEMENT_SECONDS} "
                 f"and {LONGEST_STATEMENT_SECONDS:g} seconds, not {statement_timeout!r}"
             )
-        unknown = sorted(set(connection_options).difference(_known_options()))
-        if unknown:
-            raise ConfigurationError(
-                f"unknown postgres options {', '.join(unknown)}; besides the tinyjobs ones, "
-                "PostgresBackend takes libpq connection parameters and the psycopg options "
-                f"{', '.join(sorted(PSYCOPG_OPTIONS))}"
-            )
+        _refuse_unknown(connection_options)
         self._conninfo = conninfo
         self._tables = Tables(prefix, schema)
         self._clock = FollowingClock() if clock is None else clock
@@ -166,6 +166,11 @@ class PostgresBackend(BaseBackend):
         )
 
     @classmethod
+    def check_options(cls, **options: Any) -> None:
+        named = set(inspect.signature(cls.__init__).parameters)
+        _refuse_unknown({key: value for key, value in options.items() if key not in named})
+
+    @classmethod
     def from_url(
         cls, url: str, *, clock: Clock | None = None, **options: Any
     ) -> "PostgresBackend":
@@ -177,7 +182,13 @@ class PostgresBackend(BaseBackend):
             placed = await self._placed(connection)
             stored = await self._stored_version(connection, placed) if placed.meta else None
         if placed.tables != len(TABLE_KINDS) or stored != SCHEMA_VERSION:
-            await self._create()
+            for attempt in range(SETUP_ATTEMPTS):
+                try:
+                    await self._create()
+                    break
+                except CREATION_RACES:
+                    if attempt == SETUP_ATTEMPTS - 1:
+                        raise
         async with self._connection() as connection:
             placed = await self._placed(connection)
             if placed.tables != len(TABLE_KINDS):
@@ -269,9 +280,7 @@ class PostgresBackend(BaseBackend):
             await connection.execute(
                 f"SET LOCAL lock_timeout = '{SETUP_LOCK_SECONDS}s'"
             )
-            await connection.execute(
-                "SELECT pg_advisory_xact_lock(%(key)s)", {"key": self._tables.lock}
-            )
+            await self._lock_for_setup(connection)
             placed = await self._placed(connection)
             stored = await self._stored_version(connection, placed) if placed.meta else None
             if stored is not None and stored > SCHEMA_VERSION:
@@ -283,6 +292,33 @@ class PostgresBackend(BaseBackend):
                 return
             for statement in placed.within.ddl(schema_missing=placed.schema_missing):
                 await connection.execute(statement, {})
+            created = await self._placed(connection)
+            if created.tables != len(TABLE_KINDS) or created.within.schema != placed.within.schema:
+                raise ConfigurationError(
+                    f"the tinyjobs tables for prefix {self._tables.prefix!r} changed while "
+                    "setup created them; run setup again"
+                )
+            for statement in created.within.seeds():
+                await connection.execute(statement, {})
+
+    async def _lock_for_setup(self, connection: psycopg.AsyncConnection) -> None:
+        deadline = time.monotonic() + SETUP_LOCK_SECONDS
+        while True:
+            cursor = await connection.execute(
+                "SELECT pg_catalog.pg_try_advisory_xact_lock(%(key)s) AS taken",
+                {"key": self._tables.lock},
+            )
+            if (await cursor.fetchone())["taken"]:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "another session has held the tinyjobs setup lock for prefix %r for "
+                    "%ss; creating the tables without it",
+                    self._tables.prefix,
+                    SETUP_LOCK_SECONDS,
+                )
+                return
+            await asyncio.sleep(SETUP_LOCK_PAUSE)
 
     async def _open(self) -> None:
         failed = self._opening
@@ -703,12 +739,15 @@ class PostgresBackend(BaseBackend):
                 "tx must be a psycopg connection or cursor; pass an async one to "
                 "aenqueue or asend"
             )
-        try:
-            return _stepped(connection, self._joining(connection, jobs))
-        except _Elsewhere as elsewhere:
-            with psycopg.Connection.connect(self._conninfo, **self._direct_options()) as own:
-                self._settle(_stepped(own, self._identifying()), elsewhere.identity)
-            return _stepped(connection, self._joining(connection, jobs))
+        with self._refusing():
+            try:
+                return _stepped(connection, self._joining(connection, jobs))
+            except _Elsewhere as elsewhere:
+                with psycopg.Connection.connect(self._conninfo, **self._direct_options()) as own:
+                    for statement, parameters in self._settings():
+                        own.execute(statement, parameters)
+                    self._settle(_stepped(own, self._identifying()), elsewhere.identity)
+                return _stepped(connection, self._joining(connection, jobs))
 
     async def aenqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
         connection = _connection_of(tx)
@@ -717,43 +756,61 @@ class PostgresBackend(BaseBackend):
                 "tx must be a psycopg async connection or cursor; pass a sync one to "
                 "enqueue or send"
             )
+        with self._refusing():
+            try:
+                return await _driven(connection, self._joining(connection, jobs))
+            except _Elsewhere as elsewhere:
+                async with await psycopg.AsyncConnection.connect(
+                    self._conninfo, **self._direct_options()
+                ) as own:
+                    for statement, parameters in self._settings():
+                        await own.execute(statement, parameters)
+                    self._settle(await _driven(own, self._identifying()), elsewhere.identity)
+                return await _driven(connection, self._joining(connection, jobs))
+
+    @contextmanager
+    def _refusing(self) -> Iterator[None]:
         try:
-            return await _driven(connection, self._joining(connection, jobs))
-        except _Elsewhere as elsewhere:
-            async with self._connection() as own:
-                self._settle(await _driven(own, self._identifying()), elsewhere.identity)
-            return await _driven(connection, self._joining(connection, jobs))
+            yield
+        except errors.InvalidTextRepresentation as error:
+            if REFUSAL not in (error.diag.message_primary or ""):
+                raise
+            raise ConfigurationError(
+                f"the tinyjobs tables for prefix {self._tables.prefix!r} that the connection "
+                "passed as tx reaches belong to a role that does not hold that connection's "
+                "privileges; tinyjobs never writes through them"
+            ) from None
 
     def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
         queries = self._queries
         if self._identity is None:
             raise RuntimeError("call setup() before enqueueing inside a transaction")
-        if connection not in self._joined:
-            prefix = self._tables.prefix
-            [found] = yield queries.located, {
+        prefix = self._tables.prefix
+        guard: tuple[Any, ...] = (
+            queries.located,
+            {
                 "schema": queries.schema,
                 "names": [f"{prefix}_{kind}" for kind in TABLE_KINDS],
                 "meta": f"{prefix}_meta",
-            }
-            if not found["owned"]:
-                raise ConfigurationError(
-                    f"the tinyjobs tables for prefix {prefix!r} that the connection passed "
-                    "as tx reaches belong to a role that does not hold that connection's "
-                    "privileges; tinyjobs never writes through them"
-                )
+            },
+        )
+        if connection not in self._joined:
+            [found] = yield guard
             identity = None
             if found["tables"] == len(TABLE_KINDS) and found["meta"]:
                 identity = yield from self._identifying()
             if not _same_store(self._identity, identity):
                 raise _Elsewhere(identity)
             self._joined[connection] = True
+            guard = ()
         now = self._clock.now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
         stored: list[Job] = []
         for start in range(0, len(ordered), ENQUEUE_BATCH):
             batch = ordered[start : start + ENQUEUE_BATCH]
-            stored.extend((yield from self._inserting(batch, now, due)))
+            stored.extend((yield from self._inserting(batch, now, due, guard)))
+            guard = ()
         if self._notify and due:
             yield queries.notify, {
                 "channel": self._channel,
@@ -784,13 +841,37 @@ class PostgresBackend(BaseBackend):
         self._identity = mine
 
     def _direct_options(self) -> dict[str, Any]:
-        return _connection_kwargs(self._conninfo, self._connection_options)
+        options = _connection_kwargs(self._conninfo, self._connection_options)
+        try:
+            given = conninfo_to_dict(self._conninfo)
+        except psycopg.ProgrammingError:
+            given = {}
+        if "connect_timeout" not in given and "connect_timeout" not in options:
+            options["connect_timeout"] = max(2, math.ceil(self._pool_timeout))
+        return options
+
+    def _settings(self) -> list[tuple[str, dict[str, Any]]]:
+        timeout = self._statement_timeout
+        statement = "0" if timeout is None else f"{int(timeout * 1000)}ms"
+        return [
+            (
+                "SELECT pg_catalog.set_config('search_path', %(path)s, false)",
+                {"path": SAFE_SEARCH_PATH},
+            ),
+            (
+                "SELECT set_config('default_transaction_isolation', 'read committed', false), "
+                "set_config('statement_timeout', %(statement)s, false), "
+                "set_config('idle_in_transaction_session_timeout', %(idle)s, false)",
+                {"statement": statement, "idle": f"{IDLE_IN_TRANSACTION_SECONDS}s"},
+            ),
+        ]
 
     def _inserting(
         self,
         jobs: Sequence[Job],
         now: float,
         due: set[str],
+        guard: tuple[Any, ...] = (),
     ) -> Steps[list[Job]]:
         queries = self._queries
         resolved: dict[int, Job] = {}
@@ -798,7 +879,8 @@ class PostgresBackend(BaseBackend):
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
-            rows = yield queries.insert, self._at(now, **parameters)
+            rows = yield (queries.insert, self._at(now, **parameters), *guard)
+            guard = ()
             inserted = {row["id"] for row in rows}
             due.update(row["queue"] for row in rows if row["due"])
             missing = [(index, job) for index, job in pending if job.id not in inserted]
@@ -925,23 +1007,13 @@ class PostgresBackend(BaseBackend):
             yield connection
 
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
-        timeout = self._statement_timeout
-        statement = "0" if timeout is None else f"{int(timeout * 1000)}ms"
         if self._schemas is None:
             cursor = await connection.execute(
                 "SELECT pg_catalog.current_schemas(false)::pg_catalog.text[] AS schemas"
             )
             self._schemas = (await cursor.fetchone())["schemas"]
-        await connection.execute(
-            "SELECT pg_catalog.set_config('search_path', %(path)s, false)",
-            {"path": SAFE_SEARCH_PATH},
-        )
-        await connection.execute(
-            "SELECT set_config('default_transaction_isolation', 'read committed', false), "
-            "set_config('statement_timeout', %(statement)s, false), "
-            "set_config('idle_in_transaction_session_timeout', %(idle)s, false)",
-            {"statement": statement, "idle": f"{IDLE_IN_TRANSACTION_SECONDS}s"},
-        )
+        for statement, parameters in self._settings():
+            await connection.execute(statement, parameters)
 
     async def _wake(self, queues: set[str]) -> None:
         if not self._notify or not queues or self._closed or self._channel is None:
@@ -1046,6 +1118,16 @@ async def _again(call: Callable[[], Awaitable[T]]) -> T:
         return await call()
 
 
+def _refuse_unknown(options: dict[str, Any]) -> None:
+    unknown = sorted(set(options).difference(_known_options()))
+    if unknown:
+        raise ConfigurationError(
+            f"unknown postgres options {', '.join(unknown)}; besides the tinyjobs ones, "
+            "PostgresBackend takes libpq connection parameters and the psycopg options "
+            f"{', '.join(sorted(PSYCOPG_OPTIONS))}"
+        )
+
+
 @cache
 def _known_options() -> frozenset[str]:
     return frozenset(
@@ -1148,27 +1230,73 @@ class _Elsewhere(Exception):
         self.identity = identity
 
 
+def _cursor_on(connection: Any) -> Any:
+    factory = connection.cursor_factory
+    if issubclass(factory, (psycopg.RawCursor, psycopg.AsyncRawCursor)):
+        factory = (
+            psycopg.AsyncCursor if isinstance(connection, psycopg.AsyncConnection) else psycopg.Cursor
+        )
+    return factory(connection, row_factory=dict_row)
+
+
 def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
     rows: list[dict[str, Any]] | None = None
     while True:
         try:
-            query, parameters = steps.send(rows)
+            query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
-        with connection.cursor(row_factory=dict_row) as cursor:
-            rows = cursor.execute(query, parameters).fetchall()
+        with _cursor_on(connection) as cursor:
+            if guard:
+                _guarded(connection, cursor, guard, query, parameters)
+            else:
+                cursor.execute(query, parameters)
+            rows = cursor.fetchall()
+
+
+def _guarded(
+    connection: psycopg.Connection,
+    cursor: psycopg.Cursor,
+    guard: list[Any],
+    query: str,
+    parameters: dict[str, Any],
+) -> None:
+    with (
+        _cursor_on(connection) as checking,
+        connection.pipeline() if PIPELINED else nullcontext(),
+    ):
+        checking.execute(*guard)
+        cursor.execute(query, parameters)
 
 
 async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
     rows: list[dict[str, Any]] | None = None
     while True:
         try:
-            query, parameters = steps.send(rows)
+            query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
-        async with connection.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(query, parameters)
+        async with _cursor_on(connection) as cursor:
+            if guard:
+                await _aguarded(connection, cursor, guard, query, parameters)
+            else:
+                await cursor.execute(query, parameters)
             rows = await cursor.fetchall()
+
+
+async def _aguarded(
+    connection: psycopg.AsyncConnection,
+    cursor: psycopg.AsyncCursor,
+    guard: list[Any],
+    query: str,
+    parameters: dict[str, Any],
+) -> None:
+    async with (
+        _cursor_on(connection) as checking,
+        connection.pipeline() if PIPELINED else nullcontext(),
+    ):
+        await checking.execute(*guard)
+        await cursor.execute(query, parameters)
 
 
 async def _fetch(

@@ -571,11 +571,9 @@ def _cancel_task(request: _Request) -> None:
         _cancel_once(request.task)
 
 
-def _cancel_once(task: asyncio.Task) -> bool:
-    if task.cancelling():
-        return False
-    task.cancel()
-    return True
+def _cancel_once(task: asyncio.Task) -> None:
+    if not task.cancelling():
+        task.cancel()
 
 
 def _settle_request(
@@ -845,7 +843,6 @@ def spared_until_close() -> Iterator[None]:
 @dataclass
 class _Finishing:
     asked: set[asyncio.Task] = field(default_factory=set)
-    overdue: dict[asyncio.Task, float] = field(default_factory=dict)
     insisted: set[asyncio.Task] = field(default_factory=set)
 
 
@@ -857,19 +854,14 @@ def _finish_tasks(
     finishing: _Finishing | None = None,
 ) -> None:
     state = _Finishing() if finishing is None else finishing
-    asked, overdue = state.asked, state.overdue
+    asked = state.asked
     loop.run_until_complete(asyncio.sleep(0))
     while pending := {
         task
         for task in asyncio.all_tasks(loop)
         if not (spare and task.get_context().get(_sparing, False))
     }:
-        moment = time.monotonic()
-        for task in [task for task, due in overdue.items() if due <= moment]:
-            del overdue[task]
-            if not task.done():
-                task.cancel()
-        left = deadline - moment
+        left = deadline - time.monotonic()
         fresh = [
             task
             for task in pending
@@ -890,11 +882,9 @@ def _finish_tasks(
             )
             return
         for task in fresh:
-            if not _cancel_once(task):
-                overdue[task] = moment + INSIST_SECONDS
+            _cancel_once(task)
             asked.add(task)
-        waited = min([max(left, 0), *(due - moment for due in overdue.values())])
-        loop.run_until_complete(asyncio.wait(pending, timeout=max(waited, 0)))
+        loop.run_until_complete(asyncio.wait(pending, timeout=max(left, 0)))
         loop.run_until_complete(asyncio.sleep(0))
     loop.run_until_complete(asyncio.sleep(0))
 

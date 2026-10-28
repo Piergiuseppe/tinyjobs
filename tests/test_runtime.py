@@ -1462,10 +1462,31 @@ class KeptTaskTests(unittest.TestCase):
         task.cancel()
         loop.run_until_complete(asyncio.sleep(0.01))
         started = time.monotonic()
-        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
+        runtime._finish_tasks(loop, time.monotonic() + 0.2)
         self.assertTrue(task.done())
         self.assertEqual(seen, ["swallowed", "ended"])
-        self.assertLess(time.monotonic() - started, runtime.INSIST_SECONDS + 0.5)
+        self.assertLess(time.monotonic() - started, 0.2 + runtime.INSIST_SECONDS + 0.3)
+
+    def test_a_task_cancelled_before_the_close_keeps_its_whole_budget_to_clean_up(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def tidy() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(1.0)
+                seen.append("cleaned")
+                raise
+
+        task = loop.create_task(tidy())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["cleaned"])
 
     def test_a_hand_back_submitted_as_the_loop_closes_still_runs(self):
         runner = LoopRunner()
