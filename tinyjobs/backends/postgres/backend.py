@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import json
 import inspect
 import logging
 import math
@@ -19,7 +20,6 @@ from contextlib import (
     suppress,
 )
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import cache, partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
 from urllib.parse import unquote
@@ -28,6 +28,7 @@ import psycopg
 from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
 
 from ...clock import Clock, FollowingClock, elapsed
@@ -113,17 +114,49 @@ RUNNING = (
     "SELECT state, wait_event, state_change FROM pg_catalog.pg_stat_activity "
     "WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s"
 )
-_LEFT: contextvars.ContextVar[tuple[int, Any, float] | None] = contextvars.ContextVar(
+_LEFT: contextvars.ContextVar[tuple[int, Any] | None] = contextvars.ContextVar(
     "tinyjobs_postgres_left", default=None
 )
-FENCE = (
-    "SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) AS ended "
-    "FROM pg_catalog.pg_stat_activity WHERE pid OPERATOR(pg_catalog.=) %(pid)s "
-    "AND backend_start OPERATOR(pg_catalog.=) %(born)s AND (state_change IS NULL OR "
-    "state_change OPERATOR(pg_catalog.<) "
-    "(pg_catalog.statement_timestamp() OPERATOR(pg_catalog.-) %(ago)s))"
-)
-FENCE_MILLISECONDS = 1000
+STILL_RUNNING = """
+    SELECT backend_xmin IS NOT NULL
+           AND pg_catalog.age(backend_xmin) OPERATOR(pg_catalog.>=)
+               pg_catalog.age(%(xid)s::pg_catalog.text::pg_catalog.xid)
+           AND state IS DISTINCT FROM 'idle in transaction'
+           AND state IS DISTINCT FROM 'idle in transaction (aborted)' AS running
+      FROM pg_catalog.pg_stat_activity
+     WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s
+"""
+SETTLED = """
+    SELECT marker.key
+      FROM pg_catalog.jsonb_to_recordset(%(markers)s::pg_catalog.jsonb)
+           AS marker (key pg_catalog.text, pid integer, born pg_catalog.timestamptz,
+                      at double precision)
+     WHERE NOT EXISTS (
+           SELECT FROM pg_catalog.pg_stat_activity AS activity
+            WHERE activity.pid OPERATOR(pg_catalog.=) marker.pid
+              AND (activity.backend_start IS NULL
+                   OR activity.backend_start OPERATOR(pg_catalog.=) marker.born
+                      AND (activity.state_change IS NULL
+                           OR pg_catalog.date_part('epoch', activity.state_change)
+                              OPERATOR(pg_catalog.<=) marker.at))
+     )
+"""
+HOLDING = """
+    SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) AS ended
+      FROM pg_catalog.pg_locks
+     WHERE locktype OPERATOR(pg_catalog.=) 'advisory' AND granted
+       AND database OPERATOR(pg_catalog.=) (
+           SELECT oid FROM pg_catalog.pg_database
+            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+       )
+       AND classid OPERATOR(pg_catalog.=) %(high)s::pg_catalog.oid
+       AND objid OPERATOR(pg_catalog.=) %(low)s::pg_catalog.oid
+       AND objsubid OPERATOR(pg_catalog.=) 1
+       AND pid OPERATOR(pg_catalog.=) %(pid)s
+"""
+ENDING_CLAIM_MILLISECONDS = 1000
+RECHECK_SECONDS = 1.0
+SWEEP_SECONDS = 30.0
 SETTLE_SECONDS = 5.0
 ENDING = (
     "SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) FROM pg_catalog.pg_stat_activity "
@@ -150,7 +183,6 @@ HELD = all(
     )
 )
 URI_SCHEME = re.compile(r"^\s*postgres(?:ql)?://", re.IGNORECASE)
-OVERLAP = 4
 SECRET_SETTING = re.compile(r"password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))")
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
@@ -213,7 +245,9 @@ class PostgresBackend(BaseBackend):
         self._listened: set[str] = set()
         self._hearing = 0
         self._marks: dict[str, int] = {}
-        self._unclaimed: set[_Unclaimed] = set()
+        self._unclaimed: dict[str, _Unclaimed] = {}
+        self._revoking = False
+        self._swept = -math.inf
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
         self._connection_options = connection_options
@@ -311,6 +345,7 @@ class PostgresBackend(BaseBackend):
         self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
         self._queries = queries
         await self._now()
+        await self._sweep()
 
     async def _placed(self, connection: psycopg.AsyncConnection) -> "_Placement":
         tables = self._tables
@@ -396,7 +431,8 @@ class PostgresBackend(BaseBackend):
                 {"wait": f"{REBUILD_LOCK_SECONDS}s"},
             )
             placed = await self._placed(connection)
-            if not await self._lock_for_rebuild(connection, placed):
+            first = await self._lock_for_rebuild(connection, placed)
+            if first is None:
                 return skipped
             placed = await self._placed(connection)
             schema = placed.within.schema.replace('"', '""').replace("%", "%%")
@@ -408,10 +444,16 @@ class PostgresBackend(BaseBackend):
                 }.items()
             }
             arbiters = {f"{prefix}_{name}" for name in ARBITERS}
-            waited = False
+            waited = not first
             misplaced = await self._misplaced(connection, placed)
             for row in sorted(misplaced, key=lambda row: row["name"] not in unique):
                 name = row["name"]
+                if not first and name in unique:
+                    raise ConfigurationError(
+                        f"another setup could not rebuild the tinyjobs index {name}, which keeps "
+                        f"jobs unique, or was still rebuilding it after {REBUILD_LOCK_SECONDS}s; "
+                        "run setup again once it ends"
+                    )
                 if waited and name not in unique:
                     logger.warning(
                         "setup left the tinyjobs index %s for the next setup, since a "
@@ -453,16 +495,22 @@ class PostgresBackend(BaseBackend):
 
     async def _lock_for_rebuild(
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
-    ) -> bool:
+    ) -> bool | None:
+        deadline = time.monotonic() + REBUILD_LOCK_SECONDS
+        waited = False
         while True:
             cursor = await connection.execute(
                 "SELECT pg_catalog.pg_try_advisory_lock(%(key)s) AS taken",
                 {"key": self._tables.rebuild_lock},
             )
-            if (await cursor.fetchone())["taken"]:
+            taken = (await cursor.fetchone())["taken"]
+            if taken and not waited:
                 return True
             if not await self._misplaced(connection, placed):
+                return None
+            if taken or time.monotonic() >= deadline:
                 return False
+            waited = True
             await asyncio.sleep(REBUILD_LOCK_PAUSE)
 
     async def _duplicates(
@@ -598,7 +646,10 @@ class PostgresBackend(BaseBackend):
         if self._unclaimed:
             with suppress(psycopg.Error, PoolTimeout, PoolClosed, TimeoutError):
                 async with asyncio.timeout(SETTLE_SECONDS):
-                    await self._unlease()
+                    while self._unclaimed:
+                        await self._unlease()
+                        if self._unclaimed:
+                            await asyncio.sleep(RECHECK_SECONDS)
         await self._pool.close()
 
     async def wait_for_jobs(
@@ -695,6 +746,8 @@ class PostgresBackend(BaseBackend):
         wanted = list(dict.fromkeys(queues))
         if self._unclaimed:
             await self._unlease()
+        if self._revoking and time.monotonic() - self._swept >= SWEEP_SECONDS:
+            await self._sweep()
         now = await self._now()
         query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
         _LEFT.set(None)
@@ -703,37 +756,28 @@ class PostgresBackend(BaseBackend):
             rows = await self._retrying(query, parameters)
         except BaseException as error:
             if _unanswered(error):
-                self._unclaimed.add(_Unclaimed(worker_id, parameters["token"], _LEFT.get()))
+                token = parameters["token"]
+                self._unclaimed[token] = _Unclaimed(worker_id, token, _LEFT.get())
             raise
         finally:
             _PATIENCE.reset(patience)
         return [job_from_row(row) for row in rows]
 
     async def _unlease(self) -> None:
-        for entry in list(self._unclaimed):
+        for entry in list(self._unclaimed.values()):
+            if time.monotonic() < entry.due:
+                continue
             async with self._connection() as connection:
                 if entry.backend is not None:
-                    pid, born, left = entry.backend
-                    async with connection.transaction():
-                        await connection.execute(UNROLED)
-                        fenced = await _fetch(
-                            connection,
-                            FENCE,
-                            {
-                                "pid": pid,
-                                "born": born,
-                                "ago": timedelta(seconds=time.monotonic() - left),
-                                "wait": FENCE_MILLISECONDS,
-                            },
-                        )
-                    if fenced and not fenced[0]["ended"]:
+                    if await self._still_running(connection, entry):
+                        entry.due = time.monotonic() + RECHECK_SECONDS
                         continue
                 rows = await _fetch(
                     connection,
                     self._queries.unclaim,
                     {"worker": entry.worker_id, "token": entry.token},
                 )
-            self._unclaimed.discard(entry)
+            del self._unclaimed[entry.token]
             if rows:
                 logger.warning(
                     "handed back %d job(s) a postgres claim leased to %s although its answer "
@@ -742,6 +786,52 @@ class PostgresBackend(BaseBackend):
                     entry.worker_id,
                 )
                 await self._wake({row["queue"] for row in rows})
+
+    async def _still_running(self, connection: psycopg.AsyncConnection, entry: _Unclaimed) -> bool:
+        pid, born = entry.backend
+        if entry.revoked is None:
+            [revoked] = await _fetch(
+                connection, self._queries.revoke, {"token": entry.token, "pid": pid, "born": born}
+            )
+            entry.revoked = _revocation(revoked["value"]).get("xid")
+            self._revoking = True
+        async with connection.transaction():
+            await connection.execute(UNROLED)
+            rows = await _fetch(
+                connection, STILL_RUNNING, {"pid": pid, "born": born, "xid": entry.revoked}
+            )
+            if rows and rows[0]["running"]:
+                key = _claim_key(entry.token) % 2**64
+                await connection.execute(
+                    HOLDING,
+                    {
+                        "pid": pid,
+                        "high": key >> 32,
+                        "low": key & 0xFFFFFFFF,
+                        "wait": ENDING_CLAIM_MILLISECONDS,
+                    },
+                )
+        return bool(rows) and rows[0]["running"] is not False
+
+    async def _sweep(self) -> None:
+        self._swept = time.monotonic()
+        async with self._connection() as connection:
+            rows = await _fetch(connection, self._queries.revocations, {})
+            markers = [
+                {"key": row["key"], **_revocation(row["value"])}
+                for row in rows
+                if _revocation(row["value"])
+            ]
+            settled: list[dict[str, Any]] = []
+            if markers:
+                async with connection.transaction():
+                    await connection.execute(UNROLED)
+                    settled = await _fetch(connection, SETTLED, {"markers": Jsonb(markers)})
+            if settled:
+                await connection.execute(
+                    self._queries.forget_revocations, {"keys": [row["key"] for row in settled]}
+                )
+        self._revoking = len(rows) > len(settled)
 
     def _claiming(
         self,
@@ -756,6 +846,7 @@ class PostgresBackend(BaseBackend):
             if len(wanted) == 1
             else self._queries.claim_many_queues
         )
+        token = secrets.token_hex(16)
         return query, self._at(
             now,
             queues=wanted,
@@ -764,7 +855,8 @@ class PostgresBackend(BaseBackend):
             worker=worker_id,
             lease=now + lease_seconds,
             seconds=lease_seconds,
-            token=secrets.token_hex(16),
+            token=token,
+            key=_claim_key(token),
         )
 
     async def heartbeat(
@@ -919,6 +1011,7 @@ class PostgresBackend(BaseBackend):
         )
         if not won:
             return None
+        await self._sweep()
         removed = 0
         for status, cutoff in policy.horizons(now).items():
             while removed < policy.maximum_per_sweep:
@@ -1472,17 +1565,12 @@ def _unrevealing(conninfo: str, reason: str) -> str:
     secrets = _secrets(conninfo)
     if not secrets and "password" not in conninfo.lower():
         return reason
-    head, quote, quoted = reason.partition('"')
-    if quote and (not secrets or any(_overlap(quoted, secret) for secret in secrets)):
-        reason = head + '"***"'
+    head, quote, _ = reason.partition('"')
+    if quote:
+        reason = head + '"***" (hidden, since the url holds a password)'
     for secret in sorted(secrets, key=len, reverse=True):
         reason = reason.replace(secret, "***")
     return reason
-
-
-def _overlap(text: str, secret: str) -> bool:
-    span = min(len(secret), OVERLAP)
-    return any(secret[start : start + span] in text for start in range(len(secret) - span + 1))
 
 
 def _secrets(conninfo: str) -> set[str]:
@@ -1611,11 +1699,25 @@ def _in_order(
     return placed
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Unclaimed:
     worker_id: str
     token: str
-    backend: tuple[int, Any, float] | None
+    backend: tuple[int, Any] | None
+    revoked: int | None = None
+    due: float = -math.inf
+
+
+def _claim_key(token: str) -> int:
+    return int(token[:16], 16) - 2**63
+
+
+def _revocation(value: str) -> dict[str, Any]:
+    try:
+        marker = json.loads(value)
+    except ValueError:
+        return {}
+    return marker if isinstance(marker, dict) else {}
 
 
 def _unanswered(error: BaseException) -> bool:
@@ -1624,10 +1726,10 @@ def _unanswered(error: BaseException) -> bool:
     return error.sqlstate in LOST_STATES or error.sqlstate.startswith("08")
 
 
-def _abandoned(connection: psycopg.AsyncConnection) -> tuple[int, Any, float] | None:
+def _abandoned(connection: psycopg.AsyncConnection) -> tuple[int, Any] | None:
     if not connection.closed or not isinstance(connection, _Answering) or connection.pid is None:
         return None
-    return connection.pid, connection.born, time.monotonic()
+    return connection.pid, connection.born
 
 
 @dataclass(frozen=True, slots=True)
@@ -1676,7 +1778,11 @@ class _Answering(psycopg.AsyncConnection):
             return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
             if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
-                await self._given_up(gen)
+                try:
+                    await self._given_up(gen)
+                finally:
+                    if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
+                        self.pgconn.finish()
             raise
 
     async def _heard(self, gen: Any) -> Any:

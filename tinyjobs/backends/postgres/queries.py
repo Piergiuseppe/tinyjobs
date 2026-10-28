@@ -146,6 +146,16 @@ def owners_of_code_on(tables: str) -> str:
                   AND c.oid OPERATOR(pg_catalog.=) reached.objid
                   AND granted.privilege_type OPERATOR(pg_catalog.=) ANY (
                       '{{TRIGGER,REFERENCES}}'::pg_catalog.text[])
+               UNION ALL
+               SELECT granted.grantee
+                 FROM pg_catalog.pg_attribute AS a
+                CROSS JOIN pg_catalog.aclexplode(a.attacl) AS granted
+                WHERE reached.classid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+                  AND a.attrelid OPERATOR(pg_catalog.=) reached.objid
+                  AND a.attnum OPERATOR(pg_catalog.>) 0
+                  AND NOT a.attisdropped
+                  AND a.attacl IS NOT NULL
+                  AND granted.privilege_type OPERATOR(pg_catalog.=) 'REFERENCES'
          ) AS owners (role)
     """
 
@@ -207,7 +217,11 @@ class Queries:
         def taking(picked: str) -> str:
             return f"""
             WITH RECURSIVE {picked},
-            chosen AS (SELECT ARRAY(SELECT id FROM picked) AS ids),
+            chosen AS (
+                SELECT ARRAY(SELECT id FROM picked) AS ids
+                 WHERE NOT EXISTS (SELECT FROM {meta} WHERE key = 'revoked ' || %(token)s)
+                   AND pg_catalog.pg_try_advisory_xact_lock(%(key)s::bigint)
+            ),
             claimed AS (
                 UPDATE {jobs} AS job
                    SET status = 'running',
@@ -389,6 +403,28 @@ class Queries:
             )
             SELECT count(*) AS changed FROM changed
         """
+
+        self.revoke = f"""
+            INSERT INTO {meta} (key, value)
+            VALUES (
+                'revoked ' || %(token)s,
+                pg_catalog.jsonb_build_object(
+                    'pid', %(pid)s::integer, 'born', %(born)s::timestamptz, 'at', {SERVER},
+                    'xid', pg_catalog.pg_current_xact_id()::text::bigint %% 4294967296
+                )::text
+            )
+            ON CONFLICT (key) DO UPDATE SET value = {meta}.value
+            RETURNING value
+        """
+
+        self.revocations = (
+            f"SELECT key, value FROM {meta} WHERE pg_catalog.starts_with(key, 'revoked ')"
+        )
+
+        self.forget_revocations = (
+            f"DELETE FROM {meta} WHERE key = ANY(%(keys)s::text[]) "
+            "AND pg_catalog.starts_with(key, 'revoked ')"
+        )
 
         self.unclaim = f"""
             WITH changed AS (

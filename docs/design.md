@@ -806,8 +806,8 @@ tables and the schema belong to the connecting role or to a role that can become
 Postgres 16 and later, membership before), and that no role inherits the privileges of without
 being able to become it too; a schema owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
 role reading or writing the row, so a table owned by anyone else would let that role act as
-tinyjobs. For the same reason a table is refused too when it grants `TRIGGER` or `REFERENCES` to
-such a role or to `PUBLIC`, since a foreign key from that role's own table would make a purge fire
+tinyjobs. For the same reason a table is refused too when it grants `TRIGGER`, or `REFERENCES` on
+the table or any of its columns, to such a role or to `PUBLIC`, since a foreign key from that role's own table would make a purge fire
 its triggers, or when code that runs on it belongs to one: a function behind a trigger, constraint,
 default, generated column, index or policy, an operator, a domain or type, or an index's operator
 class. Setup and every `tx=` call find that code by following, in `pg_depend`, the objects attached
@@ -833,7 +833,9 @@ newer release is refused and left alone. Every setup then checks that each tinyj
 a valid index of the right table, unique where it must be, and that the statistics below exist. One that is
 missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
 of its own and under a session advisory lock, so workers keep claiming and enqueueing while it
-builds; other setups starting meanwhile wait for that rebuild instead of racing it. The executions
+builds; other setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing
+it, and do not wait on the table again for what it left: a plain index is kept for the next setup
+with a warning and a unique one stops setup with the reason. The executions
 index claims insert against is the exception: claims cannot run without it, so it is built in one
 plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
 30 seconds for transactions already holding the table; past that a unique index stops setup with
@@ -910,12 +912,23 @@ Over several queues, each level visits the queues in the order of their oldest d
 can take a queue's newer jobs before another queue's next one, and the next claim starts from that
 other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
 job that nobody is taking. The same statement marks them running, stamps the lease and opens their
-executions, and it stamps a token of its own. A claim that ends without its answer, from a lost
-connection, a server that stopped answering or a cancelled call, is settled before the worker's next
-claim and when the backend closes: tinyjobs ends the backend it ran on if that backend has not
-changed state since, so one that PgBouncer has handed to another client is left alone, then hands
-back exactly the jobs carrying its token, without counting the attempt, so a lease
-is never left to expire on jobs a worker never received. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+executions, and it stamps a random token of its own; it takes nothing unless it also takes a
+transaction advisory lock derived from that token and finds no revocation of the token in the meta
+table. A claim that ends without its answer, from a lost connection, a server that stopped answering
+or a cancelled call, even one cancelled again while it gives up, is settled before the worker's next
+claim and when the backend closes. tinyjobs first records the token as revoked, so the claim, if it
+reaches the server later, takes nothing. It then looks, as the login role, at the backend the claim
+was sent on, named by process id and start time. If that backend holds a snapshot older than the
+revocation's transaction, which works with `track_activities` off too, the claim may be in flight
+without seeing it: tinyjobs ends the backend only if it holds the claim's lock, which no other
+session can hold, and checks again a second later. Otherwise the claim has
+committed, failed or will take nothing, and tinyjobs hands back exactly the jobs carrying its
+token, without counting the attempt, so a lease is never left to expire on jobs a worker never
+received. An idle backend is never ended, since PgBouncer may have handed it to another client. A
+revocation is deleted once its backend is gone or has changed state since it was written, checked
+by setup, by the retention sweep and every thirty seconds while one is left. The lock and the
+revocation lookup, one primary key probe, cost a claim about 5 µs: 248 against 243 µs median over
+five runs of 2,800 claims. Workers never wait on each other's rows. Walking levels rather than sorting matters when
 a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
 BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
 delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
@@ -1000,7 +1013,10 @@ tinyjobs ends that backend first, so nothing it was doing takes effect afterward
 server that cannot be asked within ten seconds is not taken for gone, since a PgBouncer whose
 server slots this pool already holds looks the same: the call waits for those five minutes of
 silence, then raises. A claim waits half its lease instead, asking after silences of a third of
-that, between one and ten seconds, so its jobs go back to the queue before the lease runs out. Cancelling a call bounds
+that, between one and ten seconds, so its jobs go back to the queue before the lease runs out. With
+no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
+when the server has taken no new connection for half its lease is given up too, and settled like
+any claim without its answer: its jobs come back without the attempt counted. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
