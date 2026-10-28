@@ -806,8 +806,11 @@ tables and the schema belong to the connecting role or to a role that can become
 Postgres 16 and later, membership before), and that no role inherits the privileges of without
 being able to become it too; a schema owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
 role reading or writing the row, so a table owned by anyone else would let that role act as
-tinyjobs. For the same reason a table that carries a trigger owned by such a role, or grants
-`TRIGGER` to one or to `PUBLIC`, is refused too. Such tables are refused before a row is read, even
+tinyjobs. For the same reason a table is refused too when it grants `TRIGGER` to such a role or to
+`PUBLIC`, or when code that runs on it belongs to one: a function behind a trigger, constraint,
+default, generated column, index or policy, an operator, a domain or type, or an index's operator
+class. Setup and every `tx=` call find that code by following the tables' entries in `pg_depend`
+down through every object a user created, and the guard stays near a tenth of a millisecond. Such tables are refused before a row is read, even
 when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
 someone else. With no tables yet, the schema they would be created in is checked the same way, and
 created only when it does not exist, so a role that owns its schema needs no `CREATE` on the
@@ -821,9 +824,11 @@ a concurrent creation it then trips over sends it round again, up to three times
 owners once more in the same transaction, so a table another role creates in the gap is caught
 before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
 newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
-an index of the right table, unique where it must be: `CREATE INDEX IF NOT EXISTS` skips a name
-another relation already holds, which would leave claims failing and dedup keys ignored, so setup
-names the missing index and stops instead. From then on every statement names the tables with the
+a valid index of the right table, unique where it must be, and under the setup lock creates one that
+is missing and rebuilds one of its table that is invalid or of the wrong kind, so a dropped index or
+a failed concurrent build heals on the next start. `CREATE INDEX IF NOT EXISTS` skips a name another
+relation already holds, which would leave claims failing and dedup keys ignored, so then setup names
+the index and stops, and the next setup after that relation is dropped creates it. From then on every statement names the tables with the
 schema setup found them in, so a table of the same name created later earlier on a `search_path`
 cannot take the jobs, and tinyjobs' own connections run with `search_path` set to `pg_catalog,
 pg_temp`, so no function or operator someone created elsewhere is ever called. The statements that
@@ -840,7 +845,10 @@ round trip (a libpq older than 14 has no pipeline mode and spends one); a failin
 Postgres skip the insert unparsed. Inside a caller's own pipeline they join it without a sync, so an
 autocommit pipeline still commits as one; there the check is read before the insert is sent, so a
 refusal sends nothing more and leaves the pipeline as any failed statement does, for the caller to
-sync. Values are bound by the server, arrays in binary, so neither the caller's `search_path`
+sync. The insert sent behind the check is never prepared: psycopg counts a statement Postgres skipped
+as prepared, and on an autocommit connection no rollback would clear that, so every later call
+would fail. A `tx=` call that needs more than one batch on an idle autocommit connection runs in a
+transaction of its own, so it stores all its jobs or none, as an enqueue through the pool does. Values are bound by the server, arrays in binary, so neither the caller's `search_path`
 nor its `standard_conforming_strings` or client encoding changes what runs or what is stored. This
 uses psycopg internals present in 3.2 and 3.3; on a psycopg without them `tx=` raises
 `UnsupportedCapabilityError` rather than run unguarded. A connection whose client encoding is
@@ -856,7 +864,11 @@ settings and timeouts as the pool's and a connect timeout, before refusing, so a
 through a move of the same store, such as a switchover to a replica, follows it.
 
 `id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
-ids are ordered on SQLite and Redis, whatever the database's locale. The jobs table has a fillfactor
+ids are ordered on SQLite and Redis, whatever the database's locale. A btree entry holds about
+2.7 kB, so the unique index covers a dedup key's SHA-256 digest, stored beside it, and the queue
+indexes cover a queue's first 500 characters, with the full name compared on top; neither has a
+length limit. Many jobs go in batches of at most 1,000 jobs and 64 MiB of payloads, keys and errors,
+in one transaction, so no array parameter nears Postgres' 1 GB limit on a value. The jobs table has a fillfactor
 of 85 and an autovacuum tuned to run often: a job row is updated several times in its life, and the
 free space lets most of those updates stay on the same page. There is no index on the lease, so a
 heartbeat touches no indexed column and is a HOT update; the reaper scans the running jobs instead,
@@ -865,7 +877,8 @@ which are few.
 ### The claim
 
 A claim is one statement. A recursive query walks the priorities present in the wanted queues from
-the highest down, using the partial index on `(queue, priority DESC, run_at)` over queued jobs, and
+the highest down, using the partial index on `(left(queue, 500), priority DESC, run_at)` over queued
+jobs, and
 for each level that holds a due job takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first,
 until it has enough. Each step reads a span of index entries per queue below the last level, in index
 order, and either finds the highest level with a due job or skips every level the spans covered,
@@ -948,8 +961,11 @@ Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_conne
 listening one. Every pooled connection is set to read committed, a 30 second `statement_timeout` and
 a one minute `idle_in_transaction_session_timeout`; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
-TCP keepalives on, and the listening one gives up connecting after `pool_timeout`, two seconds at
-least. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
+TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
+after `pool_timeout`, two seconds at least. A pooled statement that gets no answer within its
+`statement_timeout` and five seconds more, from a frozen server or a network that drops its packets,
+closes its connection and raises `OperationalError`, which the worker treats like a lost connection;
+psycopg 3.2's own cancel could wait forever there, so on 3.2 tinyjobs bounds it at five seconds too. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
 minutes, and every connection is replaced after half an hour. Deadlocks, serialization
 failures and a session the server closed under `idle_session_timeout`, which it only does while
@@ -976,7 +992,8 @@ child opens its own.
   replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
   jobs table bloats until it ends.
 - **`statement_timeout` bounds every call.** A purge or a claim that needs longer than 30 seconds
-  fails; raise it with `statement_timeout=` or turn it off with `None`.
+  fails; raise it with `statement_timeout=` or turn it off with `None`, which also turns off the
+  client's deadline.
 - **Supported versions are the ones the community supports**, 14 to 18 today. CI runs the suite
   on 14 and 18.
 

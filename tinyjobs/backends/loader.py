@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 from ..exceptions import UnknownBackendError
 
 ENTRY_POINT_GROUP = "tinyjobs.backends"
+SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
 
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
 _BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
@@ -20,13 +21,13 @@ def register_builtin(
 
 
 def check_options(url: str, options: dict[str, Any]) -> None:
-    check = _BUILTIN_CHECKS.get(urlsplit(url).scheme)
+    check = _BUILTIN_CHECKS.get(_scheme(url))
     if check is not None:
         check(url, **options)
 
 
 def scheme_of(url: str) -> str:
-    scheme = urlsplit(url).scheme
+    scheme = _scheme(url)
     if not scheme:
         raise UnknownBackendError(
             f"{url!r} has no scheme; a backend url looks like 'sqlite:///jobs.db'"
@@ -45,6 +46,11 @@ def load_backend(url: str, **options: Any) -> Any:
 def available_schemes() -> list[str]:
     plugins = {point.name for point in _plugin_entry_points()}
     return sorted(set(_BUILTIN_FACTORIES) | plugins)
+
+
+def _scheme(url: str) -> str:
+    found = SCHEME.match(url)
+    return found.group(0).lower() if found else ""
 
 
 def _plugin_entry_points():

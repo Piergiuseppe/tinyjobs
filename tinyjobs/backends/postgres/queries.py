@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .records import JOB_COLUMNS, JOB_TYPES, job_columns
-from .schema import Tables
+from .schema import QUEUE_KEY, QUEUE_KEY_CHARACTERS, Tables
 
 READING = "SELECT extract(epoch FROM pg_catalog.clock_timestamp())::double precision AS now"
 
@@ -16,6 +16,10 @@ SPAN_LIMIT = 128
 SPAN_KEPT = 16
 
 REFUSAL = "tinyjobs refuses tables that a role lacking the privileges of the current role controls"
+
+
+def queue_is(queue: str) -> str:
+    return f"{QUEUE_KEY} = left({queue}, {QUEUE_KEY_CHARACTERS}) AND queue = {queue}"
 
 
 def _qualified(kind: str) -> str:
@@ -59,6 +63,53 @@ def trusting(owner: str) -> str:
     )"""
 
 
+def catalog(name: str) -> str:
+    return f"'pg_catalog.{name}'::pg_catalog.regclass::pg_catalog.oid"
+
+
+def owners_of_code_on(tables: str) -> str:
+    def owned(table: str, owner: str) -> str:
+        return f"""SELECT {owner} FROM pg_catalog.{table}
+                    WHERE reached.classid OPERATOR(pg_catalog.=) {catalog(table)}
+                      AND oid OPERATOR(pg_catalog.=) reached.objid"""
+
+    forward = """d.classid OPERATOR(pg_catalog.=) reached.classid
+                 AND d.objid OPERATOR(pg_catalog.=) reached.objid"""
+    return f"""
+        WITH RECURSIVE reached (classid, objid) AS (
+            SELECT {catalog("pg_class")}, rooted.oid FROM ({tables}) AS rooted (oid)
+            UNION
+            SELECT d.classid, d.objid
+              FROM ({tables}) AS rooted (oid)
+              JOIN pg_catalog.pg_depend AS d
+                ON d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+               AND d.refobjid OPERATOR(pg_catalog.=) rooted.oid
+            UNION
+            SELECT CASE WHEN {forward} THEN d.refclassid ELSE d.classid END,
+                   CASE WHEN {forward} THEN d.refobjid ELSE d.objid END
+              FROM reached
+              JOIN pg_catalog.pg_depend AS d
+                ON ({forward} AND d.refobjid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid)
+                OR (d.refclassid OPERATOR(pg_catalog.=) reached.classid
+                    AND d.refobjid OPERATOR(pg_catalog.=) reached.objid
+                    AND d.deptype OPERATOR(pg_catalog.=) ANY ('{{a,i}}'::pg_catalog."char"[])
+                    AND reached.classid OPERATOR(pg_catalog.=) ANY (ARRAY[
+                        {catalog("pg_type")}, {catalog("pg_opclass")}, {catalog("pg_opfamily")}
+                    ]))
+        )
+        SELECT owners.role
+          FROM reached
+         CROSS JOIN LATERAL (
+               {owned("pg_proc", "proowner")}
+               UNION ALL {owned("pg_operator", "oprowner")}
+               UNION ALL {owned("pg_type", "typowner")}
+               UNION ALL {owned("pg_opclass", "opcowner")}
+               UNION ALL {owned("pg_opfamily", "opfowner")}
+               UNION ALL {owned("pg_class", "relowner")}
+         ) AS owners (role)
+    """
+
+
 def untouched(table: str) -> str:
     return f"""(
         NOT EXISTS (
@@ -68,11 +119,8 @@ def untouched(table: str) -> str:
                         AND {trusting("granted.grantee")})
         )
         AND NOT EXISTS (
-            SELECT FROM pg_catalog.pg_trigger AS t
-              JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) t.tgfoid
-             WHERE t.tgrelid OPERATOR(pg_catalog.=) {table}.oid
-               AND NOT t.tgisinternal
-               AND NOT {trusting("p.proowner")}
+            SELECT FROM ({owners_of_code_on(f"SELECT {table}.oid")}) AS coded
+             WHERE NOT {trusting("coded.role")}
         )
     )"""
 
@@ -117,7 +165,7 @@ class Queries:
 
         self.active_by_keys = f"""
             SELECT {columns} FROM {jobs}
-             WHERE dedup_key OPERATOR(pg_catalog.=) ANY(%(keys)b::pg_catalog.text[])
+             WHERE dedup_digest OPERATOR(pg_catalog.=) ANY(%(digests)b::pg_catalog.bytea[])
                AND status OPERATOR(pg_catalog.=) ANY(ARRAY['queued', 'running']::pg_catalog.text[])
         """
 
@@ -157,7 +205,7 @@ class Queries:
                        max(priority) AS top
                   FROM (
                        SELECT priority, run_at FROM {jobs}
-                        WHERE status = 'queued' AND queue = {queue}
+                        WHERE status = 'queued' AND {queue_is(queue)}
                           AND priority < levels.priority
                         ORDER BY priority DESC, run_at ASC
                         LIMIT levels.span
@@ -192,7 +240,7 @@ class Queries:
         def oldest_first(queue: str) -> str:
             return f"""
                 SELECT id FROM {jobs}
-                 WHERE status = 'queued' AND queue = {queue}
+                 WHERE status = 'queued' AND {queue_is(queue)}
                    AND priority = levels.priority AND run_at <= {horizon}
                  ORDER BY run_at ASC
                  LIMIT %(limit)s
@@ -221,7 +269,7 @@ class Queries:
                               AS wanted (name, position)
                         CROSS JOIN LATERAL (
                               SELECT run_at FROM {jobs}
-                               WHERE status = 'queued' AND queue = wanted.name
+                               WHERE status = 'queued' AND {queue_is("wanted.name")}
                                  AND priority = levels.priority AND run_at <= {horizon}
                                ORDER BY run_at ASC
                                LIMIT 1
@@ -345,7 +393,7 @@ class Queries:
              WHERE id = %(id)s AND status IN ('failed', 'cancelled')
                AND NOT EXISTS (
                    SELECT 1 FROM {jobs} AS holder
-                    WHERE holder.dedup_key = target.dedup_key
+                    WHERE holder.dedup_digest = target.dedup_digest
                       AND holder.status IN ('queued', 'running')
                )
             RETURNING id, queue, run_at <= {horizon} AS due
@@ -510,11 +558,7 @@ class Queries:
                   FROM found CROSS JOIN pg_catalog.aclexplode(found.relacl) AS granted
                  WHERE granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
                 UNION
-                SELECT p.proowner
-                  FROM found
-                  JOIN pg_catalog.pg_trigger AS t ON t.tgrelid OPERATOR(pg_catalog.=) found.oid
-                  JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) t.tgfoid
-                 WHERE NOT t.tgisinternal
+                SELECT coded.role FROM ({owners_of_code_on("SELECT oid FROM found")}) AS coded
             )
             SELECT (SELECT pg_catalog.count(*) FROM found) AS tables,
                    (SELECT pg_catalog.bool_or(relname OPERATOR(pg_catalog.=) %(meta)s) FROM found)
@@ -528,7 +572,17 @@ class Queries:
         """
 
         self.misplaced_indexes = """
-            SELECT wanted.name
+            SELECT wanted.name, EXISTS (
+                   SELECT FROM pg_catalog.pg_index AS i
+                     JOIN pg_catalog.pg_class AS ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid
+                     JOIN pg_catalog.pg_class AS tc ON tc.oid OPERATOR(pg_catalog.=) i.indrelid
+                     JOIN pg_catalog.pg_namespace AS n
+                       ON n.oid OPERATOR(pg_catalog.=) ic.relnamespace
+                    WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                      AND tc.relnamespace OPERATOR(pg_catalog.=) n.oid
+                      AND ic.relname OPERATOR(pg_catalog.=) wanted.name
+                      AND tc.relname OPERATOR(pg_catalog.=) wanted.owner
+                   ) AS on_its_table
               FROM ROWS FROM (
                    pg_catalog.unnest(%(indexes)b::pg_catalog.text[]),
                    pg_catalog.unnest(%(tables)b::pg_catalog.text[]),

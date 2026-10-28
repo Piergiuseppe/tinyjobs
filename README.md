@@ -562,11 +562,13 @@ with `client_encoding` `SQL_ASCII` is refused too. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
 Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every
-statement times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
+statement times out after 30 seconds (`statement_timeout=`), on the client too if the server stops
+answering, and connections are named `tinyjobs` in
 `pg_stat_activity`. The tables and their schema must belong to the connecting role or a role that
 can become it (`SET` on Postgres 16 and later), every role that inherits the owner's privileges must
-be able to become it too, and no other role may own a trigger on them or hold `TRIGGER` on them;
-otherwise pass `schema=` with one it owns. Behind PgBouncer use session
+be able to become it too, and no other role may hold `TRIGGER` on them or own code that runs on
+them, such as a trigger, a constraint's function or an index's; otherwise pass `schema=` with one it
+owns. Behind PgBouncer use session
 pooling. A transaction left open for hours anywhere on the server stops autovacuum from cleaning the
 jobs table. Postgres 14 to 18 are supported, and CI tests 14 and 18.
 
@@ -734,7 +736,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1307 tests, no test dependencies. The one that matters most is
+1316 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

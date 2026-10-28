@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping, Sequence
 
 from ...models import Execution, Job, ScheduleState
@@ -23,6 +24,7 @@ JOB_COLUMNS = (
     "lease_expires_at",
     "worker_id",
     "dedup_key",
+    "dedup_digest",
     "result",
     "last_error",
 )
@@ -45,6 +47,7 @@ JOB_TYPES = (
     "double precision",
     "text",
     "text",
+    "bytea",
     "bytea",
     "text",
 )
@@ -80,9 +83,14 @@ def job_to_row(job: Job) -> tuple:
         job.lease_expires_at,
         job.worker_id,
         job.dedup_key,
+        dedup_digest(job.dedup_key),
         job.result_payload,
         job.last_error,
     )
+
+
+def dedup_digest(key: str | None) -> bytes | None:
+    return None if key is None else hashlib.sha256(key.encode()).digest()
 
 
 def job_from_row(row: Mapping[str, Any]) -> Job:

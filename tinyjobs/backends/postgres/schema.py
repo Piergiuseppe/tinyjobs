@@ -7,6 +7,10 @@ from ...exceptions import ConfigurationError
 
 SCHEMA_VERSION = 1
 
+QUEUE_KEY_CHARACTERS = 500
+
+QUEUE_KEY = f"left(queue, {QUEUE_KEY_CHARACTERS})"
+
 NAME = re.compile(r"^[a-z_][a-z0-9_]{0,39}$")
 
 INDEXES = (
@@ -58,8 +62,41 @@ class Tables:
     def index(self, name: str) -> str:
         return f'"{self.prefix}_{name}"'
 
+    def indexes(self) -> dict[str, str]:
+        jobs, executions = self.jobs, self.executions
+        return {
+            "jobs_claim": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_claim")}
+                ON {jobs} (({QUEUE_KEY}), priority DESC, run_at ASC)
+                WHERE status = 'queued'
+            """,
+            "jobs_by_status": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_by_status")}
+                ON {jobs} (status, id DESC)
+            """,
+            "jobs_by_queue": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_by_queue")}
+                ON {jobs} (({QUEUE_KEY}), id DESC)
+            """,
+            "jobs_purge": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_purge")}
+                ON {jobs} (status, finished_at)
+                WHERE finished_at IS NOT NULL
+            """,
+            "jobs_dedup": f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {self.index("jobs_dedup")}
+                ON {jobs} (dedup_digest)
+                WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'running')
+            """,
+            "executions_claim": f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
+                ON {executions} (job_id, claim)
+            """,
+        }
+
     def ddl(self, *, schema_missing: bool) -> tuple[str, ...]:
         jobs, executions = self.jobs, self.executions
+        indexes = self.indexes()
         statements = []
         if self.requested and schema_missing:
             statements.append(f'CREATE SCHEMA IF NOT EXISTS "{self.requested}"')
@@ -91,6 +128,7 @@ class Tables:
                 lease_expires_at double precision,
                 worker_id        text,
                 dedup_key        text COLLATE "C",
+                dedup_digest     bytea,
                 result           bytea,
                 last_error       text
             ) WITH (
@@ -102,29 +140,11 @@ class Tables:
                 autovacuum_vacuum_cost_delay = 1
             )
             """,
-            f"""
-            CREATE INDEX IF NOT EXISTS {self.index("jobs_claim")}
-                ON {jobs} (queue, priority DESC, run_at ASC)
-                WHERE status = 'queued'
-            """,
-            f"""
-            CREATE INDEX IF NOT EXISTS {self.index("jobs_by_status")}
-                ON {jobs} (status, id DESC)
-            """,
-            f"""
-            CREATE INDEX IF NOT EXISTS {self.index("jobs_by_queue")}
-                ON {jobs} (queue, id DESC)
-            """,
-            f"""
-            CREATE INDEX IF NOT EXISTS {self.index("jobs_purge")}
-                ON {jobs} (status, finished_at)
-                WHERE finished_at IS NOT NULL
-            """,
-            f"""
-            CREATE UNIQUE INDEX IF NOT EXISTS {self.index("jobs_dedup")}
-                ON {jobs} (dedup_key)
-                WHERE dedup_key IS NOT NULL AND status IN ('queued', 'running')
-            """,
+            indexes["jobs_claim"],
+            indexes["jobs_by_status"],
+            indexes["jobs_by_queue"],
+            indexes["jobs_purge"],
+            indexes["jobs_dedup"],
             f"""
             CREATE TABLE IF NOT EXISTS {executions} (
                 id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -139,10 +159,7 @@ class Tables:
                 traceback   text
             ) WITH (fillfactor = 90)
             """,
-            f"""
-            CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
-                ON {executions} (job_id, claim)
-            """,
+            indexes["executions_claim"],
             f"""
             CREATE TABLE IF NOT EXISTS {self.schedules} (
                 name        text PRIMARY KEY,

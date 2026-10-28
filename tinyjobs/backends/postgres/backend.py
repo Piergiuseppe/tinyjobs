@@ -8,14 +8,20 @@ import math
 import re
 import time
 import weakref
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
+from contextlib import (
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
 from dataclasses import dataclass
 from functools import cache, partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
 from urllib.parse import unquote, urlsplit
 
 import psycopg
-from psycopg import errors, pq
+from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
@@ -35,9 +41,10 @@ from ...retention import RetentionPolicy
 from ...runtime import spared_until_close
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
-from .queries import NOTICE_CHARACTERS, REFUSAL, Queries
+from .queries import NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
 from .records import (
     JOB_COLUMNS,
+    dedup_digest,
     execution_from_row,
     job_arrays,
     job_from_row,
@@ -68,8 +75,15 @@ KEEPALIVES = {
     "keepalives_idle": 30,
     "keepalives_interval": 10,
     "keepalives_count": 3,
+    "tcp_user_timeout": 60000,
 }
+ANSWER_MARGIN_SECONDS = 5.0
+CANCEL_SECONDS = 5.0
+WAIT_INTERVAL = 0.1
+WAITS_WITH_TIMEOUT = "timeout" in inspect.signature(psycopg.AsyncConnection.wait).parameters
+UNANSWERED = (getattr(errors, "_WaitTimeout", TimeoutError), TimeoutError)
 ENQUEUE_BATCH = 1000
+ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
 RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.IdleSessionTimeout)
 RETRIES = 3
@@ -88,6 +102,7 @@ HELD = all(
         (psycopg.AsyncPipeline, "_fetch_gen"),
     )
 )
+USERINFO_SECRET = re.compile(r"://[^:@/]*:([^@/]*)@")
 SECRET_SETTING = re.compile(r"password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))")
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
@@ -177,6 +192,7 @@ class PostgresBackend(BaseBackend):
             max_lifetime=MAX_LIFETIME_SECONDS,
             open=False,
             kwargs=_connection_kwargs(self._conninfo, self._connection_options),
+            connection_class=_Answering,
             configure=self._configure,
             name="tinyjobs",
         )
@@ -202,7 +218,12 @@ class PostgresBackend(BaseBackend):
         async with self._connection() as connection:
             placed = await self._placed(connection)
             stored = await self._stored_version(connection, placed) if placed.meta else None
-        if placed.tables != len(TABLE_KINDS) or stored != SCHEMA_VERSION:
+            complete = (
+                placed.tables == len(TABLE_KINDS)
+                and stored == SCHEMA_VERSION
+                and not await self._misplaced(connection, placed)
+            )
+        if not complete:
             for attempt in range(SETUP_ATTEMPTS):
                 try:
                     await self._create()
@@ -268,18 +289,20 @@ class PostgresBackend(BaseBackend):
             raise ConfigurationError(
                 f"the tinyjobs tables for prefix {tables.prefix!r} or their schema "
                 f"{schema!r} belong to a role that does not hold the connecting user's "
-                "privileges, or carry a trigger, or a TRIGGER grant, of such a role; "
+                "privileges, or carry a TRIGGER grant to such a role or code it owns (a trigger, "
+                "constraint, default, index or policy function, operator or type); "
                 "tinyjobs only uses tables and schemas owned by its own role or by a role "
-                "that can act as it, so pass schema= with one it owns or revoke the grant"
+                "that can act as it, so pass schema= with one it owns, or revoke the grant "
+                "or drop that code"
             )
         within = tables.within(schema)
         return _Placement(within, Queries(within, self._following), count, meta, schema_missing)
 
-    async def _check_indexes(
+    async def _misplaced(
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         prefix = self._tables.prefix
-        rows = await _fetch(
+        return await _fetch(
             connection,
             self._unplaced.misplaced_indexes,
             {
@@ -289,6 +312,24 @@ class PostgresBackend(BaseBackend):
                 "uniques": [unique for _, _, unique in INDEXES],
             },
         )
+
+    async def _rebuild_indexes(
+        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    ) -> None:
+        statements = {
+            f"{self._tables.prefix}_{name}": statement
+            for name, statement in placed.within.indexes().items()
+        }
+        schema = placed.within.schema.replace('"', '""')
+        for row in await self._misplaced(connection, placed):
+            if row["on_its_table"]:
+                await connection.execute(f'DROP INDEX "{schema}"."{row["name"]}"')
+            await connection.execute(statements[row["name"]], {})
+
+    async def _check_indexes(
+        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    ) -> None:
+        rows = await self._misplaced(connection, placed)
         if rows:
             names = ", ".join(row["name"] for row in rows)
             raise ConfigurationError(
@@ -311,6 +352,8 @@ class PostgresBackend(BaseBackend):
                     f"build understands ({SCHEMA_VERSION}); upgrade the package"
                 )
             if stored == SCHEMA_VERSION:
+                if placed.tables == len(TABLE_KINDS):
+                    await self._rebuild_indexes(connection, placed)
                 return
             for statement in placed.within.ddl(schema_missing=placed.schema_missing):
                 await connection.execute(statement, {})
@@ -459,14 +502,13 @@ class PostgresBackend(BaseBackend):
         ordered, places, copies = _lock_order(jobs)
         for attempt in range(RETRIES):
             try:
-                if len(ordered) <= ENQUEUE_BATCH:
+                if not _split(ordered):
                     async with self._connection() as connection:
                         stored = await self._insert(connection, ordered, now, due)
                 else:
                     async with self._transaction() as connection:
                         stored = []
-                        for start in range(0, len(ordered), ENQUEUE_BATCH):
-                            batch = ordered[start : start + ENQUEUE_BATCH]
+                        for batch in _batches(ordered):
                             stored.extend(await self._insert(connection, batch, now, due))
                 break
             except RETRIED_ERRORS as error:
@@ -608,7 +650,7 @@ class PostgresBackend(BaseBackend):
             conditions.append("status = %(status)s")
             parameters["status"] = str(status)
         if queue is not None:
-            conditions.append("queue = %(queue)s")
+            conditions.append(queue_is("%(queue)s"))
             parameters["queue"] = queue
         if cursor is not None:
             conditions.append("id < %(cursor)s")
@@ -761,13 +803,15 @@ class PostgresBackend(BaseBackend):
         _check_held(connection)
         with self._refusing():
             try:
-                return _stepped(connection, self._joining(connection, jobs))
+                with _atomic(connection, jobs):
+                    return _stepped(connection, self._joining(connection, jobs))
             except _Elsewhere as elsewhere:
                 with psycopg.Connection.connect(self._conninfo, **self._direct_options()) as own:
                     for statement, parameters in self._settings():
                         own.execute(statement, parameters)
                     self._settle(_stepped(own, self._identifying()), elsewhere.identity)
-                return _stepped(connection, self._joining(connection, jobs))
+                with _atomic(connection, jobs):
+                    return _stepped(connection, self._joining(connection, jobs))
 
     async def aenqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
         connection = _connection_of(tx)
@@ -779,7 +823,8 @@ class PostgresBackend(BaseBackend):
         _check_held(connection)
         with self._refusing():
             try:
-                return await _driven(connection, self._joining(connection, jobs))
+                async with _atomic(connection, jobs):
+                    return await _driven(connection, self._joining(connection, jobs))
             except _Elsewhere as elsewhere:
                 async with await psycopg.AsyncConnection.connect(
                     self._conninfo, **self._direct_options()
@@ -787,7 +832,8 @@ class PostgresBackend(BaseBackend):
                     for statement, parameters in self._settings():
                         await own.execute(statement, parameters)
                     self._settle(await _driven(own, self._identifying()), elsewhere.identity)
-                return await _driven(connection, self._joining(connection, jobs))
+                async with _atomic(connection, jobs):
+                    return await _driven(connection, self._joining(connection, jobs))
 
     @contextmanager
     def _refusing(self) -> Iterator[None]:
@@ -799,7 +845,8 @@ class PostgresBackend(BaseBackend):
             raise ConfigurationError(
                 f"the tinyjobs tables for prefix {self._tables.prefix!r} that the connection "
                 "passed as tx reaches belong to a role that does not hold that connection's "
-                "privileges, or carry a trigger, or a TRIGGER grant, of such a role; "
+                "privileges, or carry a TRIGGER grant to such a role or code it owns (a trigger, "
+                "constraint, default, index or policy function, operator or type); "
                 "tinyjobs never writes through them"
             ) from None
 
@@ -829,8 +876,7 @@ class PostgresBackend(BaseBackend):
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
         stored: list[Job] = []
-        for start in range(0, len(ordered), ENQUEUE_BATCH):
-            batch = ordered[start : start + ENQUEUE_BATCH]
+        for batch in _batches(ordered):
             stored.extend((yield from self._inserting(batch, now, due, guard)))
             guard = ()
         if self._notify and due:
@@ -936,7 +982,7 @@ class PostgresBackend(BaseBackend):
         ]
         holders: dict[str, Job] = {}
         if keys:
-            rows = yield queries.active_by_keys, {"keys": keys}
+            rows = yield queries.active_by_keys, {"digests": [dedup_digest(key) for key in keys]}
             holders = {row["dedup_key"]: job_from_row(row) for row in rows}
         retry = []
         for index, job in missing:
@@ -1029,6 +1075,8 @@ class PostgresBackend(BaseBackend):
             yield connection
 
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
+        if isinstance(connection, _Answering) and self._statement_timeout is not None:
+            connection.deadline = self._statement_timeout + ANSWER_MARGIN_SECONDS
         if self._schemas is None:
             cursor = await connection.execute(
                 "SELECT pg_catalog.current_schemas(false)::pg_catalog.text[] AS schemas"
@@ -1163,6 +1211,7 @@ def _parsed(conninfo: str) -> dict[str, Any]:
 
 def _secrets(conninfo: str) -> set[str]:
     found = {match.group(1) or match.group(2) for match in SECRET_SETTING.finditer(conninfo)}
+    found |= {match.group(1) for match in USERINFO_SECRET.finditer(conninfo)}
     if "://" in conninfo:
         with suppress(ValueError):
             found.add(urlsplit(conninfo).password or "")
@@ -1223,6 +1272,30 @@ def _started(transaction: psycopg.AsyncTransaction) -> bool:
     if status is None:
         return transaction._entered and not transaction._exited
     return status is type(transaction).Status.ACTIVE
+
+
+def _split(jobs: Sequence[Job]) -> bool:
+    return len(jobs) > ENQUEUE_BATCH or sum(map(_weight, jobs)) > ENQUEUE_BATCH_BYTES
+
+
+def _batches(jobs: Sequence[Job]) -> Iterator[Sequence[Job]]:
+    start, weight = 0, 0
+    for index, job in enumerate(jobs):
+        weight += _weight(job)
+        if index > start and (index - start == ENQUEUE_BATCH or weight > ENQUEUE_BATCH_BYTES):
+            yield jobs[start:index]
+            start, weight = index, _weight(job)
+    if start < len(jobs):
+        yield jobs[start:]
+
+
+def _weight(job: Job) -> int:
+    return (
+        len(job.payload)
+        + len(job.result_payload or b"")
+        + len(job.dedup_key or "")
+        + len(job.last_error or "")
+    )
 
 
 def _lock_order(jobs: Sequence[Job]) -> tuple[list[Job], list[int], dict[int, int]]:
@@ -1290,10 +1363,55 @@ def _connection_of(tx: Any) -> Any:
     return tx
 
 
+class _Answering(psycopg.AsyncConnection):
+    deadline: float | None = None
+
+    async def wait(self, gen: Any, *args: Any, **kwargs: Any) -> Any:
+        if self.deadline is None or args or kwargs:
+            return await super().wait(gen, *args, **kwargs)
+        try:
+            if WAITS_WITH_TIMEOUT:
+                return await super().wait(gen, timeout=self.deadline)
+            return await self._bounded(gen, self.deadline)
+        except UNANSWERED:
+            self.pgconn.finish()
+            raise psycopg.OperationalError(
+                f"the postgres server did not answer within {self.deadline:g} seconds; "
+                "the connection was closed"
+            ) from None
+
+    async def _bounded(self, gen: Any, seconds: float) -> Any:
+        try:
+            async with asyncio.timeout(seconds):
+                return await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
+                await self._try_cancel(timeout=CANCEL_SECONDS)
+                try:
+                    async with asyncio.timeout(CANCEL_SECONDS):
+                        await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
+                except errors.QueryCanceled:
+                    pass
+                except TimeoutError:
+                    self.pgconn.finish()
+            raise
+
+
 class _Elsewhere(Exception):
     def __init__(self, identity: tuple[Any, ...] | None) -> None:
         super().__init__(identity)
         self.identity = identity
+
+
+def _atomic(connection: Any, jobs: Sequence[Job]) -> Any:
+    if (
+        _split(jobs)
+        and connection.autocommit
+        and connection._pipeline is None
+        and connection.info.transaction_status == pq.TransactionStatus.IDLE
+    ):
+        return connection.transaction()
+    return nullcontext()
 
 
 def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
@@ -1318,7 +1436,7 @@ def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
             elif guard and PIPELINED:
                 with connection._pipeline_nolock():
                     connection.wait(checking._execute_gen(*guard))
-                    connection.wait(cursor._execute_gen(query, parameters))
+                    connection.wait(cursor._execute_gen(query, parameters, prepare=False))
             else:
                 if guard:
                     connection.wait(checking._execute_gen(*guard))
@@ -1348,7 +1466,7 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
             elif guard and PIPELINED:
                 async with connection._pipeline_nolock():
                     await connection.wait(checking._execute_gen(*guard))
-                    await connection.wait(cursor._execute_gen(query, parameters))
+                    await connection.wait(cursor._execute_gen(query, parameters, prepare=False))
             else:
                 if guard:
                     await connection.wait(checking._execute_gen(*guard))
