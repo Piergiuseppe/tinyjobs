@@ -834,7 +834,8 @@ a valid index of the right table, unique where it must be, and that the statisti
 missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
 of its own and under a session advisory lock, so workers keep claiming and enqueueing while it
 builds; other setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing
-it, and do not wait on the table again for what it left: a plain index is kept for the next setup
+it, unless the lock is held by a session whose role cannot become the tables' owner, which is
+never a setup and is not waited for, and do not wait on the table again for what it left: a plain index is kept for the next setup
 with a warning and a unique one stops setup with the reason. The executions
 index claims insert against is the exception: claims cannot run without it, so it is built in one
 plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
@@ -912,20 +913,25 @@ Over several queues, each level visits the queues in the order of their oldest d
 can take a queue's newer jobs before another queue's next one, and the next claim starts from that
 other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
 job that nobody is taking. The same statement marks them running, stamps the lease and opens their
-executions, and it stamps a random token of its own. A claim that ends without its answer, from a
+executions, and it stamps a random token of its own and takes a transaction advisory lock derived
+from it, which only that claim's transaction can hold. A claim that ends without its answer, from a
 lost connection, a server that stopped answering or a cancelled call, even one cancelled again
-while it gives up, may still commit later, so tinyjobs keeps its token, its worker and the backend
-it was sent on, named by process id and start time, in memory. While it keeps any, at most once a
-second, before a claim, on a heartbeat, every second of a wait for jobs and for up to five seconds
-when the backend closes, one `UPDATE` hands back the running jobs carrying those tokens, without
-counting the attempt and with their executions removed, so a claim that commits late gives its
-jobs back within a second while its worker claims or waits, and by its next heartbeat otherwise,
-both inside the lease. A token is forgotten only when its backend is gone, read as the login role
-from `pg_stat_activity` before that `UPDATE`, so the `UPDATE` sees whatever the backend committed;
-a backend that is alive or hidden from the login role keeps its token, which costs nothing but
-that one statement a second. No timing is guessed and no backend is ended to settle a claim. The
-claim itself carries nothing for this, and a process without such tokens runs no extra statement.
-A process that dies loses its tokens, like any jobs it held: their leases expire. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+while it gives up, may still commit later, so tinyjobs keeps its token, its lease, its worker and
+the backend it was sent on, named by process id and start time, in memory. Each pass over them,
+as the login role, first ends the backend if it holds the claim's lock, so a claim still running
+takes nothing, then reads `pg_stat_activity` and runs one `UPDATE` that hands back the running jobs
+carrying those tokens, without counting the attempt and with their executions removed. A token is
+forgotten once that `UPDATE` hands back its jobs, or when its backend, as read before the `UPDATE`,
+is gone, belongs to another role, or has gone idle since the first pass saw it, since a backend
+only goes idle once the claim, if it arrived, has ended. A backend that sat idle since the first
+pass may still receive a claim delayed on the way, or be idle in PgBouncer's pool; its token is kept
+until the backend changes state or goes. Passes run before a claim and on a heartbeat, at most once
+a second while some backend is busy or unseen, when a wait for jobs is also cut to a second, and
+once every third of the lease while all sit idle. Closing runs passes for up to five seconds while
+some backend is busy, so a claim still running there is ended too. No timing is guessed, and no
+backend that might serve someone else is ended: only the holder of the claim's own lock. A process
+without such tokens runs no extra statement; the lock costs a claim about 3 µs. A process that dies
+loses its tokens, like any jobs it held: their leases expire. Workers never wait on each other's rows. Walking levels rather than sorting matters when
 a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
 BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
 delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
@@ -995,9 +1001,10 @@ listening one. Every pooled connection is set to read committed, a 30 second `st
 a one minute `idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
 trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
 call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
-instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements,
-within the caller's transaction or one of its own on an autocommit connection, and puts the caller's
-value back after them; every connection,
+instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements
+without a round trip of its own: on an idle autocommit connection the setting travels in the same
+pipeline as the statement and ends with it, and inside the caller's transaction the caller's value
+is kept on the server and put back with the last statement, or after a failure; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
 TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
 after `pool_timeout`, two seconds at least. A pooled statement is never cut short while bytes move
@@ -1005,7 +1012,8 @@ in either direction or while the server is still working on it, waiting on a loc
 standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
 waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
 server what the statement's backend is doing, on an idle pooled connection when the pool has one,
-waiting at most a second for it, and otherwise on a fresh connection. The question names the
+which gets a second to take the question and answer it, and otherwise, or when it does not, on a
+fresh connection. The question names the
 backend by its process id and start time, so a reused id is never taken for it, runs as the login
 role, which sees its own sessions even when the url or `ALTER ROLE ... SET role` switches to
 another, and uses only `pg_catalog` operators whatever the url's `search_path`. If the backend is
@@ -1019,7 +1027,8 @@ silence, then raises. A claim waits half its lease instead, asking after silence
 that, between one and ten seconds, so its worker moves on well inside the lease. With
 no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
 when the server has taken no new connection for half its lease is given up too, and settled like
-any claim without its answer: once it commits, its jobs come back without the attempt counted. Cancelling a call bounds
+any claim without its answer: it is ended if still running, and its jobs come back without the
+attempt counted. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle

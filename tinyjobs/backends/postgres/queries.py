@@ -219,6 +219,7 @@ class Queries:
             WITH RECURSIVE {picked},
             chosen AS (
                 SELECT ARRAY(SELECT id FROM picked) AS ids
+                 WHERE pg_catalog.pg_try_advisory_xact_lock(%(key)s::bigint)
             ),
             claimed AS (
                 UPDATE {jobs} AS job
@@ -404,18 +405,19 @@ class Queries:
 
         self.unclaim = f"""
             WITH changed AS (
-                UPDATE {jobs}
-                   SET status = 'queued', attempts = attempts - 1, lease_expires_at = NULL,
+                UPDATE {jobs} AS job
+                   SET status = 'queued', attempts = job.attempts - 1, lease_expires_at = NULL,
                        worker_id = NULL, claim_token = NULL
-                 WHERE status = 'running' AND worker_id = ANY(%(workers)s::text[])
-                   AND claim_token = ANY(%(tokens)s::text[])
-                RETURNING id, claims, queue
+                  FROM pg_catalog.unnest(%(tokens)s::text[]) AS ghost (token)
+                 WHERE job.status = 'running' AND job.worker_id = ANY(%(workers)s::text[])
+                   AND job.claim_token = ghost.token
+                RETURNING job.id, job.claims, job.queue, ghost.token
             ),
             forgotten AS (
                 DELETE FROM {executions} AS execution USING changed
                  WHERE execution.job_id = changed.id AND execution.claim = changed.claims
             )
-            SELECT queue FROM changed
+            SELECT queue, token FROM changed
         """
 
         self.hand_back = f"""

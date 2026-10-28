@@ -14,7 +14,7 @@ from tinyjobs.backends import (
     load_backend,
     register_builtin,
 )
-from tinyjobs.backends.loader import ENTRY_POINT_GROUP
+from tinyjobs.backends.loader import ENTRY_POINT_GROUP, scheme_of
 from tinyjobs.exceptions import UnknownBackendError, UnsupportedCapabilityError
 
 
@@ -72,6 +72,14 @@ class BackendResolutionTests(unittest.TestCase):
     def test_a_url_without_a_scheme_is_rejected(self):
         with self.assertRaises(UnknownBackendError):
             load_backend("jobs.db")
+
+    def test_a_url_without_a_scheme_is_never_repeated_back(self):
+        with self.assertRaises(UnknownBackendError) as caught:
+            load_backend("host=db password=Zq9secret")
+        self.assertNotIn("Zq9secret", str(caught.exception))
+
+    def test_leading_whitespace_before_the_scheme_is_ignored(self):
+        self.assertEqual(scheme_of(" \tsqlite:///jobs.db"), "sqlite")
 
     def test_the_entry_point_group_is_stable(self):
         self.assertEqual(ENTRY_POINT_GROUP, "tinyjobs.backends")

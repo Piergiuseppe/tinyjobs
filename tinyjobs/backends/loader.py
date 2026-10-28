@@ -7,6 +7,7 @@ from ..exceptions import UnknownBackendError
 
 ENTRY_POINT_GROUP = "tinyjobs.backends"
 SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
+LEADING = "".join(map(chr, range(33)))
 
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
 _BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
@@ -30,7 +31,7 @@ def scheme_of(url: str) -> str:
     scheme = _scheme(url)
     if not scheme:
         raise UnknownBackendError(
-            f"{url!r} has no scheme; a backend url looks like 'sqlite:///jobs.db'"
+            "the backend url has no scheme; a backend url looks like 'sqlite:///jobs.db'"
         )
     return scheme
 
@@ -49,7 +50,7 @@ def available_schemes() -> list[str]:
 
 
 def _scheme(url: str) -> str:
-    found = SCHEME.match(url)
+    found = SCHEME.match(url.lstrip(LEADING))
     return found.group(0).lower() if found else ""
 
 

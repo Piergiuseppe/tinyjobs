@@ -1340,6 +1340,29 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ConfigurationError, "another setup"):
                     await asyncio.wait_for(again.setup(), 5)
 
+    async def test_a_rebuild_lock_held_by_a_role_that_cannot_own_the_tables_is_ignored(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
+        stranger = await self.role()
+        async with await psycopg.AsyncConnection.connect(
+            signed_in_as(POSTGRES_URL, stranger), autocommit=True
+        ) as squatting:
+            await squatting.execute("SELECT pg_advisory_lock(%s)", [live._tables.rebuild_lock])
+            starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(starting.close)
+            started = time.monotonic()
+            with mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 5):
+                await asyncio.wait_for(starting.setup(), 10)
+            self.assertLess(time.monotonic() - started, 3)
+        found = await sql(
+            "SELECT 1 FROM pg_indexes WHERE indexname = %(name)s", {"name": f"{prefix}_jobs_dedup"}
+        )
+        self.assertEqual(found, [(1,)])
+
     async def test_setups_queued_behind_a_held_table_do_not_each_wait_for_it(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
@@ -1508,6 +1531,69 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             blocking.commit()
             self.assertEqual(blocking.execute("SHOW jit").fetchone(), ("on",))
         self.assertEqual(await sql(f'SELECT jit FROM "{self.prefix}_seen"'), [("off",)] * 3)
+
+    async def test_an_uncompiled_tx_enqueue_costs_at_most_one_more_round_trip(self):
+        await self.backend.setup()
+        joining = self.backend._joining
+        counted: list[int] = []
+
+        def counting(*args):
+            steps = joining(*args)
+            counted.append(0)
+            rows = None
+            while True:
+                try:
+                    step = steps.send(rows)
+                except StopIteration as finished:
+                    return finished.value
+                counted[-1] += 1
+                rows = yield step
+
+        async def trips(compiling: bool, opened: bool) -> int:
+            self.backend._compiling = compiling
+            async with await psycopg.AsyncConnection.connect(
+                POSTGRES_URL, autocommit=not opened
+            ) as caller:
+                await self.backend.aenqueue_in(caller, [make_job()])
+                with (
+                    mock.patch.object(self.backend, "_joining", counting),
+                    mock.patch.object(
+                        postgres_backend, "_within", wraps=postgres_backend._within
+                    ) as began,
+                ):
+                    await self.backend.aenqueue_in(caller, [make_job()])
+                self.assertFalse(began.called)
+                if opened:
+                    await caller.commit()
+            return counted[-1]
+
+        self.assertEqual(await trips(True, False), await trips(False, False))
+        self.assertLessEqual(await trips(True, True), await trips(False, True) + 1)
+
+    async def test_a_tx_enqueue_that_reconnects_to_check_the_store_still_restores_jit(self):
+        await self.backend.setup()
+        self.backend._compiling = True
+        real = self.backend._identity
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as caller:
+            await caller.execute("SET LOCAL jit = on")
+            self.backend._identity = (real[0], real[1], "not-the-cluster")
+            await self.backend.aenqueue_in(caller, [make_job()])
+            self.assertEqual(self.backend._identity, real)
+            self.assertEqual(await (await caller.execute("SHOW jit")).fetchone(), ("on",))
+            self.backend._identity = ("another", "stale", None)
+            self.backend._joined.clear()
+            with self.assertRaises(ConfigurationError):
+                await self.backend.aenqueue_in(caller, [make_job()])
+            self.assertEqual(await (await caller.execute("SHOW jit")).fetchone(), ("on",))
+            await caller.rollback()
+        with psycopg.Connection.connect(POSTGRES_URL) as blocking:
+            blocking.execute("SET LOCAL jit = on")
+            self.backend._identity = ("another", "stale", None)
+            self.backend._joined.clear()
+            with self.assertRaises(ConfigurationError):
+                self.backend.enqueue_in(blocking, [make_job()])
+            self.assertEqual(blocking.execute("SHOW jit").fetchone(), ("on",))
+            blocking.rollback()
 
     @unittest.skipUnless(
         PostgresBackend is not None and JIT_AVAILABLE, "the server cannot compile statements"
@@ -2468,6 +2554,10 @@ class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
                     PostgresBackend.from_url(conninfo)
                 self.assertNotIn("Secret", str(caught.exception))
 
+    def test_whitespace_before_the_scheme_is_dropped_from_a_postgres_url(self):
+        backend = PostgresBackend.from_url(" \n" + POSTGRES_URL)
+        self.assertEqual(backend._conninfo, POSTGRES_URL)
+
     def test_a_scheme_in_capitals_is_read_as_a_postgres_url(self):
         backend = PostgresBackend.from_url(POSTGRES_URL.replace("postgresql://", "PostgreSQL://", 1))
         self.assertTrue(backend._conninfo.startswith("postgresql://"))
@@ -2692,7 +2782,8 @@ class PostgresClockTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_host_whose_clock_runs_an_hour_ahead_leaves_live_leases_alone(self):
         here = await self.open()
-        job = await here.enqueue(make_job(run_at=time.time(), created_at=time.time()))
+        now = await server_time()
+        job = await here.enqueue(make_job(run_at=now, created_at=now))
         [claimed] = await here.claim(
             worker_id="here", queues=["default"], limit=1, lease_seconds=30.0
         )
@@ -3763,7 +3854,7 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
     async def haunted(self, backend: PostgresBackend, connection) -> tuple[str, dict]:
         query, parameters = backend._claiming(await backend._now(), ["default"], "w", 1, 60.0)
         backend._ghosts[parameters["token"]] = postgres_backend._Ghost(
-            "w", parameters["token"], await self.own_backend(connection)
+            "w", parameters["token"], await self.own_backend(connection), 60.0
         )
         return query, parameters
 
@@ -3807,34 +3898,32 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             job = await self.claim_until_taken(backend, 10)
         self.assertEqual((job.id, job.attempts), (stored.id, 1))
 
-    async def test_a_ghost_still_running_is_handed_back_once_it_commits(self):
+    async def test_a_ghost_still_running_is_ended_before_it_takes_its_jobs(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
         backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
         self.addAsyncCleanup(backend.close)
         await backend.setup()
-        stored = await backend.enqueue(make_job())
-        await self.slow_claims(prefix, 1.5)
+        stored = await backend.enqueue(make_job(max_attempts=1))
+        await self.slow_claims(prefix, 30)
         async with await psycopg.AsyncConnection.connect(
             POSTGRES_URL, autocommit=True
         ) as lost:
             query, parameters = await self.haunted(backend, lost)
             claiming = asyncio.create_task(lost.execute(query, parameters))
             await asyncio.sleep(0.5)
+            started = time.monotonic()
             await backend._exorcise()
-            self.assertEqual(len(backend._ghosts), 1)
-            await (await claiming).fetchall()
-            self.assertEqual(await self.jobs(prefix), [("running", 1, "w")])
-            await backend._exorcise()
-            self.assertEqual(await self.jobs(prefix), [("queued", 0, None)])
-            self.assertEqual(len(backend._ghosts), 1)
+            self.assertLess(time.monotonic() - started, 2)
+            with self.assertRaises(psycopg.OperationalError):
+                await claiming
+        self.assertEqual(backend._ghosts, {})
+        self.assertEqual(await self.jobs(prefix), [("queued", 0, None)])
+        await sql(f'DROP TRIGGER slow ON "{prefix}_executions"')
         [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
         self.assertEqual((job.id, job.attempts), (stored.id, 1))
-        self.assertEqual(
-            await sql(f'SELECT count(*) FROM "{prefix}_executions"'), [(1,)]
-        )
 
-    async def test_a_ghost_on_an_untracked_backend_is_still_handed_back(self):
+    async def test_a_ghost_on_an_untracked_backend_is_handed_back_and_laid(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
         backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
@@ -3847,7 +3936,7 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             query, parameters = await self.haunted(backend, lost)
             self.assertEqual(len(await (await lost.execute(query, parameters)).fetchall()), 1)
             await backend._exorcise()
-            self.assertEqual(len(backend._ghosts), 1)
+            self.assertEqual(backend._ghosts, {})
         [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
         self.assertEqual((job.id, job.attempts), (stored.id, 1))
 
@@ -3863,22 +3952,60 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         ) as lost:
             query, parameters = await self.haunted(backend, lost)
             await backend._exorcise()
-            self.assertEqual(await (await lost.execute("SELECT 1")).fetchone(), (1,))
+            await lost.execute("BEGIN")
+            await lost.execute("SELECT 1")
             other = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
             self.addAsyncCleanup(other.close)
             await other.setup()
             await backend._exorcise()
             self.assertEqual(len(backend._ghosts), 1)
             self.assertEqual(len(await (await lost.execute(query, parameters)).fetchall()), 1)
+            await lost.execute("COMMIT")
             await backend._exorcise()
             self.assertEqual(await self.jobs(prefix), [("queued", 0, None)])
-            pid = lost.info.backend_pid
-        while await sql("SELECT 1 FROM pg_stat_activity WHERE pid = %(pid)s", {"pid": pid}):
-            await asyncio.sleep(0.05)
-        await backend._exorcise()
-        self.assertEqual(backend._ghosts, {})
+            self.assertEqual(backend._ghosts, {})
         [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
         self.assertEqual((job.id, job.attempts), (stored.id, 1))
+
+    async def test_a_ghost_whose_backend_went_back_to_work_is_laid(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, notify=False)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        async with await psycopg.AsyncConnection.connect(
+            POSTGRES_URL, autocommit=True
+        ) as pooled:
+            await self.haunted(backend, pooled)
+            await backend._exorcise()
+            await backend._exorcise()
+            self.assertEqual(len(backend._ghosts), 1)
+            self.assertEqual(await (await pooled.execute("SELECT 1")).fetchone(), (1,))
+            await backend._exorcise()
+            self.assertEqual(backend._ghosts, {})
+            self.assertEqual(await (await pooled.execute("SELECT 1")).fetchone(), (1,))
+
+    async def test_a_ghost_whose_backend_sits_idle_costs_no_waits(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, notify=False)
+        await backend.setup()
+        async with await psycopg.AsyncConnection.connect(
+            POSTGRES_URL, autocommit=True
+        ) as parted:
+            await self.haunted(backend, parted)
+            await backend._exorcise()
+            self.assertEqual(len(backend._ghosts), 1)
+            started = time.monotonic()
+            await backend.wait_for_jobs(worker_id="w", queues=["default"], timeout=2.5)
+            self.assertGreater(time.monotonic() - started, 2.4)
+            swept = backend._swept
+            await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
+            self.assertEqual(backend._swept, swept)
+            started = time.monotonic()
+            await backend.close()
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(await (await parted.execute("SELECT 1")).fetchone(), (1,))
 
     async def test_a_ghost_on_a_backend_serving_someone_else_never_waits_for_it(self):
         prefix = new_prefix()
@@ -3901,7 +4028,7 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await backend._exorcise()
             self.assertLess(time.monotonic() - started, 1.0)
             self.assertEqual(await self.jobs(prefix), [("queued", 0, None)])
-            self.assertEqual(len(backend._ghosts), 1)
+            self.assertEqual(backend._ghosts, {})
             await busy
             await old.execute("ROLLBACK")
         [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
@@ -3955,6 +4082,9 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             POSTGRES_URL, autocommit=True
         ) as lost:
             await self.haunted(backend, lost)
+            busy = asyncio.create_task(lost.execute("SELECT pg_sleep(4)"))
+            self.addAsyncCleanup(asyncio.wait, [busy])
+            await asyncio.sleep(0.2)
             backend._swept = float("-inf")
             for _ in range(3):
                 await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
@@ -3997,12 +4127,14 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         await backend.setup()
         async with await psycopg.AsyncConnection.connect(url, autocommit=True) as reused:
             pid, born = await self.own_backend(reused)
-            backend._ghosts["t"] = postgres_backend._Ghost("w", "t", (pid, born - timedelta(hours=1)))
+            backend._ghosts["ab" * 16] = postgres_backend._Ghost(
+                "w", "ab" * 16, (pid, born - timedelta(hours=1)), 60.0
+            )
             await backend._exorcise()
             self.assertEqual(backend._ghosts, {})
             self.assertEqual(await (await reused.execute("SELECT 1")).fetchone(), (1,))
 
-    async def test_a_ghost_on_a_backend_the_sweep_cannot_see_is_kept(self):
+    async def test_a_ghost_on_a_backend_of_another_role_is_laid(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
         login, owner = await self.session_role()
@@ -4013,28 +4145,34 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         await backend.setup()
         async with await psycopg.AsyncConnection.connect(
             POSTGRES_URL, autocommit=True
-        ) as hidden:
-            backend._ghosts["t"] = postgres_backend._Ghost("w", "t", await self.own_backend(hidden))
+        ) as stranger:
+            backend._ghosts["ab" * 16] = postgres_backend._Ghost(
+                "w", "ab" * 16, await self.own_backend(stranger), 60.0
+            )
             await backend._exorcise()
-            self.assertEqual(list(backend._ghosts), ["t"])
+            self.assertEqual(backend._ghosts, {})
+            self.assertEqual(await (await stranger.execute("SELECT 1")).fetchone(), (1,))
 
-    async def test_closing_hands_back_a_ghost_that_lands_while_it_closes(self):
+    async def test_closing_ends_a_ghost_still_running_so_it_takes_nothing(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
         backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
         await backend.setup()
-        await backend.enqueue(make_job())
-        await self.slow_claims(prefix, 1.5)
+        await backend.enqueue(make_job(max_attempts=1))
+        await self.slow_claims(prefix, 8)
         async with await psycopg.AsyncConnection.connect(
             POSTGRES_URL, autocommit=True
         ) as lost:
             query, parameters = await self.haunted(backend, lost)
             claiming = asyncio.create_task(lost.execute(query, parameters))
             await asyncio.sleep(0.3)
-            closing = asyncio.create_task(backend.close())
-            await claiming
-        await closing
+            started = time.monotonic()
+            await backend.close()
+            self.assertLess(time.monotonic() - started, 3)
+            with self.assertRaises(psycopg.OperationalError):
+                await claiming
         self.assertEqual(await self.jobs(prefix), [("queued", 0, None)])
+        self.assertEqual(await sql(f'SELECT count(*) FROM "{prefix}_executions"'), [(0,)])
 
     async def test_a_slow_claim_given_up_for_want_of_connections_gives_its_jobs_back(self):
         prefix = new_prefix()
@@ -4112,6 +4250,24 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(psycopg.OperationalError, "did not answer"):
                     await asyncio.wait_for(backend.complete(job, None), 20)
                 self.assertLess(time.monotonic() - started, 4)
+
+    async def test_a_dead_pooled_connection_costs_the_probe_a_second_not_its_whole_budget(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        async with stalling_proxy() as (url, frozen):
+            backend = PostgresBackend.from_url(
+                url, prefix=prefix, min_connections=2, max_connections=2, notify=False
+            )
+            self.addAsyncCleanup(backend.close)
+            await backend.setup()
+            await asyncio.gather(backend.get("x"), backend.get("y"))
+            frozen.set()
+            started = time.monotonic()
+            postgres_backend._PROBING.set(True)
+            verdict = await backend._asked_pooled(1, None, 20.0, 300.0)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(verdict)
+        self.assertLess(elapsed, postgres_backend.PROBE_POOL_SECONDS + 1.5)
 
     async def test_the_probe_never_ends_a_session_that_reused_the_pid(self):
         from datetime import timedelta
@@ -4204,6 +4360,25 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(postgres_backend._ready_now(fileno, psycopg.waiting.WAIT_R), 0)
         far.send(b"x")
         self.assertEqual(postgres_backend._ready_now(fileno, both), psycopg.waiting.READY_RW)
+
+    def test_a_platform_without_poll_still_reads_what_the_server_sent(self):
+        import socket
+
+        near, far = socket.socketpair()
+        self.addCleanup(near.close)
+        self.addCleanup(far.close)
+        both = psycopg.waiting.WAIT_RW
+        with mock.patch.object(postgres_backend, "POLLABLE", False), mock.patch.object(
+            postgres_backend.select, "poll", side_effect=AttributeError("poll")
+        ):
+            self.assertEqual(postgres_backend._ready_now(near.fileno(), psycopg.waiting.WAIT_R), 0)
+            self.assertEqual(
+                postgres_backend._ready_now(near.fileno(), both), psycopg.waiting.READY_W
+            )
+            far.send(b"x")
+            self.assertEqual(
+                postgres_backend._ready_now(near.fileno(), both), psycopg.waiting.READY_RW
+            )
 
     async def claimed_on(self, backend: PostgresBackend):
         await backend.enqueue(make_job())

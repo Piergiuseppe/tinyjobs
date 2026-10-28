@@ -118,10 +118,41 @@ _LEFT: contextvars.ContextVar[tuple[int, Any] | None] = contextvars.ContextVar(
 _PROBING: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "tinyjobs_postgres_probing", default=False
 )
-ALIVE = (
-    "SELECT pid, backend_start FROM pg_catalog.pg_stat_activity "
-    "WHERE pid OPERATOR(pg_catalog.=) ANY(%(pids)s::integer[])"
-)
+ALIVE = """
+    SELECT pid, backend_start, state, state_change,
+           usesysid OPERATOR(pg_catalog.=) (
+               SELECT usesysid FROM pg_catalog.pg_stat_activity
+                WHERE pid OPERATOR(pg_catalog.=) pg_catalog.pg_backend_pid()
+           ) AS mine
+      FROM pg_catalog.pg_stat_activity
+     WHERE pid OPERATOR(pg_catalog.=) ANY(%(pids)s::integer[])
+"""
+CLAIMING = """
+    SELECT pg_catalog.pg_terminate_backend(activity.pid, %(wait)s) AS ended
+      FROM ROWS FROM (
+               pg_catalog.unnest(%(pids)s::integer[]),
+               pg_catalog.unnest(%(borns)s::pg_catalog.timestamptz[]),
+               pg_catalog.unnest(%(highs)s::bigint[]),
+               pg_catalog.unnest(%(lows)s::bigint[])
+           ) AS ghost (pid, born, high, low)
+      JOIN pg_catalog.pg_stat_activity AS activity
+        ON activity.pid OPERATOR(pg_catalog.=) ghost.pid
+       AND activity.backend_start OPERATOR(pg_catalog.=) ghost.born
+     WHERE EXISTS (
+           SELECT FROM pg_catalog.pg_locks AS held
+            WHERE held.pid OPERATOR(pg_catalog.=) ghost.pid
+              AND held.locktype OPERATOR(pg_catalog.=) 'advisory' AND held.granted
+              AND held.database OPERATOR(pg_catalog.=) (
+                  SELECT oid FROM pg_catalog.pg_database
+                   WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+              )
+              AND held.classid OPERATOR(pg_catalog.=) ghost.high::pg_catalog.oid
+              AND held.objid OPERATOR(pg_catalog.=) ghost.low::pg_catalog.oid
+              AND held.objsubid OPERATOR(pg_catalog.=) 1
+     )
+"""
+ENDING_CLAIM_MILLISECONDS = 1000
+FRESH = "SELECT pg_catalog.pg_stat_clear_snapshot()"
 PROBE_POOL_SECONDS = 1.0
 GHOST_SECONDS = 1.0
 SETTLE_SECONDS = 5.0
@@ -130,12 +161,42 @@ ENDING = (
     "WHERE pid OPERATOR(pg_catalog.=) %(pid)s AND backend_start OPERATOR(pg_catalog.=) %(born)s "
     "AND state_change OPERATOR(pg_catalog.=) %(seen)s"
 )
+REBUILDERS = """
+    SELECT pg_catalog.count(*) AS rebuilders
+      FROM pg_catalog.pg_locks AS held
+      JOIN pg_catalog.pg_stat_activity AS activity
+        ON activity.pid OPERATOR(pg_catalog.=) held.pid
+     WHERE held.locktype OPERATOR(pg_catalog.=) 'advisory' AND held.granted
+       AND held.database OPERATOR(pg_catalog.=) (
+           SELECT oid FROM pg_catalog.pg_database
+            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+       )
+       AND held.classid OPERATOR(pg_catalog.=) %(high)s::pg_catalog.oid
+       AND held.objid OPERATOR(pg_catalog.=) %(low)s::pg_catalog.oid
+       AND held.objsubid OPERATOR(pg_catalog.=) 1
+       AND pg_catalog.pg_has_role(activity.usesysid, (
+           SELECT c.relowner FROM pg_catalog.pg_class AS c
+             JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+            WHERE c.relname OPERATOR(pg_catalog.=) %(jobs)s::pg_catalog.name
+              AND n.nspname OPERATOR(pg_catalog.=) %(schema)s::pg_catalog.name
+       ), 'MEMBER')
+"""
 JIT_AVAILABLE = "SELECT pg_catalog.pg_jit_available() AS available"
-UNCOMPILED = (
-    "SELECT pg_catalog.current_setting('jit') AS jit, "
-    "pg_catalog.set_config('jit', 'off', true) AS off"
+UNCOMPILED = ("SELECT pg_catalog.set_config('jit', 'off', true)", {})
+KEPT_UNCOMPILED = (
+    "SELECT pg_catalog.set_config('tinyjobs.jit', CASE WHEN kept.jit "
+    "OPERATOR(pg_catalog.<>) ''::pg_catalog.text THEN kept.jit "
+    "ELSE pg_catalog.current_setting('jit') END, true), "
+    "pg_catalog.set_config('jit', 'off', true) "
+    "FROM (SELECT pg_catalog.current_setting('tinyjobs.jit', true) AS jit) AS kept",
+    {},
 )
-RECOMPILED = "SELECT pg_catalog.set_config('jit', %(jit)s, true) AS jit"
+RECOMPILED = (
+    "SELECT pg_catalog.set_config('jit', kept.jit, true), "
+    "pg_catalog.set_config('tinyjobs.jit', '', true) "
+    "FROM (SELECT pg_catalog.current_setting('tinyjobs.jit', true) AS jit) AS kept "
+    "WHERE kept.jit OPERATOR(pg_catalog.<>) ''::pg_catalog.text"
+)
 ENQUEUE_BATCH = 1000
 ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
@@ -144,6 +205,7 @@ RETRIES = 3
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
 PIPELINED = psycopg.Pipeline.is_supported()
+POLLABLE = hasattr(select, "poll")
 HELD = all(
     hasattr(kind, name)
     for kind, name in (
@@ -482,12 +544,30 @@ class PostgresBackend(BaseBackend):
             taken = (await cursor.fetchone())["taken"]
             if taken and not waited:
                 return True
+            if not taken and not await self._rebuilders(connection, placed):
+                return True
             if not await self._misplaced(connection, placed):
                 return None
             if taken or time.monotonic() >= deadline:
                 return False
             waited = True
             await asyncio.sleep(REBUILD_LOCK_PAUSE)
+
+    async def _rebuilders(
+        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+    ) -> int:
+        key = self._tables.rebuild_lock % 2**64
+        [row] = await _fetch(
+            connection,
+            REBUILDERS,
+            {
+                "high": key >> 32,
+                "low": key & 0xFFFFFFFF,
+                "jobs": f"{self._tables.prefix}_jobs",
+                "schema": placed.within.schema,
+            },
+        )
+        return row["rebuilders"]
 
     async def _duplicates(
         self, connection: psycopg.AsyncConnection, name: str, jobs: str
@@ -624,7 +704,7 @@ class PostgresBackend(BaseBackend):
                 async with asyncio.timeout(SETTLE_SECONDS):
                     while True:
                         await self._exorcise()
-                        if not self._ghosts:
+                        if all(ghost.stale for ghost in self._ghosts.values()):
                             break
                         await asyncio.sleep(GHOST_SECONDS)
         await self._pool.close()
@@ -633,7 +713,7 @@ class PostgresBackend(BaseBackend):
         self, *, worker_id: str, queues: Sequence[str], timeout: float
     ) -> None:
         if self._ghosts:
-            timeout = min(timeout, GHOST_SECONDS)
+            timeout = min(timeout, self._pause())
         if not self._notify or self._closed or self._channel is None:
             await asyncio.sleep(timeout)
             return
@@ -734,27 +814,47 @@ class PostgresBackend(BaseBackend):
         except BaseException as error:
             if _unanswered(error):
                 token = parameters["token"]
-                self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get())
+                self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get(), lease_seconds)
                 self._swept = -math.inf
             raise
         finally:
             _PATIENCE.reset(patience)
         return [job_from_row(row) for row in rows]
 
+    def _pause(self) -> float:
+        ghosts = self._ghosts.values()
+        if not all(ghost.stale for ghost in ghosts):
+            return GHOST_SECONDS
+        return max(GHOST_SECONDS, min(ghost.lease for ghost in ghosts) / 3)
+
     async def _haunted(self) -> None:
-        if time.monotonic() - self._swept >= GHOST_SECONDS:
+        if time.monotonic() - self._swept >= self._pause():
             await self._exorcise()
 
     async def _exorcise(self) -> None:
         self._swept = time.monotonic()
         ghosts = list(self._ghosts.values())
         async with self._connection() as connection:
-            pids = sorted({ghost.backend[0] for ghost in ghosts if ghost.backend is not None})
+            haunting = [ghost for ghost in ghosts if ghost.backend is not None]
             seen: list[dict[str, Any]] = []
-            if pids:
+            if haunting:
+                keys = [_claim_key(ghost.token) % 2**64 for ghost in haunting]
                 async with _within(connection):
                     await connection.execute(UNROLED)
-                    seen = await _fetch(connection, ALIVE, {"pids": pids})
+                    await connection.execute(
+                        CLAIMING,
+                        {
+                            "pids": [ghost.backend[0] for ghost in haunting],
+                            "borns": [ghost.backend[1] for ghost in haunting],
+                            "highs": [key >> 32 for key in keys],
+                            "lows": [key & 0xFFFFFFFF for key in keys],
+                            "wait": ENDING_CLAIM_MILLISECONDS,
+                        },
+                    )
+                    await connection.execute(FRESH)
+                    seen = await _fetch(
+                        connection, ALIVE, {"pids": sorted({ghost.backend[0] for ghost in haunting})}
+                    )
             rows = await _fetch(
                 connection,
                 self._queries.unclaim,
@@ -763,8 +863,9 @@ class PostgresBackend(BaseBackend):
                     "tokens": [ghost.token for ghost in ghosts],
                 },
             )
+        landed = {row["token"] for row in rows}
         for ghost in ghosts:
-            if _laid(ghost, seen):
+            if ghost.token in landed or _laid(ghost, seen):
                 self._ghosts.pop(ghost.token, None)
         if rows:
             logger.warning(
@@ -796,6 +897,7 @@ class PostgresBackend(BaseBackend):
             lease=now + lease_seconds,
             seconds=lease_seconds,
             token=token,
+            key=_claim_key(token),
         )
 
     async def heartbeat(
@@ -1042,17 +1144,27 @@ class PostgresBackend(BaseBackend):
                 "aenqueue or asend"
             )
         _check_held(connection)
+        owned = _owned(connection)
+        wrapping = self._wrapping(jobs, owned)
         with self._refusing():
             try:
-                with _atomic(connection, jobs, self._compiling):
-                    return _stepped(connection, self._joining(connection, jobs))
-            except _Elsewhere as elsewhere:
-                with psycopg.Connection.connect(self._conninfo, **self._direct_options()) as own:
-                    for statement, parameters in self._settings():
-                        own.execute(statement, parameters)
-                    self._settle(_stepped(own, self._identifying()), elsewhere.identity)
-                with _atomic(connection, jobs, self._compiling):
-                    return _stepped(connection, self._joining(connection, jobs))
+                try:
+                    with _atomic(connection, wrapping):
+                        return _stepped(connection, self._joining(connection, jobs, owned))
+                except _Elsewhere as elsewhere:
+                    with psycopg.Connection.connect(
+                        self._conninfo, **self._direct_options()
+                    ) as own:
+                        for statement, parameters in self._settings():
+                            own.execute(statement, parameters)
+                        self._settle(_stepped(own, self._identifying()), elsewhere.identity)
+                    with _atomic(connection, wrapping):
+                        return _stepped(connection, self._joining(connection, jobs, owned))
+            except Exception:
+                if self._compiling and not owned and _restorable(connection):
+                    with suppress(psycopg.Error):
+                        _stepped(connection, _recompiling())
+                raise
 
     async def aenqueue_in(self, tx: Any, jobs: Sequence[Job]) -> list[Job]:
         connection = _connection_of(tx)
@@ -1062,19 +1174,32 @@ class PostgresBackend(BaseBackend):
                 "enqueue or send"
             )
         _check_held(connection)
+        owned = _owned(connection)
+        wrapping = self._wrapping(jobs, owned)
         with self._refusing():
             try:
-                async with _atomic(connection, jobs, self._compiling):
-                    return await _driven(connection, self._joining(connection, jobs))
-            except _Elsewhere as elsewhere:
-                async with await psycopg.AsyncConnection.connect(
-                    self._conninfo, **self._direct_options()
-                ) as own:
-                    for statement, parameters in self._settings():
-                        await own.execute(statement, parameters)
-                    self._settle(await _driven(own, self._identifying()), elsewhere.identity)
-                async with _atomic(connection, jobs, self._compiling):
-                    return await _driven(connection, self._joining(connection, jobs))
+                try:
+                    async with _atomic(connection, wrapping):
+                        return await _driven(connection, self._joining(connection, jobs, owned))
+                except _Elsewhere as elsewhere:
+                    async with await psycopg.AsyncConnection.connect(
+                        self._conninfo, **self._direct_options()
+                    ) as own:
+                        for statement, parameters in self._settings():
+                            await own.execute(statement, parameters)
+                        self._settle(
+                            await _driven(own, self._identifying()), elsewhere.identity
+                        )
+                    async with _atomic(connection, wrapping):
+                        return await _driven(connection, self._joining(connection, jobs, owned))
+            except Exception:
+                if self._compiling and not owned and _restorable(connection):
+                    with suppress(psycopg.Error):
+                        await _driven(connection, _recompiling())
+                raise
+
+    def _wrapping(self, jobs: Sequence[Job], owned: bool) -> bool:
+        return owned and (_split(jobs) or (self._compiling and not PIPELINED))
 
     @contextmanager
     def _refusing(self) -> Iterator[None]:
@@ -1093,12 +1218,12 @@ class PostgresBackend(BaseBackend):
                 "tinyjobs never writes through them"
             ) from None
 
-    def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
+    def _joining(self, connection: Any, jobs: Sequence[Job], owned: bool) -> Steps[list[Job]]:
         queries = self._queries
         if self._identity is None:
             raise RuntimeError("call setup() before enqueueing inside a transaction")
         prefix = self._tables.prefix
-        guard: tuple[Any, ...] = (
+        located = (
             queries.located,
             {
                 "schema": queries.schema,
@@ -1106,32 +1231,33 @@ class PostgresBackend(BaseBackend):
                 "meta": f"{prefix}_meta",
             },
         )
-        compiling = self._compiling
-        if compiling:
-            [kept] = yield UNCOMPILED, {}
+        uncompiled: tuple[Any, ...] = ()
+        if self._compiling:
+            uncompiled = (UNCOMPILED,) if owned else (KEPT_UNCOMPILED,)
+        guards = (*uncompiled, located)
         if connection not in self._joined:
-            [found] = yield guard
+            [found] = yield (*located, *uncompiled)
             identity = None
             if found["tables"] == len(TABLE_KINDS) and found["meta"]:
                 identity = yield from self._identifying()
             if not _same_store(self._identity, identity):
                 raise _Elsewhere(identity)
             self._joined[connection] = True
-            guard = ()
+            guards = uncompiled
         now = self._clock.now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
         stored: list[Job] = []
         for batch in _batches(ordered):
-            stored.extend((yield from self._inserting(batch, now, due, guard)))
-            guard = ()
+            stored.extend((yield from self._inserting(batch, now, due, guards, uncompiled)))
+            guards = uncompiled
+        notify: tuple[Any, ...] = ()
         if self._notify and due:
-            yield queries.notify, {
-                "channel": self._channel,
-                "queues": sorted(due),
-            }
-        if compiling:
-            yield RECOMPILED, {"jit": kept["jit"]}
+            notify = ((queries.notify, {"channel": self._channel, "queues": sorted(due)}),)
+        if self._compiling and not owned:
+            yield (RECOMPILED, {}, *notify)
+        elif notify:
+            yield notify[0]
         return _in_order(places, copies, len(jobs), stored)
 
     def _identifying(self) -> Steps[tuple[Any, ...] | None]:
@@ -1190,7 +1316,8 @@ class PostgresBackend(BaseBackend):
         jobs: Sequence[Job],
         now: float,
         due: set[str],
-        guard: tuple[Any, ...] = (),
+        guards: tuple[Any, ...] = (),
+        uncompiled: tuple[Any, ...] = (),
     ) -> Steps[list[Job]]:
         queries = self._queries
         resolved: dict[int, Job] = {}
@@ -1198,8 +1325,8 @@ class PostgresBackend(BaseBackend):
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
-            rows = yield (queries.insert, self._at(now, **parameters), *guard)
-            guard = ()
+            rows = yield (queries.insert, self._at(now, **parameters), *guards)
+            guards = uncompiled
             inserted = {row["id"] for row in rows}
             due.update(row["queue"] for row in rows if row["due"])
             missing = [(index, job) for index, job in pending if job.id not in inserted]
@@ -1366,9 +1493,9 @@ class PostgresBackend(BaseBackend):
             return None
         seen: list[dict[str, Any] | None] = []
         try:
-            async with asyncio.timeout(PROBE_SECONDS), _within(probe):
+            async with asyncio.timeout(PROBE_POOL_SECONDS) as limit, _within(probe):
                 await probe.execute(UNROLED)
-                return await _asking(probe, pid, born, quiet, patience, seen)
+                return await _asking(probe, pid, born, quiet, patience, seen, limit)
         except (TimeoutError, psycopg.Error):
             return False if seen else None
         finally:
@@ -1554,7 +1681,7 @@ def _userinfo_secret(conninfo: str) -> str:
 
 
 def _lowered(conninfo: str) -> str:
-    return URI_SCHEME.sub(lambda match: match.group(0).lower(), conninfo, count=1)
+    return URI_SCHEME.sub(lambda match: match.group(0).lstrip().lower(), conninfo, count=1)
 
 
 def _refuse_unknown(options: dict[str, Any]) -> None:
@@ -1675,16 +1802,31 @@ class _Ghost:
     worker_id: str
     token: str
     backend: tuple[int, Any] | None
+    lease: float
+    seen: tuple[Any] | None = None
+    stale: bool = False
+
+
+def _claim_key(token: str) -> int:
+    return int(token[:16], 16) - 2**63
 
 
 def _laid(ghost: _Ghost, seen: list[dict[str, Any]]) -> bool:
     if ghost.backend is None:
         return True
     pid, born = ghost.backend
-    return not any(
-        row["pid"] == pid and (row["backend_start"] is None or row["backend_start"] == born)
-        for row in seen
+    row = next(
+        (row for row in seen if row["pid"] == pid and row["mine"] and row["backend_start"] == born),
+        None,
     )
+    if row is None:
+        return True
+    if ghost.seen is None:
+        ghost.seen = (row["state_change"],)
+    elif row["state"] == "idle" and row["state_change"] != ghost.seen[0]:
+        return True
+    ghost.stale = row["state"] == "idle" and row["state_change"] == ghost.seen[0]
+    return False
 
 
 def _unanswered(error: BaseException) -> bool:
@@ -1808,6 +1950,8 @@ def _busy(row: dict[str, Any], quiet: float, patience: float) -> bool:
 
 
 def _ready_now(fileno: int, state: int) -> int:
+    if not POLLABLE:
+        return _selected_now(fileno, state)
     poller = select.poll()
     poller.register(
         fileno,
@@ -1820,6 +1964,18 @@ def _ready_now(fileno: int, state: int) -> int:
     broken = seen & (select.POLLERR | select.POLLHUP | select.POLLNVAL)
     return (waiting.READY_R if state & waiting.WAIT_R and seen & select.POLLIN or broken else 0) | (
         waiting.READY_W if state & waiting.WAIT_W and seen & select.POLLOUT or broken else 0
+    )
+
+
+def _selected_now(fileno: int, state: int) -> int:
+    readable, writable, broken = select.select(
+        [fileno] if state & waiting.WAIT_R else [],
+        [fileno] if state & waiting.WAIT_W else [],
+        [fileno],
+        0,
+    )
+    return (waiting.READY_R if readable or broken and state & waiting.WAIT_R else 0) | (
+        waiting.READY_W if writable or broken and state & waiting.WAIT_W else 0
     )
 
 
@@ -1854,13 +2010,28 @@ class _Elsewhere(Exception):
         self.identity = identity
 
 
-def _atomic(connection: Any, jobs: Sequence[Job], compiling: bool) -> Any:
-    if (
-        (compiling or _split(jobs))
-        and connection.autocommit
+def _owned(connection: Any) -> bool:
+    return (
+        connection.autocommit
         and connection._pipeline is None
         and connection.info.transaction_status == pq.TransactionStatus.IDLE
-    ):
+    )
+
+
+def _restorable(connection: Any) -> bool:
+    status = connection.info.transaction_status
+    return not connection.closed and (
+        status == pq.TransactionStatus.INTRANS
+        or (connection._pipeline is not None and status != pq.TransactionStatus.INERROR)
+    )
+
+
+def _recompiling() -> Steps[None]:
+    yield RECOMPILED, {}
+
+
+def _atomic(connection: Any, wrapping: bool) -> Any:
+    if wrapping:
         if isinstance(connection, psycopg.AsyncConnection):
             return _within(connection)
         return connection.transaction()
@@ -1876,22 +2047,23 @@ def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
     ):
         while True:
             try:
-                query, parameters, *guard = steps.send(rows)
+                query, parameters, *guards = steps.send(rows)
             except StopIteration as finished:
                 return finished.value
             pipeline = connection._pipeline
             if pipeline is not None:
-                if guard:
+                for guard in guards:
                     connection.wait(checking._execute_gen(*guard))
                     connection.wait(pipeline._fetch_gen(flush=True))
                 connection.wait(cursor._execute_gen(query, parameters))
                 connection.wait(pipeline._fetch_gen(flush=True))
-            elif guard and PIPELINED:
+            elif guards and PIPELINED:
                 with connection._pipeline_nolock():
-                    connection.wait(checking._execute_gen(*guard))
+                    for guard in guards:
+                        connection.wait(checking._execute_gen(*guard))
                     connection.wait(cursor._execute_gen(query, parameters, prepare=False))
             else:
-                if guard:
+                for guard in guards:
                     connection.wait(checking._execute_gen(*guard))
                 connection.wait(cursor._execute_gen(query, parameters))
             rows = cursor.fetchall()
@@ -1906,22 +2078,23 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
     ):
         while True:
             try:
-                query, parameters, *guard = steps.send(rows)
+                query, parameters, *guards = steps.send(rows)
             except StopIteration as finished:
                 return finished.value
             pipeline = connection._pipeline
             if pipeline is not None:
-                if guard:
+                for guard in guards:
                     await connection.wait(checking._execute_gen(*guard))
                     await connection.wait(pipeline._fetch_gen(flush=True))
                 await connection.wait(cursor._execute_gen(query, parameters))
                 await connection.wait(pipeline._fetch_gen(flush=True))
-            elif guard and PIPELINED:
+            elif guards and PIPELINED:
                 async with connection._pipeline_nolock():
-                    await connection.wait(checking._execute_gen(*guard))
+                    for guard in guards:
+                        await connection.wait(checking._execute_gen(*guard))
                     await connection.wait(cursor._execute_gen(query, parameters, prepare=False))
             else:
-                if guard:
+                for guard in guards:
                     await connection.wait(checking._execute_gen(*guard))
                 await connection.wait(cursor._execute_gen(query, parameters))
             rows = await cursor.fetchall()
@@ -1934,9 +2107,12 @@ async def _asking(
     quiet: float,
     patience: float,
     seen: list[dict[str, Any] | None],
+    limit: asyncio.Timeout | None = None,
 ) -> bool:
     row = await (await probe.execute(RUNNING, {"pid": pid, "born": born})).fetchone()
     seen.append(row)
+    if limit is not None:
+        limit.reschedule(asyncio.get_running_loop().time() + PROBE_SECONDS)
     if row is None or _busy(row, quiet, patience):
         return row is not None
     cursor = await probe.execute(

@@ -224,7 +224,8 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_host_whose_clock_runs_an_hour_ahead_leaves_live_leases_alone(self):
         here = await self.open()
-        job = await here.enqueue(make_job(run_at=time.time(), created_at=time.time()))
+        now = await self.server_time(here)
+        job = await here.enqueue(make_job(run_at=now, created_at=now))
         [claimed] = await here.claim(
             worker_id="here", queues=["default"], limit=1, lease_seconds=30.0
         )
