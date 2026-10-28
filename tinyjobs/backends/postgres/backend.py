@@ -5,13 +5,14 @@ import hashlib
 import inspect
 import logging
 import math
+import re
 import time
 import weakref
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from functools import cache, partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import psycopg
 from psycopg import errors, pq
@@ -74,6 +75,9 @@ RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.I
 RETRIES = 3
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
+QUOTED = re.compile(r'"([^"]*)"')
+PLACEHOLDER = re.compile(r"%(?:%|\((\w+)\)s)")
+SECRET_SETTING = re.compile(r"password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))")
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
 
@@ -407,9 +411,7 @@ class PostgresBackend(BaseBackend):
 
     async def _listen(self) -> None:
         options = {
-            key: value
-            for key, value in _connection_kwargs(self._conninfo, self._connection_options).items()
-            if key != "row_factory"
+            key: value for key, value in self._direct_options().items() if key != "row_factory"
         }
         while True:
             try:
@@ -809,7 +811,6 @@ class PostgresBackend(BaseBackend):
             if not _same_store(self._identity, identity):
                 raise _Elsewhere(identity)
             self._joined[connection] = True
-            guard = ()
         now = self._clock.now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
@@ -1129,11 +1130,24 @@ def _parsed(conninfo: str) -> dict[str, Any]:
     try:
         return conninfo_to_dict(conninfo)
     except psycopg.ProgrammingError as error:
-        reason = str(error).strip()
-        secret = urlsplit(conninfo).password if "://" in conninfo else None
-        if secret:
-            reason = reason.replace(secret, "***")
+        reason = QUOTED.sub(partial(_masked, _secrets(conninfo)), str(error).strip())
         raise ConfigurationError(f"the postgres url is not valid: {reason}") from None
+
+
+def _secrets(conninfo: str) -> set[str]:
+    found = {match.group(1) or match.group(2) for match in SECRET_SETTING.finditer(conninfo)}
+    if "://" in conninfo:
+        with suppress(ValueError):
+            found.add(urlsplit(conninfo).password or "")
+    found |= {unquote(secret) for secret in found}
+    return {secret for secret in found if secret}
+
+
+def _masked(secrets: set[str], match: re.Match[str]) -> str:
+    token = match.group(1)
+    if any(token in secret or secret in token for secret in secrets):
+        return '"***"'
+    return match.group(0)
 
 
 def _refuse_unknown(options: dict[str, Any]) -> None:
@@ -1264,16 +1278,22 @@ def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
             query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
-        if guard and connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
+        if not guard:
+            with _cursor_on(connection) as cursor:
+                rows = cursor.execute(query, parameters).fetchall()
+        elif connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
             with psycopg.ClientCursor(connection, row_factory=dict_row) as cursor:
-                cursor.execute(_behind(cursor, guard, query, parameters))
+                cursor.execute(_behind(connection, guard, query, parameters))
                 cursor.nextset()
                 rows = cursor.fetchall()
-            continue
-        with _cursor_on(connection) as cursor:
-            if guard:
-                cursor.execute(*guard)
-            rows = cursor.execute(query, parameters).fetchall()
+        else:
+            with _cursor_on(connection) as cursor:
+                with connection.lock:
+                    connection.wait(cursor._execute_gen(*guard))
+                    connection.wait(cursor._execute_gen(query, parameters))
+                with connection.pipeline():
+                    pass
+                rows = cursor.fetchall()
 
 
 async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
@@ -1283,21 +1303,73 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
             query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
-        if guard and connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
+        if not guard:
+            async with _cursor_on(connection) as cursor:
+                await cursor.execute(query, parameters)
+                rows = await cursor.fetchall()
+        elif connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
             async with psycopg.AsyncClientCursor(connection, row_factory=dict_row) as cursor:
-                await cursor.execute(_behind(cursor, guard, query, parameters))
+                await cursor.execute(_behind(connection, guard, query, parameters))
                 cursor.nextset()
                 rows = await cursor.fetchall()
-            continue
-        async with _cursor_on(connection) as cursor:
-            if guard:
-                await cursor.execute(*guard)
-            await cursor.execute(query, parameters)
-            rows = await cursor.fetchall()
+        else:
+            async with _cursor_on(connection) as cursor:
+                async with connection.lock:
+                    await connection.wait(cursor._execute_gen(*guard))
+                    await connection.wait(cursor._execute_gen(query, parameters))
+                async with connection.pipeline():
+                    pass
+                rows = await cursor.fetchall()
 
 
-def _behind(cursor: Any, guard: list[Any], query: str, parameters: dict[str, Any]) -> str:
-    return f"{cursor.mogrify(*guard)};\n{cursor.mogrify(query, parameters)}"
+def _behind(connection: Any, guard: list[Any], query: str, parameters: dict[str, Any]) -> str:
+    escaping = pq.Escaping(connection.pgconn)
+    encoding = connection.info.encoding
+
+    def quoted(value: Any) -> str:
+        text = _spelled(value)
+        if text is None:
+            return "NULL"
+        return escaping.escape_literal(text.encode(encoding)).decode(encoding)
+
+    def bound(statement: str, values: dict[str, Any]) -> str:
+        return PLACEHOLDER.sub(
+            lambda match: quoted(values[match.group(1)]) if match.group(1) else "%",
+            statement,
+        )
+
+    return f"{bound(*guard)};\n{bound(query, parameters)}"
+
+
+def _spelled(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return "{" + ",".join(_element(item) for item in value) + "}"
+    return _scalar(value)
+
+
+def _element(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    text = _scalar(value)
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return repr(value)
+    if isinstance(value, str):
+        return value
+    raise TypeError(f"tinyjobs cannot spell a {type(value).__name__} parameter")
 
 
 async def _fetch(

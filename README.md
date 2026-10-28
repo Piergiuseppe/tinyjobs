@@ -557,13 +557,14 @@ with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
 
 `app.send(name, tx=connection)` and the async calls take it too. The connection must reach the
 database tinyjobs uses, not a copy of it, and the tables must belong to its role or to a role that
-holds its privileges, the same rule as below, or the enqueue raises `ConfigurationError`. In Django, add
+can become it, the same rule as below, or the enqueue raises `ConfigurationError`. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
 Each process holds at most 10 connections (`max_connections=`) plus one for `LISTEN`, every
 statement times out after 30 seconds (`statement_timeout=`), and connections are named `tinyjobs` in
 `pg_stat_activity`. The tables and their schema must belong to the connecting role or a role that
-holds its privileges, and no other role may own a trigger on them or hold `TRIGGER` on them;
+can become it (`SET` on Postgres 16 and later), every role that inherits the owner's privileges must
+be able to become it too, and no other role may own a trigger on them or hold `TRIGGER` on them;
 otherwise pass `schema=` with one it owns. Behind PgBouncer use session
 pooling. A transaction left open for hours anywhere on the server stops autovacuum from cleaning the
 jobs table. Postgres 14 to 18 are supported, and CI tests 14 and 18.
@@ -732,7 +733,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1295 tests, no test dependencies. The one that matters most is
+1302 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

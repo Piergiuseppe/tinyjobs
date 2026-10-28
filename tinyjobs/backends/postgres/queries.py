@@ -22,6 +22,10 @@ def _qualified(kind: str) -> str:
     return kind if " " in kind or kind == "integer" else f"pg_catalog.{kind}"
 
 
+def _carried(kind: str) -> str:
+    return "text" if kind == "bytea" else kind
+
+
 def becoming(role: str) -> str:
     return f"""(CASE
         WHEN pg_catalog.current_setting('server_version_num')::pg_catalog.int4
@@ -31,13 +35,31 @@ def becoming(role: str) -> str:
     END)"""
 
 
+def answering(role: str) -> str:
+    return f"""(
+        {becoming(role)}
+        AND NOT EXISTS (
+            WITH RECURSIVE heirs (id) AS (
+                SELECT m.member FROM pg_catalog.pg_auth_members AS m
+                 WHERE m.roleid OPERATOR(pg_catalog.=) {role}
+                UNION
+                SELECT m.member FROM pg_catalog.pg_auth_members AS m
+                  JOIN heirs ON m.roleid OPERATOR(pg_catalog.=) heirs.id
+            )
+            SELECT FROM heirs
+             WHERE pg_catalog.pg_has_role(heirs.id, {role}, 'USAGE')
+               AND NOT {becoming("heirs.id")}
+        )
+    )"""
+
+
 def trusting(owner: str) -> str:
     database_owner = """(SELECT d.datdba FROM pg_catalog.pg_database AS d
                   WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())"""
     return f"""(
-        {becoming(owner)}
+        {answering(owner)}
         OR ({owner} OPERATOR(pg_catalog.=) pg_catalog.to_regrole('pg_database_owner')
-            AND {becoming(database_owner)})
+            AND {answering(database_owner)})
     )"""
 
 
@@ -72,7 +94,11 @@ class Queries:
             else "%(lease)s::double precision"
         )
         arrays = ", ".join(
-            f"pg_catalog.unnest(%({column})s::{_qualified(kind)}[])"
+            f"pg_catalog.unnest(%({column})s::{_qualified(_carried(kind))}[])"
+            for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
+        )
+        decoded = ", ".join(
+            f"pg_catalog.decode({column}, 'hex')" if kind == "bytea" else column
             for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
         )
 
@@ -85,7 +111,7 @@ class Queries:
             ),
             inserted AS (
                 INSERT INTO {jobs} ({columns})
-                SELECT {columns} FROM incoming ORDER BY position
+                SELECT {decoded} FROM incoming ORDER BY position
                 ON CONFLICT DO NOTHING
                 RETURNING id, queue, run_at OPERATOR(pg_catalog.<=) {horizon} AS due
             )
@@ -106,6 +132,7 @@ class Queries:
         def taking(picked: str) -> str:
             return f"""
             WITH RECURSIVE {picked},
+            chosen AS (SELECT ARRAY(SELECT id FROM picked) AS ids),
             claimed AS (
                 UPDATE {jobs} AS job
                    SET status = 'running',
@@ -113,8 +140,7 @@ class Queries:
                        attempts = job.attempts + 1,
                        claims = job.claims + 1,
                        lease_expires_at = {lease_end}
-                  FROM picked
-                 WHERE job.id = picked.id AND job.status = 'queued'
+                 WHERE job.id = ANY((SELECT ids FROM chosen)::text[]) AND job.status = 'queued'
                 RETURNING {job_columns("job")}
             ),
             opened AS (
@@ -126,7 +152,8 @@ class Queries:
                        started_at = excluded.started_at, finished_at = NULL,
                        error_type = NULL, traceback = NULL
             )
-            SELECT {columns} FROM claimed ORDER BY priority DESC, run_at ASC
+            SELECT {columns} FROM claimed
+             ORDER BY priority DESC, run_at ASC, array_position((SELECT ids FROM chosen), id)
             """
 
         def chunk(queue: str) -> str:

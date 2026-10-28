@@ -58,7 +58,16 @@ def job_columns(alias: str | None = None) -> str:
 
 def job_arrays(jobs: Sequence[Job]) -> list[list[Any]]:
     rows = [job_to_row(job) for job in jobs]
-    return [list(column) for column in zip(*rows)] if rows else [[] for _ in JOB_COLUMNS]
+    if not rows:
+        return [[] for _ in JOB_COLUMNS]
+    return [
+        [_hexed(value) for value in column] if kind == "bytea" else list(column)
+        for kind, column in zip(JOB_TYPES, zip(*rows))
+    ]
+
+
+def _hexed(value: bytes | None) -> str | None:
+    return None if value is None else bytes(value).hex()
 
 
 def job_to_row(job: Job) -> tuple:
