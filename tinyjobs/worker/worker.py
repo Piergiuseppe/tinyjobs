@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from contextlib import suppress
@@ -19,6 +20,7 @@ from ..models import Job
 from ..retention import RetentionPolicy
 from ..retry import RetryPolicy
 from ..runtime import inside_running_loop
+from ..deadlines import Deadline, bounded, under
 from ..duration import format_seconds
 from ..executors import ExecutorResolver
 from ..polling import AdaptiveInterval
@@ -29,6 +31,7 @@ if TYPE_CHECKING:
     from ..app import TinyJobs
 
 LEASE_MARGIN_SECONDS = 1.0
+RELEASE_SECONDS = 1.0
 
 logger = logging.getLogger("tinyjobs.worker")
 
@@ -92,6 +95,7 @@ class Worker:
         self._capacity.set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown_timeout = self._configured_shutdown_timeout
+        self._ending = Deadline()
 
     @property
     def id(self) -> str:
@@ -109,14 +113,14 @@ class Worker:
         asyncio.run(self.start())
 
     def stop(self) -> None:
-        stopping, loop = self._stopping, self._loop
+        stopping, ending, loop = self._stopping, self._ending, self._loop
         if loop is None or (
             inside_running_loop() and loop is asyncio.get_running_loop()
         ):
-            self._request_stop(stopping)
+            self._request_stop(stopping, ending)
             return
         with suppress(RuntimeError):
-            loop.call_soon_threadsafe(self._request_stop, stopping)
+            loop.call_soon_threadsafe(self._request_stop, stopping, ending)
 
     async def start(self) -> None:
         await self._app.ready()
@@ -136,6 +140,15 @@ class Worker:
         watcher = ShutdownWatcher(self._request_stop, self._request_force)
         background: list[asyncio.Task] = []
         heartbeat: list[asyncio.Task] = []
+        with under(self._ending):
+            await self._served(watcher, background, heartbeat)
+
+    async def _served(
+        self,
+        watcher: ShutdownWatcher,
+        background: list[asyncio.Task],
+        heartbeat: list[asyncio.Task],
+    ) -> None:
         try:
             if self._handle_signals:
                 watcher.install()
@@ -274,14 +287,26 @@ class Worker:
         return done
 
     def _release_later(self, job: Job) -> None:
-        release = asyncio.ensure_future(self._app.backend.release(job))
+        release = asyncio.ensure_future(self._releasing(job))
         self._releases.add(release)
         release.add_done_callback(self._released(job))
+
+    async def _releasing(self, job: Job) -> None:
+        with under(self._ending):
+            async with bounded(self._ending.at):
+                await self._app.backend.release(job)
 
     def _released(self, job: Job):
         def done(release: asyncio.Future) -> None:
             self._releases.discard(release)
-            if not release.cancelled() and release.exception() is not None:
+            if release.cancelled():
+                logger.warning(
+                    "could not release job %s in time; the reaper takes it back once its "
+                    "lease expires",
+                    job.id,
+                )
+                return
+            if release.exception() is not None:
                 logger.warning(
                     "could not release job %s; the reaper takes it back once its "
                     "lease expires",
@@ -347,7 +372,8 @@ class Worker:
         )
         self._request_stop()
         try:
-            await self._app.backend.hand_back(job)
+            async with bounded(self._held(job)):
+                await self._app.backend.hand_back(job)
         except Exception:
             logger.warning(
                 "could not hand back job %s; the reaper takes it back once its "
@@ -365,24 +391,33 @@ class Worker:
             job.id,
             format_seconds(delay),
         )
-        await self._app.backend.hand_back(job, delay)
+        async with bounded(self._held(job)):
+            await self._app.backend.hand_back(job, delay)
+
+    def _held(self, job: Job) -> float:
+        return max(
+            self._held_until.get((job.id, job.claims), 0.0) - LEASE_MARGIN_SECONDS,
+            time.monotonic() + RELEASE_SECONDS,
+        )
 
     @property
     def _beat_seconds(self) -> float:
         return max(self._lease_seconds / 3.0, 1.0)
 
     async def _heartbeat_loop(self) -> None:
+        asked = time.monotonic()
         while True:
-            await asyncio.sleep(self._beat_seconds)
+            await asyncio.sleep(max(0.0, asked + self._beat_seconds - time.monotonic()))
+            asked = time.monotonic()
             beaten = list(self._inflight)
             job_ids = list({job_id for job_id, _ in beaten})
             if not job_ids:
                 continue
-            asked = time.monotonic()
             try:
-                await self._app.backend.heartbeat(
-                    job_ids, self._lease_seconds, worker_id=self._id
-                )
+                async with bounded(asked + self._lease_seconds / 4):
+                    await self._app.backend.heartbeat(
+                        job_ids, self._lease_seconds, worker_id=self._id
+                    )
                 for key in beaten:
                     if key in self._held_until:
                         self._held_until[key] = asked + self._lease_seconds
@@ -428,7 +463,15 @@ class Worker:
 
     async def _drain(self) -> None:
         await self._wait_for_jobs()
-        await asyncio.gather(*self._releases, return_exceptions=True)
+        if not self._releases:
+            return
+        left = self._ending.left()
+        _, late = await asyncio.wait(
+            tuple(self._releases), timeout=None if left == math.inf else max(0.0, left)
+        )
+        for release in late:
+            release.cancel()
+        await asyncio.gather(*late, return_exceptions=True)
 
     async def _wait_for_jobs(self) -> None:
         if not self._running:
@@ -489,13 +532,19 @@ class Worker:
         except asyncio.TimeoutError:
             return
 
-    def _request_stop(self, stopping: asyncio.Event | None = None) -> None:
+    def _request_stop(
+        self, stopping: asyncio.Event | None = None, ending: Deadline | None = None
+    ) -> None:
         logger.info("shutdown requested; finishing in-flight jobs")
+        (self._ending if ending is None else ending).end(
+            time.monotonic() + self._shutdown_timeout + RELEASE_SECONDS
+        )
         (self._stopping if stopping is None else stopping).set()
 
     def _request_force(self) -> None:
         logger.warning("second signal received; exiting now")
         self._forced.set()
         self._shutdown_timeout = 0.0
+        self._ending.end(time.monotonic() + RELEASE_SECONDS)
         for task in tuple(self._running):
             task.cancel()

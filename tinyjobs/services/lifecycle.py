@@ -5,10 +5,12 @@ import logging
 import time
 import traceback as traceback_module
 from functools import partial
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from contextlib import nullcontext
+from typing import Any, AsyncContextManager, Awaitable, Callable, TYPE_CHECKING
 
 from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
+from ..deadlines import bounded
 from ..exceptions import Retry
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     from ..task import Task
 
 FIRST_RETRY_SECONDS = 0.25
+LAST_WORD_SECONDS = 1.0
 LONGEST_RETRY_SECONDS = 4.0
 
 logger = logging.getLogger("tinyjobs.worker")
@@ -81,10 +84,10 @@ class JobLifecycleService:
         interrupted = False
         while True:
             try:
-                if interrupted:
-                    return await write() or await self._recorded_before(job, status)
-                applied = await write()
-                return applied
+                async with self._held(held_until):
+                    if interrupted:
+                        return await write() or await self._recorded_before(job, status)
+                    return await write()
             except transient as error:
                 if deadline is None:
                     deadline = held_until() if held_until else 0.0
@@ -101,6 +104,11 @@ class JobLifecycleService:
                 await asyncio.sleep(pause)
                 delay = min(delay * 2, LONGEST_RETRY_SECONDS)
                 interrupted = True
+
+    def _held(self, held_until: Callable[[], float] | None) -> AsyncContextManager[Any]:
+        if held_until is None:
+            return nullcontext()
+        return bounded(max(held_until(), time.monotonic() + LAST_WORD_SECONDS))
 
     async def _recorded_before(self, job: Job, status: ExecutionStatus) -> bool:
         history = await self._backend.executions(job.id)

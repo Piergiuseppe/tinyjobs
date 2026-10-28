@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager, closing, nullcontext, suppress
 from unittest import mock
 
 import tinyjobs.clock
+from tinyjobs import deadlines
 from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
 from tinyjobs.runtime import run_on
@@ -843,6 +844,24 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ConfigurationError, "more than one schema"):
             await backend.setup()
 
+    async def test_tables_a_stranger_plants_earlier_on_the_search_path_are_passed_over(self):
+        await self.set_up_as(None)
+        stranger = await self.role()
+        decoy = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(f'CREATE SCHEMA "{decoy}" AUTHORIZATION "{stranger}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA IF EXISTS "{decoy}" CASCADE')
+        await sql(
+            f'SET ROLE "{stranger}"; '
+            f'CREATE TABLE "{decoy}"."{self.prefix}_meta" (key text, value text); RESET ROLE'
+        )
+        with self.assertLogs("tinyjobs", "WARNING") as logged:
+            backend = await self.set_up_as(None, options=f"-c search_path={decoy},public")
+        self.assertIn(decoy, "\n".join(logged.output))
+        job = await backend.enqueue(make_job())
+        self.assertEqual((await backend.get(job.id)).id, job.id)
+        [(count,)] = await sql(f'SELECT count(*) FROM public."{self.prefix}_jobs"')
+        self.assertGreaterEqual(count, 1)
+
     async def role(self) -> str:
         role = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
         await sql(f"CREATE ROLE \"{role}\" LOGIN PASSWORD 'tinyjobs'")
@@ -1339,8 +1358,72 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             again = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
             self.addAsyncCleanup(again.close)
             with mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 1):
-                with self.assertRaisesRegex(ConfigurationError, "another setup"):
+                with self.assertRaisesRegex(ConfigurationError, f"pid {stuck.info.backend_pid}"):
                     await asyncio.wait_for(again.setup(), 5)
+
+    async def test_a_lock_on_the_whole_meta_table_holds_rebuilds_up_for_a_bounded_time(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as stuck:
+            await stuck.execute(f'LOCK TABLE "{prefix}_meta" IN EXCLUSIVE MODE')
+            starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(starting.close)
+            started = time.monotonic()
+            with mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 1):
+                with self.assertRaisesRegex(ConfigurationError, f"pid {stuck.info.backend_pid}"):
+                    await asyncio.wait_for(starting.setup(), 10)
+            self.assertLess(time.monotonic() - started, 4)
+
+    async def test_a_rebuild_held_up_by_any_open_snapshot_names_the_session_holding_it(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, autocommit=True) as reading:
+            await reading.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            await reading.execute("SELECT 1")
+            starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(starting.close)
+            with mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 1):
+                with self.assertRaisesRegex(
+                    ConfigurationError,
+                    f"every transaction open in this database.*pid {reading.info.backend_pid}",
+                ):
+                    await asyncio.wait_for(starting.setup(), 10)
+            await reading.execute("ROLLBACK")
+
+    async def test_a_transaction_timeout_never_ends_a_rebuild_early(self):
+        [(version,)] = await sql("SHOW server_version_num")
+        if int(version) < 170000:
+            self.skipTest("transaction_timeout needs postgres 17")
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, autocommit=True) as reading:
+            await reading.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            await reading.execute("SELECT 1")
+            starting = PostgresBackend.from_url(
+                POSTGRES_URL, prefix=prefix, options="-c transaction_timeout=1s"
+            )
+            self.addAsyncCleanup(starting.close)
+            setup = asyncio.ensure_future(starting.setup())
+            await asyncio.sleep(2.5)
+            self.assertFalse(setup.done())
+            await reading.execute("ROLLBACK")
+            await asyncio.wait_for(setup, 10)
+        found = await sql(
+            "SELECT 1 FROM pg_indexes WHERE indexname = %(name)s", {"name": f"{prefix}_jobs_dedup"}
+        )
+        self.assertEqual(found, [(1,)])
 
     async def test_a_role_that_can_only_read_the_meta_table_cannot_hold_rebuilds_up(self):
         prefix = new_prefix()
@@ -4498,6 +4581,197 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(claiming, 20)
         self.assertLess(time.monotonic() - cancelled, 0.6)
         self.assertEqual(len(backend._ghosts), 1)
+
+    async def test_a_heartbeat_nobody_answers_gives_up_and_the_next_runs_on_a_fresh_connection(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        async with muting_proxy() as (url, mute):
+            backend = PostgresBackend.from_url(
+                url, prefix=prefix, min_connections=2, max_connections=2, notify=False
+            )
+            self.addAsyncCleanup(backend.close)
+            await backend.setup()
+            await backend.enqueue(make_job())
+            [job] = await backend.claim(
+                worker_id="w", queues=["default"], limit=1, lease_seconds=60
+            )
+
+            async def used() -> None:
+                async with backend._connection() as connection:
+                    await connection.execute("SELECT pg_catalog.pg_sleep(0.2)")
+
+            await asyncio.gather(used(), used())
+            mute()
+            started = time.monotonic()
+            with self.assertRaises(psycopg.OperationalError):
+                await asyncio.wait_for(backend.heartbeat([job.id], 8.0, worker_id="w"), 30)
+            self.assertLess(time.monotonic() - started, 3)
+            started = time.monotonic()
+            await asyncio.wait_for(backend.heartbeat([job.id], 8.0, worker_id="w"), 30)
+            self.assertLess(time.monotonic() - started, 2)
+        [(left,)] = await sql(
+            f'SELECT lease_expires_at - extract(epoch FROM clock_timestamp()) FROM "{prefix}_jobs"'
+        )
+        self.assertGreater(left, 5)
+
+    async def test_a_call_cancelled_with_its_answer_lost_sends_the_next_to_a_fresh_connection(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        async with muting_proxy() as (url, mute):
+            backend = PostgresBackend.from_url(
+                url, prefix=prefix, min_connections=2, max_connections=2, notify=False
+            )
+            self.addAsyncCleanup(backend.close)
+            await backend.setup()
+            job = await backend.enqueue(make_job())
+
+            async def used() -> None:
+                async with backend._connection() as connection:
+                    await connection.execute("SELECT pg_catalog.pg_sleep(0.2)")
+
+            await asyncio.gather(used(), used())
+            mute()
+            with self.assertRaises(TimeoutError), deadlines.until(time.monotonic() + 1.5):
+                async with asyncio.timeout(0.5):
+                    await backend.get(job.id)
+            started = time.monotonic()
+            self.assertEqual((await asyncio.wait_for(backend.get(job.id), 30)).id, job.id)
+            self.assertLess(time.monotonic() - started, 2)
+
+    async def cut_off_app(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        proxy = stalling_proxy()
+        url, frozen = await proxy.__aenter__()
+        self.addAsyncCleanup(proxy.__aexit__, None, None, None)
+        app = TinyJobs(url, prefix=prefix, min_connections=2, max_connections=2)
+        self.addAsyncCleanup(app.aclose)
+        self.addAsyncCleanup(frozen.clear)
+        await app.ready()
+        return app, frozen
+
+    async def test_recording_an_outcome_waits_no_longer_than_the_lease_left(self):
+        app, frozen = await self.cut_off_app()
+
+        @app.task()
+        def noop():
+            return None
+
+        await noop.aenqueue()
+        [job] = await app.backend.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60
+        )
+        frozen.set()
+        started = time.monotonic()
+        with self.assertRaises((psycopg.OperationalError, TimeoutError)):
+            await asyncio.wait_for(
+                app.lifecycle.complete(job, None, held_until=lambda: started + 2.0), 30
+            )
+        self.assertLess(time.monotonic() - started, 3)
+
+    async def test_a_call_routed_to_the_backend_loop_keeps_the_caller_deadline(self):
+        async def seen() -> tuple[float, asyncio.AbstractEventLoop]:
+            return deadlines.left(), asyncio.get_running_loop()
+
+        with deadlines.until(time.monotonic() + 5):
+            left, loop = await self.app.backend._routed(seen(), "seen")
+        self.assertIsNot(loop, asyncio.get_running_loop())
+        self.assertGreater(left, 4)
+        self.assertLess(left, 5)
+
+    async def test_closing_with_the_server_cut_off_waits_a_second_for_the_pool(self):
+        app, frozen = await self.cut_off_app()
+        job = await app.backend.enqueue(make_job())
+        frozen.set()
+        with self.assertRaises(psycopg.OperationalError), deadlines.until(time.monotonic() + 1):
+            await asyncio.wait_for(app.backend.get(job.id), 30)
+        started = time.monotonic()
+        await asyncio.wait_for(app.aclose(), 30)
+        self.assertLess(time.monotonic() - started, 2.5)
+
+    async def stopping_cut_off(self, shutdown_timeout: float = 1.0):
+        app, frozen = await self.cut_off_app()
+        running = asyncio.Event()
+
+        @app.task()
+        async def slow():
+            running.set()
+            await asyncio.sleep(30)
+
+        await slow.aenqueue()
+        worker = app.worker(
+            concurrency=1,
+            poll_maximum=0.05,
+            lease_seconds=60,
+            shutdown_timeout=shutdown_timeout,
+            handle_signals=False,
+        )
+        runner = asyncio.create_task(worker.start())
+        self.addAsyncCleanup(asyncio.wait, [runner])
+        await asyncio.wait_for(running.wait(), 15)
+        frozen.set()
+        stopped = time.monotonic()
+        worker.stop()
+        return worker, runner, stopped
+
+    async def test_a_worker_stopping_with_the_server_cut_off_ends_within_its_shutdown_timeout(
+        self,
+    ):
+        worker, runner, stopped = await self.stopping_cut_off()
+        await asyncio.wait_for(runner, 30)
+        self.assertLess(time.monotonic() - stopped, 1.0 + 2.0)
+
+    async def test_a_second_signal_with_the_server_cut_off_ends_the_worker_promptly(self):
+        worker, runner, _ = await self.stopping_cut_off(shutdown_timeout=5.0)
+        await asyncio.sleep(0.2)
+        forced = time.monotonic()
+        worker._request_force()
+        await asyncio.wait_for(runner, 30)
+        self.assertLess(time.monotonic() - forced, 1.5)
+
+    async def test_a_claim_whose_pooled_connections_all_died_gives_up_within_half_its_lease(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        application = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL,
+            prefix=prefix,
+            min_connections=2,
+            max_connections=2,
+            pool_timeout=10,
+            notify=False,
+            application_name=application,
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        await backend.claim(worker_id="w", queues=["nothing"], limit=1, lease_seconds=60)
+        while backend._pool.get_stats().get("pool_available", 0) < 2:
+            await asyncio.sleep(0.05)
+        reachable = backend._pool.conninfo
+        backend._pool.conninfo = "postgresql://postgres@127.0.0.1:1/unreachable"
+        self.addCleanup(setattr, backend._pool, "conninfo", reachable)
+        await sql(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE application_name = %(name)s",
+            {"name": application},
+        )
+        await asyncio.sleep(0.3)
+        self.assertLess(await self.claimed_within(backend, 2.0), 1.6)
+
+    async def test_wake_ups_deferred_during_a_claim_outlive_its_deadline(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        backend._woken["default"] = time.monotonic()
+        with deadlines.until(time.monotonic() - 1):
+            await backend._wake({"default"})
+            waking = backend._waking
+        self.assertIsNotNone(waking)
+        self.assertNotIn(deadlines.current, waking.get_context())
+        with self.assertNoLogs("tinyjobs", "DEBUG"):
+            await asyncio.wait_for(waking, 10)
 
     async def test_a_slow_claim_given_up_for_want_of_connections_gives_its_jobs_back(self):
         prefix = new_prefix()

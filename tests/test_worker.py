@@ -1173,6 +1173,44 @@ class ShutdownTests(WorkerTestCase):
         self.assertTrue([beat for beat in beats if beat > stopped])
         self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
 
+    async def test_a_release_that_never_answers_ends_with_the_shutdown_timeout(self):
+        @self.app.task
+        async def handler():
+            await asyncio.sleep(30)
+
+        async def silent(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        await handler.aenqueue()
+        worker = self.make_worker(shutdown_timeout=0.5)
+        with mock.patch.object(self.app.backend, "release", silent):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.sleep(0.3)
+            stopped = time.monotonic()
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=30)
+        self.assertLess(time.monotonic() - stopped, 0.5 + 1.5)
+
+    async def test_a_second_signal_gives_a_release_that_never_answers_a_second(self):
+        @self.app.task
+        async def handler():
+            await asyncio.sleep(30)
+
+        async def silent(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        await handler.aenqueue()
+        worker = self.make_worker(shutdown_timeout=30.0)
+        with mock.patch.object(self.app.backend, "release", silent):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.sleep(0.3)
+            worker.stop()
+            await asyncio.sleep(0.1)
+            forced = time.monotonic()
+            worker._request_force()
+            await asyncio.wait_for(runner, timeout=30)
+        self.assertLess(time.monotonic() - forced, 1.5)
+
     async def test_a_job_that_outlives_the_grace_period_returns_to_the_queue(self):
         @self.app.task
         async def handler():
@@ -1794,6 +1832,31 @@ class HeartbeatTests(WorkerTestCase):
         with mock.patch.object(self.app.backend, "heartbeat", closed):
             await self.settle(self.make_worker(lease_seconds=3.0), [job])
         self.assertEqual(len(calls), 1)
+
+    async def test_a_heartbeat_that_never_answers_is_given_up_before_the_lease_lapses(self):
+        from unittest import mock
+
+        calls: list[float] = []
+
+        @self.app.task
+        async def slow():
+            await asyncio.sleep(4.5)
+
+        job = await slow.aenqueue()
+        heartbeat = self.app.backend.heartbeat
+
+        async def silent_once(*args, **kwargs):
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                await asyncio.Event().wait()
+            return await heartbeat(*args, **kwargs)
+
+        worker = self.make_worker(lease_seconds=3.0, reap_interval=0.2, concurrency=1)
+        with mock.patch.object(self.app.backend, "heartbeat", silent_once):
+            await self.settle(worker, [job])
+        self.assertLess(calls[1] - calls[0], 1.6)
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.SUCCESS, 1))
 
 
 class StaleHeartbeatTests(WorkerTestCase):

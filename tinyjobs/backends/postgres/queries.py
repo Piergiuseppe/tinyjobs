@@ -686,8 +686,7 @@ class Queries:
 
 
         self.placement = f"""
-            SELECT DISTINCT ON (c.relname)
-                   c.relname::text AS name, n.nspname::text AS schema,
+            SELECT c.relname::text AS name, n.nspname::text AS schema,
                    {trusting("c.relowner")} AND {trusting("n.nspowner")} AND {untouched("c")}
                    AS owned
               FROM pg_class AS c

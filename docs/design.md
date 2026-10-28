@@ -801,7 +801,10 @@ when a `postgres://` or `postgresql://` URL is used. It runs on psycopg 3's asyn
 Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
 `<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
 Before `setup` reads any of them it finds them in the catalog, along the schemas the connection's
-`search_path` named when the pool opened, and checks that all four sit in one schema and that the
+`search_path` named when the pool opened, passing over a table of a tinyjobs name that a role it
+does not trust owns, or sits in a schema such a role owns, when a trusted one of that name comes later
+on the path, with a warning naming the schema, so a role allowed to create schemas cannot stop new
+processes by planting one earlier. It checks that all four sit in one schema and that the
 tables and the schema belong to the connecting role or to a role that can become it (`SET` on
 Postgres 16 and later, membership before), and that no role inherits the privileges of without
 being able to become it too; a schema owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
@@ -834,14 +837,19 @@ newer release is refused and left alone. Every setup then checks that each tinyj
 a valid index of the right table, unique where it must be, and that the statistics below exist on
 the jobs table, so an object of that name another role made first stops setup instead. One that is
 missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
-of its own while a second one holds the meta table's instance row `FOR UPDATE`, a lock only roles
-that may write that table can take, so workers keep claiming and enqueueing while it builds; other
-setups starting meanwhile wait up to 30 seconds for that rebuild instead of racing it, and do not wait on the table again for what it left: a plain index is kept for the next setup
-with a warning and a unique one stops setup with the reason. The executions
+of its own while a second one holds the meta table's instance row `FOR UPDATE`, so workers keep
+claiming and enqueueing while it builds. Only a role that may write the meta table can take that row
+lock, though one allowed to `LOCK` it, as `MAINTAIN` allows, can hold the table; each attempt waits
+half a second for the table, and neither connection is ended by `transaction_timeout` or
+`idle_in_transaction_session_timeout`. Other setups starting meanwhile wait up to 30 seconds for
+that rebuild instead of racing it, and do not wait on the table again for what it left: a plain
+index is kept for the next setup with a warning and a unique one stops setup with the reason, naming
+the pid, role and application of each session still holding the meta table. The executions
 index claims insert against is the exception: claims cannot run without it, so it is built in one
 plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
-30 seconds for transactions already holding the table; past that a unique index stops setup with
-the reason, and the plain ones left are kept for the next setup with a warning, without waiting
+30 seconds for every transaction open in the database when it started, since that is what
+`CONCURRENTLY` waits for, whether or not they touch the table; past that a unique index stops setup
+with the reason and the oldest sessions it waited for, and the plain ones left are kept for the next setup with a warning, without waiting
 again, since jobs run without them, only more slowly. If active jobs with the same dedup key got in
 while that index was missing, setup names those jobs and asks to cancel all but one of each group.
 `CREATE INDEX IF NOT EXISTS` skips a name another relation already holds, which would leave claims
@@ -1038,7 +1046,14 @@ up after 3.0 seconds rather than 40, and one due to read the clock after 3.0 rat
 no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
 when the server has taken no new connection for half its lease is given up too, and settled like
 any claim without its answer: it is ended if still running, and its jobs come back without the
-attempt counted. Cancelling a call bounds
+attempt counted. A heartbeat gets a quarter of its lease the same way, its sweep half of that, and
+the next one starts a third of the lease after the last one started, so a heartbeat that hears nothing
+leaves the next one time to renew the lease: with the connections already open frozen and new ones
+answering, a heartbeat on a 12 second lease gave up within 4.0 seconds with at least 8.0 left on
+the lease, where it used to wait past 40 with the lease lapsed. The worker records an outcome or hands a job
+back within the lease it still holds, one second at least. Once a statement goes unanswered, the
+pooled connections idle since before it are closed and replaced rather than used, since a frozen
+network path or a hung proxy silences them all alike. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
@@ -1288,8 +1303,13 @@ On `SIGTERM` (or the first `SIGINT`), the worker stops claiming, keeps heartbeat
 and waits up to `--shutdown-timeout` for them to finish. A claim still waiting on the backend shares
 that wait: jobs it brings back in time run like the others, and one that has not answered by then is
 given up. Anything still running is released back to
-`QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. A
-second `SIGINT` exits at once and lets the leases lapse.
+`QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. The
+releases get one second more, and one that has not landed by then is left to its lease. With the
+server cut off and `--shutdown-timeout 3`, the worker exited 5.1 seconds after the signal, the last
+second spent closing the pool, which waits that long for connections still being opened; it used to
+outlive the 45 seconds it was given. A second `SIGINT` exits at once and lets the leases lapse: a
+release already sent gets a second, and the worker exited 2.1 seconds after the second signal with
+the server cut off, where it used to take 305.6.
 
 A claim whose caller is cancelled while it is in flight still lands in the backend, so tinyjobs lets
 it finish and hands its jobs back, as if they were never claimed; otherwise a cancelled drain would
