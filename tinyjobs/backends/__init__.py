@@ -15,12 +15,12 @@ def _postgres(url: str, **options):
     return PostgresBackend.from_url(url, **options)
 
 
-def _postgres_options(**options):
+def _postgres_options(url: str, **options):
     try:
         from .postgres import PostgresBackend
     except ImportError:
         return
-    PostgresBackend.check_options(**options)
+    PostgresBackend.check_options(url, **options)
 
 
 register_builtin("sqlite", SQLiteBackend.from_url)

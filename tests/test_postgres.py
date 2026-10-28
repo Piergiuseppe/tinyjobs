@@ -313,7 +313,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             touched = plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
             self.assertLess(touched, 80)
 
-    async def claim_touches(self, queues: list[str]) -> int:
+    async def claim_plan(self, queues: list[str]) -> dict:
         query, parameters = self.backend._claiming(self.clock.now(), queues, "explain", 1, 60.0)
         async with self.backend._connection() as connection:
             async with connection.transaction(force_rollback=True):
@@ -322,7 +322,22 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                     f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}", parameters
                 )
                 [[plan]] = (await cursor.fetchone()).values()
-        return plan["Plan"]["Shared Hit Blocks"] + plan["Plan"]["Shared Read Blocks"]
+        return plan["Plan"]
+
+    async def claim_touches(self, queues: list[str]) -> int:
+        plan = await self.claim_plan(queues)
+        return plan["Shared Hit Blocks"] + plan["Shared Read Blocks"]
+
+    async def claim_walk(self, queues: list[str]) -> tuple[int, int]:
+        scans: list[dict] = []
+        pending = [await self.claim_plan(queues)]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.get("Plans", []))
+            if node.get("Index Name", "").endswith("_jobs_claim"):
+                scans.append(node)
+        widest = max(scans, key=lambda node: node["Actual Loops"])
+        return widest["Actual Loops"], widest["Actual Rows"] * widest["Actual Loops"]
 
     async def test_due_jobs_are_claimed_past_many_delayed_higher_priorities(self):
         later = self.clock.now() + 3600
@@ -341,7 +356,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_delayed_levels_holding_a_few_jobs_each_are_skipped_in_spans(self):
         later = self.clock.now() + 3600
         levels = 0
-        for copies in (3, 8, 16):
+        for copies in (3, 8):
             delayed = [
                 make_job(priority=levels + level, run_at=later + copy)
                 for level in range(1, 1501)
@@ -350,7 +365,22 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             levels += 1500
             await self.backend.enqueue_many(delayed)
         due = await self.enqueue(priority=0)
-        self.assertLess(await self.claim_touches(["default"]), 6000)
+        steps, _ = await self.claim_walk(["default"])
+        self.assertLess(steps, 600)
+        [claimed] = await self.claim(limit=10)
+        self.assertEqual(claimed.id, due.id)
+
+    async def test_delayed_levels_holding_many_jobs_each_cost_one_descent_each(self):
+        later = self.clock.now() + 3600
+        delayed = [
+            make_job(priority=level, run_at=later + copy)
+            for level in range(1, 301)
+            for copy in range(100)
+        ]
+        await self.backend.enqueue_many(delayed)
+        due = await self.enqueue(priority=0)
+        _, entries = await self.claim_walk(["default"])
+        self.assertLess(entries, 10000)
         [claimed] = await self.claim(limit=10)
         self.assertEqual(claimed.id, due.id)
 
@@ -829,6 +859,11 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             )
         with self.assertRaisesRegex(ConfigurationError, "max_conections"):
             TinyJobs(POSTGRES_URL, prefix=self.prefix, max_conections=4)
+        with self.assertRaisesRegex(ConfigurationError, "max_connections"):
+            TinyJobs(f"{POSTGRES_URL}?max_connections=4", prefix=self.prefix)
+        for name in ("conninfo", "connection_options"):
+            with self.assertRaisesRegex(ConfigurationError, name):
+                TinyJobs(POSTGRES_URL, prefix=self.prefix, **{name: "x"})
         PostgresBackend.from_url(
             POSTGRES_URL, prefix=self.prefix, connect_timeout=5, prepare_threshold=None
         )
@@ -1011,21 +1046,16 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         return backend, name, owner
 
     async def test_a_role_change_never_runs_the_tables_owners_code(self):
-        from tinyjobs.backends.postgres import backend as module
-
         backend, name, owner = await self.store_with_owner_code()
         factories = (
             (psycopg.Cursor, psycopg.AsyncCursor),
             (psycopg.ClientCursor, psycopg.AsyncClientCursor),
             (psycopg.RawCursor, psycopg.AsyncRawCursor),
         )
-        modes = ((False, True), (True, True), (False, False))
-        for (sync_factory, async_factory), autocommit, (piped, pipelined) in itertools.product(
-            factories, (False, True), modes
+        for (sync_factory, async_factory), autocommit, piped in itertools.product(
+            factories, (False, True), (False, True)
         ):
-            with self.subTest(
-                sync_factory.__name__, autocommit=autocommit, piped=piped, pipelined=pipelined
-            ), mock.patch.object(module, "PIPELINED", pipelined):
+            with self.subTest(sync_factory.__name__, autocommit=autocommit, piped=piped):
                 ran: list[str] = []
                 with psycopg.Connection.connect(
                     url_for(dbname=name), autocommit=autocommit, cursor_factory=sync_factory
@@ -1108,6 +1138,79 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             with suppress(psycopg.Error):
                 await locking
             await locker.rollback()
+
+    async def test_tx_enqueues_running_at_once_on_one_connection_all_land(self):
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            await self.backend.aenqueue_in(connection, [make_job()])
+            stored = await asyncio.gather(
+                *(self.backend.aenqueue_in(connection, [make_job()]) for _ in range(10))
+            )
+            await connection.commit()
+        with psycopg.Connection.connect(POSTGRES_URL) as connection:
+            self.backend.enqueue_in(connection, [make_job()])
+            threads = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        lambda: [self.backend.enqueue_in(connection, [make_job()]) for _ in range(10)]
+                    )
+                    for _ in range(4)
+                )
+            )
+            connection.commit()
+        jobs = [job for [job] in stored] + [job for run in threads for [job] in run]
+        self.assertEqual(len(jobs), 50)
+        for job in jobs:
+            self.assertIsNotNone(await self.backend.get(job.id))
+
+    async def test_tables_another_role_may_add_triggers_to_are_refused(self):
+        outsider = await self.role()
+        await sql(f'GRANT TRIGGER ON "{self.prefix}_jobs" TO "{outsider}"')
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix)
+        self.addAsyncCleanup(backend.close)
+        with self.assertRaisesRegex(ConfigurationError, "TRIGGER grant"):
+            await backend.setup()
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "never writes through them"):
+                await self.backend.aenqueue_in(connection, [make_job()])
+        await sql(f'REVOKE TRIGGER ON "{self.prefix}_jobs" FROM "{outsider}"')
+        await sql(f'GRANT TRIGGER ON "{self.prefix}_jobs" TO PUBLIC')
+        with self.assertRaisesRegex(ConfigurationError, "TRIGGER grant"):
+            await backend.setup()
+        await sql(f'REVOKE TRIGGER ON "{self.prefix}_jobs" FROM PUBLIC')
+        await sql(
+            f'CREATE FUNCTION public."{outsider}_hook"() RETURNS trigger LANGUAGE plpgsql '
+            "AS $$ BEGIN RETURN NEW; END $$"
+        )
+        await sql(f'ALTER FUNCTION public."{outsider}_hook"() OWNER TO "{outsider}"')
+        await sql(
+            f'CREATE TRIGGER hook BEFORE INSERT ON "{self.prefix}_jobs" '
+            f'FOR EACH ROW EXECUTE FUNCTION public."{outsider}_hook"()'
+        )
+        with self.assertRaisesRegex(ConfigurationError, "TRIGGER grant"):
+            await backend.setup()
+        await sql(f'DROP TRIGGER hook ON "{self.prefix}_jobs"')
+        await sql(f'DROP FUNCTION public."{outsider}_hook"()')
+        await backend.setup()
+
+    async def test_an_owner_that_inherits_but_cannot_become_the_user_is_not_trusted(self):
+        [(version,)] = await sql("SHOW server_version_num")
+        if int(version) < 160000:
+            self.skipTest("SET on role grants arrived in Postgres 16")
+        owner = await self.role()
+        user = await self.role()
+        name = await self.database_owned_by(owner)
+        await sql(f'GRANT "{user}" TO "{owner}" WITH INHERIT TRUE, SET FALSE')
+        theirs = PostgresBackend.from_url(
+            url_for(dbname=name, user=owner, password="tinyjobs"), prefix=self.prefix, schema="theirs"
+        )
+        self.addAsyncCleanup(theirs.close)
+        await theirs.setup()
+        mine = PostgresBackend.from_url(
+            url_for(dbname=name, user=user, password="tinyjobs"), prefix=self.prefix, schema="theirs"
+        )
+        self.addAsyncCleanup(mine.close)
+        with self.assertRaisesRegex(ConfigurationError, "does not hold"):
+            await mine.setup()
 
     async def test_jobs_sharing_a_key_in_one_call_keep_the_first_one_given(self):
         given = [make_job(id="job-b", dedup_key="k"), make_job(id="job-a", dedup_key="k")]
@@ -2150,9 +2253,14 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         query = "SELECT pid FROM pg_stat_activity WHERE query LIKE 'LISTEN %%' AND query LIKE %(channel)s"
         channel = f"%{self.app.backend._channel}%"
         [(pid,)] = await sql(query, {"channel": channel})
+        inner = self.app.backend._inner
+        heard: list[str | None] = []
+        hear = inner._hear
+        inner._hear = lambda queue: (heard.append(queue), hear(queue))[1]
         await sql("SELECT pg_terminate_backend(%(pid)s)", {"pid": pid})
         await asyncio.sleep(2.5)
         self.assertNotEqual(await sql(query, {"channel": channel}), [(pid,)])
+        self.assertEqual(heard.count(None), 1)
         self.assertLess(await self.latency(self.app, ran), 0.3)
 
     async def test_only_jobs_sent_after_the_last_claim_cut_the_wait_short(self):

@@ -7,10 +7,11 @@ import logging
 import math
 import time
 import weakref
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
 from functools import cache, partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
+from urllib.parse import urlsplit
 
 import psycopg
 from psycopg import errors, pq
@@ -75,7 +76,6 @@ READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
-PIPELINED = psycopg.Pipeline.is_supported()
 
 logger = logging.getLogger("tinyjobs.postgres")
 
@@ -117,6 +117,7 @@ class PostgresBackend(BaseBackend):
                 f"statement_timeout must be None or between {SHORTEST_STATEMENT_SECONDS} "
                 f"and {LONGEST_STATEMENT_SECONDS:g} seconds, not {statement_timeout!r}"
             )
+        _parsed(conninfo)
         _refuse_unknown(connection_options)
         self._conninfo = conninfo
         self._tables = Tables(prefix, schema)
@@ -166,8 +167,13 @@ class PostgresBackend(BaseBackend):
         )
 
     @classmethod
-    def check_options(cls, **options: Any) -> None:
-        named = set(inspect.signature(cls.__init__).parameters)
+    def check_options(cls, conninfo: str, /, **options: Any) -> None:
+        named = {
+            name
+            for name, parameter in inspect.signature(cls.__init__).parameters.items()
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        }
+        _parsed(conninfo)
         _refuse_unknown({key: value for key, value in options.items() if key not in named})
 
     @classmethod
@@ -247,8 +253,9 @@ class PostgresBackend(BaseBackend):
             raise ConfigurationError(
                 f"the tinyjobs tables for prefix {tables.prefix!r} or their schema "
                 f"{schema!r} belong to a role that does not hold the connecting user's "
-                "privileges; tinyjobs only uses tables and schemas owned by its own role "
-                "or by a role that has its privileges, so pass schema= with one it owns"
+                "privileges, or carry a trigger, or a TRIGGER grant, of such a role; "
+                "tinyjobs only uses tables and schemas owned by its own role or by a role "
+                "that can act as it, so pass schema= with one it owns or revoke the grant"
             )
         within = tables.within(schema)
         return _Placement(within, Queries(within, self._following), count, meta, schema_missing)
@@ -415,7 +422,6 @@ class PostgresBackend(BaseBackend):
                         self._hear(notice.payload)
             except psycopg.Error as error:
                 logger.debug("listening for new jobs failed: %s", error)
-            self._hear(None)
             await asyncio.sleep(LISTEN_RETRY_SECONDS)
 
     def _hear(self, queue: str | None) -> None:
@@ -778,7 +784,8 @@ class PostgresBackend(BaseBackend):
             raise ConfigurationError(
                 f"the tinyjobs tables for prefix {self._tables.prefix!r} that the connection "
                 "passed as tx reaches belong to a role that does not hold that connection's "
-                "privileges; tinyjobs never writes through them"
+                "privileges, or carry a trigger, or a TRIGGER grant, of such a role; "
+                "tinyjobs never writes through them"
             ) from None
 
     def _joining(self, connection: Any, jobs: Sequence[Job]) -> Steps[list[Job]]:
@@ -1118,6 +1125,17 @@ async def _again(call: Callable[[], Awaitable[T]]) -> T:
         return await call()
 
 
+def _parsed(conninfo: str) -> dict[str, Any]:
+    try:
+        return conninfo_to_dict(conninfo)
+    except psycopg.ProgrammingError as error:
+        reason = str(error).strip()
+        secret = urlsplit(conninfo).password if "://" in conninfo else None
+        if secret:
+            reason = reason.replace(secret, "***")
+        raise ConfigurationError(f"the postgres url is not valid: {reason}") from None
+
+
 def _refuse_unknown(options: dict[str, Any]) -> None:
     unknown = sorted(set(options).difference(_known_options()))
     if unknown:
@@ -1246,27 +1264,16 @@ def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
             query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
+        if guard and connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
+            with psycopg.ClientCursor(connection, row_factory=dict_row) as cursor:
+                cursor.execute(_behind(cursor, guard, query, parameters))
+                cursor.nextset()
+                rows = cursor.fetchall()
+            continue
         with _cursor_on(connection) as cursor:
             if guard:
-                _guarded(connection, cursor, guard, query, parameters)
-            else:
-                cursor.execute(query, parameters)
-            rows = cursor.fetchall()
-
-
-def _guarded(
-    connection: psycopg.Connection,
-    cursor: psycopg.Cursor,
-    guard: list[Any],
-    query: str,
-    parameters: dict[str, Any],
-) -> None:
-    with (
-        _cursor_on(connection) as checking,
-        connection.pipeline() if PIPELINED else nullcontext(),
-    ):
-        checking.execute(*guard)
-        cursor.execute(query, parameters)
+                cursor.execute(*guard)
+            rows = cursor.execute(query, parameters).fetchall()
 
 
 async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
@@ -1276,27 +1283,21 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
             query, parameters, *guard = steps.send(rows)
         except StopIteration as finished:
             return finished.value
+        if guard and connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
+            async with psycopg.AsyncClientCursor(connection, row_factory=dict_row) as cursor:
+                await cursor.execute(_behind(cursor, guard, query, parameters))
+                cursor.nextset()
+                rows = await cursor.fetchall()
+            continue
         async with _cursor_on(connection) as cursor:
             if guard:
-                await _aguarded(connection, cursor, guard, query, parameters)
-            else:
-                await cursor.execute(query, parameters)
+                await cursor.execute(*guard)
+            await cursor.execute(query, parameters)
             rows = await cursor.fetchall()
 
 
-async def _aguarded(
-    connection: psycopg.AsyncConnection,
-    cursor: psycopg.AsyncCursor,
-    guard: list[Any],
-    query: str,
-    parameters: dict[str, Any],
-) -> None:
-    async with (
-        _cursor_on(connection) as checking,
-        connection.pipeline() if PIPELINED else nullcontext(),
-    ):
-        await checking.execute(*guard)
-        await cursor.execute(query, parameters)
+def _behind(cursor: Any, guard: list[Any], query: str, parameters: dict[str, Any]) -> str:
+    return f"{cursor.mogrify(*guard)};\n{cursor.mogrify(query, parameters)}"
 
 
 async def _fetch(

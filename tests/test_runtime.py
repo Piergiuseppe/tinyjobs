@@ -1488,6 +1488,35 @@ class KeptTaskTests(unittest.TestCase):
         self.assertTrue(task.done())
         self.assertEqual(seen, ["cleaned"])
 
+    def test_a_task_its_own_timeout_took_the_cancel_from_is_cancelled_again(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def polling() -> None:
+            recovered = False
+            try:
+                while True:
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        if recovered:
+                            raise
+                        recovered = True
+                        await asyncio.sleep(0.1)
+                        asyncio.current_task().uncancel()
+            finally:
+                seen.append("ended")
+
+        task = loop.create_task(polling())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        started = time.monotonic()
+        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["ended"])
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_a_hand_back_submitted_as_the_loop_closes_still_runs(self):
         runner = LoopRunner()
         loop = runner.own_loop()

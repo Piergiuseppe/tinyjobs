@@ -22,7 +22,7 @@ def register_builtin(
 def check_options(url: str, options: dict[str, Any]) -> None:
     check = _BUILTIN_CHECKS.get(urlsplit(url).scheme)
     if check is not None:
-        check(**options)
+        check(url, **options)
 
 
 def scheme_of(url: str) -> str:

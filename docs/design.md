@@ -802,10 +802,12 @@ Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>
 `<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
 Before `setup` reads any of them it finds them in the catalog, along the schemas the connection's
 `search_path` named when the pool opened, and checks that all four sit in one schema and that the
-tables and the schema belong to the connecting role or to a role that holds its privileges; a schema
-owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a
-view's function with the privileges of the role reading or writing the row, so a table owned by
-anyone else would let that role act as tinyjobs. Such tables are refused before a row is read, even
+tables and the schema belong to the connecting role or to a role that can become it (`SET` on
+Postgres 16 and later, membership before); a schema owned by `pg_database_owner` counts as the
+database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
+role reading or writing the row, so a table owned by anyone else would let that role act as
+tinyjobs. For the same reason a table that carries a trigger owned by such a role, or grants
+`TRIGGER` to one or to `PUBLIC`, is refused too. Such tables are refused before a row is read, even
 when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
 someone else. With no tables yet, the schema they would be created in is checked the same way, and
 created only when it does not exist, so a role that owns its schema needs no `CREATE` on the
@@ -831,9 +833,10 @@ switch with `SET ROLE` between two calls, so every `tx=` call runs the ownership
 caller's connection, against the role current at that moment, before anything touches the tables;
 a role the tables' owner does not answer to never writes through them, and none of the owner's
 triggers, defaults or index expressions runs with its privileges. After the first call the check
-travels with the insert in one psycopg pipeline, so it costs no round trip (a libpq older than 14
-has no pipeline mode and spends one): it fails by raising, Postgres then skips everything up to
-the pipeline's sync, and the insert is never parsed, planned or run. A guard inside the insert
+and the insert go as one multi-statement query bound on the client, so the check costs no round
+trip: Postgres runs the statements one at a time, so a failing check raises before the insert is
+parsed, planned or run. Inside a caller's own pipeline they go one after the other in it. Several
+`tx=` calls running at once on one connection are safe either way. A guard inside the insert
 statement would not do: a statement-level `BEFORE` trigger fires before any row reaches the guard,
 and the planner may evaluate an immutable column default before the statement starts. A refused
 call leaves the caller's transaction aborted. Setup also reads the store's identity: a
@@ -860,7 +863,7 @@ until it has enough. Each step reads a span of index entries per queue below the
 order, and either finds the highest level with a due job or skips every level the spans covered,
 since they hold each such level's oldest job; over several queues it skips only down to the highest
 of the spans' last entries. The span starts at one entry, doubles up to 128 while steps cross several
-levels, and drops back to one when it finds a due level, or when a full span of 128 entries stays
+levels, and drops back to one when it finds a due level, or when a span of at least 16 entries stays
 inside one level. So the common
 claim reads one entry per queue, delayed jobs spread one per priority are skipped up to 128 per step,
 and a large delayed level costs one index descent instead of a scan.
@@ -894,7 +897,8 @@ never do. Each worker process holds one extra
 connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
 unless it claimed since. A lost listening connection is reopened within a second, and every reopen
 wakes the workers once, since notifications sent meanwhile are gone. A server
-`idle_session_timeout` closes an idle listener too, and it reopens the same way. Polling stays as the fallback, so
+`idle_session_timeout` closes an idle listener too, and it reopens the same way; idle pooled
+connections it closes are replaced, and `psycopg_pool` logs a warning for each. Polling stays as the fallback, so
 `notify=False` or a dropped notification costs latency, never a job.
 
 ### Joining the caller's transaction
@@ -946,7 +950,8 @@ neither an error nor a wait: with eight of them dead, the next three statements 
 second together. A read that still loses its connection mid-flight, such as `get`, a listing or the
 clock, runs once more on a fresh one; writes do not, since the server may have applied them, and
 nothing is retried after waiting `pool_timeout` for a connection. Options the backend does not know
-and libpq does not either, such as a misspelled `max_conections=`, are refused by `TinyJobs(...)`
+and libpq does not either, such as a misspelled `max_conections=`, whether passed as arguments or
+in the url's query string, are refused by `TinyJobs(...)`
 itself rather than surfacing as a pool that never opens; `cursor_factory` is not taken either, since
 tinyjobs picks its own cursors. On a caller's connection whose cursors bind raw, `tx=` uses a plain
 cursor of its own. A fork leaves the parent's connections alone: the

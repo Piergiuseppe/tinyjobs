@@ -13,23 +13,49 @@ NOTICE_CHARACTERS = 1000
 
 SPAN_LIMIT = 128
 
-REFUSAL = "tinyjobs refuses tables whose owner lacks the privileges of the current role"
+SPAN_KEPT = 16
+
+REFUSAL = "tinyjobs refuses tables that a role lacking the privileges of the current role controls"
 
 
 def _qualified(kind: str) -> str:
     return kind if " " in kind or kind == "integer" else f"pg_catalog.{kind}"
 
 
+def becoming(role: str) -> str:
+    return f"""(CASE
+        WHEN pg_catalog.current_setting('server_version_num')::pg_catalog.int4
+             OPERATOR(pg_catalog.>=) 160000
+        THEN pg_catalog.pg_has_role({role}, CURRENT_USER, 'SET')
+        ELSE pg_catalog.pg_has_role({role}, CURRENT_USER, 'MEMBER')
+    END)"""
+
+
 def trusting(owner: str) -> str:
+    database_owner = """(SELECT d.datdba FROM pg_catalog.pg_database AS d
+                  WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())"""
     return f"""(
-        pg_catalog.pg_has_role({owner}, CURRENT_USER, 'USAGE')
+        {becoming(owner)}
         OR ({owner} OPERATOR(pg_catalog.=) pg_catalog.to_regrole('pg_database_owner')
-            AND pg_catalog.pg_has_role(
-                (SELECT d.datdba FROM pg_catalog.pg_database AS d
-                  WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
-                CURRENT_USER,
-                'USAGE'
-            ))
+            AND {becoming(database_owner)})
+    )"""
+
+
+def untouched(table: str) -> str:
+    return f"""(
+        NOT EXISTS (
+            SELECT FROM pg_catalog.aclexplode({table}.relacl) AS granted
+             WHERE granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
+               AND NOT (granted.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                        AND {trusting("granted.grantee")})
+        )
+        AND NOT EXISTS (
+            SELECT FROM pg_catalog.pg_trigger AS t
+              JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) t.tgfoid
+             WHERE t.tgrelid OPERATOR(pg_catalog.=) {table}.oid
+               AND NOT t.tgisinternal
+               AND NOT {trusting("p.proowner")}
+        )
     )"""
 
 
@@ -126,7 +152,7 @@ class Queries:
                             THEN seen.due ELSE seen.last END::bigint,
                        coalesce(seen.due >= seen.last, seen.last IS NULL),
                        CASE WHEN seen.due >= seen.last OR seen.last IS NULL THEN 1
-                            WHEN seen.top > seen.last OR levels.span < {SPAN_LIMIT}
+                            WHEN seen.top > seen.last OR levels.span < {SPAN_KEPT}
                             THEN least(levels.span * 2, {SPAN_LIMIT}) ELSE 1 END
                   FROM levels
                  CROSS JOIN LATERAL ({seen}) AS seen
@@ -449,7 +475,7 @@ class Queries:
             SELECT pg_catalog.count(*) AS tables,
                    pg_catalog.bool_or(c.relname OPERATOR(pg_catalog.=) %(meta)s) AS meta,
                    CASE WHEN COALESCE(pg_catalog.bool_and(
-                       {trusting("c.relowner")} AND {trusting("n.nspowner")}
+                       {trusting("c.relowner")} AND {trusting("n.nspowner")} AND {untouched("c")}
                    ), true) THEN true
                    ELSE pg_catalog.concat('{REFUSAL}')::pg_catalog.bool END AS owned
               FROM pg_catalog.pg_class AS c
@@ -486,7 +512,8 @@ class Queries:
         self.placement = f"""
             SELECT DISTINCT ON (c.relname)
                    c.relname::text AS name, n.nspname::text AS schema,
-                   {trusting("c.relowner")} AND {trusting("n.nspowner")} AS owned
+                   {trusting("c.relowner")} AND {trusting("n.nspowner")} AND {untouched("c")}
+                   AS owned
               FROM pg_class AS c
               JOIN pg_namespace AS n ON n.oid = c.relnamespace
              WHERE c.relname = ANY(%(names)s::name[])

@@ -59,6 +59,7 @@ EXITING_MESSAGE = (
 
 STOP_SECONDS = 5.0
 INSIST_SECONDS = 0.5
+RECHECK_SECONDS = 0.05
 FORK_PAUSE_SECONDS = 0.1
 FORK_ACK_SECONDS = 1.0
 LOOP_THREAD_PREFIX = "tinyjobs-loop"
@@ -884,7 +885,12 @@ def _finish_tasks(
         for task in fresh:
             _cancel_once(task)
             asked.add(task)
-        loop.run_until_complete(asyncio.wait(pending, timeout=max(left, 0)))
+        for task in pending & asked:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        loop.run_until_complete(
+            asyncio.wait(pending, timeout=min(max(left, 0), RECHECK_SECONDS))
+        )
         loop.run_until_complete(asyncio.sleep(0))
     loop.run_until_complete(asyncio.sleep(0))
 
