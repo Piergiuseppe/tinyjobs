@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import inspect
 import logging
 import math
 import re
+import secrets
+import select
 import time
 import weakref
 from contextlib import (
@@ -18,7 +21,7 @@ from contextlib import (
 from dataclasses import dataclass
 from functools import cache, partial
 from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator, Sequence, TypeVar
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote
 
 import psycopg
 from psycopg import errors, pq, waiting
@@ -50,7 +53,7 @@ from .records import (
     job_from_row,
     schedule_from_row,
 )
-from .schema import INDEXES, SCHEMA_VERSION, Tables
+from .schema import COLUMNS, INDEXES, SCHEMA_VERSION, STATISTICS, Tables
 
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MIN_CONNECTIONS = 1
@@ -64,6 +67,7 @@ TABLE_KINDS = ("jobs", "executions", "schedules", "meta")
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
 SETUP_LOCK_PAUSE = 0.05
+REBUILD_LOCK_SECONDS = 30
 SETUP_ATTEMPTS = 3
 CREATION_RACES = (errors.UniqueViolation, errors.DuplicateTable, errors.DuplicateObject)
 MAX_IDLE_SECONDS = 300.0
@@ -77,11 +81,30 @@ KEEPALIVES = {
     "keepalives_count": 3,
     "tcp_user_timeout": 60000,
 }
-ANSWER_MARGIN_SECONDS = 5.0
+SILENCE_SECONDS = 10.0
+PROBE_SECONDS = 10.0
 CANCEL_SECONDS = 5.0
+ENDING_MILLISECONDS = 5000
 WAIT_INTERVAL = 0.1
-WAITS_WITH_TIMEOUT = "timeout" in inspect.signature(psycopg.AsyncConnection.wait).parameters
-UNANSWERED = (getattr(errors, "_WaitTimeout", TimeoutError), TimeoutError)
+UNKNOWN_STATES = frozenset({None, "disabled"})
+IN_TRANSIT_SECONDS = 300.0
+RUNNING = (
+    "SELECT state, wait_event, state_change FROM pg_catalog.pg_stat_activity "
+    "WHERE pid = %(pid)s"
+)
+_LEFT: contextvars.ContextVar[tuple[int, Any] | None] = contextvars.ContextVar(
+    "tinyjobs_postgres_left", default=None
+)
+FENCE = (
+    "SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) AS ended "
+    "FROM pg_catalog.pg_stat_activity WHERE pid = %(pid)s AND backend_start = %(born)s"
+)
+FENCE_MILLISECONDS = 1000
+SETTLE_SECONDS = 5.0
+ENDING = (
+    "SELECT pg_catalog.pg_terminate_backend(pid, %(wait)s) FROM pg_catalog.pg_stat_activity "
+    "WHERE pid = %(pid)s AND state_change = %(seen)s"
+)
 ENQUEUE_BATCH = 1000
 ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
@@ -89,7 +112,6 @@ RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.I
 RETRIES = 3
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
-QUOTED = re.compile(r'"([^"]*)"')
 PIPELINED = psycopg.Pipeline.is_supported()
 HELD = all(
     hasattr(kind, name)
@@ -102,7 +124,7 @@ HELD = all(
         (psycopg.AsyncPipeline, "_fetch_gen"),
     )
 )
-USERINFO_SECRET = re.compile(r"://[^:@/]*:([^@/]*)@")
+URI_SCHEME = re.compile(r"^\s*postgres(?:ql)?://", re.IGNORECASE)
 SECRET_SETTING = re.compile(r"password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))")
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
@@ -147,6 +169,7 @@ class PostgresBackend(BaseBackend):
                 f"statement_timeout must be None or between {SHORTEST_STATEMENT_SECONDS} "
                 f"and {LONGEST_STATEMENT_SECONDS:g} seconds, not {statement_timeout!r}"
             )
+        conninfo = _lowered(conninfo)
         _parsed(conninfo)
         _refuse_unknown(connection_options)
         self._conninfo = conninfo
@@ -164,6 +187,7 @@ class PostgresBackend(BaseBackend):
         self._listened: set[str] = set()
         self._hearing = 0
         self._marks: dict[str, int] = {}
+        self._unclaimed: set[_Unclaimed] = set()
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
         self._connection_options = connection_options
@@ -204,7 +228,7 @@ class PostgresBackend(BaseBackend):
             for name, parameter in inspect.signature(cls.__init__).parameters.items()
             if parameter.kind is inspect.Parameter.KEYWORD_ONLY
         }
-        _parsed(conninfo)
+        _parsed(_lowered(conninfo))
         _refuse_unknown({key: value for key, value in options.items() if key not in named})
 
     @classmethod
@@ -222,6 +246,7 @@ class PostgresBackend(BaseBackend):
                 placed.tables == len(TABLE_KINDS)
                 and stored == SCHEMA_VERSION
                 and not await self._misplaced(connection, placed)
+                and not await self._missing_columns(connection, placed)
             )
         if not complete:
             for attempt in range(SETUP_ATTEMPTS):
@@ -231,6 +256,15 @@ class PostgresBackend(BaseBackend):
                 except CREATION_RACES:
                     if attempt == SETUP_ATTEMPTS - 1:
                         raise
+        skipped: set[str] = set()
+        if not complete:
+            async with self._connection() as connection:
+                placed = await self._placed(connection)
+                rebuilding = placed.tables == len(TABLE_KINDS) and bool(
+                    await self._misplaced(connection, placed)
+                )
+            if rebuilding:
+                skipped = await self._rebuild_indexes()
         async with self._connection() as connection:
             placed = await self._placed(connection)
             if placed.tables != len(TABLE_KINDS):
@@ -239,7 +273,7 @@ class PostgresBackend(BaseBackend):
                     f"although the meta table records schema version {SCHEMA_VERSION}; "
                     "restore them or drop the rest so setup creates them again"
                 )
-            await self._check_indexes(connection, placed)
+            await self._check_indexes(connection, placed, skipped)
             queries = placed.queries
             rows = await _fetch(connection, queries.identity, {})
             if not rows:
@@ -302,34 +336,119 @@ class PostgresBackend(BaseBackend):
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
     ) -> list[dict[str, Any]]:
         prefix = self._tables.prefix
-        return await _fetch(
+        schema = placed.within.schema
+        indexes = await _fetch(
             connection,
             self._unplaced.misplaced_indexes,
             {
-                "schema": placed.within.schema,
+                "schema": schema,
                 "indexes": [f"{prefix}_{name}" for name, _, _ in INDEXES],
                 "tables": [f"{prefix}_{kind}" for _, kind, _ in INDEXES],
                 "uniques": [unique for _, _, unique in INDEXES],
             },
         )
+        statistics = await _fetch(
+            connection,
+            self._unplaced.missing_statistics,
+            {"schema": schema, "statistics": [f"{prefix}_{name}" for name, _ in STATISTICS]},
+        )
+        return indexes + statistics
 
-    async def _rebuild_indexes(
+    async def _missing_columns(
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
-    ) -> None:
-        statements = {
-            f"{self._tables.prefix}_{name}": statement
-            for name, statement in placed.within.indexes().items()
-        }
-        schema = placed.within.schema.replace('"', '""')
-        for row in await self._misplaced(connection, placed):
-            if row["on_its_table"]:
-                await connection.execute(f'DROP INDEX "{schema}"."{row["name"]}"')
-            await connection.execute(statements[row["name"]], {})
+    ) -> list[dict[str, Any]]:
+        if placed.tables != len(TABLE_KINDS):
+            return []
+        prefix = self._tables.prefix
+        return await _fetch(
+            connection,
+            self._unplaced.missing_columns,
+            {
+                "schema": placed.within.schema,
+                "columns": [name for name, _ in COLUMNS],
+                "tables": [f"{prefix}_{kind}" for _, kind in COLUMNS],
+            },
+        )
+
+    async def _rebuild_indexes(self) -> set[str]:
+        prefix = self._tables.prefix
+        unique = {f"{prefix}_{name}" for name, _, is_unique in INDEXES if is_unique}
+        skipped: set[str] = set()
+        async with await psycopg.AsyncConnection.connect(
+            self._conninfo, **self._direct_options()
+        ) as connection:
+            for statement, parameters in self._settings():
+                await connection.execute(statement, parameters)
+            await connection.execute(
+                "SELECT pg_catalog.set_config('statement_timeout', '0', false), "
+                "pg_catalog.set_config('lock_timeout', %(wait)s, false)",
+                {"wait": f"{REBUILD_LOCK_SECONDS}s"},
+            )
+            await self._lock_for_setup(connection, "pg_catalog.pg_try_advisory_lock")
+            placed = await self._placed(connection)
+            schema = placed.within.schema.replace('"', '""').replace("%", "%%")
+            statements = {
+                f"{prefix}_{name}": statement
+                for name, statement in {
+                    **placed.within.indexes(concurrently=True),
+                    **placed.within.statistics(),
+                }.items()
+            }
+            for row in await self._misplaced(connection, placed):
+                name = row["name"]
+                try:
+                    if row["on_its_table"]:
+                        await connection.execute(
+                            f'DROP INDEX CONCURRENTLY IF EXISTS "{schema}"."{name}"', {}
+                        )
+                    await connection.execute(statements[name], {})
+                except errors.UniqueViolation:
+                    raise ConfigurationError(
+                        await self._duplicates(connection, name, placed.within.jobs)
+                    ) from None
+                except (errors.LockNotAvailable, errors.QueryCanceled) as error:
+                    if name in unique:
+                        raise ConfigurationError(
+                            f"setup could not rebuild the tinyjobs index {name}, which keeps "
+                            f"jobs unique, within {REBUILD_LOCK_SECONDS}s ({error}); a "
+                            "transaction holding the table that long must end first, then "
+                            "run setup again"
+                        ) from None
+                    logger.warning(
+                        "setup could not rebuild the tinyjobs index %s within %ss (%s); jobs "
+                        "still run without it, more slowly, and the next setup tries again",
+                        name,
+                        REBUILD_LOCK_SECONDS,
+                        error,
+                    )
+                    skipped.add(name)
+        return skipped
+
+    async def _duplicates(
+        self, connection: psycopg.AsyncConnection, name: str, jobs: str
+    ) -> str:
+        if name != f"{self._tables.prefix}_jobs_dedup":
+            return (
+                f"setup could not rebuild the tinyjobs index {name} because rows it must keep "
+                "unique are duplicated"
+            )
+        cursor = await connection.execute(
+            f"SELECT pg_catalog.min(dedup_key) AS key FROM {jobs} "
+            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'running') "
+            "GROUP BY dedup_digest HAVING pg_catalog.count(*) > 1 LIMIT 5",
+            {},
+        )
+        keys = ", ".join(repr(row["key"]) for row in await cursor.fetchall())
+        return (
+            f"setup could not rebuild the tinyjobs index {name}: while it was missing, "
+            f"jobs with the same dedup key became active more than once ({keys}); cancel "
+            "all but one of each and run setup again"
+        )
 
     async def _check_indexes(
-        self, connection: psycopg.AsyncConnection, placed: "_Placement"
+        self, connection: psycopg.AsyncConnection, placed: "_Placement", skipped: set[str]
     ) -> None:
-        rows = await self._misplaced(connection, placed)
+        rows = [row for row in await self._misplaced(connection, placed) if row["name"] not in skipped]
         if rows:
             names = ", ".join(row["name"] for row in rows)
             raise ConfigurationError(
@@ -351,9 +470,7 @@ class PostgresBackend(BaseBackend):
                     f"postgres schema version {stored} is newer than this tinyjobs "
                     f"build understands ({SCHEMA_VERSION}); upgrade the package"
                 )
-            if stored == SCHEMA_VERSION:
-                if placed.tables == len(TABLE_KINDS):
-                    await self._rebuild_indexes(connection, placed)
+            if stored == SCHEMA_VERSION and not await self._missing_columns(connection, placed):
                 return
             for statement in placed.within.ddl(schema_missing=placed.schema_missing):
                 await connection.execute(statement, {})
@@ -366,11 +483,15 @@ class PostgresBackend(BaseBackend):
             for statement in created.within.seeds():
                 await connection.execute(statement, {})
 
-    async def _lock_for_setup(self, connection: psycopg.AsyncConnection) -> None:
+    async def _lock_for_setup(
+        self,
+        connection: psycopg.AsyncConnection,
+        taking: str = "pg_catalog.pg_try_advisory_xact_lock",
+    ) -> None:
         deadline = time.monotonic() + SETUP_LOCK_SECONDS
         while True:
             cursor = await connection.execute(
-                "SELECT pg_catalog.pg_try_advisory_xact_lock(%(key)s) AS taken",
+                f"SELECT {taking}(%(key)s) AS taken",
                 {"key": self._tables.lock},
             )
             if (await cursor.fetchone())["taken"]:
@@ -437,6 +558,10 @@ class PostgresBackend(BaseBackend):
             await asyncio.wait({listening})
         for event in self._waiters:
             event.set()
+        if self._unclaimed:
+            with suppress(psycopg.Error, PoolTimeout, PoolClosed, TimeoutError):
+                async with asyncio.timeout(SETTLE_SECONDS):
+                    await self._unlease()
         await self._pool.close()
 
     async def wait_for_jobs(
@@ -531,11 +656,43 @@ class PostgresBackend(BaseBackend):
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
+        if self._unclaimed:
+            await self._unlease()
         now = await self._now()
-        rows = await self._retrying(
-            *self._claiming(now, wanted, worker_id, limit, lease_seconds)
-        )
+        query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
+        _LEFT.set(None)
+        try:
+            rows = await self._retrying(query, parameters)
+        except BaseException as error:
+            if _unanswered(error):
+                self._unclaimed.add(_Unclaimed(worker_id, parameters["token"], _LEFT.get()))
+            raise
         return [job_from_row(row) for row in rows]
+
+    async def _unlease(self) -> None:
+        for entry in list(self._unclaimed):
+            async with self._connection() as connection:
+                if entry.backend is not None:
+                    pid, born = entry.backend
+                    fenced = await _fetch(
+                        connection, FENCE, {"pid": pid, "born": born, "wait": FENCE_MILLISECONDS}
+                    )
+                    if fenced and not fenced[0]["ended"]:
+                        continue
+                rows = await _fetch(
+                    connection,
+                    self._queries.unclaim,
+                    {"worker": entry.worker_id, "token": entry.token},
+                )
+            self._unclaimed.discard(entry)
+            if rows:
+                logger.warning(
+                    "handed back %d job(s) a postgres claim leased to %s although its answer "
+                    "never arrived",
+                    len(rows),
+                    entry.worker_id,
+                )
+                await self._wake({row["queue"] for row in rows})
 
     def _claiming(
         self,
@@ -558,6 +715,7 @@ class PostgresBackend(BaseBackend):
             worker=worker_id,
             lease=now + lease_seconds,
             seconds=lease_seconds,
+            token=secrets.token_hex(16),
         )
 
     async def heartbeat(
@@ -929,7 +1087,9 @@ class PostgresBackend(BaseBackend):
             (
                 "SELECT set_config('default_transaction_isolation', 'read committed', false), "
                 "set_config('statement_timeout', %(statement)s, false), "
-                "set_config('idle_in_transaction_session_timeout', %(idle)s, false)",
+                "set_config('idle_in_transaction_session_timeout', %(idle)s, false), "
+                "pg_catalog.pg_backend_pid() AS pid, (SELECT backend_start FROM "
+                "pg_catalog.pg_stat_get_activity(pg_catalog.pg_backend_pid())) AS born",
                 {"statement": statement, "idle": f"{IDLE_IN_TRANSACTION_SECONDS}s"},
             ),
         ]
@@ -1048,10 +1208,14 @@ class PostgresBackend(BaseBackend):
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[psycopg.AsyncConnection]:
+        _LEFT.set(None)
         try:
             connection = await self._live()
             try:
                 yield connection
+            except BaseException:
+                _LEFT.set(_abandoned(connection))
+                raise
             finally:
                 await self._pool.putconn(connection)
         except (psycopg.OperationalError, PoolTimeout):
@@ -1075,15 +1239,42 @@ class PostgresBackend(BaseBackend):
             yield connection
 
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
-        if isinstance(connection, _Answering) and self._statement_timeout is not None:
-            connection.deadline = self._statement_timeout + ANSWER_MARGIN_SECONDS
+        if isinstance(connection, _Answering):
+            connection.pid = connection.info.backend_pid
+            connection.working = self._working
         if self._schemas is None:
             cursor = await connection.execute(
                 "SELECT pg_catalog.current_schemas(false)::pg_catalog.text[] AS schemas"
             )
             self._schemas = (await cursor.fetchone())["schemas"]
         for statement, parameters in self._settings():
-            await connection.execute(statement, parameters)
+            cursor = await connection.execute(statement, parameters)
+        if isinstance(connection, _Answering):
+            row = await cursor.fetchone()
+            connection.pid, connection.born = row["pid"], row["born"]
+
+    async def _working(self, pid: int, quiet: float) -> bool:
+        try:
+            async with asyncio.timeout(PROBE_SECONDS):
+                async with await psycopg.AsyncConnection.connect(
+                    self._conninfo, **self._direct_options()
+                ) as probe:
+                    row = await (await probe.execute(RUNNING, {"pid": pid})).fetchone()
+                    if row is not None and _busy(row, quiet):
+                        return True
+                    if row is None:
+                        return False
+                    with suppress(psycopg.Error):
+                        cursor = await probe.execute(
+                            ENDING,
+                            {"pid": pid, "seen": row["state_change"], "wait": ENDING_MILLISECONDS},
+                        )
+                        return await cursor.fetchone() is None
+                    return False
+        except TimeoutError:
+            return False
+        except psycopg.Error as error:
+            return error.sqlstate is not None
 
     async def _wake(self, queues: set[str]) -> None:
         if not self._notify or not queues or self._closed or self._channel is None:
@@ -1203,27 +1394,44 @@ def _check_held(connection: Any) -> None:
 
 def _parsed(conninfo: str) -> dict[str, Any]:
     try:
-        return conninfo_to_dict(conninfo)
+        parsed = conninfo_to_dict(conninfo)
     except psycopg.ProgrammingError as error:
-        reason = QUOTED.sub(partial(_masked, _secrets(conninfo)), str(error).strip())
+        reason = _unrevealing(conninfo, str(error).strip())
         raise ConfigurationError(f"the postgres url is not valid: {reason}") from None
+    ports = str(parsed.get("port") or "").split(",")
+    if "@" in str(parsed.get("host") or "") or not all(
+        port.strip().isdigit() for port in ports if port.strip()
+    ):
+        raise ConfigurationError(
+            "the postgres url is not valid: its host or port is malformed; a password "
+            "holding '@', '/', '?' or '#' must have them percent-encoded"
+        )
+    return parsed
+
+
+def _unrevealing(conninfo: str, reason: str) -> str:
+    secrets = _secrets(conninfo)
+    if not secrets and "password" not in conninfo.lower():
+        return reason
+    head, quoted, _ = reason.partition('"')
+    reason = head + ('"***"' if quoted else "")
+    for secret in sorted(secrets, key=len, reverse=True):
+        reason = reason.replace(secret, "***")
+    return reason
 
 
 def _secrets(conninfo: str) -> set[str]:
     found = {match.group(1) or match.group(2) for match in SECRET_SETTING.finditer(conninfo)}
-    found |= {match.group(1) for match in USERINFO_SECRET.finditer(conninfo)}
     if "://" in conninfo:
-        with suppress(ValueError):
-            found.add(urlsplit(conninfo).password or "")
+        userinfo = conninfo.partition("://")[2].rpartition("@")[0]
+        if ":" in userinfo:
+            found.add(userinfo.partition(":")[2])
     found |= {unquote(secret) for secret in found}
     return {secret for secret in found if secret}
 
 
-def _masked(secrets: set[str], match: re.Match[str]) -> str:
-    token = match.group(1)
-    if any(token in secret or secret in token for secret in secrets):
-        return '"***"'
-    return match.group(0)
+def _lowered(conninfo: str) -> str:
+    return URI_SCHEME.sub(lambda match: match.group(0).lower(), conninfo, count=1)
 
 
 def _refuse_unknown(options: dict[str, Any]) -> None:
@@ -1331,6 +1539,25 @@ def _in_order(
 
 
 @dataclass(frozen=True, slots=True)
+class _Unclaimed:
+    worker_id: str
+    token: str
+    backend: tuple[int, Any] | None
+
+
+def _unanswered(error: BaseException) -> bool:
+    if not isinstance(error, psycopg.Error) or error.sqlstate is None:
+        return True
+    return error.sqlstate in LOST_STATES or error.sqlstate.startswith("08")
+
+
+def _abandoned(connection: psycopg.AsyncConnection) -> tuple[int, Any] | None:
+    if not connection.closed or not isinstance(connection, _Answering) or connection.pid is None:
+        return None
+    return connection.pid, connection.born
+
+
+@dataclass(frozen=True, slots=True)
 class _Placement:
     within: Tables
     queries: Queries
@@ -1364,37 +1591,101 @@ def _connection_of(tx: Any) -> Any:
 
 
 class _Answering(psycopg.AsyncConnection):
-    deadline: float | None = None
+    pid: int | None = None
+    born: Any = None
+    working: Callable[[int, float], Awaitable[bool]] | None = None
+    heard: float = 0.0
 
     async def wait(self, gen: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.deadline is None or args or kwargs:
+        if self.working is None or self.pid is None or args or kwargs:
             return await super().wait(gen, *args, **kwargs)
         try:
-            if WAITS_WITH_TIMEOUT:
-                return await super().wait(gen, timeout=self.deadline)
-            return await self._bounded(gen, self.deadline)
-        except UNANSWERED:
-            self.pgconn.finish()
-            raise psycopg.OperationalError(
-                f"the postgres server did not answer within {self.deadline:g} seconds; "
-                "the connection was closed"
-            ) from None
-
-    async def _bounded(self, gen: Any, seconds: float) -> Any:
-        try:
-            async with asyncio.timeout(seconds):
-                return await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
+            return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
             if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
-                await self._try_cancel(timeout=CANCEL_SECONDS)
-                try:
-                    async with asyncio.timeout(CANCEL_SECONDS):
-                        await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
-                except errors.QueryCanceled:
-                    pass
-                except TimeoutError:
-                    self.pgconn.finish()
+                await self._given_up(gen)
             raise
+
+    async def _heard(self, gen: Any) -> Any:
+        self.heard = time.monotonic()
+        try:
+            state = next(gen)
+            while True:
+                state = gen.send(await self._answer(state))
+        except StopIteration as finished:
+            return finished.value
+        except OSError as error:
+            raise psycopg.OperationalError("connection socket closed") from error
+
+    async def _answer(self, state: int) -> int:
+        ready = await _ready(self.pgconn.socket, state, SILENCE_SECONDS)
+        while not ready:
+            if not await self.working(self.pid, time.monotonic() - self.heard):
+                ready = _ready_now(self.pgconn.socket, state)
+                if ready:
+                    return ready
+                self.pgconn.finish()
+                raise psycopg.OperationalError(
+                    "the postgres server did not answer: it finished or stopped the statement "
+                    "but its answer never arrived, or it cannot be reached; the connection was "
+                    "closed"
+                )
+            ready = await _ready(self.pgconn.socket, state, SILENCE_SECONDS)
+        self.heard = time.monotonic()
+        return ready
+
+    async def _given_up(self, gen: Any) -> None:
+        await self._try_cancel(timeout=CANCEL_SECONDS)
+        try:
+            async with asyncio.timeout(CANCEL_SECONDS):
+                await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
+        except errors.QueryCanceled:
+            pass
+        except TimeoutError:
+            self.pgconn.finish()
+
+
+def _busy(row: dict[str, Any], quiet: float) -> bool:
+    if row["state"] in UNKNOWN_STATES:
+        return True
+    if row["wait_event"] == "ClientWrite":
+        return False
+    return row["wait_event"] != "ClientRead" or quiet < IN_TRANSIT_SECONDS
+
+
+def _ready_now(fileno: int, state: int) -> int:
+    readable, writable, _ = select.select(
+        [fileno] if state & waiting.WAIT_R else [],
+        [fileno] if state & waiting.WAIT_W else [],
+        [],
+        0,
+    )
+    return (waiting.READY_R if readable else 0) | (waiting.READY_W if writable else 0)
+
+
+async def _ready(fileno: int, state: int, seconds: float) -> int:
+    loop = asyncio.get_running_loop()
+    heard = loop.create_future()
+    ready = 0
+
+    def wake(flag: int) -> None:
+        nonlocal ready
+        ready |= flag
+        if not heard.done():
+            heard.set_result(None)
+
+    if state & waiting.WAIT_R:
+        loop.add_reader(fileno, wake, waiting.READY_R)
+    if state & waiting.WAIT_W:
+        loop.add_writer(fileno, wake, waiting.READY_W)
+    timer = loop.call_later(seconds, wake, 0)
+    try:
+        await heard
+    finally:
+        timer.cancel()
+        loop.remove_reader(fileno)
+        loop.remove_writer(fileno)
+    return ready
 
 
 class _Elsewhere(Exception):

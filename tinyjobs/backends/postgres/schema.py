@@ -22,6 +22,10 @@ INDEXES = (
     ("executions_claim", "executions", True),
 )
 
+STATISTICS = (("jobs_queue", "jobs"),)
+
+COLUMNS = (("claim_token", "jobs"),)
+
 
 class Tables:
     def __init__(self, prefix: str, schema: str | None = None) -> None:
@@ -62,7 +66,16 @@ class Tables:
     def index(self, name: str) -> str:
         return f'"{self.prefix}_{name}"'
 
-    def indexes(self) -> dict[str, str]:
+    def indexes(self, *, concurrently: bool = False) -> dict[str, str]:
+        statements = self._indexes()
+        if not concurrently:
+            return statements
+        return {
+            name: statement.replace(" INDEX IF NOT EXISTS ", " INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+            for name, statement in statements.items()
+        }
+
+    def _indexes(self) -> dict[str, str]:
         jobs, executions = self.jobs, self.executions
         return {
             "jobs_claim": f"""
@@ -91,6 +104,22 @@ class Tables:
             "executions_claim": f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
                 ON {executions} (job_id, claim)
+            """,
+        }
+
+    def columns(self) -> dict[str, str]:
+        return {
+            "claim_token": f"ALTER TABLE {self.jobs} ADD COLUMN IF NOT EXISTS claim_token text",
+        }
+
+    def statistics(self) -> dict[str, str]:
+        qualify = (
+            ('"' + self.schema.replace('"', '""') + '".').replace("%", "%%") if self.schema else ""
+        )
+        return {
+            "jobs_queue": f"""
+            CREATE STATISTICS IF NOT EXISTS {qualify}"{self.prefix}_jobs_queue" (dependencies)
+                ON queue, ({QUEUE_KEY}) FROM {self.jobs}
             """,
         }
 
@@ -130,7 +159,8 @@ class Tables:
                 dedup_key        text COLLATE "C",
                 dedup_digest     bytea,
                 result           bytea,
-                last_error       text
+                last_error       text,
+                claim_token      text
             ) WITH (
                 fillfactor = 85,
                 autovacuum_vacuum_scale_factor = 0.01,
@@ -140,11 +170,13 @@ class Tables:
                 autovacuum_vacuum_cost_delay = 1
             )
             """,
+            self.columns()["claim_token"],
             indexes["jobs_claim"],
             indexes["jobs_by_status"],
             indexes["jobs_by_queue"],
             indexes["jobs_purge"],
             indexes["jobs_dedup"],
+            self.statistics()["jobs_queue"],
             f"""
             CREATE TABLE IF NOT EXISTS {executions} (
                 id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

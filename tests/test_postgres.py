@@ -57,17 +57,33 @@ def url_for(*, dbname: str | None = None, user: str | None = None, password: str
 
 
 @asynccontextmanager
-async def stalling_proxy():
+async def stalling_proxy(rate: float | None = None):
     frozen = asyncio.Event()
     links: list[asyncio.StreamWriter] = []
     target = urllib.parse.urlsplit(POSTGRES_URL)
 
     async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        backlog: asyncio.Queue[bytes] = asyncio.Queue()
+        sending = asyncio.create_task(trickle(backlog, writer)) if rate else None
         with suppress(OSError, asyncio.CancelledError):
             while data := await reader.read(65536):
-                if not frozen.is_set():
+                if frozen.is_set():
+                    continue
+                if sending is None:
                     writer.write(data)
                     await writer.drain()
+                else:
+                    backlog.put_nowait(data)
+        if sending is not None:
+            backlog.put_nowait(b"")
+            with suppress(OSError, asyncio.CancelledError):
+                await sending
+
+    async def trickle(backlog: asyncio.Queue[bytes], writer: asyncio.StreamWriter) -> None:
+        while data := await backlog.get():
+            writer.write(data)
+            await writer.drain()
+            await asyncio.sleep(len(data) / rate)
 
     async def link(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         upstream_reader, upstream_writer = await asyncio.open_connection(
@@ -83,6 +99,43 @@ async def stalling_proxy():
         yield POSTGRES_URL.replace(place, f"127.0.0.1:{port}", 1), frozen
     finally:
         frozen.clear()
+        for writer in links:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+
+
+@asynccontextmanager
+async def muting_proxy():
+    muted: list[int] = []
+    links: list[asyncio.StreamWriter] = []
+    target = urllib.parse.urlsplit(POSTGRES_URL)
+
+    async def pipe(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter, born: int | None
+    ) -> None:
+        with suppress(OSError, asyncio.CancelledError):
+            while data := await reader.read(65536):
+                if born is None or not muted or born >= muted[0]:
+                    writer.write(data)
+                    await writer.drain()
+
+    async def link(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        born = len(links)
+        upstream_reader, upstream_writer = await asyncio.open_connection(
+            target.hostname, target.port or 5432
+        )
+        links.extend((writer, upstream_writer))
+        await asyncio.gather(
+            pipe(reader, upstream_writer, None), pipe(upstream_reader, writer, born)
+        )
+
+    server = await asyncio.start_server(link, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    place = target.hostname + (f":{target.port}" if target.port else "")
+    try:
+        yield POSTGRES_URL.replace(place, f"127.0.0.1:{port}", 1), lambda: muted.append(len(links))
+    finally:
         for writer in links:
             writer.close()
         server.close()
@@ -1054,6 +1107,83 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row[1] for row in rows))
         await self.assertUniqueKeysHold(again)
 
+    async def test_rebuilding_an_index_never_blocks_live_writers(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_claim"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await live.aenqueue_in(holder, [make_job()])
+            starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(starting.close)
+            with (
+                mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 1),
+                self.assertLogs("tinyjobs", "WARNING") as logged,
+            ):
+                setting_up = asyncio.create_task(starting.setup())
+                await asyncio.sleep(0.3)
+                started = time.monotonic()
+                await live.enqueue(make_job())
+                await live.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=30.0)
+                self.assertLess(time.monotonic() - started, 0.5)
+                await setting_up
+            self.assertIn("jobs still run without it", "\n".join(logged.output))
+            await holder.commit()
+        again = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(again.close)
+        await again.setup()
+        rows = await sql(
+            "SELECT i.indisvalid FROM pg_index AS i JOIN pg_class AS c ON c.oid = i.indexrelid "
+            f"WHERE c.relname = '{prefix}_jobs_claim'"
+        )
+        self.assertEqual(rows, [(True,)])
+
+    async def test_a_unique_index_that_cannot_be_rebuilt_stops_setup_with_the_reason(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        live = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(live.close)
+        await live.setup()
+        await sql(f'DROP INDEX "{prefix}_jobs_dedup"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await live.aenqueue_in(holder, [make_job()])
+            starting = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(starting.close)
+            with mock.patch.object(postgres_backend, "REBUILD_LOCK_SECONDS", 1):
+                with self.assertRaisesRegex(ConfigurationError, "keeps jobs unique"):
+                    await starting.setup()
+            await holder.rollback()
+        await live.enqueue(make_job(dedup_key="twice"))
+        await live.enqueue(make_job(dedup_key="twice"))
+        again = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(again.close)
+        with self.assertRaisesRegex(ConfigurationError, "'twice'.*cancel all but one"):
+            await again.setup()
+        [(extra,)] = await sql(
+            f"SELECT max(id) FROM \"{prefix}_jobs\" WHERE dedup_key = 'twice'"
+        )
+        await live.cancel(extra)
+        await again.setup()
+        await self.assertUniqueKeysHold(again)
+
+    async def test_setup_restores_the_statistics_that_tie_queue_names_to_their_index(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        query = f"SELECT stxkind FROM pg_statistic_ext WHERE stxname = '{prefix}_jobs_queue'"
+        [(kinds,)] = await sql(query)
+        self.assertIn("f", kinds)
+        await sql(f'DROP STATISTICS "{prefix}_jobs_queue"')
+        again = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(again.close)
+        await again.setup()
+        [(kinds,)] = await sql(query)
+        self.assertIn("f", kinds)
+
     async def assertUniqueKeysHold(self, backend: PostgresBackend) -> None:
         first = await backend.enqueue(make_job(dedup_key="held"))
         second = await backend.enqueue(make_job(dedup_key="held"))
@@ -1417,6 +1547,47 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
             await self.backend.aenqueue_in(connection, [make_job()])
             await connection.commit()
+
+    async def test_objects_of_other_roles_that_only_mention_the_tables_do_not_block_them(self):
+        stranger = await self.role()
+        await self.backend.setup()
+        jobs = f'"{self.prefix}_jobs"'
+        await sql(f'GRANT SELECT ON {jobs} TO "{stranger}"')
+        await sql(f'CREATE SCHEMA "{stranger}" AUTHORIZATION "{stranger}"')
+        self.addAsyncCleanup(sql, f'DROP SCHEMA IF EXISTS "{stranger}" CASCADE')
+        async with await psycopg.AsyncConnection.connect(
+            url_for(user=stranger, password="tinyjobs"), autocommit=True
+        ) as holder:
+            await holder.execute(
+                f'CREATE VIEW "{stranger}".seen AS SELECT id FROM public.{jobs}; '
+                f"CREATE FUNCTION pg_temp.held() RETURNS regclass LANGUAGE sql BEGIN ATOMIC "
+                f"SELECT 'public.{jobs}'::regclass; END"
+            )
+            again = await self.make_backend(self.clock)
+            self.addAsyncCleanup(again.close)
+            await again.setup()
+            async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+                await again.aenqueue_in(connection, [make_job()])
+                await connection.commit()
+
+    async def test_tables_tied_to_the_jobs_by_a_foreign_key_are_held_to_the_same_rule(self):
+        planter = await self.role()
+        await self.backend.setup()
+        await sql(
+            f'CREATE TABLE "{self.prefix}_audit" (job_id text COLLATE "C" '
+            f'REFERENCES "{self.prefix}_jobs" (id) ON DELETE CASCADE)'
+        )
+        self.addAsyncCleanup(sql, f'DROP TABLE IF EXISTS "{self.prefix}_audit"')
+        await sql(f'GRANT TRIGGER ON "{self.prefix}_audit" TO "{planter}"')
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "never writes through"):
+                await self.backend.aenqueue_in(connection, [make_job()])
+        again = await self.make_backend(self.clock)
+        self.addAsyncCleanup(again.close)
+        with self.assertRaisesRegex(ConfigurationError, "drop that code"):
+            await again.setup()
+        await sql(f'REVOKE TRIGGER ON "{self.prefix}_audit" FROM "{planter}"')
+        await again.setup()
 
     async def test_a_dedup_key_longer_than_an_index_row_still_dedups(self):
         key = os.urandom(3000).hex()
@@ -1901,6 +2072,11 @@ class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
             "postgresql://app@db/shop?sslmode=disable&password=Hunter2%zzSecret",
             "postgresql://app:Hunter2Secret@[::1/shop",
             "postgresql://app:Hunter2Secret@[::1]x/shop",
+            "postgresql://app:Hunter2/Secret@db:5432/shop",
+            "postgresql://app:Hunter2@Secret@db:5432/shop",
+            "postgresql://app:Hunter2/Secret%zz@db/shop",
+            'postgresql://app:Hun"ter2Secret%zz@db/shop',
+            "Postgres://app:Hunter2/Secret@db:5432/shop",
         ):
             for build in (TinyJobs, PostgresBackend.from_url):
                 with self.subTest(url=url, build=build):
@@ -1908,6 +2084,10 @@ class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
                         build(url)
                     self.assertNotIn("Hunter2", str(caught.exception))
                     self.assertNotIn("Secret", str(caught.exception))
+
+    def test_a_scheme_in_capitals_is_read_as_a_postgres_url(self):
+        backend = PostgresBackend.from_url(POSTGRES_URL.replace("postgresql://", "PostgreSQL://", 1))
+        self.assertTrue(backend._conninfo.startswith("postgresql://"))
 
     async def test_two_spellings_of_one_store_share_its_channel(self):
         prefix = new_prefix()
@@ -2844,9 +3024,12 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_server_that_stops_answering_fails_a_pooled_call_instead_of_hanging(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
-        with mock.patch.object(postgres_backend, "ANSWER_MARGIN_SECONDS", 0.5):
+        with (
+            mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.5),
+            mock.patch.object(postgres_backend, "PROBE_SECONDS", 0.5),
+        ):
             async with stalling_proxy() as (url, frozen):
-                backend = PostgresBackend.from_url(url, prefix=prefix, statement_timeout=0.5)
+                backend = PostgresBackend.from_url(url, prefix=prefix)
                 self.addAsyncCleanup(backend.close)
                 await backend.setup()
                 job = await self.claimed_on(backend)
@@ -2858,10 +3041,6 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                 frozen.clear()
                 self.assertTrue(await backend.complete(job, None))
 
-    @unittest.skipIf(
-        PostgresBackend is not None and postgres_backend.WAITS_WITH_TIMEOUT,
-        "psycopg bounds its own cancellation once wait() takes a timeout",
-    )
     async def test_a_call_cancelled_while_the_server_stalls_gives_up_its_connection(self):
         prefix = new_prefix()
         self.addAsyncCleanup(drop, prefix)
@@ -2881,6 +3060,164 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(time.monotonic() - started, 5)
                 frozen.clear()
                 self.assertTrue(await backend.complete(job, None))
+
+    async def test_a_commit_the_server_is_still_making_is_waited_for(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        with mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.3):
+            backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix, statement_timeout=0.2)
+            self.addAsyncCleanup(backend.close)
+            await backend.setup()
+            await sql(
+                f'CREATE FUNCTION "{prefix}_slow"() RETURNS trigger LANGUAGE plpgsql AS '
+                "$$ BEGIN PERFORM pg_sleep(1.5); RETURN NULL; END $$"
+            )
+            self.addAsyncCleanup(sql, f'DROP FUNCTION IF EXISTS "{prefix}_slow"() CASCADE')
+            await sql(
+                f'CREATE CONSTRAINT TRIGGER slow AFTER INSERT ON "{prefix}_jobs" '
+                f'DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "{prefix}_slow"()'
+            )
+            started = time.monotonic()
+            job = await backend.enqueue(make_job())
+            self.assertGreater(time.monotonic() - started, 1.5)
+            self.assertEqual(await sql(f'SELECT id FROM "{prefix}_jobs"'), [(job.id,)])
+
+    async def test_a_payload_slower_to_arrive_than_the_silence_is_still_claimed(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        with (
+            mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.3, create=True),
+            mock.patch.object(postgres_backend, "ANSWER_MARGIN_SECONDS", 0.3, create=True),
+        ):
+            direct = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+            self.addAsyncCleanup(direct.close)
+            await direct.setup()
+            await direct.enqueue(make_job(payload=b"x" * 1_000_000))
+            async with stalling_proxy(rate=500_000) as (url, _):
+                backend = PostgresBackend.from_url(url, prefix=prefix, statement_timeout=0.5)
+                self.addAsyncCleanup(backend.close)
+                await backend.setup()
+                started = time.monotonic()
+                [job] = await backend.claim(
+                    worker_id="w", queues=["default"], limit=1, lease_seconds=30.0
+                )
+                self.assertGreater(time.monotonic() - started, 0.8)
+                self.assertEqual(len(job.payload), 1_000_000)
+
+    async def test_an_upload_slower_than_the_silence_is_still_stored(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        with (
+            mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.3, create=True),
+            mock.patch.object(postgres_backend, "ANSWER_MARGIN_SECONDS", 0.3, create=True),
+        ):
+            async with stalling_proxy(rate=500_000) as (url, _):
+                backend = PostgresBackend.from_url(
+                    url, prefix=prefix, statement_timeout=0.5, prepare_threshold=0
+                )
+                self.addAsyncCleanup(backend.close)
+                await backend.setup()
+                started = time.monotonic()
+                job = await backend.enqueue(make_job(payload=b"x" * 1_000_000))
+                self.assertGreater(time.monotonic() - started, 0.8)
+        self.assertEqual(
+            await sql(
+                f'SELECT length(payload) FROM "{prefix}_jobs" WHERE id = %(id)s', {"id": job.id}
+            ),
+            [(1_000_000,)],
+        )
+
+    async def test_an_answer_lost_on_its_way_back_fails_the_call_and_ends_its_backend(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        probed: list[int] = []
+        working = PostgresBackend._working
+
+        async def watched(backend: PostgresBackend, pid: int, quiet: float) -> bool:
+            probed.append(pid)
+            return await working(backend, pid, quiet)
+
+        with (
+            mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.3),
+            mock.patch.object(postgres_backend, "IN_TRANSIT_SECONDS", 1.0),
+            mock.patch.object(PostgresBackend, "_working", watched),
+        ):
+            async with muting_proxy() as (url, mute):
+                backend = PostgresBackend.from_url(url, prefix=prefix)
+                self.addAsyncCleanup(backend.close)
+                await backend.setup()
+                job = await self.claimed_on(backend)
+                mute()
+                started = time.monotonic()
+                with self.assertRaises(psycopg.OperationalError):
+                    await asyncio.wait_for(backend.complete(job, None), 10)
+                self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(
+            await sql(f'SELECT status FROM "{prefix}_jobs" WHERE id = %(id)s', {"id": job.id}),
+            [("success",)],
+        )
+        self.assertEqual(
+            await sql(
+                "SELECT pid FROM pg_stat_activity WHERE pid = ANY(%(pids)s)", {"pids": probed}
+            ),
+            [],
+        )
+
+    async def test_a_claim_whose_answer_never_arrived_hands_its_jobs_back(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        with (
+            mock.patch.object(postgres_backend, "SILENCE_SECONDS", 0.3),
+            mock.patch.object(postgres_backend, "PROBE_SECONDS", 0.5),
+        ):
+            async with stalling_proxy() as (url, frozen):
+                backend = PostgresBackend.from_url(url, prefix=prefix)
+                self.addAsyncCleanup(backend.close)
+                await backend.setup()
+                stored = await backend.enqueue(make_job())
+                await sql(
+                    f'CREATE FUNCTION "{prefix}_slow"() RETURNS trigger LANGUAGE plpgsql AS '
+                    "$$ BEGIN PERFORM pg_sleep(1); RETURN NULL; END $$"
+                )
+                self.addAsyncCleanup(sql, f'DROP FUNCTION IF EXISTS "{prefix}_slow"() CASCADE')
+                await sql(
+                    f'CREATE CONSTRAINT TRIGGER slow AFTER INSERT ON "{prefix}_executions" '
+                    f'DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "{prefix}_slow"()'
+                )
+                claiming = asyncio.create_task(
+                    backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60.0)
+                )
+                await asyncio.sleep(0.4)
+                frozen.set()
+                with self.assertRaises(psycopg.OperationalError):
+                    await asyncio.wait_for(claiming, 10)
+                await asyncio.sleep(1)
+                self.assertEqual(
+                    await sql(f'SELECT status, worker_id FROM "{prefix}_jobs"'), [("running", "w")]
+                )
+                frozen.clear()
+                [job] = await backend.claim(
+                    worker_id="w", queues=["default"], limit=1, lease_seconds=60.0
+                )
+        self.assertEqual((job.id, job.attempts), (stored.id, 1))
+        self.assertEqual(
+            await sql(f'SELECT count(*) FROM "{prefix}_executions" WHERE status = \'running\''),
+            [(1,)],
+        )
+
+    async def test_setup_restores_a_missing_claim_token_column(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        await sql(f'ALTER TABLE "{prefix}_jobs" DROP COLUMN claim_token')
+        again = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(again.close)
+        await again.setup()
+        await again.enqueue(make_job())
+        [job] = await again.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=30.0)
+        self.assertTrue(await again.complete(job, None))
 
     async def claimed_on(self, backend: PostgresBackend):
         await backend.enqueue(make_job())

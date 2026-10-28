@@ -809,8 +809,11 @@ role reading or writing the row, so a table owned by anyone else would let that 
 tinyjobs. For the same reason a table is refused too when it grants `TRIGGER` to such a role or to
 `PUBLIC`, or when code that runs on it belongs to one: a function behind a trigger, constraint,
 default, generated column, index or policy, an operator, a domain or type, or an index's operator
-class. Setup and every `tx=` call find that code by following the tables' entries in `pg_depend`
-down through every object a user created, and the guard stays near a tenth of a millisecond. Such tables are refused before a row is read, even
+class. Setup and every `tx=` call find that code by following, in `pg_depend`, the objects attached
+to the tables down through every object a user created, and the same goes for each table a foreign
+key ties to them, whose triggers a cascade or a check would fire; a view, a function or a stored
+`regclass` that merely names the tables runs nothing during tinyjobs' statements and is not counted,
+so no role can block the tables by creating one. The guard stays near a tenth of a millisecond. Such tables are refused before a row is read, even
 when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
 someone else. With no tables yet, the schema they would be created in is checked the same way, and
 created only when it does not exist, so a role that owns its schema needs no `CREATE` on the
@@ -824,11 +827,18 @@ a concurrent creation it then trips over sends it round again, up to three times
 owners once more in the same transaction, so a table another role creates in the gap is caught
 before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
 newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
-a valid index of the right table, unique where it must be, and under the setup lock creates one that
-is missing and rebuilds one of its table that is invalid or of the wrong kind, so a dropped index or
-a failed concurrent build heals on the next start. `CREATE INDEX IF NOT EXISTS` skips a name another
-relation already holds, which would leave claims failing and dedup keys ignored, so then setup names
-the index and stops, and the next setup after that relation is dropped creates it. From then on every statement names the tables with the
+a valid index of the right table, unique where it must be, and that the statistics below exist. A column a later release added, such
+as the claim token, is added to existing tables with `ADD COLUMN IF NOT EXISTS` without changing the
+schema version, so older processes keep working alongside. One
+that is missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a
+connection of its own and under a session advisory lock, so workers keep claiming and enqueueing
+while it builds. The build waits up to 30 seconds for transactions already holding the table; past
+that a plain index is left for the next setup with a warning, since jobs run without it, only more
+slowly, while a unique one stops setup with the reason. If active jobs with the same dedup key got
+in while that index was missing, setup names the keys and asks to cancel all but one.
+`CREATE INDEX IF NOT EXISTS` skips a name another relation already holds, which would leave claims
+failing and dedup keys ignored, so then setup names the index and stops, and the next setup after
+that relation is dropped creates it. From then on every statement names the tables with the
 schema setup found them in, so a table of the same name created later earlier on a `search_path`
 cannot take the jobs, and tinyjobs' own connections run with `search_path` set to `pg_catalog,
 pg_temp`, so no function or operator someone created elsewhere is ever called. The statements that
@@ -867,7 +877,11 @@ through a move of the same store, such as a switchover to a replica, follows it.
 ids are ordered on SQLite and Redis, whatever the database's locale. A btree entry holds about
 2.7 kB, so the unique index covers a dedup key's SHA-256 digest, stored beside it, and the queue
 indexes cover a queue's first 500 characters, with the full name compared on top; neither has a
-length limit. Many jobs go in batches of at most 1,000 jobs and 64 MiB of payloads, keys and errors,
+length limit. Queues longer than that which share their first 500 characters share index entries,
+so each is claimed by reading its siblings' rows too. Extended statistics tell the planner that the
+prefix and the name go together; without them it multiplies the two conditions' selectivities, and
+after a few prepared listings by queue and status Postgres picked a generic plan that read the whole
+primary key, 14 ms instead of 0.12 at 300,000 jobs. Many jobs go in batches of at most 1,000 jobs and 64 MiB of payloads, keys and errors,
 in one transaction, so no array parameter nears Postgres' 1 GB limit on a value. The jobs table has a fillfactor
 of 85 and an autovacuum tuned to run often: a job row is updated several times in its life, and the
 free space lets most of those updates stay on the same page. There is no index on the lease, so a
@@ -892,7 +906,11 @@ Over several queues, each level visits the queues in the order of their oldest d
 can take a queue's newer jobs before another queue's next one, and the next claim starts from that
 other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
 job that nobody is taking. The same statement marks them running, stamps the lease and opens their
-executions. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+executions, and it stamps a token of its own. A claim that ends without its answer, from a lost
+connection, a server that stopped answering or a cancelled call, is settled before the worker's next
+claim and when the backend closes: tinyjobs ends the backend it ran on if that backend is still
+there, then hands back exactly the jobs carrying its token, without counting the attempt, so a lease
+is never left to expire on jobs a worker never received. Workers never wait on each other's rows. Walking levels rather than sorting matters when
 a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
 BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
 delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
@@ -962,10 +980,17 @@ listening one. Every pooled connection is set to read committed, a 30 second `st
 a one minute `idle_in_transaction_session_timeout`; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
 TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
-after `pool_timeout`, two seconds at least. A pooled statement that gets no answer within its
-`statement_timeout` and five seconds more, from a frozen server or a network that drops its packets,
-closes its connection and raises `OperationalError`, which the worker treats like a lost connection;
-psycopg 3.2's own cancel could wait forever there, so on 3.2 tinyjobs bounds it at five seconds too. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
+after `pool_timeout`, two seconds at least. A pooled statement is never cut short while bytes move
+in either direction or while the server is still working on it, waiting on a lock, a synchronous
+standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
+waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
+server, on a fresh connection, what the statement's backend is doing. If the server cannot be
+reached within ten seconds, or the backend is gone, the call raises `OperationalError`, which the
+worker treats like a lost connection. If the backend has been blocked sending to us for those ten
+seconds, or has waited five minutes for bytes from us with nothing moving on our side, an answer
+lost on its way or a request stuck in a proxy, tinyjobs ends that backend first, so nothing it was
+doing takes effect afterwards, then raises. Cancelling a call bounds the cancel request at five
+seconds on psycopg 3.2 and 3.3 alike. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
 minutes, and every connection is replaced after half an hour. Deadlocks, serialization
 failures and a session the server closed under `idle_session_timeout`, which it only does while
@@ -979,7 +1004,9 @@ clock, runs once more on a fresh one; writes do not, since the server may have a
 nothing is retried after waiting `pool_timeout` for a connection. Options the backend does not know
 and libpq does not either, such as a misspelled `max_conections=`, whether passed as arguments or
 in the url's query string, are refused by `TinyJobs(...)`
-itself rather than surfacing as a pool that never opens; `cursor_factory` is not taken either, since
+itself rather than surfacing as a pool that never opens; so is a url whose host or port came out
+malformed, which is what a raw `@`, `/`, `?` or `#` in the password does, and an error about the url
+never quotes it once it holds a password; `cursor_factory` is not taken either, since
 tinyjobs picks its own cursors. On a caller's connection whose cursors bind raw, `tx=` uses a plain
 cursor of its own. A fork leaves the parent's connections alone: the
 child opens its own.
@@ -991,9 +1018,11 @@ child opens its own.
 - **A held snapshot stops the cleanup.** A transaction left open anywhere on the server, or a
   replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
   jobs table bloats until it ends.
-- **`statement_timeout` bounds every call.** A purge or a claim that needs longer than 30 seconds
-  fails; raise it with `statement_timeout=` or turn it off with `None`, which also turns off the
-  client's deadline.
+- **`statement_timeout` is the server's limit, and so is what it counts.** A purge or a claim that
+  needs longer than 30 seconds fails, and Postgres counts sending a result, and receiving the
+  parameters of a statement not yet prepared, as part of the statement, so a payload slower than
+  that to move fails at once with nothing applied. Raise it with `statement_timeout=` or turn it off
+  with `None`; the watch on silent connections stays on either way.
 - **Supported versions are the ones the community supports**, 14 to 18 today. CI runs the suite
   on 14 and 18.
 

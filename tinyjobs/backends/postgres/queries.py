@@ -75,15 +75,28 @@ def owners_of_code_on(tables: str) -> str:
 
     forward = """d.classid OPERATOR(pg_catalog.=) reached.classid
                  AND d.objid OPERATOR(pg_catalog.=) reached.objid"""
+    attached = """d.deptype OPERATOR(pg_catalog.=) ANY ('{a,i}'::pg_catalog."char"[])"""
     return f"""
-        WITH RECURSIVE reached (classid, objid) AS (
-            SELECT {catalog("pg_class")}, rooted.oid FROM ({tables}) AS rooted (oid)
+        WITH RECURSIVE rooted (oid) AS (
+            {tables}
+            UNION
+            SELECT CASE WHEN con.confrelid OPERATOR(pg_catalog.=) rooted.oid
+                        THEN con.conrelid ELSE con.confrelid END
+              FROM rooted
+              JOIN pg_catalog.pg_constraint AS con
+                ON con.contype OPERATOR(pg_catalog.=) 'f'
+               AND (con.confrelid OPERATOR(pg_catalog.=) rooted.oid
+                    OR con.conrelid OPERATOR(pg_catalog.=) rooted.oid)
+        ),
+        reached (classid, objid) AS (
+            SELECT {catalog("pg_class")}, rooted.oid FROM rooted
             UNION
             SELECT d.classid, d.objid
-              FROM ({tables}) AS rooted (oid)
+              FROM rooted
               JOIN pg_catalog.pg_depend AS d
                 ON d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
                AND d.refobjid OPERATOR(pg_catalog.=) rooted.oid
+               AND {attached}
             UNION
             SELECT CASE WHEN {forward} THEN d.refclassid ELSE d.classid END,
                    CASE WHEN {forward} THEN d.refobjid ELSE d.objid END
@@ -92,7 +105,7 @@ def owners_of_code_on(tables: str) -> str:
                 ON ({forward} AND d.refobjid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid)
                 OR (d.refclassid OPERATOR(pg_catalog.=) reached.classid
                     AND d.refobjid OPERATOR(pg_catalog.=) reached.objid
-                    AND d.deptype OPERATOR(pg_catalog.=) ANY ('{{a,i}}'::pg_catalog."char"[])
+                    AND {attached}
                     AND reached.classid OPERATOR(pg_catalog.=) ANY (ARRAY[
                         {catalog("pg_type")}, {catalog("pg_opclass")}, {catalog("pg_opfamily")}
                     ]))
@@ -106,6 +119,13 @@ def owners_of_code_on(tables: str) -> str:
                UNION ALL {owned("pg_opclass", "opcowner")}
                UNION ALL {owned("pg_opfamily", "opfowner")}
                UNION ALL {owned("pg_class", "relowner")}
+               UNION ALL
+               SELECT granted.grantee
+                 FROM pg_catalog.pg_class AS c
+                CROSS JOIN pg_catalog.aclexplode(c.relacl) AS granted
+                WHERE reached.classid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+                  AND c.oid OPERATOR(pg_catalog.=) reached.objid
+                  AND granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
          ) AS owners (role)
     """
 
@@ -113,14 +133,9 @@ def owners_of_code_on(tables: str) -> str:
 def untouched(table: str) -> str:
     return f"""(
         NOT EXISTS (
-            SELECT FROM pg_catalog.aclexplode({table}.relacl) AS granted
-             WHERE granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
-               AND NOT (granted.grantee OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
-                        AND {trusting("granted.grantee")})
-        )
-        AND NOT EXISTS (
             SELECT FROM ({owners_of_code_on(f"SELECT {table}.oid")}) AS coded
-             WHERE NOT {trusting("coded.role")}
+             WHERE NOT (coded.role OPERATOR(pg_catalog.<>) 0::pg_catalog.oid
+                        AND {trusting("coded.role")})
         )
     )"""
 
@@ -179,7 +194,8 @@ class Queries:
                        worker_id = %(worker)s,
                        attempts = job.attempts + 1,
                        claims = job.claims + 1,
-                       lease_expires_at = {lease_end}
+                       lease_expires_at = {lease_end},
+                       claim_token = %(token)s
                  WHERE job.id = ANY((SELECT ids FROM chosen)::text[]) AND job.status = 'queued'
                 RETURNING {job_columns("job")}
             ),
@@ -352,6 +368,21 @@ class Queries:
                  WHERE status = 'running' AND job_id IN (SELECT id FROM changed)
             )
             SELECT count(*) AS changed FROM changed
+        """
+
+        self.unclaim = f"""
+            WITH changed AS (
+                UPDATE {jobs}
+                   SET status = 'queued', attempts = attempts - 1, lease_expires_at = NULL,
+                       worker_id = NULL, claim_token = NULL
+                 WHERE status = 'running' AND worker_id = %(worker)s AND claim_token = %(token)s
+                RETURNING id, claims, queue
+            ),
+            forgotten AS (
+                DELETE FROM {executions} AS execution USING changed
+                 WHERE execution.job_id = changed.id AND execution.claim = changed.claims
+            )
+            SELECT queue FROM changed
         """
 
         self.hand_back = f"""
@@ -554,10 +585,6 @@ class Queries:
                 UNION
                 SELECT nspowner FROM found
                 UNION
-                SELECT granted.grantee
-                  FROM found CROSS JOIN pg_catalog.aclexplode(found.relacl) AS granted
-                 WHERE granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
-                UNION
                 SELECT coded.role FROM ({owners_of_code_on("SELECT oid FROM found")}) AS coded
             )
             SELECT (SELECT pg_catalog.count(*) FROM found) AS tables,
@@ -569,6 +596,37 @@ class Queries:
                            OR NOT {trusting("controlling.role")}
                    ) THEN true
                    ELSE pg_catalog.concat('{REFUSAL}')::pg_catalog.bool END AS owned
+        """
+
+        self.missing_statistics = """
+            SELECT wanted.name, false AS on_its_table
+              FROM pg_catalog.unnest(%(statistics)b::pg_catalog.text[]) AS wanted (name)
+             WHERE NOT EXISTS (
+                   SELECT FROM pg_catalog.pg_statistic_ext AS x
+                     JOIN pg_catalog.pg_namespace AS n
+                       ON n.oid OPERATOR(pg_catalog.=) x.stxnamespace
+                    WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                      AND x.stxname OPERATOR(pg_catalog.=) wanted.name
+             )
+        """
+
+        self.missing_columns = """
+            SELECT wanted.name
+              FROM ROWS FROM (
+                   pg_catalog.unnest(%(columns)b::pg_catalog.text[]),
+                   pg_catalog.unnest(%(tables)b::pg_catalog.text[])
+              ) AS wanted (name, owner)
+             WHERE NOT EXISTS (
+                   SELECT FROM pg_catalog.pg_attribute AS a
+                     JOIN pg_catalog.pg_class AS c ON c.oid OPERATOR(pg_catalog.=) a.attrelid
+                     JOIN pg_catalog.pg_namespace AS n
+                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+                    WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                      AND c.relname OPERATOR(pg_catalog.=) wanted.owner
+                      AND a.attname OPERATOR(pg_catalog.=) wanted.name
+                      AND NOT a.attisdropped
+             )
+             ORDER BY wanted.name
         """
 
         self.misplaced_indexes = """
