@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import importlib.util
 import os
@@ -14,7 +15,7 @@ import weakref
 from contextlib import ExitStack, contextmanager, suppress
 from unittest import mock
 
-from tinyjobs import RetryPolicy, Task, TinyJobs, runtime
+from tinyjobs import RetryPolicy, Task, TinyJobs, deadlines, runtime
 from tinyjobs.backends import managed
 from tinyjobs.backends.sqlite import SQLiteBackend
 from tinyjobs.exceptions import (
@@ -951,6 +952,20 @@ class ClosedAppTests(BackendTestCase):
             writer.join(5)
             self.assertTrue(closed.wait(5))
         self.assertLess(stall, 0.5)
+
+    def test_a_claim_left_behind_past_its_deadline_does_not_hold_the_close(self):
+        async def scenario():
+            await self.app.ready()
+            backend = self.app.backend
+            behind = concurrent.futures.Future()
+            backend._returning[behind] = deadlines.Deadline(time.monotonic() - 1)
+            started = time.monotonic()
+            with mock.patch.object(managed, "CLOSE_GRACE_SECONDS", 3.0):
+                await self.app.aclose()
+            behind.cancel()
+            return time.monotonic() - started
+
+        self.assertLess(asyncio.run(scenario()), 1.0)
 
     def test_a_worker_stops_once_its_app_is_closed(self):
         async def scenario():

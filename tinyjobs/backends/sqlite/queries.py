@@ -49,6 +49,12 @@ HEARTBEAT = """
      WHERE status = 'running' AND (? IS NULL OR worker_id = ?) AND id IN ({ids})
 """
 
+RENEWED = """
+    SELECT id FROM jobs
+     WHERE lease_expires_at = ? AND status = 'running' AND (? IS NULL OR worker_id = ?)
+       AND id IN ({ids})
+"""
+
 COMPLETE_JOB = """
     UPDATE jobs
        SET status = 'success', finished_at = ?, result = ?,

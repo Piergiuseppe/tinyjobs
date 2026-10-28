@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Collection, Protocol, Sequence, runtime_checkable
 
 from ..models import Execution, ExecutionError, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
@@ -52,7 +53,7 @@ class Backend(Protocol):
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None: ...
+    ) -> Collection[str] | None: ...
 
     async def complete(self, job: Job, result: bytes | None) -> bool: ...
 
@@ -65,6 +66,8 @@ class Backend(Protocol):
     ) -> bool: ...
 
     async def release(self, job: Job, delay: float = 0.0) -> bool: ...
+
+    async def release_many(self, jobs: Sequence[Job]) -> int: ...
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
 
@@ -129,6 +132,10 @@ class BaseBackend(ABC):
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         return await self.release(job, delay)
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        released = await asyncio.gather(*(self.release(job) for job in jobs))
+        return sum(map(bool, released))
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return None

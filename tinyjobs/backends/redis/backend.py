@@ -133,16 +133,18 @@ class RedisBackend(BaseBackend):
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None:
-        if job_ids:
-            now = await self._now()
-            await self._script(
-                "heartbeat",
-                now,
-                number(now + lease_seconds),
-                worker_id or "",
-                *job_ids,
-            )
+    ) -> list[str]:
+        if not job_ids:
+            return []
+        now = await self._now()
+        renewed = await self._script(
+            "heartbeat",
+            now,
+            number(now + lease_seconds),
+            worker_id or "",
+            *job_ids,
+        )
+        return [item.decode() if isinstance(item, bytes) else str(item) for item in renewed]
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return bool(
@@ -182,6 +184,24 @@ class RedisBackend(BaseBackend):
         return bool(
             await self._run(
                 "release", job.id, job.worker_id or "", job.claims, run_at
+            )
+        )
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        if not jobs:
+            return 0
+        clock = self._clock
+        now = clock.now() if self._read or not isinstance(clock, FollowingClock) else await self._now()
+        held = [
+            part
+            for job in jobs
+            for part in (job.id, job.worker_id or "", job.claims, number(now))
+        ]
+        return int(
+            await self._forgetting(
+                self._scripts.run_once(
+                    "release_many", now, *held, following=isinstance(clock, FollowingClock)
+                )
             )
         )
 

@@ -10,7 +10,7 @@ import unittest
 from contextlib import suppress
 from unittest import mock
 
-from tinyjobs import runtime
+from tinyjobs import deadlines, runtime
 from tinyjobs.runtime import FORK_PAUSE_SECONDS, LoopRunner
 
 
@@ -1820,6 +1820,31 @@ class KeptTaskTests(unittest.TestCase):
             runner.close_here()
         self.assertLess(time.monotonic() - began, 3.0)
         self.assertEqual(events, ["cleaned up"])
+
+    def test_a_kept_task_past_its_deadline_is_cancelled_without_waiting_out_the_close(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        started = threading.Event()
+        events: list[str] = []
+
+        async def kept() -> None:
+            deadlines.current.set(deadlines.Deadline(time.monotonic() + 0.2))
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+
+        runtime.submit(loop, kept(), "kept", kept=True)
+        self.assertTrue(started.wait(5))
+        time.sleep(0.3)
+        with mock.patch.object(runtime, "STOP_SECONDS", 3.0):
+            began = time.monotonic()
+            runner.close_here()
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertEqual(events, ["cancelled"])
 
     def test_the_tasks_a_kept_task_waits_on_are_kept_too(self):
         runner = LoopRunner()

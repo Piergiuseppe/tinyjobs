@@ -630,7 +630,13 @@ latency to sub-millisecond without changing the polling fallback that covers cro
 A claimed job holds a lease. The worker refreshes it (`heartbeat`) at one third of the lease duration
 while the job runs, naming itself, so a worker that lost the job cannot extend the lease of the one
 that holds it now. A plugin gets `worker_id` only when its `heartbeat` names that parameter; an
-older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it. If
+older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it.
+`heartbeat` returns the ids whose lease it renewed; a job missing from that answer, and not already
+recording its outcome, is logged once as no longer held, by id, and left out of later heartbeats. A
+heartbeat that runs out of time or hits a transient error is a one-line warning, not a traceback.
+On Redis over a link adding 300 ms each way, with a 6 second lease and eight jobs at a time, 218
+jobs ran once each with no heartbeat error, where 27 heartbeats used to fail and a job whose outcome
+got a second and a half ran twice. If
 the worker is killed by SIGKILL, by the OOM killer or by a yanked power cable, the lease
 simply expires.
 
@@ -1018,7 +1024,11 @@ pipeline as the statement and ends with it, and inside the caller's transaction 
 is kept on the server and put back with the last statement, or after a failure; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
 TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
-after `pool_timeout`, two seconds at least. A pooled statement is never cut short while bytes move
+after `pool_timeout`, two seconds at least. Pooled connections give up connecting after
+`pool_timeout` too, between two and five seconds, unless the url sets `connect_timeout`, and a new
+connection whose setup statements get no answer within five seconds is closed and another opened:
+with the server accepting connections but not answering their setup for a while, jobs started 4.9
+seconds after it answered again, where none had started 120 seconds later. A pooled statement is never cut short while bytes move
 in either direction or while the server is still working on it, waiting on a lock, a synchronous
 standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
 waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
@@ -1050,10 +1060,17 @@ attempt counted. A heartbeat gets a quarter of its lease the same way, its sweep
 the next one starts a third of the lease after the last one started, so a heartbeat that hears nothing
 leaves the next one time to renew the lease: with the connections already open frozen and new ones
 answering, a heartbeat on a 12 second lease gave up within 4.0 seconds with at least 8.0 left on
-the lease, where it used to wait past 40 with the lease lapsed. The worker records an outcome or hands a job
-back within the lease it still holds, one second at least. Once a statement goes unanswered, the
+the lease, where it used to wait past 40 with the lease lapsed. The worker gives an outcome or a
+hand-back one full lease from when it starts, and during shutdown no more than the shutdown
+deadline. An outcome whose call ran out of time is checked against the job's execution history on a
+fresh call, within a second; if it landed, it counts as recorded and its hooks run. Once a statement goes unanswered, the
 pooled connections idle since before it are closed and replaced rather than used, since a frozen
-network path or a hung proxy silences them all alike. Cancelling a call bounds
+network path or a hung proxy silences them all alike. A call cut by its
+deadline or cancelled sends the server a cancel request and waits for the statement to stop, both
+within half a second once the deadline has passed. A backend whose stop is not confirmed in that
+time has its connection closed and is ended with `pg_terminate_backend`, matched by process id and
+start time, before the next statement this backend sends, so a statement left waiting on a lock
+never applies afterwards. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
@@ -1300,23 +1317,38 @@ point where `timeout=` is introduced, not in a footnote.
 ### Graceful shutdown
 
 On `SIGTERM` (or the first `SIGINT`), the worker stops claiming, keeps heartbeating in-flight jobs,
-and waits up to `--shutdown-timeout` for them to finish. A claim still waiting on the backend shares
-that wait: jobs it brings back in time run like the others, and one that has not answered by then is
-given up. Anything still running is released back to
-`QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. The
-releases get one second more, and one that has not landed by then is left to its lease. With the
-server cut off and `--shutdown-timeout 3`, the worker exited 5.1 seconds after the signal, the last
-second spent closing the pool, which waits that long for connections still being opened; it used to
-outlive the 45 seconds it was given. A second `SIGINT` exits at once and lets the leases lapse: a
-release already sent gets a second, and the worker exited 2.1 seconds after the second signal with
-the server cut off, where it used to take 305.6.
+and returns within `--shutdown-timeout`. The last quarter of it, one second at least, is kept for
+releases; jobs get the rest to finish. A claim still waiting on the backend shares that wait: jobs it
+brings back in time run like the others, and one that has not answered by then is given up and its
+statement stopped on the server. Anything still running is then released back to `QUEUED` in one
+call for all of them, a single round trip on Redis, so another worker picks it up immediately rather than waiting for the lease to
+expire; a release that has not landed when the timeout ends is left to its lease. With the server
+cut off and `--shutdown-timeout 3`, the worker returned 3.0 seconds after the signal and the process
+exited after 4.6, the rest spent closing the app: half a second for the cancel of the release cut
+at the deadline and a second for the pool, which waits that long for connections still being
+opened; it took 9.6 before, and under uvicorn with `shutdown_timeout=5` 6.2 rather than 12.2. A
+backend that went silent is not asked to end what it left behind at close; one that still answers
+gets half a second a pass for it. Over a link
+that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on Postgres and on
+Redis, where seven of them used to be left `running` until their lease ran out. A second `SIGINT`
+ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
+the second signal with the server cut off, where it took 6.6.
+
+A job running in a thread cannot be stopped, and releasing it would let another worker run it while
+the thread still does. So at shutdown the worker leaves such a job running instead: it keeps its
+lease renewed, records its outcome when the thread returns, within the release share of the timeout
+from that moment, and returns after that. A second signal does not change this. With a 20 second
+`def` job and the server cut off, the worker exited 17.4 seconds after the signal, once the thread was
+done and its outcome had been given up; before, the job was released while its thread kept running.
 
 A claim whose caller is cancelled while it is in flight still lands in the backend, so tinyjobs lets
 it finish and hands its jobs back, as if they were never claimed; otherwise a cancelled drain would
 leave its job `running` for the hour its lease lasts. The claim runs on tinyjobs' own loop, not the
 caller's, so this holds when the caller's loop ends with the claim in flight (`asyncio.run`
 returning, Ctrl-C under it) and when the process exits: that loop finishes such claims before it
-stops, including a hand-back sent while that loop is being closed. Closing it cancels every other task
+stops, including a hand-back sent while that loop is being closed, unless the caller's deadline has
+passed: a claim the worker gave up at shutdown neither holds the app's close nor the loop's, and
+its jobs come back through the sweep of unanswered claims or their lease. Closing it cancels every other task
 at once and waits five seconds at most, and half a second more for a task that swallowed the cancel,
 which is cancelled once again: a task that keeps ignoring cancellation is logged and left behind, so
 the close never hangs. At exit SQLite runs only the calls

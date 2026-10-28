@@ -19,6 +19,7 @@ from functools import partial
 from queue import SimpleQueue
 from typing import Any, Callable, Coroutine, Iterator, TypeVar
 
+from .deadlines import current as current_deadline
 from .exceptions import (
     AppClosedError,
     EventLoopStoppedError,
@@ -896,7 +897,11 @@ def _finish_tasks(
 
 
 def _is_kept(task: asyncio.Task) -> bool:
-    return task in _kept or task.get_context().get(_keeping, False)
+    context = task.get_context()
+    if not (task in _kept or context.get(_keeping, False)):
+        return False
+    deadline = context.get(current_deadline)
+    return deadline is None or deadline.left() > 0
 
 
 def _gone(loop: asyncio.AbstractEventLoop) -> bool:

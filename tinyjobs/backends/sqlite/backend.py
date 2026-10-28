@@ -40,6 +40,7 @@ from .queries import (
     FINISH_EXECUTION,
     HAND_BACK_JOB,
     HEARTBEAT,
+    RENEWED,
     INSERT_EXECUTION,
     INSERT_JOB,
     MARK_EXECUTIONS_LOST,
@@ -161,7 +162,13 @@ class SQLiteBackend(BaseBackend):
                 if self._closed or function.__name__ not in RETURNING_CALLS:
                     raise AppClosedError(EXECUTOR_GONE_MESSAGE) from error
                 return _gated(None, function, *args)
-            result = await pending
+            try:
+                result = await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                await asyncio.wait({pending})
+                if not pending.cancelled():
+                    pending.exception()
+                raise
             if result is not STEPPED_ASIDE:
                 return result
 
@@ -216,8 +223,8 @@ class SQLiteBackend(BaseBackend):
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None:
-        await self._call(
+    ) -> list[str]:
+        return await self._call(
             self._heartbeat_sync, tuple(job_ids), lease_seconds, worker_id
         )
 
@@ -419,9 +426,9 @@ class SQLiteBackend(BaseBackend):
 
     def _heartbeat_sync(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None
-    ) -> None:
+    ) -> list[str]:
         if not job_ids:
-            return
+            return []
         placeholders = ", ".join("?" for _ in job_ids)
         expiry = self._clock.now() + lease_seconds
         with self._connections.write() as connection:
@@ -429,6 +436,13 @@ class SQLiteBackend(BaseBackend):
                 HEARTBEAT.format(ids=placeholders),
                 (expiry, worker_id, worker_id, *job_ids),
             )
+            return [
+                row[0]
+                for row in connection.execute(
+                    RENEWED.format(ids=placeholders),
+                    (expiry, worker_id, worker_id, *job_ids),
+                )
+            ]
 
     def _complete_sync(self, job: Job, result: bytes | None) -> bool:
         now = self._clock.now()

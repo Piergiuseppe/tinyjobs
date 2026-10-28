@@ -6,8 +6,10 @@ import inspect
 import time
 from contextlib import suppress
 from functools import partial
-from typing import Any, Coroutine, Sequence
+from typing import Any, Collection, Coroutine, Sequence
 
+from ..deadlines import Deadline
+from ..deadlines import current as current_deadline
 from ..exceptions import AppClosedError, EventLoopStoppedError
 from ..models import Execution, ExecutionError, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
@@ -37,7 +39,7 @@ class ManagedBackend:
         if self._loop is not None:
             runner.keep(self._loop, backend)
         self._active = 0
-        self._returning: set[concurrent.futures.Future] = set()
+        self._returning: dict[concurrent.futures.Future, Deadline | None] = {}
         self._closing = False
         self._gate = tracked_lock()
         self.capabilities = backend.capabilities
@@ -59,7 +61,7 @@ class ManagedBackend:
         with self._gate:
             self._closing = True
         deadline = time.monotonic() + CLOSE_GRACE_SECONDS
-        while (self._active or self._returning) and time.monotonic() < deadline:
+        while (self._active or self._awaited()) and time.monotonic() < deadline:
             await asyncio.sleep(CLOSE_POLL_SECONDS)
         if not self.alive:
             return
@@ -111,10 +113,16 @@ class ManagedBackend:
                 return None
             return self._pending()
 
+    def _awaited(self) -> bool:
+        return any(
+            deadline is None or deadline.left() > 0
+            for deadline in list(self._returning.values())
+        )
+
     def _pending(self) -> concurrent.futures.Future:
         outcome: concurrent.futures.Future = concurrent.futures.Future()
-        self._returning.add(outcome)
-        outcome.add_done_callback(self._returning.discard)
+        self._returning[outcome] = current_deadline.get()
+        outcome.add_done_callback(partial(self._returned, outcome))
         return outcome
 
     async def _claim_kept(self, decided: dict[int, object], **arguments: Any) -> list[Job]:
@@ -125,6 +133,9 @@ class ManagedBackend:
             return jobs
         await self._hand_back_all(jobs)
         return []
+
+    def _returned(self, outcome: concurrent.futures.Future, _: object) -> None:
+        self._returning.pop(outcome, None)
 
     def _abandon_claim(
         self,
@@ -169,13 +180,13 @@ class ManagedBackend:
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None:
+    ) -> Collection[str] | None:
         if worker_id is not None and self._knows_holders:
-            await self._forward(
+            return await self._forward(
                 self._inner.heartbeat, job_ids, lease_seconds, worker_id=worker_id
             )
-            return
         await self._forward(self._inner.heartbeat, job_ids, lease_seconds)
+        return None
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return await self._forward(self._inner.complete, job, result)
@@ -193,6 +204,13 @@ class ManagedBackend:
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         return await self._forward(self._inner.release, job, delay)
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        method = getattr(self._inner, "release_many", None)
+        if method is not None:
+            return await self._forward(method, jobs)
+        released = await asyncio.gather(*(self.release(job) for job in jobs))
+        return sum(map(bool, released))
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         method = getattr(self._inner, "hand_back", self._inner.release)

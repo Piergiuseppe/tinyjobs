@@ -11,6 +11,7 @@ from typing import Any, AsyncContextManager, Awaitable, Callable, TYPE_CHECKING
 from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
 from ..deadlines import bounded
+from ..deadlines import left as time_left
 from ..exceptions import Retry
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 FIRST_RETRY_SECONDS = 0.25
 LAST_WORD_SECONDS = 1.0
+VERIFY_SECONDS = 1.0
 LONGEST_RETRY_SECONDS = 4.0
 
 logger = logging.getLogger("tinyjobs.worker")
@@ -78,37 +80,44 @@ class JobLifecycleService:
         status: ExecutionStatus,
         held_until: Callable[[], float] | None,
     ) -> bool:
-        transient = getattr(self._backend, "transient_errors", ())
+        transient = (*getattr(self._backend, "transient_errors", ()), TimeoutError)
+        deadline = held_until() if held_until else None
         delay = FIRST_RETRY_SECONDS
-        deadline: float | None = None
         interrupted = False
         while True:
             try:
-                async with self._held(held_until):
+                async with self._held(deadline):
                     if interrupted:
                         return await write() or await self._recorded_before(job, status)
                     return await write()
             except transient as error:
-                if deadline is None:
-                    deadline = held_until() if held_until else 0.0
-                left = deadline - time.monotonic()
+                left = 0.0 if deadline is None else min(deadline - time.monotonic(), time_left())
                 if left <= 0:
+                    if await self._verified(job, status):
+                        return True
                     raise
                 pause = min(delay, left)
                 logger.warning(
                     "could not record the outcome of job %s (%s); trying again in %.2gs",
                     job.id,
-                    error,
+                    str(error) or type(error).__name__,
                     pause,
                 )
                 await asyncio.sleep(pause)
                 delay = min(delay * 2, LONGEST_RETRY_SECONDS)
                 interrupted = True
 
-    def _held(self, held_until: Callable[[], float] | None) -> AsyncContextManager[Any]:
-        if held_until is None:
+    def _held(self, deadline: float | None) -> AsyncContextManager[Any]:
+        if deadline is None:
             return nullcontext()
-        return bounded(max(held_until(), time.monotonic() + LAST_WORD_SECONDS))
+        return bounded(max(deadline, time.monotonic() + LAST_WORD_SECONDS))
+
+    async def _verified(self, job: Job, status: ExecutionStatus) -> bool:
+        try:
+            async with bounded(time.monotonic() + VERIFY_SECONDS):
+                return await self._recorded_before(job, status)
+        except Exception:
+            return False
 
     async def _recorded_before(self, job: Job, status: ExecutionStatus) -> bool:
         history = await self._backend.executions(job.id)

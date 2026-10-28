@@ -296,9 +296,11 @@ async def lifespan(api: FastAPI):
         yield
 ```
 
-Shutdown waits up to `shutdown_timeout` (30 s) for running jobs and a claim still in flight, and a second Ctrl-C does not cut it
-short. Keep it under your orchestrator's grace period: `docker stop` allows 10 s, and past it the
-process is killed and its jobs wait out their leases instead of going straight back to the queue.
+Shutdown ends within `shutdown_timeout` (30 s): running jobs and a claim still in flight get the first
+three quarters, releasing what is still running gets the rest, and a second Ctrl-C does not cut it
+short. A `def` job whose thread is still running is not released; the worker waits for it. Keep it
+under your orchestrator's grace period: `docker stop` allows 10 s, and past it the process
+is killed and its jobs wait out their leases instead of going straight back to the queue.
 
 Starlette takes the same `lifespan`. Leave out `worker=True` and the server only enqueues, with
 `tinyjobs worker --app tasks:app` running the jobs elsewhere.
@@ -737,7 +739,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1407 tests, no test dependencies. The one that matters most is
+1435 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

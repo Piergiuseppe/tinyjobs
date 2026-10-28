@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from functools import partial
 from typing import Any, TYPE_CHECKING
@@ -23,18 +23,30 @@ class ThreadExecutor(Executor):
         self._pool = ThreadPoolExecutor(
             max_workers=concurrency, thread_name_prefix="tinyjobs"
         )
+        self._threaded: dict[asyncio.Task | None, Future] = {}
 
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
         call = partial(
             copy_context().run, task.function, *payload.args, **payload.kwargs
         )
         try:
-            future = asyncio.get_running_loop().run_in_executor(self._pool, call)
+            running = self._pool.submit(call)
         except RuntimeError as error:
             raise ExecutorClosedError(EXECUTOR_CLOSED_MESSAGE) from error
-        if task.timeout is None:
-            return await future
-        return await asyncio.wait_for(asyncio.shield(future), task.timeout)
+        owner = asyncio.current_task()
+        self._threaded[owner] = running
+        try:
+            future = asyncio.wrap_future(running)
+            if task.timeout is None:
+                return await future
+            return await asyncio.wait_for(asyncio.shield(future), task.timeout)
+        finally:
+            if self._threaded.get(owner) is running:
+                del self._threaded[owner]
+
+    def thread_of(self, owner: asyncio.Task) -> Future | None:
+        running = self._threaded.get(owner)
+        return running if running is not None and running.running() else None
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)

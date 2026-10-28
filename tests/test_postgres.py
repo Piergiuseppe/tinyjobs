@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import os
 import re
 import signal
@@ -16,6 +17,7 @@ from unittest import mock
 
 import tinyjobs.clock
 from tinyjobs import deadlines
+from tinyjobs.services import lifecycle
 from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
 from tinyjobs.runtime import run_on
@@ -4667,7 +4669,8 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(
                 app.lifecycle.complete(job, None, held_until=lambda: started + 2.0), 30
             )
-        self.assertLess(time.monotonic() - started, 3)
+        cut = deadlines.GRACE_SECONDS + postgres_backend.CUT_SECONDS
+        self.assertLess(time.monotonic() - started, 2.0 + cut + lifecycle.VERIFY_SECONDS + cut)
 
     async def test_a_call_routed_to_the_backend_loop_keeps_the_caller_deadline(self):
         async def seen() -> tuple[float, asyncio.AbstractEventLoop]:
@@ -5399,6 +5402,149 @@ class PostgresInstallTests(unittest.TestCase):
             builtins.__import__ = real_import
             sys.modules.update(saved)
         self.assertIn("pip install 'tinyjobs[postgres]'", str(caught.exception))
+
+
+
+@requires_postgres
+class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.prefix = new_prefix()
+        self.addAsyncCleanup(drop, self.prefix)
+        self.backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, min_connections=1, max_connections=2, notify=False
+        )
+        self.addAsyncCleanup(self.backend.close)
+        await self.backend.setup()
+        await self.backend.enqueue(make_job())
+        [self.job] = await self.backend.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60
+        )
+
+    async def held(self) -> psycopg.AsyncConnection:
+        holder = await psycopg.AsyncConnection.connect(POSTGRES_URL)
+        self.addAsyncCleanup(holder.close)
+        await holder.execute(
+            f'SELECT FROM "{self.prefix}_jobs" WHERE id = %(id)s FOR UPDATE', {"id": self.job.id}
+        )
+        return holder
+
+    async def waiting_on_locks(self) -> int:
+        [(count,)] = await sql(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+            "AND datname = current_database() AND query LIKE %(table)s",
+            {"table": f'%{self.prefix}_jobs%'},
+        )
+        return count
+
+    async def cut_complete(self) -> float:
+        started = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            async with deadlines.bounded(time.monotonic() + 0.3):
+                await self.backend.complete(self.job, None)
+        return time.monotonic() - started
+
+    async def test_a_statement_cut_on_a_lock_is_cancelled_and_leaves_nothing_behind(self):
+        holder = await self.held()
+        took = await self.cut_complete()
+        self.assertLess(took, 0.3 + deadlines.GRACE_SECONDS + postgres_backend.CUT_SECONDS)
+        self.assertEqual(await self.waiting_on_locks(), 0)
+        self.assertEqual(self.backend._orphans, {})
+        self.assertEqual(self.backend._silenced, -math.inf)
+        await holder.rollback()
+        self.assertIs((await self.backend.get(self.job.id)).status, JobStatus.RUNNING)
+
+    async def test_a_cut_statement_whose_cancel_is_lost_is_ended_before_the_next_one(self):
+        holder = await self.held()
+
+        async def lost(self, timeout=None):
+            return None
+
+        with mock.patch.object(postgres_backend._Answering, "_try_cancel", lost):
+            await self.cut_complete()
+        self.assertEqual(len(self.backend._orphans), 1)
+        self.assertEqual(await self.waiting_on_locks(), 1)
+        self.assertEqual((await self.backend.get(self.job.id)).id, self.job.id)
+        self.assertEqual(self.backend._orphans, {})
+        self.assertEqual(await self.waiting_on_locks(), 0)
+        await holder.rollback()
+        await asyncio.sleep(0.2)
+        self.assertIs((await self.backend.get(self.job.id)).status, JobStatus.RUNNING)
+
+    async def test_an_outcome_cut_after_it_landed_is_reported_as_recorded(self):
+        app = TinyJobs(POSTGRES_URL, prefix=self.prefix)
+        self.addAsyncCleanup(app.aclose)
+        await app.ready()
+        holder = await self.held()
+        letting_go = asyncio.get_running_loop().call_later(
+            1.7, asyncio.ensure_future, holder.rollback()
+        )
+        self.addCleanup(letting_go.cancel)
+
+        async def lost(self, timeout=None):
+            return None
+
+        started = time.monotonic()
+        with mock.patch.object(postgres_backend._Answering, "_try_cancel", lost):
+            landed = await asyncio.wait_for(
+                on_backend_loop(
+                    app,
+                    app.lifecycle.complete(
+                        self.job, None, held_until=lambda: time.monotonic() + 0.2
+                    ),
+                ),
+                10,
+            )
+        self.assertGreater(time.monotonic() - started, 1.7)
+        self.assertTrue(landed)
+        self.assertIs((await app.aget(self.job.id)).status, JobStatus.SUCCESS)
+
+    async def test_a_connection_that_never_finishes_its_setup_is_closed(self):
+        connection = await postgres_backend._Answering.connect(POSTGRES_URL)
+        self.addAsyncCleanup(connection.close)
+
+        async def hangs(connection):
+            await asyncio.Event().wait()
+
+        started = time.monotonic()
+        with (
+            mock.patch.object(postgres_backend, "CONNECT_SECONDS", 0.3),
+            mock.patch.object(self.backend, "_configured", hangs),
+            self.assertRaisesRegex(psycopg.OperationalError, "did not answer its setup"),
+        ):
+            await asyncio.wait_for(self.backend._configure(connection), 5)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertTrue(connection.closed)
+
+    async def closing_with_an_orphan(self) -> list[int]:
+        swept: list[int] = []
+
+        async def sweep() -> None:
+            swept.append(1)
+            self.backend._orphans.clear()
+
+        self.backend._orphans[(1, None)] = None
+        with mock.patch.object(self.backend, "_exorcise", sweep):
+            await self.backend.close()
+        return swept
+
+    async def test_a_close_after_the_server_went_silent_does_not_wait_to_end_orphans(self):
+        self.backend._silenced = time.monotonic()
+        self.assertEqual(await self.closing_with_an_orphan(), [])
+
+    async def test_a_close_while_the_server_answers_ends_orphans_first(self):
+        await self.backend.get(self.job.id)
+        self.assertEqual(await self.closing_with_an_orphan(), [1])
+
+    async def test_pooled_connections_give_up_connecting_within_five_seconds(self):
+        slow = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, pool_timeout=30)
+        self.assertEqual(slow._pool.kwargs["connect_timeout"], 5)
+        quick = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, pool_timeout=0.5)
+        self.assertEqual(quick._pool.kwargs["connect_timeout"], 2)
+        chosen = PostgresBackend.from_url(
+            POSTGRES_URL + ("&" if "?" in POSTGRES_URL else "?") + "connect_timeout=9",
+            prefix=self.prefix,
+        )
+        self.assertNotIn("connect_timeout", chosen._pool.kwargs)
 
 
 if __name__ == "__main__":

@@ -336,6 +336,7 @@ class Queries:
              WHERE status = 'running'
                AND (%(worker)s::text IS NULL OR worker_id = %(worker)s)
                AND id = ANY(%(ids)b::text[])
+            RETURNING id
         """
 
         held = (
@@ -401,6 +402,27 @@ class Queries:
                  WHERE status = 'running' AND job_id IN (SELECT id FROM changed)
             )
             SELECT count(*) AS changed FROM changed
+        """
+
+        self.release_many = f"""
+            WITH changed AS (
+                UPDATE {jobs} AS job
+                   SET status = 'queued', run_at = %(now)s, lease_expires_at = NULL,
+                       worker_id = NULL, hand_backs = 0
+                  FROM ROWS FROM (
+                           pg_catalog.unnest(%(ids)s::pg_catalog.text[]),
+                           pg_catalog.unnest(%(workers)s::pg_catalog.text[]),
+                           pg_catalog.unnest(%(claims)s::pg_catalog.int4[])
+                       ) AS released (id, worker, claims)
+                 WHERE job.id = released.id AND job.status = 'running'
+                   AND job.worker_id = released.worker AND job.claims = released.claims
+                RETURNING job.id, job.queue
+            ),
+            lost AS (
+                UPDATE {executions} SET status = 'lost', finished_at = %(now)s
+                 WHERE status = 'running' AND job_id IN (SELECT id FROM changed)
+            )
+            SELECT queue FROM changed
         """
 
         self.unclaim = f"""
