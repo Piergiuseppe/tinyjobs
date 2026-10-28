@@ -40,6 +40,7 @@ try:
     import psycopg.sql
 
     from tinyjobs.backends.postgres import PostgresBackend
+    from tinyjobs.backends.postgres import backend as postgres_backend
     from tinyjobs.backends.postgres.schema import Tables
 except ImportError:
     PostgresBackend = None
@@ -335,7 +336,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 names.append(match.group(1))
             return f"${names.index(match.group(1)) + 1}"
 
-        prepared = re.sub(r"%\((\w+)\)s", numbered, query).replace("%%", "%")
+        prepared = re.sub(r"%\((\w+)\)[sb]", numbered, query).replace("%%", "%")
         async with self.backend._connection() as connection:
             async with connection.transaction(force_rollback=True):
                 await connection.execute("SET LOCAL plan_cache_mode = force_generic_plan")
@@ -777,6 +778,22 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             for _ in range(3):
                 backend.enqueue_in(connection, [make_job(), make_job()])
             connection.commit()
+        many = postgres_backend.ENQUEUE_BATCH + 1
+        for piped in (False, True):
+            with psycopg.connect(
+                POSTGRES_URL, options=path, cursor_factory=psycopg.ClientCursor
+            ) as connection:
+                with connection.pipeline() if piped else nullcontext():
+                    backend.enqueue_in(connection, [make_job()])
+                    backend.enqueue_in(connection, [make_job() for _ in range(many)])
+                connection.commit()
+            async with await psycopg.AsyncConnection.connect(
+                POSTGRES_URL, options=path, cursor_factory=psycopg.AsyncClientCursor
+            ) as connection:
+                async with connection.pipeline() if piped else nullcontext():
+                    await backend.aenqueue_in(connection, [make_job()])
+                    await backend.aenqueue_in(connection, [make_job() for _ in range(many)])
+                await connection.commit()
         self.assertEqual(claimed.id, job.id)
         self.assertEqual(await self.calls(trap), [])
 
@@ -807,6 +824,28 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await sql(f'CREATE DATABASE "{name}" OWNER "{owner}"')
         self.addAsyncCleanup(sql, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         return name
+
+    async def test_a_sql_ascii_database_takes_jobs_from_the_pool_and_through_a_utf8_tx(self):
+        name = f"tinyjobs_test_{uuid.uuid4().hex[:12]}"
+        await sql(
+            f"CREATE DATABASE \"{name}\" ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C' "
+            "TEMPLATE template0"
+        )
+        self.addAsyncCleanup(sql, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+        backend = PostgresBackend.from_url(url_for(dbname=name), prefix=self.prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        pooled = await backend.enqueue(make_job(task="café.task"))
+        async with await psycopg.AsyncConnection.connect(url_for(dbname=name)) as connection:
+            with self.assertRaisesRegex(ConfigurationError, "client_encoding=UTF8"):
+                await backend.aenqueue_in(connection, [make_job()])
+        async with await psycopg.AsyncConnection.connect(
+            url_for(dbname=name), client_encoding="UTF8"
+        ) as connection:
+            [joined] = await backend.aenqueue_in(connection, [make_job(task="naïve.task")])
+            await connection.commit()
+        for job in (pooled, joined):
+            self.assertEqual((await backend.get(job.id)).task, job.task)
 
     async def test_a_database_owner_without_the_users_privileges_is_not_trusted(self):
         owner = await self.role()
@@ -1169,8 +1208,11 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
     async def test_a_role_reset_racing_an_enqueue_never_runs_the_owners_code_as_the_new_role(self):
         backend, name, owner = await self.store_with_owner_code()
-        for autocommit, piped, joined in itertools.product((False, True), repeat=3):
-            with self.subTest(autocommit=autocommit, piped=piped, joined=joined):
+        batch = postgres_backend.ENQUEUE_BATCH
+        for autocommit, piped, joined, count in itertools.product(
+            (False, True), (False, True), (False, True), (1, batch + 1)
+        ):
+            with self.subTest(autocommit=autocommit, piped=piped, joined=joined, count=count):
                 ran: list[str] = []
                 async with await psycopg.AsyncConnection.connect(
                     url_for(dbname=name), autocommit=autocommit
@@ -1181,7 +1223,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                         await backend.aenqueue_in(connection, [make_job()])
                     async with connection.pipeline() if piped else nullcontext():
                         await asyncio.gather(
-                            backend.aenqueue_in(connection, [make_job()]),
+                            backend.aenqueue_in(connection, [make_job() for _ in range(count)]),
                             connection.execute("RESET ROLE"),
                             return_exceptions=True,
                         )
@@ -1208,8 +1250,9 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                     reset.join(0.2)
                 return result
 
-        for autocommit, piped in itertools.product((False, True), repeat=2):
-            with self.subTest(autocommit=autocommit, piped=piped):
+        batch = postgres_backend.ENQUEUE_BATCH
+        for autocommit, piped, count in itertools.product((False, True), (False, True), (1, batch + 1)):
+            with self.subTest(autocommit=autocommit, piped=piped, count=count):
                 ran: list[str] = []
                 with Racing.connect(url_for(dbname=name), autocommit=autocommit) as connection:
                     connection.add_notice_handler(lambda notice: ran.append(notice.message_primary))
@@ -1218,12 +1261,63 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                     with connection.pipeline() if piped else nullcontext():
                         connection.racing = True
                         with suppress(psycopg.Error, ConfigurationError):
-                            backend.enqueue_in(connection, [make_job()])
+                            backend.enqueue_in(connection, [make_job() for _ in range(count)])
                     for reset in resets:
                         reset.join()
                 self.assertEqual(
                     [line for line in ran if not line.endswith(f"ran as {owner}")], []
                 )
+
+    async def test_a_refusal_inside_a_caller_pipeline_recovers_like_any_failed_statement(self):
+        backend, name, owner = await self.store_with_owner_code()
+        for autocommit, accepted, _ in itertools.product((False, True), (False, True), range(10)):
+            with psycopg.Connection.connect(url_for(dbname=name), autocommit=autocommit) as connection:
+                with connection.pipeline() as pipeline:
+                    if accepted:
+                        connection.execute(f'SET ROLE "{owner}"')
+                        backend.enqueue_in(connection, [make_job()])
+                        connection.execute("RESET ROLE")
+                    with (
+                        mock.patch.object(
+                            psycopg.Cursor,
+                            "_execute_gen",
+                            autospec=True,
+                            side_effect=psycopg.Cursor._execute_gen,
+                        ) as executed,
+                        self.assertRaisesRegex(ConfigurationError, "never writes through them"),
+                    ):
+                        backend.enqueue_in(connection, [make_job()])
+                    self.assertEqual(executed.call_count, 1)
+                    with suppress(psycopg.Error):
+                        pipeline.sync()
+                    if not autocommit:
+                        connection.rollback()
+                    self.assertEqual(connection.execute("SELECT 1").fetchone(), (1,))
+            async with await psycopg.AsyncConnection.connect(
+                url_for(dbname=name), autocommit=autocommit
+            ) as connection:
+                async with connection.pipeline() as pipeline:
+                    if accepted:
+                        await connection.execute(f'SET ROLE "{owner}"')
+                        await backend.aenqueue_in(connection, [make_job()])
+                        await connection.execute("RESET ROLE")
+                    with (
+                        mock.patch.object(
+                            psycopg.AsyncCursor,
+                            "_execute_gen",
+                            autospec=True,
+                            side_effect=psycopg.AsyncCursor._execute_gen,
+                        ) as executed,
+                        self.assertRaisesRegex(ConfigurationError, "never writes through them"),
+                    ):
+                        await backend.aenqueue_in(connection, [make_job()])
+                    self.assertEqual(executed.call_count, 1)
+                    with suppress(psycopg.Error):
+                        await pipeline.sync()
+                    if not autocommit:
+                        await connection.rollback()
+                    cursor = await connection.execute("SELECT 1")
+                    self.assertEqual(await cursor.fetchone(), (1,))
 
     async def test_tx_writes_behind_statements_the_caller_pipelined(self):
         table = f'"{self.prefix}_orders"'
@@ -1245,6 +1339,33 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await sql(f"SELECT id FROM {table} ORDER BY id"), [(1,), (2,), (3,), (4,)])
         for job in stored:
             self.assertIsNotNone(await self.backend.get(job.id))
+
+    async def test_an_autocommit_pipeline_that_fails_later_keeps_neither_its_rows_nor_the_job(self):
+        table = f'"{self.prefix}_orders"'
+        await sql(f"CREATE TABLE {table} (id integer PRIMARY KEY)")
+        self.addAsyncCleanup(sql, f"DROP TABLE {table}")
+        jobs = []
+        for joined in (False, True):
+            with psycopg.Connection.connect(POSTGRES_URL, autocommit=True) as connection:
+                if joined:
+                    self.backend.enqueue_in(connection, [make_job()])
+                with self.assertRaises(errors.UniqueViolation), connection.pipeline():
+                    connection.execute(f"INSERT INTO {table} VALUES (1)")
+                    jobs.extend(self.backend.enqueue_in(connection, [make_job()]))
+                    connection.execute(f"INSERT INTO {table} VALUES (1)")
+            async with await psycopg.AsyncConnection.connect(
+                POSTGRES_URL, autocommit=True
+            ) as connection:
+                if joined:
+                    await self.backend.aenqueue_in(connection, [make_job()])
+                with self.assertRaises(errors.UniqueViolation):
+                    async with connection.pipeline():
+                        await connection.execute(f"INSERT INTO {table} VALUES (2)")
+                        jobs.extend(await self.backend.aenqueue_in(connection, [make_job()]))
+                        await connection.execute(f"INSERT INTO {table} VALUES (2)")
+        self.assertEqual(await sql(f"SELECT count(*) FROM {table}"), [(0,)])
+        for job in jobs:
+            self.assertIsNone(await self.backend.get(job.id))
 
     async def test_a_tx_identity_check_gives_up_after_the_statement_timeout(self):
         backend = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, statement_timeout=1)
@@ -1291,6 +1412,28 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             connection.commit()
         for job in (pooled, *joined, synced):
             self.assertEqual((await self.backend.get(job.id)).payload, payload)
+
+    async def test_text_in_a_client_encoding_other_than_utf8_round_trips_through_tx(self):
+        given = make_job(task="ソ表.能", queue="キュー", dedup_key="予\\表")
+        async with await psycopg.AsyncConnection.connect(
+            POSTGRES_URL, options="-c client_encoding=SJIS"
+        ) as connection:
+            await self.backend.aenqueue_in(connection, [given])
+            await connection.commit()
+        stored = await self.backend.get(given.id)
+        self.assertEqual(
+            (stored.task, stored.queue, stored.dedup_key), (given.task, given.queue, given.dedup_key)
+        )
+
+    async def test_tx_is_refused_on_a_psycopg_whose_connections_cannot_be_held(self):
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
+            with mock.patch.object(postgres_backend, "HELD", False):
+                with self.assertRaisesRegex(UnsupportedCapabilityError, "psycopg 3.2 or 3.3"):
+                    await self.backend.aenqueue_in(connection, [make_job()])
+        with psycopg.connect(POSTGRES_URL) as connection:
+            with mock.patch.object(postgres_backend, "HELD", False):
+                with self.assertRaisesRegex(UnsupportedCapabilityError, "psycopg 3.2 or 3.3"):
+                    self.backend.enqueue_in(connection, [make_job()])
 
     async def test_tx_enqueues_running_at_once_on_one_connection_all_land(self):
         async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as connection:
@@ -2738,14 +2881,17 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_store_identity_is_read_once_per_connection(self):
         async with await self.connect() as connection:
             with mock.patch.object(
-                psycopg.AsyncCursor, "execute", autospec=True, side_effect=psycopg.AsyncCursor.execute
+                psycopg.AsyncCursor,
+                "_execute_gen",
+                autospec=True,
+                side_effect=psycopg.AsyncCursor._execute_gen,
             ) as executed:
                 await self.app.asend("x.task", tx=connection)
                 await self.app.asend("x.task", tx=connection)
             await connection.commit()
         queries = [str(call.args[1]) for call in executed.call_args_list]
         self.assertEqual(sum("'instance'" in query for query in queries), 1)
-        self.assertEqual(sum("pg_class" in query for query in queries), 3)
+        self.assertEqual(sum("pg_class" in query for query in queries), 2)
 
     async def test_a_sync_connection_is_refused_by_the_async_calls(self):
         with psycopg.connect(POSTGRES_URL) as connection:

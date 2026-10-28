@@ -21,7 +21,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...exceptions import ConfigurationError
+from ...exceptions import ConfigurationError, UnsupportedCapabilityError
 from ...models import (
     Execution,
     ExecutionError,
@@ -76,7 +76,18 @@ RETRIES = 3
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
 QUOTED = re.compile(r'"([^"]*)"')
-PLACEHOLDER = re.compile(r"%(?:%|\((\w+)\)s)")
+PIPELINED = psycopg.Pipeline.is_supported()
+HELD = all(
+    hasattr(kind, name)
+    for kind, name in (
+        (psycopg.Connection, "_pipeline_nolock"),
+        (psycopg.AsyncConnection, "_pipeline_nolock"),
+        (psycopg.Cursor, "_execute_gen"),
+        (psycopg.AsyncCursor, "_execute_gen"),
+        (psycopg.Pipeline, "_fetch_gen"),
+        (psycopg.AsyncPipeline, "_fetch_gen"),
+    )
+)
 SECRET_SETTING = re.compile(r"password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))")
 LOST_STATES = frozenset({"57P01", "57P02", "57P05"})
 WAKE_ERRORS = (psycopg.Error, PoolTimeout)
@@ -747,6 +758,7 @@ class PostgresBackend(BaseBackend):
                 "tx must be a psycopg connection or cursor; pass an async one to "
                 "aenqueue or asend"
             )
+        _check_held(connection)
         with self._refusing():
             try:
                 return _stepped(connection, self._joining(connection, jobs))
@@ -764,6 +776,7 @@ class PostgresBackend(BaseBackend):
                 "tx must be a psycopg async connection or cursor; pass a sync one to "
                 "enqueue or send"
             )
+        _check_held(connection)
         with self._refusing():
             try:
                 return await _driven(connection, self._joining(connection, jobs))
@@ -811,6 +824,7 @@ class PostgresBackend(BaseBackend):
             if not _same_store(self._identity, identity):
                 raise _Elsewhere(identity)
             self._joined[connection] = True
+            guard = ()
         now = self._clock.now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
@@ -1126,6 +1140,19 @@ async def _again(call: Callable[[], Awaitable[T]]) -> T:
         return await call()
 
 
+def _check_held(connection: Any) -> None:
+    if connection.info.parameter_status("client_encoding") == "SQL_ASCII":
+        raise ConfigurationError(
+            "tx= needs a connection whose client_encoding is not SQL_ASCII, since psycopg "
+            "reads every text value on it as bytes; connect it with client_encoding=UTF8"
+        )
+    if not HELD:
+        raise UnsupportedCapabilityError(
+            "tx= needs a psycopg that tinyjobs can hold a connection's lock with for a whole "
+            f"call, which psycopg {psycopg.__version__} is not; use psycopg 3.2 or 3.3"
+        )
+
+
 def _parsed(conninfo: str) -> dict[str, Any]:
     try:
         return conninfo_to_dict(conninfo)
@@ -1172,7 +1199,7 @@ def _connection_kwargs(conninfo: str, options: dict[str, Any]) -> dict[str, Any]
         given = {**conninfo_to_dict(conninfo), **options}
     except psycopg.ProgrammingError:
         given = dict(options)
-    defaults = {"application_name": "tinyjobs", **KEEPALIVES}
+    defaults = {"application_name": "tinyjobs", "client_encoding": "UTF8", **KEEPALIVES}
     kept = {key: value for key, value in defaults.items() if key not in given}
     return {**kept, **options, "autocommit": True, "row_factory": dict_row}
 
@@ -1186,9 +1213,16 @@ async def _begin(transaction: psycopg.AsyncTransaction) -> None:
     try:
         await transaction.__aenter__()
     except BaseException as error:
-        if transaction.status is psycopg.AsyncTransaction.Status.ACTIVE:
+        if _started(transaction):
             await transaction.__aexit__(type(error), error, error.__traceback__)
         raise
+
+
+def _started(transaction: psycopg.AsyncTransaction) -> bool:
+    status = getattr(transaction, "status", None)
+    if status is None:
+        return transaction._entered and not transaction._exited
+    return status is type(transaction).Status.ACTIVE
 
 
 def _lock_order(jobs: Sequence[Job]) -> tuple[list[Job], list[int], dict[int, int]]:
@@ -1262,114 +1296,64 @@ class _Elsewhere(Exception):
         self.identity = identity
 
 
-def _cursor_on(connection: Any) -> Any:
-    factory = connection.cursor_factory
-    if issubclass(factory, (psycopg.RawCursor, psycopg.AsyncRawCursor)):
-        factory = (
-            psycopg.AsyncCursor if isinstance(connection, psycopg.AsyncConnection) else psycopg.Cursor
-        )
-    return factory(connection, row_factory=dict_row)
-
-
 def _stepped(connection: psycopg.Connection, steps: Steps[T]) -> T:
     rows: list[dict[str, Any]] | None = None
-    while True:
-        try:
-            query, parameters, *guard = steps.send(rows)
-        except StopIteration as finished:
-            return finished.value
-        if not guard:
-            with _cursor_on(connection) as cursor:
-                rows = cursor.execute(query, parameters).fetchall()
-        elif connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
-            with psycopg.ClientCursor(connection, row_factory=dict_row) as cursor:
-                cursor.execute(_behind(connection, guard, query, parameters))
-                cursor.nextset()
-                rows = cursor.fetchall()
-        else:
-            with _cursor_on(connection) as cursor:
-                with connection.lock:
-                    connection.wait(cursor._execute_gen(*guard))
+    with (
+        connection.lock,
+        psycopg.Cursor(connection, row_factory=dict_row) as checking,
+        psycopg.Cursor(connection, row_factory=dict_row) as cursor,
+    ):
+        while True:
+            try:
+                query, parameters, *guard = steps.send(rows)
+            except StopIteration as finished:
+                return finished.value
+            pipeline = connection._pipeline
+            if pipeline is not None:
+                if guard:
+                    connection.wait(checking._execute_gen(*guard))
+                    connection.wait(pipeline._fetch_gen(flush=True))
+                connection.wait(cursor._execute_gen(query, parameters))
+                connection.wait(pipeline._fetch_gen(flush=True))
+            elif guard and PIPELINED:
+                with connection._pipeline_nolock():
+                    connection.wait(checking._execute_gen(*guard))
                     connection.wait(cursor._execute_gen(query, parameters))
-                with connection.pipeline():
-                    pass
-                rows = cursor.fetchall()
+            else:
+                if guard:
+                    connection.wait(checking._execute_gen(*guard))
+                connection.wait(cursor._execute_gen(query, parameters))
+            rows = cursor.fetchall()
 
 
 async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
     rows: list[dict[str, Any]] | None = None
-    while True:
-        try:
-            query, parameters, *guard = steps.send(rows)
-        except StopIteration as finished:
-            return finished.value
-        if not guard:
-            async with _cursor_on(connection) as cursor:
-                await cursor.execute(query, parameters)
-                rows = await cursor.fetchall()
-        elif connection.pgconn.pipeline_status == pq.PipelineStatus.OFF:
-            async with psycopg.AsyncClientCursor(connection, row_factory=dict_row) as cursor:
-                await cursor.execute(_behind(connection, guard, query, parameters))
-                cursor.nextset()
-                rows = await cursor.fetchall()
-        else:
-            async with _cursor_on(connection) as cursor:
-                async with connection.lock:
-                    await connection.wait(cursor._execute_gen(*guard))
+    async with (
+        connection.lock,
+        psycopg.AsyncCursor(connection, row_factory=dict_row) as checking,
+        psycopg.AsyncCursor(connection, row_factory=dict_row) as cursor,
+    ):
+        while True:
+            try:
+                query, parameters, *guard = steps.send(rows)
+            except StopIteration as finished:
+                return finished.value
+            pipeline = connection._pipeline
+            if pipeline is not None:
+                if guard:
+                    await connection.wait(checking._execute_gen(*guard))
+                    await connection.wait(pipeline._fetch_gen(flush=True))
+                await connection.wait(cursor._execute_gen(query, parameters))
+                await connection.wait(pipeline._fetch_gen(flush=True))
+            elif guard and PIPELINED:
+                async with connection._pipeline_nolock():
+                    await connection.wait(checking._execute_gen(*guard))
                     await connection.wait(cursor._execute_gen(query, parameters))
-                async with connection.pipeline():
-                    pass
-                rows = await cursor.fetchall()
-
-
-def _behind(connection: Any, guard: list[Any], query: str, parameters: dict[str, Any]) -> str:
-    escaping = pq.Escaping(connection.pgconn)
-    encoding = connection.info.encoding
-
-    def quoted(value: Any) -> str:
-        text = _spelled(value)
-        if text is None:
-            return "NULL"
-        return escaping.escape_literal(text.encode(encoding)).decode(encoding)
-
-    def bound(statement: str, values: dict[str, Any]) -> str:
-        return PLACEHOLDER.sub(
-            lambda match: quoted(values[match.group(1)]) if match.group(1) else "%",
-            statement,
-        )
-
-    return f"{bound(*guard)};\n{bound(query, parameters)}"
-
-
-def _spelled(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, (list, tuple)):
-        return "{" + ",".join(_element(item) for item in value) + "}"
-    return _scalar(value)
-
-
-def _element(value: Any) -> str:
-    if value is None:
-        return "NULL"
-    text = _scalar(value)
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _scalar(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "NaN"
-        if math.isinf(value):
-            return "Infinity" if value > 0 else "-Infinity"
-        return repr(value)
-    if isinstance(value, str):
-        return value
-    raise TypeError(f"tinyjobs cannot spell a {type(value).__name__} parameter")
+            else:
+                if guard:
+                    await connection.wait(checking._execute_gen(*guard))
+                await connection.wait(cursor._execute_gen(query, parameters))
+            rows = await cursor.fetchall()
 
 
 async def _fetch(

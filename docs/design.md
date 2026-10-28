@@ -832,15 +832,19 @@ the caller's `search_path` cannot change them either. The caller may connect as 
 switch with `SET ROLE` between two calls, so every `tx=` call runs the ownership check through the
 caller's connection, against the role current at that moment, before anything touches the tables;
 a role the tables' owner does not answer to never writes through them, and none of the owner's
-triggers, defaults or index expressions runs with its privileges. The check and the insert go as
-one multi-statement query, so the check costs no round trip and no other statement on that
-connection, such as a `RESET ROLE` from another task or thread, can land between them. Postgres
-analyses, plans and runs the statements one at a time, so a failing check raises before the insert
-is analysed. tinyjobs writes the values into that query itself, quoted by libpq and without type
-names, since every type the statements name is spelled with `pg_catalog`; so neither the caller's
-`search_path` nor its `standard_conforming_strings` changes what runs or what is stored. Inside a
-caller's own pipeline, where one query cannot hold two statements, both are queued together under
-the connection's lock. A guard inside the insert
+triggers, defaults or index expressions runs with its privileges. A `tx=` call holds the
+connection's lock from the check to its last statement, as psycopg's own `executemany` does, so no
+other statement on that connection, such as a `RESET ROLE` from another task or thread, lands
+anywhere inside it. The check and the first insert share one pipeline sync, so the check costs no
+round trip (a libpq older than 14 has no pipeline mode and spends one); a failing check makes
+Postgres skip the insert unparsed. Inside a caller's own pipeline they join it without a sync, so an
+autocommit pipeline still commits as one; there the check is read before the insert is sent, so a
+refusal sends nothing more and leaves the pipeline as any failed statement does, for the caller to
+sync. Values are bound by the server, arrays in binary, so neither the caller's `search_path`
+nor its `standard_conforming_strings` or client encoding changes what runs or what is stored. This
+uses psycopg internals present in 3.2 and 3.3; on a psycopg without them `tx=` raises
+`UnsupportedCapabilityError` rather than run unguarded. A connection whose client encoding is
+`SQL_ASCII` is refused, since psycopg reads its text as bytes. A guard inside the insert
 statement would not do: a statement-level `BEFORE` trigger fires before any row reaches the guard,
 and the planner may evaluate an immutable column default before the statement starts. A refused
 call leaves the caller's transaction aborted. Setup also reads the store's identity: a
@@ -945,8 +949,8 @@ listening one. Every pooled connection is set to read committed, a 30 second `st
 a one minute `idle_in_transaction_session_timeout`; every connection,
 the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
 TCP keepalives on, and the listening one gives up connecting after `pool_timeout`, two seconds at
-least. Inserted payloads travel as hex text that the server decodes, so no session setting, such as
-`standard_conforming_strings`, changes the bytes stored. A connection beyond the minimum closes after five idle
+least. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
+database works too. A connection beyond the minimum closes after five idle
 minutes, and every connection is replaced after half an hour. Deadlocks, serialization
 failures and a session the server closed under `idle_session_timeout`, which it only does while
 waiting for a command, so before the statement ran, are retried three times with a warning, except inside the caller's transaction, which only

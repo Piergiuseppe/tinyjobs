@@ -22,10 +22,6 @@ def _qualified(kind: str) -> str:
     return kind if " " in kind or kind == "integer" else f"pg_catalog.{kind}"
 
 
-def _carried(kind: str) -> str:
-    return "text" if kind == "bytea" else kind
-
-
 def becoming(role: str) -> str:
     return f"""(CASE
         WHEN pg_catalog.current_setting('server_version_num')::pg_catalog.int4
@@ -94,11 +90,7 @@ class Queries:
             else "%(lease)s::double precision"
         )
         arrays = ", ".join(
-            f"pg_catalog.unnest(%({column})s::{_qualified(_carried(kind))}[])"
-            for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
-        )
-        decoded = ", ".join(
-            f"pg_catalog.decode({column}, 'hex')" if kind == "bytea" else column
+            f"pg_catalog.unnest(%({column})b::{_qualified(kind)}[])"
             for column, kind in zip(JOB_COLUMNS, JOB_TYPES)
         )
 
@@ -111,7 +103,7 @@ class Queries:
             ),
             inserted AS (
                 INSERT INTO {jobs} ({columns})
-                SELECT {decoded} FROM incoming ORDER BY position
+                SELECT {columns} FROM incoming ORDER BY position
                 ON CONFLICT DO NOTHING
                 RETURNING id, queue, run_at OPERATOR(pg_catalog.<=) {horizon} AS due
             )
@@ -120,12 +112,12 @@ class Queries:
 
         self.by_ids = (
             f"SELECT {columns} FROM {jobs} "
-            "WHERE id OPERATOR(pg_catalog.=) ANY(%(ids)s::pg_catalog.text[])"
+            "WHERE id OPERATOR(pg_catalog.=) ANY(%(ids)b::pg_catalog.text[])"
         )
 
         self.active_by_keys = f"""
             SELECT {columns} FROM {jobs}
-             WHERE dedup_key OPERATOR(pg_catalog.=) ANY(%(keys)s::pg_catalog.text[])
+             WHERE dedup_key OPERATOR(pg_catalog.=) ANY(%(keys)b::pg_catalog.text[])
                AND status OPERATOR(pg_catalog.=) ANY(ARRAY['queued', 'running']::pg_catalog.text[])
         """
 
@@ -152,8 +144,10 @@ class Queries:
                        started_at = excluded.started_at, finished_at = NULL,
                        error_type = NULL, traceback = NULL
             )
-            SELECT {columns} FROM claimed
-             ORDER BY priority DESC, run_at ASC, array_position((SELECT ids FROM chosen), id)
+            SELECT {job_columns("claimed")} FROM claimed
+              JOIN unnest((SELECT ids FROM chosen)) WITH ORDINALITY AS chosen_at (id, place)
+                ON chosen_at.id = claimed.id
+             ORDER BY claimed.priority DESC, claimed.run_at ASC, chosen_at.place
             """
 
         def chunk(queue: str) -> str:
@@ -191,7 +185,7 @@ class Queries:
 
         many_queues = levels(f"""
             SELECT max(each.due) AS due, max(each.last) AS last, max(each.top) AS top
-              FROM unnest(%(queues)s::text[]) AS wanted (name)
+              FROM unnest(%(queues)b::text[]) AS wanted (name)
              CROSS JOIN LATERAL ({chunk("wanted.name")}) AS each
         """)
 
@@ -223,7 +217,7 @@ class Queries:
                   FROM levels
                  CROSS JOIN LATERAL (
                        SELECT wanted.name
-                         FROM unnest(%(queues)s::text[]) WITH ORDINALITY
+                         FROM unnest(%(queues)b::text[]) WITH ORDINALITY
                               AS wanted (name, position)
                         CROSS JOIN LATERAL (
                               SELECT run_at FROM {jobs}
@@ -244,7 +238,7 @@ class Queries:
             UPDATE {jobs} SET lease_expires_at = {lease_end}
              WHERE status = 'running'
                AND (%(worker)s::text IS NULL OR worker_id = %(worker)s)
-               AND id = ANY(%(ids)s::text[])
+               AND id = ANY(%(ids)b::text[])
         """
 
         held = (
@@ -360,7 +354,7 @@ class Queries:
         self.notify = (
             "SELECT pg_catalog.count(pg_catalog.pg_notify("
             f"%(channel)s, pg_catalog.left(queue, {NOTICE_CHARACTERS}))) AS sent "
-            "FROM pg_catalog.unnest(%(queues)s::pg_catalog.text[]) AS woken (queue)"
+            "FROM pg_catalog.unnest(%(queues)b::pg_catalog.text[]) AS woken (queue)"
         )
 
         self.reap = f"""
@@ -458,8 +452,8 @@ class Queries:
 
         self.register_schedules = f"""
             INSERT INTO {schedules} AS stored (name, cron, timezone, next_run_at)
-            SELECT * FROM unnest(%(names)s::text[], %(crons)s::text[],
-                                 %(timezones)s::text[], %(next_runs)s::double precision[])
+            SELECT * FROM unnest(%(names)b::text[], %(crons)b::text[],
+                                 %(timezones)b::text[], %(next_runs)b::double precision[])
             ON CONFLICT (name) DO UPDATE
                SET cron = excluded.cron, timezone = excluded.timezone,
                    next_run_at = excluded.next_run_at
@@ -499,25 +493,46 @@ class Queries:
         )
 
         self.located = f"""
-            SELECT pg_catalog.count(*) AS tables,
-                   pg_catalog.bool_or(c.relname OPERATOR(pg_catalog.=) %(meta)s) AS meta,
-                   CASE WHEN COALESCE(pg_catalog.bool_and(
-                       {trusting("c.relowner")} AND {trusting("n.nspowner")} AND {untouched("c")}
-                   ), true) THEN true
+            WITH found AS (
+                SELECT c.oid, c.relname, c.relowner, c.relacl, n.nspowner
+                  FROM pg_catalog.pg_class AS c
+                  JOIN pg_catalog.pg_namespace AS n
+                    ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+                 WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
+                   AND c.relname OPERATOR(pg_catalog.=) ANY (%(names)b::pg_catalog.name[])
+            ),
+            controlling (role) AS (
+                SELECT relowner FROM found
+                UNION
+                SELECT nspowner FROM found
+                UNION
+                SELECT granted.grantee
+                  FROM found CROSS JOIN pg_catalog.aclexplode(found.relacl) AS granted
+                 WHERE granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
+                UNION
+                SELECT p.proowner
+                  FROM found
+                  JOIN pg_catalog.pg_trigger AS t ON t.tgrelid OPERATOR(pg_catalog.=) found.oid
+                  JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) t.tgfoid
+                 WHERE NOT t.tgisinternal
+            )
+            SELECT (SELECT pg_catalog.count(*) FROM found) AS tables,
+                   (SELECT pg_catalog.bool_or(relname OPERATOR(pg_catalog.=) %(meta)s) FROM found)
+                   AS meta,
+                   CASE WHEN NOT EXISTS (
+                       SELECT FROM controlling
+                        WHERE controlling.role OPERATOR(pg_catalog.=) 0::pg_catalog.oid
+                           OR NOT {trusting("controlling.role")}
+                   ) THEN true
                    ELSE pg_catalog.concat('{REFUSAL}')::pg_catalog.bool END AS owned
-              FROM pg_catalog.pg_class AS c
-              JOIN pg_catalog.pg_namespace AS n
-                ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-             WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
-               AND c.relname OPERATOR(pg_catalog.=) ANY (%(names)s::pg_catalog.name[])
         """
 
         self.misplaced_indexes = """
             SELECT wanted.name
               FROM ROWS FROM (
-                   pg_catalog.unnest(%(indexes)s::pg_catalog.text[]),
-                   pg_catalog.unnest(%(tables)s::pg_catalog.text[]),
-                   pg_catalog.unnest(%(uniques)s::pg_catalog.bool[])
+                   pg_catalog.unnest(%(indexes)b::pg_catalog.text[]),
+                   pg_catalog.unnest(%(tables)b::pg_catalog.text[]),
+                   pg_catalog.unnest(%(uniques)b::pg_catalog.bool[])
               ) AS wanted (name, owner, is_unique)
              WHERE NOT EXISTS (
                    SELECT FROM pg_catalog.pg_index AS i
@@ -543,9 +558,9 @@ class Queries:
                    AS owned
               FROM pg_class AS c
               JOIN pg_namespace AS n ON n.oid = c.relnamespace
-             WHERE c.relname = ANY(%(names)s::name[])
-               AND n.nspname = ANY(%(schemas)s::name[])
-             ORDER BY c.relname, array_position(%(schemas)s::name[], n.nspname)
+             WHERE c.relname = ANY(%(names)b::name[])
+               AND n.nspname = ANY(%(schemas)b::name[])
+             ORDER BY c.relname, array_position(%(schemas)b::name[], n.nspname)
         """
 
         self.schema_trust = f"""
