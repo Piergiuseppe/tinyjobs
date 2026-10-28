@@ -80,35 +80,54 @@ def owners_of_code_on(tables: str) -> str:
         WITH RECURSIVE rooted (oid) AS (
             {tables}
             UNION
-            SELECT CASE WHEN con.confrelid OPERATOR(pg_catalog.=) rooted.oid
-                        THEN con.conrelid ELSE con.confrelid END
+            SELECT tied.oid
               FROM rooted
-              JOIN pg_catalog.pg_constraint AS con
-                ON con.contype OPERATOR(pg_catalog.=) 'f'
-               AND (con.confrelid OPERATOR(pg_catalog.=) rooted.oid
-                    OR con.conrelid OPERATOR(pg_catalog.=) rooted.oid)
+             CROSS JOIN LATERAL (
+                   SELECT con.conrelid
+                     FROM pg_catalog.pg_depend AS d
+                     JOIN pg_catalog.pg_constraint AS con
+                       ON con.oid OPERATOR(pg_catalog.=) d.objid
+                    WHERE d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+                      AND d.refobjid OPERATOR(pg_catalog.=) rooted.oid
+                      AND d.classid OPERATOR(pg_catalog.=) {catalog("pg_constraint")}
+                      AND con.contype OPERATOR(pg_catalog.=) 'f'
+                      AND con.confrelid OPERATOR(pg_catalog.=) rooted.oid
+                   UNION ALL
+                   SELECT inherited.inhrelid FROM pg_catalog.pg_inherits AS inherited
+                    WHERE inherited.inhparent OPERATOR(pg_catalog.=) rooted.oid
+             ) AS tied (oid)
         ),
         reached (classid, objid) AS (
             SELECT {catalog("pg_class")}, rooted.oid FROM rooted
             UNION
-            SELECT d.classid, d.objid
+            SELECT attachment.classid, attachment.objid
               FROM rooted
-              JOIN pg_catalog.pg_depend AS d
-                ON d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
-               AND d.refobjid OPERATOR(pg_catalog.=) rooted.oid
-               AND {attached}
+             CROSS JOIN LATERAL (
+                   SELECT d.classid, d.objid FROM pg_catalog.pg_depend AS d
+                    WHERE d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+                      AND d.refobjid OPERATOR(pg_catalog.=) rooted.oid
+                      AND {attached}
+                   OFFSET 0
+             ) AS attachment
             UNION
-            SELECT CASE WHEN {forward} THEN d.refclassid ELSE d.classid END,
-                   CASE WHEN {forward} THEN d.refobjid ELSE d.objid END
+            SELECT next.classid, next.objid
               FROM reached
-              JOIN pg_catalog.pg_depend AS d
-                ON ({forward} AND d.refobjid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid)
-                OR (d.refclassid OPERATOR(pg_catalog.=) reached.classid
-                    AND d.refobjid OPERATOR(pg_catalog.=) reached.objid
-                    AND {attached}
-                    AND reached.classid OPERATOR(pg_catalog.=) ANY (ARRAY[
-                        {catalog("pg_type")}, {catalog("pg_opclass")}, {catalog("pg_opfamily")}
-                    ]))
+             CROSS JOIN LATERAL (
+                   SELECT d.refclassid, d.refobjid FROM pg_catalog.pg_depend AS d
+                    WHERE {forward}
+                      AND d.refobjid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
+                      AND NOT (d.classid OPERATOR(pg_catalog.=) {catalog("pg_constraint")}
+                               AND d.refclassid OPERATOR(pg_catalog.=) {catalog("pg_class")}
+                               AND d.deptype OPERATOR(pg_catalog.=) 'n')
+                   UNION ALL
+                   SELECT d.classid, d.objid FROM pg_catalog.pg_depend AS d
+                    WHERE d.refclassid OPERATOR(pg_catalog.=) reached.classid
+                      AND d.refobjid OPERATOR(pg_catalog.=) reached.objid
+                      AND {attached}
+                      AND reached.classid OPERATOR(pg_catalog.=) ANY (ARRAY[
+                          {catalog("pg_type")}, {catalog("pg_opclass")}, {catalog("pg_opfamily")}
+                      ])
+             ) AS next (classid, objid)
         )
         SELECT owners.role
           FROM reached
@@ -125,7 +144,8 @@ def owners_of_code_on(tables: str) -> str:
                 CROSS JOIN pg_catalog.aclexplode(c.relacl) AS granted
                 WHERE reached.classid OPERATOR(pg_catalog.=) {catalog("pg_class")}
                   AND c.oid OPERATOR(pg_catalog.=) reached.objid
-                  AND granted.privilege_type OPERATOR(pg_catalog.=) 'TRIGGER'
+                  AND granted.privilege_type OPERATOR(pg_catalog.=) ANY (
+                      '{{TRIGGER,REFERENCES}}'::pg_catalog.text[])
          ) AS owners (role)
     """
 
@@ -608,25 +628,6 @@ class Queries:
                     WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
                       AND x.stxname OPERATOR(pg_catalog.=) wanted.name
              )
-        """
-
-        self.missing_columns = """
-            SELECT wanted.name
-              FROM ROWS FROM (
-                   pg_catalog.unnest(%(columns)b::pg_catalog.text[]),
-                   pg_catalog.unnest(%(tables)b::pg_catalog.text[])
-              ) AS wanted (name, owner)
-             WHERE NOT EXISTS (
-                   SELECT FROM pg_catalog.pg_attribute AS a
-                     JOIN pg_catalog.pg_class AS c ON c.oid OPERATOR(pg_catalog.=) a.attrelid
-                     JOIN pg_catalog.pg_namespace AS n
-                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
-                    WHERE n.nspname OPERATOR(pg_catalog.=) %(schema)s
-                      AND c.relname OPERATOR(pg_catalog.=) wanted.owner
-                      AND a.attname OPERATOR(pg_catalog.=) wanted.name
-                      AND NOT a.attisdropped
-             )
-             ORDER BY wanted.name
         """
 
         self.misplaced_indexes = """

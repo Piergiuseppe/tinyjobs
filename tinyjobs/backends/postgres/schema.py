@@ -24,7 +24,7 @@ INDEXES = (
 
 STATISTICS = (("jobs_queue", "jobs"),)
 
-COLUMNS = (("claim_token", "jobs"),)
+ARBITERS = frozenset({"executions_claim"})
 
 
 class Tables:
@@ -45,6 +45,7 @@ class Tables:
         self.schedules = f'{qualify}"{prefix}_schedules"'
         self.meta = f'{qualify}"{prefix}_meta"'
         self.lock = zlib.crc32(f"tinyjobs:{schema or ''}:{prefix}".encode())
+        self.rebuild_lock = zlib.crc32(f"tinyjobs-rebuild:{schema or ''}:{prefix}".encode())
 
     def within(self, schema: str) -> "Tables":
         placed = Tables.__new__(Tables)
@@ -72,6 +73,8 @@ class Tables:
             return statements
         return {
             name: statement.replace(" INDEX IF NOT EXISTS ", " INDEX CONCURRENTLY IF NOT EXISTS ", 1)
+            if name not in ARBITERS
+            else statement
             for name, statement in statements.items()
         }
 
@@ -105,11 +108,6 @@ class Tables:
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
                 ON {executions} (job_id, claim)
             """,
-        }
-
-    def columns(self) -> dict[str, str]:
-        return {
-            "claim_token": f"ALTER TABLE {self.jobs} ADD COLUMN IF NOT EXISTS claim_token text",
         }
 
     def statistics(self) -> dict[str, str]:
@@ -170,7 +168,6 @@ class Tables:
                 autovacuum_vacuum_cost_delay = 1
             )
             """,
-            self.columns()["claim_token"],
             indexes["jobs_claim"],
             indexes["jobs_by_status"],
             indexes["jobs_by_queue"],
