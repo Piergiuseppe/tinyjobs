@@ -584,6 +584,12 @@ classic source of "database is locked" in multi-process SQLite.
 
 One connection per thread (`check_same_thread=True`), never shared across threads.
 
+A cancelled call still queued behind another is taken off the backend's thread at once; one
+already running gets half a second, then the cancel goes on while it finishes in that thread. A
+release at shutdown is one write transaction for every job. With another process holding the write
+lock, four jobs released at shutdown let the app close 6.5 seconds after the signal, where each
+release waited out `busy_timeout` behind the others and the close took 22.6.
+
 Switching a fresh file to WAL needs an exclusive lock, and SQLite answers "database is locked" at
 once instead of honouring `busy_timeout`. Two workers starting together on a new file lost that race
 in 11 of 60 tries, so the switch is retried until `busy_timeout` runs out.
@@ -634,9 +640,16 @@ older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is cal
 `heartbeat` returns the ids whose lease it renewed; a job missing from that answer, and not already
 recording its outcome, is logged once as no longer held, by id, and left out of later heartbeats. A
 heartbeat that runs out of time or hits a transient error is a one-line warning, not a traceback.
+An answer that is not a collection of ids, such as a plugin's count, is logged once and the worker
+keeps beating without tracking lost leases; a count used to end the heartbeats silently. A heartbeat
+unanswered after a quarter of the lease is joined by a second one, without cutting the first, and
+the two get until the lease they renew would lapse. A cut call costs Redis its connection, and a
+fresh one three round trips more, so on a slow link one late heartbeat used to make every later one
+late too.
 On Redis over a link adding 300 ms each way, with a 6 second lease and eight jobs at a time, 218
 jobs ran once each with no heartbeat error, where 27 heartbeats used to fail and a job whose outcome
-got a second and a half ran twice. If
+got a second and a half ran twice. Over 70 seconds on that link, eight jobs ran once with no
+heartbeat warning, where from the first clock reading due all 20 heartbeats failed. If
 the worker is killed by SIGKILL, by the OOM killer or by a yanked power cable, the lease
 simply expires.
 
@@ -968,7 +981,10 @@ never writes one that ends too soon.
 Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
 `pg_notify` with the queue as payload, cut to its first 1,000 characters so it stays under
 Postgres's limit, at most once per queue every 50 ms; a burst sends one notification and a trailing
-one. The channel is `tinyjobs_` and a hash of the instance id, which always fits in a channel name.
+one. A caller with a deadline does not wait for the notification, which is sent on its own: at a
+600 ms round trip a release of eight jobs under a one second deadline returned after 0.61 seconds,
+where waiting for the notification took it past the deadline and the worker logged them unreleased
+though they were queued. The channel is `tinyjobs_` and a hash of the instance id, which always fits in a channel name.
 So every spelling of one store, by `schema=` or by `search_path`, shares one channel, and two stores
 never do. Each worker process holds one extra
 connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
@@ -1063,14 +1079,20 @@ answering, a heartbeat on a 12 second lease gave up within 4.0 seconds with at l
 the lease, where it used to wait past 40 with the lease lapsed. The worker gives an outcome or a
 hand-back one full lease from when it starts, and during shutdown no more than the shutdown
 deadline. An outcome whose call ran out of time is checked against the job's execution history on a
-fresh call, within a second; if it landed, it counts as recorded and its hooks run. Once a statement goes unanswered, the
+fresh call within a second, bounded by the worker's own end rather than by the job's deadline that
+just ran out; if it landed, it counts as recorded and its hooks run. Once a statement goes unanswered, the
 pooled connections idle since before it are closed and replaced rather than used, since a frozen
 network path or a hung proxy silences them all alike. A call cut by its
 deadline or cancelled sends the server a cancel request and waits for the statement to stop, both
 within half a second once the deadline has passed. A backend whose stop is not confirmed in that
 time has its connection closed and is ended with `pg_terminate_backend`, matched by process id and
 start time, before the next statement this backend sends, so a statement left waiting on a lock
-never applies afterwards. Cancelling a call bounds
+never applies afterwards. It is ended only while it runs, as the login role, a statement that
+started before the cut, measured on the server's clock; behind PgBouncer a backend whose statement
+ended may already serve another client, so one gone idle or running a later statement is
+forgotten instead. A claim delayed on its way is then handed back by the sweep of unanswered claims.
+The next statement waits for a pass already running rather than going ahead of it, and a backend
+not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
 database works too. A connection beyond the minimum closes after five idle
@@ -1334,10 +1356,24 @@ Redis, where seven of them used to be left `running` until their lease ran out. 
 ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
 the second signal with the server cut off, where it took 6.6.
 
+A job whose outcome is being written when the jobs' share ends is not cancelled: the write keeps
+its deadline, which ends a second before the timeout, or half the release share when that is
+shorter, and the check of a write whose answer is lost gets the rest. With a 2 second timeout and the
+outcome held on a row lock for 1.3 seconds, it was recorded and its hooks ran, where it used to be
+cut and left `running` for its lease. A cancelled job still awaiting in its cleanup when the timeout
+ends is cancelled once more and left behind, logged, for the reaper: with `--shutdown-timeout 4` and a
+cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 18.0.
+
 A job running in a thread cannot be stopped, and releasing it would let another worker run it while
 the thread still does. So at shutdown the worker leaves such a job running instead: it keeps its
 lease renewed, records its outcome when the thread returns, within the release share of the timeout
-from that moment, and returns after that. A second signal does not change this. With a 20 second
+from that moment, and returns after that. A second signal does not change this: it ends the wait at
+once and keeps such a job the same way, where its thread used to be waited for under the cut
+deadline, so its outcome was given up and the job ran again; with `SIGTERM` then `SIGINT` the job now
+ran once and was recorded. A `def` job still queued in the thread pool behind a busy thread is taken
+out of the pool before it is released, so it never runs here afterwards; one whose call has started
+is kept like a running one. It used to be released and still run here once a thread freed up,
+while another worker ran it too. With a 20 second
 `def` job and the server cut off, the worker exited 17.4 seconds after the signal, once the thread was
 done and its outcome had been given up; before, the job was released while its thread kept running.
 

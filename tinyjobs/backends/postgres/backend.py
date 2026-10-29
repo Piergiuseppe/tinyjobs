@@ -44,6 +44,7 @@ from ...models import (
 )
 from ...retention import RetentionPolicy
 from ...runtime import spared_until_close
+from ...sheltered import sheltered
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .queries import NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
@@ -151,14 +152,26 @@ CLAIMING = """
      )
 """
 ORPHANED = """
-    SELECT pg_catalog.pg_terminate_backend(activity.pid, %(wait)s) AS ended
+    SELECT orphan.pid, orphan.born,
+           activity.pid IS NULL
+           OR pg_catalog.pg_terminate_backend(activity.pid, %(wait)s) AS settled
       FROM ROWS FROM (
                pg_catalog.unnest(%(pids)s::integer[]),
-               pg_catalog.unnest(%(borns)s::pg_catalog.timestamptz[])
-           ) AS orphan (pid, born)
-      JOIN pg_catalog.pg_stat_activity AS activity
+               pg_catalog.unnest(%(borns)s::pg_catalog.timestamptz[]),
+               pg_catalog.unnest(%(ages)s::pg_catalog.float8[])
+           ) AS orphan (pid, born, age)
+      LEFT JOIN pg_catalog.pg_stat_activity AS activity
         ON activity.pid OPERATOR(pg_catalog.=) orphan.pid
        AND activity.backend_start OPERATOR(pg_catalog.=) orphan.born
+       AND activity.state OPERATOR(pg_catalog.=) 'active'
+       AND activity.usesysid OPERATOR(pg_catalog.=) (
+           SELECT oid FROM pg_catalog.pg_roles
+            WHERE rolname OPERATOR(pg_catalog.=) SESSION_USER
+       )
+       AND activity.query_start OPERATOR(pg_catalog.<=) (
+           pg_catalog.statement_timestamp()
+           OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => orphan.age)
+       )
 """
 ENDING_CLAIM_MILLISECONDS = 1000
 CUT_SECONDS = 0.5
@@ -314,12 +327,14 @@ class PostgresBackend(BaseBackend):
         self._woken: dict[str, float] = {}
         self._waiting: set[str] = set()
         self._waking: asyncio.Task | None = None
+        self._sending: set[asyncio.Task] = set()
         self._heard: dict[str, int] = {}
         self._listened: set[str] = set()
         self._hearing = 0
         self._marks: dict[str, int] = {}
         self._ghosts: dict[str, _Ghost] = {}
-        self._orphans: dict[tuple[int, Any], None] = {}
+        self._orphans: dict[tuple[int, Any], float] = {}
+        self._fresh = False
         self._unended = False
         self._swept = -math.inf
         self._silenced = -math.inf
@@ -770,7 +785,7 @@ class PostgresBackend(BaseBackend):
             self._opening.add_done_callback(_settled)
         opening = self._opening
         try:
-            await self._forgetting(asyncio.shield(opening))
+            await self._forgetting(sheltered(opening))
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if self._closed and opening.cancelled() and not (current and current.cancelling()):
@@ -788,12 +803,19 @@ class PostgresBackend(BaseBackend):
             with spared_until_close():
                 self._closing = asyncio.ensure_future(self._shut())
             self._closing.add_done_callback(_settled)
-        await asyncio.shield(self._closing)
+        await sheltered(self._closing)
 
     async def _shut(self) -> None:
         waking, self._waking = self._waking, None
         if waking is not None:
             waking.cancel()
+        sending = tuple(self._sending)
+        if sending:
+            _, unsent = await asyncio.wait(sending, timeout=SETTLE_PASS_SECONDS)
+            for task in unsent:
+                task.cancel()
+            if unsent:
+                await asyncio.wait(unsent)
         opening = self._opening
         if opening is not None and not opening.done():
             opening.cancel()
@@ -932,7 +954,7 @@ class PostgresBackend(BaseBackend):
         with until(time.monotonic() + max(0.0, _left()) / 2):
             try:
                 await self._haunted()
-            except (psycopg.Error, PoolTimeout) as error:
+            except (psycopg.Error, PoolTimeout, TimeoutError) as error:
                 logger.warning(
                     "could not hand back the jobs of postgres claims whose answer never arrived, "
                     "trying again later: %s",
@@ -940,7 +962,8 @@ class PostgresBackend(BaseBackend):
                 )
 
     def _orphaned(self, pid: int, born: Any) -> None:
-        self._orphans[pid, born] = None
+        self._orphans[pid, born] = time.monotonic()
+        self._fresh = True
         self._swept = -math.inf
 
     def _pause(self) -> float:
@@ -950,23 +973,35 @@ class PostgresBackend(BaseBackend):
         return max(GHOST_SECONDS, min(ghost.lease for ghost in ghosts) / 3)
 
     async def _haunted(self) -> None:
+        if self._fresh:
+            left = _left()
+            async with asyncio.timeout(None if left == math.inf else max(0.0, left)):
+                await self._sweeping.acquire()
+            try:
+                woken = await self._pass() if self._fresh else set()
+            finally:
+                self._sweeping.release()
+            await self._wake(woken)
+            return
         if self._sweeping.locked() or time.monotonic() - self._swept < self._pause():
             return
         await self._exorcise()
 
     async def _exorcise(self) -> None:
         async with self._sweeping:
-            await self._pass()
+            woken = await self._pass()
+        await self._wake(woken)
 
-    async def _pass(self) -> None:
+    async def _pass(self) -> set[str]:
         self._swept = time.monotonic()
+        self._fresh = False
         ghosts = list(self._ghosts.values())
         orphans = list(self._orphans)
         async with self._connection() as connection:
             if orphans:
                 await self._ended(connection, orphans)
             if not ghosts:
-                return
+                return set()
             haunting = [ghost for ghost in ghosts if ghost.backend is not None]
             seen: list[dict[str, Any]] = []
             if haunting:
@@ -1015,7 +1050,7 @@ class PostgresBackend(BaseBackend):
                 "handed back %d job(s) a postgres claim leased although its answer never arrived",
                 len(rows),
             )
-            await self._wake({row["queue"] for row in rows})
+        return {row["queue"] for row in rows}
 
     async def _ended(
         self, connection: psycopg.AsyncConnection, orphans: list[tuple[int, Any]]
@@ -1023,22 +1058,27 @@ class PostgresBackend(BaseBackend):
         async with _within(connection):
             await connection.execute(UNROLED)
             [endable] = await _fetch(connection, ENDABLE, {})
+            settled = orphans
             if endable["may"]:
-                await connection.execute(
+                now = time.monotonic()
+                rows = await _fetch(
+                    connection,
                     ORPHANED,
                     {
                         "pids": [pid for pid, _ in orphans],
                         "borns": [born for _, born in orphans],
+                        "ages": [now - self._orphans.get(orphan, now) for orphan in orphans],
                         "wait": ENDING_CLAIM_MILLISECONDS,
                     },
                 )
+                settled = [(row["pid"], row["born"]) for row in rows if row["settled"]]
             elif not self._unended:
                 self._unended = True
                 logger.warning(
                     "the postgres login role may not run pg_terminate_backend, so a statement "
                     "that did not stop when its time ran out keeps running until it ends"
                 )
-        for orphan in orphans:
+        for orphan in settled:
             self._orphans.pop(orphan, None)
 
     def _claiming(
@@ -1756,7 +1796,13 @@ class PostgresBackend(BaseBackend):
         if quiet:
             for queue in quiet:
                 self._woken[queue] = moment
-            await self._send(quiet)
+            sending = asyncio.create_task(
+                self._send(quiet), name="tinyjobs-postgres-notify", context=contextvars.Context()
+            )
+            self._sending.add(sending)
+            sending.add_done_callback(self._sending.discard)
+            if _left() == math.inf:
+                await asyncio.wait({sending})
         if self._waiting and self._waking is None and not self._closed:
             self._waking = asyncio.create_task(
                 self._wake_later(), name="tinyjobs-postgres-wake", context=contextvars.Context()

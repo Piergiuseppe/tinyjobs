@@ -30,6 +30,9 @@ class Deadline:
 current: contextvars.ContextVar[Deadline | None] = contextvars.ContextVar(
     "tinyjobs_deadline", default=None
 )
+final: contextvars.ContextVar[Deadline | None] = contextvars.ContextVar(
+    "tinyjobs_final_deadline", default=None
+)
 
 
 def left() -> float:
@@ -63,4 +66,13 @@ async def bounded(at: float) -> AsyncIterator[Deadline]:
         async with asyncio.timeout(
             None if remaining == math.inf else max(0.0, remaining) + GRACE_SECONDS
         ):
+            yield deadline
+
+
+@asynccontextmanager
+async def lastly(seconds: float) -> AsyncIterator[Deadline]:
+    hard = final.get()
+    deadline = Deadline(time.monotonic() + seconds, current.get() if hard is None else hard)
+    with under(deadline):
+        async with asyncio.timeout(max(0.0, deadline.left()) + GRACE_SECONDS):
             yield deadline

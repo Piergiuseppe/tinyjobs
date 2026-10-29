@@ -10,7 +10,7 @@ from typing import Any, AsyncContextManager, Awaitable, Callable, TYPE_CHECKING
 
 from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
-from ..deadlines import bounded
+from ..deadlines import bounded, lastly
 from ..deadlines import left as time_left
 from ..exceptions import Retry
 from ..models import ExecutionError, Job
@@ -114,7 +114,7 @@ class JobLifecycleService:
 
     async def _verified(self, job: Job, status: ExecutionStatus) -> bool:
         try:
-            async with bounded(time.monotonic() + VERIFY_SECONDS):
+            async with lastly(VERIFY_SECONDS):
                 return await self._recorded_before(job, status)
         except Exception:
             return False

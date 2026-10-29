@@ -22,6 +22,7 @@ from ...models import (
 from ...retention import RetentionPolicy
 from ...exceptions import AppClosedError
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
+from ...sheltered import sheltered
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
@@ -90,6 +91,7 @@ HELD_TRANSACTION_MESSAGE = (
 )
 
 RETIRE_SECONDS = 1.0
+CANCELLED_CALL_SECONDS = 0.5
 
 STEPPED_ASIDE = object()
 
@@ -98,6 +100,7 @@ RETURNING_CALLS = frozenset(
         "_complete_sync",
         "_fail_sync",
         "_release_sync",
+        "_release_many_sync",
         "_hand_back_sync",
         "_heartbeat_sync",
         "_close_sync",
@@ -146,28 +149,26 @@ class SQLiteBackend(BaseBackend):
         pause_threads_at_fork(self)
 
     async def _call(self, function, *args):
-        loop = asyncio.get_running_loop()
         refuse_interrupted(function.__name__.strip("_"))
         if function.__name__ not in LOCK_FREE_CALLS:
             self.refuse_held_transaction()
         while True:
             executor = self._executor
             try:
-                pending = loop.run_in_executor(
-                    executor, partial(_gated, executor, function, *args)
-                )
+                running = executor.submit(_gated, executor, function, *args)
             except RuntimeError as error:
                 if executor.retiring:
                     continue
                 if self._closed or function.__name__ not in RETURNING_CALLS:
                     raise AppClosedError(EXECUTOR_GONE_MESSAGE) from error
                 return _gated(None, function, *args)
+            pending = asyncio.wrap_future(running)
             try:
-                result = await asyncio.shield(pending)
+                result = await sheltered(pending)
             except asyncio.CancelledError:
-                await asyncio.wait({pending})
-                if not pending.cancelled():
-                    pending.exception()
+                pending.add_done_callback(_retrieved)
+                if not running.cancel():
+                    await asyncio.wait({pending}, timeout=CANCELLED_CALL_SECONDS)
                 raise
             if result is not STEPPED_ASIDE:
                 return result
@@ -244,6 +245,11 @@ class SQLiteBackend(BaseBackend):
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._release_sync, job, delay)
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        if not jobs:
+            return 0
+        return await self._call(self._release_many_sync, tuple(jobs))
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._hand_back_sync, job, delay)
@@ -493,6 +499,19 @@ class SQLiteBackend(BaseBackend):
             )
         return True
 
+    def _release_many_sync(self, jobs: Sequence[Job]) -> int:
+        now = self._clock.now()
+        released = 0
+        with self._connections.write() as connection:
+            for job in jobs:
+                cursor = connection.execute(
+                    RELEASE_JOB, (now, job.id, job.worker_id, job.claims)
+                )
+                if cursor.rowcount == 1:
+                    connection.execute(MARK_EXECUTIONS_LOST.format(ids="?"), (now, job.id))
+                    released += 1
+        return released
+
     def _hand_back_sync(self, job: Job, delay: float) -> bool:
         with self._connections.write() as connection:
             cursor = connection.execute(
@@ -713,6 +732,11 @@ def _drop_unique_legacy_index(connection: sqlite3.Connection) -> None:
 
 def _executor() -> CountingPool:
     return CountingPool(max_workers=1, thread_name_prefix="tinyjobs-sqlite")
+
+
+def _retrieved(future: asyncio.Future) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def _gated(pool: CountingPool | None, function: Callable[..., T], *args: Any) -> T:

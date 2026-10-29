@@ -8,6 +8,7 @@ from typing import Any, TYPE_CHECKING
 
 from ..exceptions import ExecutorClosedError
 from ..models import JobPayload
+from ..sheltered import sheltered
 from .base import Executor
 
 if TYPE_CHECKING:
@@ -39,14 +40,16 @@ class ThreadExecutor(Executor):
             future = asyncio.wrap_future(running)
             if task.timeout is None:
                 return await future
-            return await asyncio.wait_for(asyncio.shield(future), task.timeout)
+            return await asyncio.wait_for(sheltered(future), task.timeout)
         finally:
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
 
-    def thread_of(self, owner: asyncio.Task) -> Future | None:
+    def keeps(self, owner: asyncio.Task) -> Future | None:
         running = self._threaded.get(owner)
-        return running if running is not None and running.running() else None
+        if running is None or running.cancel():
+            return None
+        return running
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)

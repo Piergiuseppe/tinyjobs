@@ -277,6 +277,94 @@ class ClosedSQLiteBackendTests(unittest.IsolatedAsyncioTestCase):
             await backend.get("anything")
 
 
+class SQLiteCancelledCallTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.backend = SQLiteBackend(str(Path(directory.name) / "jobs.db"))
+        await self.backend.setup()
+        self.addAsyncCleanup(self.backend.close)
+        self.gate = threading.Event()
+        self.addCleanup(self.gate.set)
+
+    async def cancelled(self, call: asyncio.Future, times: int = 1) -> float:
+        started = time.monotonic()
+        for _ in range(times):
+            call.cancel()
+            await asyncio.sleep(0.05)
+        with self.assertRaises(asyncio.CancelledError):
+            await call
+        return time.monotonic() - started
+
+    async def test_a_call_cancelled_while_queued_ends_at_once_and_never_runs(self):
+        ran: list[str] = []
+        real = self.backend._get_sync
+
+        def counted(job_id):
+            ran.append(job_id)
+            return real(job_id)
+
+        counted.__name__ = "_get_sync"
+        self.backend._executor.submit(self.gate.wait, 5)
+        with mock.patch.object(self.backend, "_get_sync", counted):
+            call = asyncio.ensure_future(self.backend.get("cancelled"))
+            await asyncio.sleep(0.05)
+            took = await self.cancelled(call)
+            self.gate.set()
+            await self.backend.get("after")
+        self.assertLess(took, 0.3)
+        self.assertEqual(ran, ["after"])
+
+    async def test_a_running_call_holds_its_cancel_back_half_a_second_at_most(self):
+        from tinyjobs.backends.sqlite import backend as sqlite_backend
+
+        failures: list[dict] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: failures.append(context))
+        self.addCleanup(loop.set_exception_handler, None)
+
+        def locked(job_id):
+            self.gate.wait(5)
+            raise sqlite3.OperationalError("database is locked")
+
+        locked.__name__ = "_get_sync"
+        with mock.patch.object(self.backend, "_get_sync", locked):
+            call = asyncio.ensure_future(self.backend.get("held"))
+            await asyncio.sleep(0.05)
+            took = await self.cancelled(call, times=2)
+            self.gate.set()
+        await self.backend.get("after")
+        del call
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertLess(took, sqlite_backend.CANCELLED_CALL_SECONDS + 0.3)
+        self.assertEqual(failures, [])
+
+    async def test_jobs_are_released_together_in_one_call(self):
+        from tinyjobs.status import JobStatus
+        from tinyjobs.testing.contract import make_job
+
+        for _ in range(4):
+            await self.backend.enqueue(make_job())
+        jobs = await self.backend.claim(
+            worker_id="w", queues=("default",), limit=4, lease_seconds=60.0
+        )
+        calls: list[str] = []
+        real = self.backend._call
+
+        async def counted(function, *args):
+            calls.append(function.__name__)
+            return await real(function, *args)
+
+        with mock.patch.object(self.backend, "_call", counted):
+            self.assertEqual(await self.backend.release_many([*jobs, jobs[0]]), 4)
+        self.assertEqual(calls, ["_release_many_sync"])
+        for job in jobs:
+            self.assertIs((await self.backend.get(job.id)).status, JobStatus.QUEUED)
+            [execution] = await self.backend.executions(job.id)
+            self.assertIs(execution.status, ExecutionStatus.LOST)
+
+
 class FreshDatabaseTests(unittest.TestCase):
     def test_a_write_rolls_back_a_transaction_left_open_on_its_connection(self):
         with tempfile.TemporaryDirectory() as directory:

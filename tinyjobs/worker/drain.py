@@ -10,6 +10,7 @@ from ..executors import ExecutorResolver
 from ..models import Job
 from ..runtime import inside_running_loop
 from ..services.execution import current_runner
+from ..sheltered import sheltered
 
 if TYPE_CHECKING:
     from ..app import TinyJobs
@@ -136,7 +137,7 @@ class Drain:
     async def _abandon(self, running: asyncio.Future, job: Job) -> None:
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
-        await asyncio.shield(self._app.backend.release(job))
+        await sheltered(self._app.backend.release(job))
 
     async def _attempt(self, job: Job, task: "Task") -> None:
         current_runner.set(self)

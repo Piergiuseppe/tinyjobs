@@ -307,6 +307,30 @@ class TimeoutTests(WorkerTestCase):
         await asyncio.sleep(0.5)
         self.assertEqual(finished, [True])
 
+    async def test_a_thread_failing_after_its_timeout_leaves_the_loop_quiet(self):
+        import gc
+
+        failures: list[dict] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: failures.append(context))
+        self.addCleanup(loop.set_exception_handler, None)
+        ended = asyncio.Event()
+
+        @self.app.task(timeout=0.05, max_attempts=1)
+        def handler():
+            time.sleep(0.3)
+            loop.call_soon_threadsafe(ended.set)
+            raise ValueError("late")
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        await asyncio.wait_for(ended.wait(), SETTLE_TIMEOUT)
+        await asyncio.sleep(0.05)
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
+        self.assertEqual([context["message"] for context in failures], [])
+
 
 class UndecodableJobTests(WorkerTestCase):
     async def test_a_payload_the_worker_cannot_decode_fails_the_job(self):
@@ -413,6 +437,43 @@ class RoutingTests(WorkerTestCase):
         with self.assertRaises(asyncio.TimeoutError):
             await asyncio.wait_for(self.app.adrain(), 0.2)
         self.assertIs(await self.status_of(job), JobStatus.QUEUED)
+
+    async def test_a_release_failing_after_a_second_cancel_leaves_the_loop_quiet(self):
+        import gc
+
+        failures: list[dict] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: failures.append(context))
+        self.addCleanup(loop.set_exception_handler, None)
+        releasing = asyncio.Event()
+        failed = asyncio.Event()
+
+        async def release(job):
+            releasing.set()
+            try:
+                await asyncio.sleep(0.2)
+                raise RuntimeError("late")
+            finally:
+                failed.set()
+
+        @self.app.task
+        async def slow():
+            await asyncio.sleep(5.0)
+
+        job = await slow.aenqueue()
+        with mock.patch.object(self.app.backend, "release", release):
+            running = asyncio.ensure_future(self.app.adrain())
+            while await self.status_of(job) is not JobStatus.RUNNING:
+                await asyncio.sleep(0.01)
+            running.cancel()
+            await asyncio.wait_for(releasing.wait(), SETTLE_TIMEOUT)
+            running.cancel()
+            await asyncio.wait({running})
+            await asyncio.wait_for(failed.wait(), SETTLE_TIMEOUT)
+            await asyncio.sleep(0.05)
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertEqual([context["message"] for context in failures], [])
 
     async def test_a_stopped_drain_puts_back_a_job_that_outlasts_its_grace(self):
         from tinyjobs.worker import Drain
@@ -2172,7 +2233,7 @@ class LostLeaseTests(WorkerTestCase):
 
         @self.app.task
         async def slow():
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(4.5)
 
         job = await slow.aenqueue()
         backend = self.app.backend
@@ -2189,6 +2250,230 @@ class LostLeaseTests(WorkerTestCase):
             await self.settle(worker, [job])
         self.assertTrue(any("got no answer in time" in line for line in logs.output))
         self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+
+
+def honouring_deadlines(write):
+    from tinyjobs.deadlines import left
+
+    async def honoured(*args, **kwargs):
+        if left() <= 0:
+            raise TimeoutError("the deadline had passed")
+        return await write(*args, **kwargs)
+
+    return honoured
+
+
+class ShutdownOutcomeTests(WorkerTestCase):
+    async def test_a_second_signal_keeps_the_outcome_of_a_thread_ending_during_the_wait(self):
+        await self.app.ready()
+        started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        @self.app.task
+        def blocking():
+            loop.call_soon_threadsafe(started.set)
+            time.sleep(2.0)
+            return "done"
+
+        job = await blocking.aenqueue()
+        backend = self.app.backend
+        worker = self.make_worker(shutdown_timeout=6.0, lease_seconds=6.0)
+        with (
+            mock.patch.object(backend, "complete", honouring_deadlines(backend.complete)),
+            mock.patch.object(backend, "executions", honouring_deadlines(backend.executions)),
+        ):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            worker.stop()
+            await asyncio.sleep(0.2)
+            worker._request_force()
+            await asyncio.wait_for(runner, timeout=10)
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.SUCCESS, 1))
+
+    async def test_a_job_queued_behind_a_busy_thread_is_released_without_running_here(self):
+        await self.app.ready()
+        ran: list[str] = []
+
+        @self.app.task(timeout=0.2, max_attempts=1)
+        def stuck():
+            time.sleep(2.0)
+
+        @self.app.task
+        def long():
+            time.sleep(2.5)
+
+        @self.app.task(timeout=30)
+        def waiting():
+            ran.append("waiting")
+
+        await stuck.aenqueue()
+        await long.aenqueue()
+        queued = await waiting.aenqueue()
+        worker = self.make_worker(concurrency=2, shutdown_timeout=0.5)
+        runner = asyncio.create_task(worker.start())
+        deadline = time.monotonic() + 5
+        while await self.status_of(queued) is not JobStatus.RUNNING:
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.02)
+        worker.stop()
+        await asyncio.wait_for(runner, timeout=10)
+        self.assertEqual(ran, [])
+        self.assertIs(await self.status_of(queued), JobStatus.QUEUED)
+
+    async def test_an_outcome_still_being_written_when_the_wait_ends_is_recorded(self):
+        await self.app.ready()
+        succeeded: list[str] = []
+        started = asyncio.Event()
+
+        @self.app.task
+        async def quick():
+            started.set()
+
+        @self.app.on_job_success
+        def noted(job, *args):
+            succeeded.append(job.id)
+
+        job = await quick.aenqueue()
+        backend = self.app.backend
+        real = backend.complete
+
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(1.2)
+            return await real(*args, **kwargs)
+
+        worker = self.make_worker(shutdown_timeout=2.0)
+        with mock.patch.object(backend, "complete", slow):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertEqual(succeeded, [job.id])
+
+    async def test_an_outcome_whose_answer_is_lost_is_verified_before_the_worker_ends(self):
+        await self.app.ready()
+        succeeded: list[str] = []
+        started = asyncio.Event()
+
+        @self.app.task
+        async def quick():
+            started.set()
+
+        @self.app.on_job_success
+        def noted(job, *args):
+            succeeded.append(job.id)
+
+        job = await quick.aenqueue()
+        backend = self.app.backend
+        real = backend.complete
+
+        async def landed_unanswered(*args, **kwargs):
+            from tinyjobs.deadlines import left
+
+            await real(*args, **kwargs)
+            await asyncio.sleep(max(0.0, left()))
+            raise TimeoutError("the answer was lost")
+
+        worker = self.make_worker(shutdown_timeout=2.0)
+        with (
+            mock.patch.object(backend, "complete", landed_unanswered),
+            mock.patch.object(backend, "executions", honouring_deadlines(backend.executions)),
+            self.assertNoLogs("tinyjobs.worker", "ERROR"),
+        ):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertEqual(succeeded, [job.id])
+
+    async def test_a_job_whose_cleanup_ignores_the_stop_is_left_behind_within_the_timeout(self):
+        await self.app.ready()
+        started = asyncio.Event()
+
+        @self.app.task
+        async def stubborn():
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                await asyncio.shield(asyncio.sleep(10))
+
+        job = await stubborn.aenqueue()
+        worker = self.make_worker(shutdown_timeout=1.0)
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            stopped = time.monotonic()
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=20)
+        self.assertLess(time.monotonic() - stopped, 1.0 + 0.5 + 0.5)
+        self.assertTrue(any("leaves them behind" in line for line in logs.output))
+        self.assertFalse(any("could not release" in line for line in logs.output))
+        self.assertIs(await self.status_of(job), JobStatus.RUNNING)
+
+
+class HeartbeatAnswerTests(WorkerTestCase):
+    async def beaten(self, answer, seconds: float = 3.5) -> tuple[int, list[str]]:
+        await self.app.ready()
+
+        @self.app.task
+        async def slow():
+            await asyncio.sleep(seconds)
+
+        job = await slow.aenqueue()
+        calls: list[int] = []
+
+        async def answered(*args, **kwargs):
+            calls.append(1)
+            return answer
+
+        worker = self.make_worker(lease_seconds=3.0)
+        with (
+            mock.patch.object(self.app.backend, "heartbeat", answered),
+            self.assertLogs("tinyjobs.worker", "INFO") as logs,
+        ):
+            await self.settle(worker, [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        return len(calls), logs.output
+
+    async def test_a_heartbeat_answering_a_count_keeps_beating_and_warns_once(self):
+        beats, output = await self.beaten(1)
+        self.assertGreaterEqual(beats, 2)
+        self.assertEqual(sum("rather than the ids" in line for line in output), 1)
+
+    async def test_a_heartbeat_answering_ids_that_are_not_text_loses_no_job(self):
+        beats, output = await self.beaten([1, 2])
+        self.assertGreaterEqual(beats, 2)
+        self.assertFalse(any("no longer holds" in line for line in output))
+        self.assertEqual(sum("rather than the ids" in line for line in output), 1)
+
+    async def test_a_heartbeat_slower_than_a_quarter_of_the_lease_still_renews_it(self):
+        await self.app.ready()
+
+        @self.app.task
+        async def slow():
+            await asyncio.sleep(3.5)
+
+        job = await slow.aenqueue()
+        backend = self.app.backend
+        real = backend.heartbeat
+        calls: list[float] = []
+
+        async def slow_link(*args, **kwargs):
+            calls.append(time.monotonic())
+            await asyncio.sleep(1.4)
+            return await real(*args, **kwargs)
+
+        worker = self.make_worker(lease_seconds=3.0)
+        with (
+            mock.patch.object(backend, "heartbeat", slow_link),
+            self.assertNoLogs("tinyjobs.worker", "WARNING"),
+        ):
+            await self.settle(worker, [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertGreaterEqual(len(calls), 2)
 
 
 class CutOutcomeTests(WorkerTestCase):
