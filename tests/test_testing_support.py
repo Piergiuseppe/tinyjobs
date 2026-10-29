@@ -170,6 +170,38 @@ class DrainTests(unittest.TestCase):
         self.assertEqual((job.refresh().status, job.attempts), (JobStatus.FAILED, 3))
         self.assertEqual(self.calls, ["try"] * 3)
 
+    def test_a_drain_claims_nothing_while_a_timed_out_thread_still_runs(self):
+        import threading
+        import time
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+
+        @self.app.task(timeout=0.1, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        @self.app.task(timeout=0.3)
+        def charge():
+            self.calls.append("charged")
+
+        first = runaway.enqueue()
+        job = charge.enqueue()
+        drained: list[int] = []
+        draining = threading.Thread(target=lambda: drained.append(self.app.drain()))
+        draining.start()
+        self.addCleanup(draining.join, 10)
+        deadline = time.monotonic() + 10
+        while first.refresh().status is not JobStatus.FAILED:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        time.sleep(0.5)
+        self.assertIs(job.refresh().status, JobStatus.QUEUED)
+        held.set()
+        draining.join(10)
+        self.assertEqual(drained, [2])
+        self.assertIs(job.refresh().status, JobStatus.SUCCESS)
+
     def test_an_unknown_task_raises_and_stays_queued(self):
         job = self.app.send("elsewhere.task")
         with self.assertRaises(UnknownTaskError):

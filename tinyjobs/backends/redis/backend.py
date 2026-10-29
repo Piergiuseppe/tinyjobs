@@ -5,6 +5,8 @@ import contextvars
 import functools
 import inspect
 import logging
+import math
+import threading
 from typing import Any, Awaitable, Sequence, TypeVar
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
@@ -75,6 +77,8 @@ class RedisBackend(BaseBackend):
         self._reading = asyncio.Lock()
         self._read = False
         self._refreshing: asyncio.Task | None = None
+        self._reserving = threading.Lock()
+        self._reserved: dict[object, int] = {}
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -114,21 +118,31 @@ class RedisBackend(BaseBackend):
             await asyncio.wait({refreshing})
         await self._client.aclose()
 
+    def reserve(self, owner: object, jobs: int) -> int:
+        with self._reserving:
+            if jobs < 0:
+                self._reserved.pop(owner, None)
+            else:
+                self._reserved[owner] = jobs + SPARE_CONNECTIONS
+            reserved = sum(self._reserved.values())
+        return max(1, math.ceil(reserved / self._client.connection_pool.max_connections))
+
     async def spare(self) -> None:
         client = self._client
         await client.initialize()
         if client.connection is not None:
             return
         pool = client.connection_pool
-        taken = await asyncio.gather(
-            *(_acquire(pool) for _ in range(SPARE_CONNECTIONS)), return_exceptions=True
-        )
-        for connection in taken:
-            if not isinstance(connection, BaseException):
-                await pool.release(connection)
-        for connection in taken:
-            if isinstance(connection, BaseException):
-                raise connection
+        with self._reserving:
+            wanted = sum(self._reserved.values()) or SPARE_CONNECTIONS
+        count = min(wanted, pool.max_connections - len(pool._in_use_connections))
+        taking = [asyncio.ensure_future(_acquire(pool)) for _ in range(count)]
+        try:
+            await asyncio.gather(*taking)
+        finally:
+            for task in taking:
+                task.cancel()
+            await asyncio.shield(_returned(pool, taking))
 
     async def enqueue(self, job: Job) -> Job:
         return (await self.enqueue_many([job]))[0]
@@ -545,6 +559,13 @@ def _mend(pool: Any) -> None:
         return
     if type(pool).get_connection is BlockingConnectionPool.get_connection:
         pool.__class__ = _unwedged(type(pool))
+
+
+async def _returned(pool: Any, taking: list[asyncio.Future]) -> None:
+    await asyncio.wait(taking)
+    for task in taking:
+        if not task.cancelled() and task.exception() is None:
+            await pool.release(task.result())
 
 
 async def _acquire(pool: Any) -> Any:

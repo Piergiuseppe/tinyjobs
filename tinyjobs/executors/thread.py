@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from contextvars import copy_context
 from functools import partial
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from ..exceptions import ExecutorClosedError
 from ..models import JobPayload
@@ -16,17 +17,25 @@ from .base import Executor
 if TYPE_CHECKING:
     from ..task import Task
 
+logger = logging.getLogger("tinyjobs.worker")
+
 EXECUTOR_CLOSED_MESSAGE = (
     "the job threads were shut down, so this job was handed back without running"
 )
 
 
 class ThreadExecutor(Executor):
-    def __init__(self, concurrency: int) -> None:
+    def __init__(self, concurrency: int, freed: Callable[[], None] | None = None) -> None:
         self._pool = ThreadPoolExecutor(
             max_workers=concurrency, thread_name_prefix="tinyjobs"
         )
         self._threaded: dict[asyncio.Task | None, Future] = {}
+        self._strays: set[Future] = set()
+        self._freed = freed
+
+    @property
+    def strays(self) -> int:
+        return len(self._strays)
 
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
         loop = asyncio.get_running_loop()
@@ -60,6 +69,23 @@ class ThreadExecutor(Executor):
             started.cancel()
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
+            if not running.cancel() and not running.done():
+                self._stray(loop, running, task)
+
+    def _stray(self, loop: asyncio.AbstractEventLoop, running: Future, task: "Task") -> None:
+        self._strays.add(running)
+        logger.warning(
+            "%s ended while its thread still runs; %d job thread(s) are taken this way, "
+            "so the worker runs that many fewer jobs until they return",
+            task.name,
+            len(self._strays),
+        )
+        running.add_done_callback(partial(_returned, loop, partial(self._back, running)))
+
+    def _back(self, running: Future) -> None:
+        self._strays.discard(running)
+        if self._freed is not None:
+            self._freed()
 
     def keeps(self, owner: asyncio.Task) -> Future | None:
         running = self._threaded.get(owner)
@@ -76,6 +102,11 @@ def _started(loop: asyncio.AbstractEventLoop, started: asyncio.Future, call: Any
     with suppress(RuntimeError):
         loop.call_soon_threadsafe(_began, started, began)
     return call()
+
+
+def _returned(loop: asyncio.AbstractEventLoop, back: Any, _: object) -> None:
+    with suppress(RuntimeError):
+        loop.call_soon_threadsafe(back)
 
 
 def _began(started: asyncio.Future, began: float) -> None:

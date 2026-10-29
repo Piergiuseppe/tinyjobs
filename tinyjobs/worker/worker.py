@@ -92,7 +92,9 @@ class Worker:
 
     def _prepare_run(self) -> None:
         self._executors = ExecutorResolver(
-            concurrency=self._concurrency, async_concurrency=self._async_concurrency
+            concurrency=self._concurrency,
+            async_concurrency=self._async_concurrency,
+            freed=self._freed,
         )
         self._stopping = asyncio.Event()
         self._forced = asyncio.Event()
@@ -105,6 +107,9 @@ class Worker:
         self._admitting = Deadline()
         self._beating = Deadline()
         self._sparing: asyncio.Task | None = None
+        self._reserved: Any = None
+        self._waves = 1
+        self._transient: tuple[type[BaseException], ...] = ()
 
     @property
     def id(self) -> str:
@@ -133,26 +138,20 @@ class Worker:
 
     async def start(self) -> None:
         await self._app.ready()
+        self._transient = tuple(getattr(self._app.backend, "transient_errors", ()))
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
         self._app.attach(self)
-        expected = self._expect(self._concurrency)
         try:
             await self._serve()
         finally:
-            expected()
+            if self._reserved is not None:
+                self._reserved(self, -1)
             closing = self._app.detach(self)
             self._prepare_run()
             self._finished.set()
             if closing:
                 await self._app.aclose()
-
-    def _expect(self, count: int):
-        expect = getattr(self._app.backend, "expect", None)
-        if expect is None:
-            return lambda: None
-        expect(count)
-        return partial(expect, -count)
 
     async def _serve(self) -> None:
         watcher = ShutdownWatcher(self._request_stop, self._request_force)
@@ -203,6 +202,9 @@ class Worker:
                 self._executors.shutdown()
                 logger.info("worker %s stopped", self._id)
 
+    def _freed(self) -> None:
+        self._capacity.set()
+
     def _start_background(self) -> list[asyncio.Task]:
         background = [
             asyncio.create_task(self._reaper_loop(), name="tinyjobs-reaper"),
@@ -218,7 +220,7 @@ class Worker:
 
     async def _claim_loop(self) -> None:
         while not self._stopping.is_set():
-            capacity = self._concurrency - len(self._inflight)
+            capacity = self._concurrency - len(self._inflight) - self._executors.strays
             if capacity <= 0:
                 self._capacity.clear()
                 await self._wait_for(self._capacity)
@@ -506,10 +508,6 @@ class Worker:
             job_ids, self._lease_seconds, worker_id=self._id
         )
 
-    @property
-    def _transient(self) -> tuple[type[BaseException], ...]:
-        return tuple(getattr(self._app.backend, "transient_errors", ()))
-
     def _forget_lost(self, beaten: list[tuple[str, int]], answer: Any) -> None:
         if answer is None:
             return
@@ -672,7 +670,7 @@ class Worker:
         run.kept = True
         run.deadline.outer = None
         run.last.outer = None
-        window = _release_window(self._configured_shutdown_timeout)
+        window = _release_window(self._configured_shutdown_timeout) * self._waves
         thread.add_done_callback(partial(_ended_by, asyncio.get_running_loop(), run, window))
 
     async def _wait_for(self, event: asyncio.Event) -> None:
@@ -735,6 +733,10 @@ class Worker:
             asyncio.get_running_loop()
         except (BackendNotReadyError, RuntimeError):
             return
+        reserve = getattr(backend, "reserve", None)
+        if reserve is not None:
+            self._waves = reserve(self, len(self._running))
+            self._reserved = reserve
         spare = getattr(backend, "spare", None)
         if spare is None:
             return

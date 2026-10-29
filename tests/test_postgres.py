@@ -2696,6 +2696,19 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.heard(listener), [])
 
 
+def revealed(error: BaseException) -> str:
+    texts: list[str] = []
+    pending, seen = [error], set()
+    while pending:
+        link = pending.pop()
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        texts.extend((repr(link), str(link), repr(link.args)))
+        pending.extend((link.__cause__, link.__context__))
+    return "\n".join(texts)
+
+
 @requires_postgres
 class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
     def test_a_statement_timeout_that_would_switch_the_guard_off_is_refused(self):
@@ -2725,13 +2738,13 @@ class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(url=url, build=build):
                     with self.assertRaisesRegex(ConfigurationError, "not valid") as caught:
                         build(url)
-                    self.assertNotIn("Hunter2", str(caught.exception))
-                    self.assertNotIn("Secret", str(caught.exception))
+                    self.assertNotIn("Hunter2", revealed(caught.exception))
+                    self.assertNotIn("Secret", revealed(caught.exception))
         for conninfo in ("host=db password=Hunter2 SecretTail", "host=db password=Hunter2\tSecretTail"):
             with self.subTest(conninfo=conninfo):
                 with self.assertRaisesRegex(ConfigurationError, "not valid") as caught:
                     PostgresBackend.from_url(conninfo)
-                self.assertNotIn("Secret", str(caught.exception))
+                self.assertNotIn("Secret", revealed(caught.exception))
 
     def test_a_postgres_url_holding_a_nul_is_refused(self):
         for url in (POSTGRES_URL + "\x00", POSTGRES_URL.replace("://", "://\x00", 1)):
@@ -3112,6 +3125,7 @@ class PostgresClockTests(unittest.IsolatedAsyncioTestCase):
         backend = await self.open(min_connections=3)
         while backend._idle() < 3:
             await asyncio.sleep(0.05)
+        backend.reserve(self, 0)
         await backend.spare()
         reads = self.slow_reads(backend)
         with later_by(FOLLOW_SECONDS + 1, module):
@@ -5694,6 +5708,38 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
         )
         return count == 1
 
+    async def test_every_pooled_connection_shows_its_token_after_each_kind_of_call(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        backend = self.backend
+        other = await backend.enqueue(make_job())
+        [taken] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
+        calls = {
+            "enqueue": lambda: backend.enqueue(make_job()),
+            "split enqueue": lambda: backend.enqueue_many(
+                [make_job() for _ in range(postgres_backend.ENQUEUE_BATCH + 1)]
+            ),
+            "heartbeat": lambda: backend.heartbeat([self.job.id], 60, worker_id="w"),
+            "complete": lambda: backend.complete(self.job, None),
+            "release": lambda: backend.release(taken),
+            "cancel": lambda: backend.cancel(other.id),
+            "reap": backend.reap_expired,
+            "stats": lambda: backend.stats(time.time()),
+            "purge": lambda: backend.purge(RetentionPolicy(), time.time()),
+            "requeue": lambda: backend.requeue(other.id),
+            "get": lambda: backend.get(other.id),
+            "setup": backend.setup,
+        }
+        for name, call in calls.items():
+            await call()
+            pids = [connection.pid for connection in list(backend._pool._pool)]
+            rows = await sql(
+                "SELECT query FROM pg_stat_activity WHERE pid = ANY(%(pids)s)", {"pids": pids}
+            )
+            self.assertTrue(rows, name)
+            for (query,) in rows:
+                self.assertTrue(query.startswith("/* tinyjobs "), (name, query))
+
     async def test_a_backend_that_never_ran_our_statements_is_never_ended(self):
         other, pid, born = await self.session()
         busy = asyncio.ensure_future(other.execute("SELECT pg_sleep(1)"))
@@ -5874,25 +5920,7 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
         await backend.setup()
         return backend
 
-    async def test_the_pool_grows_with_the_jobs_its_workers_run_at_once(self):
-        backend = await self.open()
-        self.assertEqual(backend._pool.max_size, 10)
-        backend.expect(16)
-        backend.expect(4)
-        await backend.reap_expired()
-        self.assertEqual(backend._pool.max_size, 16 + 4 + 2 * postgres_backend.WORKER_CONNECTIONS)
-        backend.expect(-16)
-        backend.expect(-4)
-        await backend.reap_expired()
-        self.assertEqual(backend._pool.max_size, 10)
-
-    async def test_a_chosen_pool_size_is_kept_whatever_the_workers_run(self):
-        backend = await self.open(max_connections=4)
-        backend.expect(16)
-        await backend.reap_expired()
-        self.assertEqual(backend._pool.max_size, 4)
-
-    async def test_a_worker_with_many_jobs_at_once_gets_a_pool_to_match(self):
+    async def test_the_pool_stays_at_ten_whatever_its_workers_run(self):
         app = TinyJobs(POSTGRES_URL, prefix=self.prefix)
         self.addAsyncCleanup(app.aclose)
         await app.ready()
@@ -5911,16 +5939,74 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         worker.stop()
         await asyncio.wait_for(runner, 10)
-        self.assertEqual(sizes, [16 + postgres_backend.WORKER_CONNECTIONS])
+        self.assertEqual(sizes, [postgres_backend.DEFAULT_MAX_CONNECTIONS])
+
+    async def test_a_stop_keeps_a_connection_for_each_running_job_within_the_pool(self):
+        backend = await self.open(min_connections=1, max_connections=6)
+        owner = object()
+        self.assertEqual(backend.reserve(owner, 3), 1)
+        await backend.spare()
+        self.assertEqual(backend._pool.min_size, 3 + postgres_backend.SPARE_CONNECTIONS)
+        deadline = time.monotonic() + 5
+        while backend._pool.get_stats()["pool_available"] < 3 + postgres_backend.SPARE_CONNECTIONS:
+            self.assertLess(time.monotonic(), deadline)
+            await asyncio.sleep(0.05)
+        other = object()
+        self.assertEqual(backend.reserve(other, 3), 2)
+        await backend.spare()
+        self.assertEqual(backend._pool.min_size, 6)
+        backend.reserve(owner, -1)
+        backend.reserve(other, -1)
+        await backend.reap_expired()
+        self.assertEqual(backend._pool.min_size, 1)
+
+    async def test_a_stop_with_every_connection_busy_opens_none_past_the_pool_size(self):
+        backend = await self.open(min_connections=1, max_connections=2)
+        async with backend._pool.connection(), backend._pool.connection():
+            backend.reserve(self, 6)
+            await backend.spare()
+            await asyncio.sleep(0.3)
+            self.assertEqual(backend._pool.get_stats()["pool_size"], 2)
+        backend.reserve(self, -1)
+
+    async def test_one_worker_stopping_leaves_the_others_on_its_app_as_they_were(self):
+        app = TinyJobs(POSTGRES_URL, prefix=self.prefix)
+        self.addAsyncCleanup(app.aclose)
+        await app.ready()
+        backend = app.backend._inner
+        first, second = (
+            app.worker(concurrency=2, scheduler=False, handle_signals=False, shutdown_timeout=1.0)
+            for _ in range(2)
+        )
+        running = [asyncio.create_task(worker.start()) for worker in (first, second)]
+        await asyncio.sleep(0.3)
+        first.stop()
+        await asyncio.wait_for(running[0], 10)
+        self.assertFalse(running[1].done())
+        await backend.reap_expired()
+        self.assertEqual(backend._pool.min_size, 1)
+        while backend._idle() < 2:
+            await asyncio.sleep(0.05)
+        self.assertTrue(backend._refreshable())
+        second.stop()
+        await asyncio.wait_for(running[1], 10)
+        third = app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        runner = asyncio.create_task(third.start())
+        await asyncio.sleep(0.3)
+        self.assertTrue(backend._refreshable())
+        third.stop()
+        await asyncio.wait_for(runner, 10)
 
     async def test_a_stop_with_connections_to_spare_opens_none(self):
         backend = await self.open(min_connections=1)
         async with backend._pool.connection(), backend._pool.connection():
             pass
+        opened = backend._pool.get_stats()["pool_size"]
+        self.assertGreaterEqual(opened, postgres_backend.SPARE_CONNECTIONS)
+        backend.reserve(self, 0)
         await backend.spare()
-        self.assertEqual(backend._pool.min_size, 1)
-        await backend.reap_expired()
-        self.assertEqual(backend._pool.min_size, 1)
+        await asyncio.sleep(0.2)
+        self.assertEqual(backend._pool.get_stats()["pool_size"], opened)
 
     async def test_closing_while_the_listener_waits_on_its_first_statement_sends_no_cancel(self):
         backend = await self.open()
@@ -5959,6 +6045,7 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(postgres_backend._Answering, "connect", classmethod(slowly)),
             self.assertNoLogs("psycopg.pool", "WARNING"),
         ):
+            backend.reserve(self, 0)
             await backend.spare()
             while not slow:
                 await asyncio.sleep(0.02)
@@ -5971,6 +6058,7 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_stop_keeps_spare_connections_open_for_the_releases(self):
         backend = await self.open(min_connections=1)
         self.assertEqual(backend._pool.min_size, 1)
+        backend.reserve(self, 0)
         await backend.spare()
         self.assertEqual(backend._pool.min_size, postgres_backend.SPARE_CONNECTIONS)
         deadline = time.monotonic() + 5

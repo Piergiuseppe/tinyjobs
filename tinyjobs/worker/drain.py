@@ -39,7 +39,8 @@ class Drain:
         self._prepare_run()
 
     def _prepare_run(self) -> None:
-        self._executors = ExecutorResolver(concurrency=1)
+        self._freed = asyncio.Event()
+        self._executors = ExecutorResolver(concurrency=1, freed=self._freed.set)
         self._stopping = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -85,12 +86,24 @@ class Drain:
         while not self._stopping.is_set():
             queues = self._queues or await self._known_queues()
             drained = 0
-            while not self._stopping.is_set() and (job := await self._claim(queues)):
+            while await self._free() and (job := await self._claim(queues)):
                 drained += await self._execute(job)
             ran += drained
             if not drained or self._queues:
                 return ran
         return ran
+
+    async def _free(self) -> bool:
+        while self._executors.strays and not self._stopping.is_set():
+            self._freed.clear()
+            waiting = asyncio.ensure_future(self._freed.wait())
+            stopping = asyncio.ensure_future(self._stopping.wait())
+            try:
+                await asyncio.wait((waiting, stopping), return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                waiting.cancel()
+                stopping.cancel()
+        return not self._stopping.is_set()
 
     async def _claim(self, queues: Sequence[str]) -> Job | None:
         jobs = await self._app.backend.claim(

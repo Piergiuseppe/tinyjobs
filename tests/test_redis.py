@@ -385,6 +385,23 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertGreaterEqual(len(idle), SPARE_CONNECTIONS)
 
+    async def test_a_stop_opens_a_connection_for_each_running_job_within_the_pool(self):
+        from tinyjobs.backends.redis.backend import SPARE_CONNECTIONS
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=8)
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        owner = object()
+        backend.reserve(owner, 4)
+        await backend.spare()
+        connected = [c for c in pool._available_connections if c.is_connected]
+        self.assertEqual(len(connected), 4 + SPARE_CONNECTIONS)
+        backend.reserve(object(), 4)
+        await backend.spare()
+        connected = [c for c in pool._available_connections if c.is_connected]
+        self.assertEqual(len(connected), 8)
+        self.assertEqual(len(pool._in_use_connections), 0)
+
     async def test_a_spare_cancelled_while_it_connects_leaves_the_pool_usable(self):
         from redis.asyncio.connection import Connection
 
@@ -410,6 +427,33 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pool._in_use_connections), 0)
         async with asyncio.timeout(1.0):
             await backend.setup()
+
+    async def test_a_spare_cut_after_one_connection_returns_it_to_the_pool(self):
+        from tinyjobs.backends.redis import backend as module
+        from tinyjobs.backends.redis.backend import _acquire
+
+        backend = RedisBackend.from_url(
+            REDIS_URL, prefix=self.prefix, max_connections=2, pool_timeout=20.0
+        )
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        taken: list[object] = []
+
+        async def one_then_none(pool):
+            if taken:
+                await asyncio.sleep(30)
+            taken.append(1)
+            return await _acquire(pool)
+
+        with mock.patch.object(module, "_acquire", one_then_none):
+            with self.assertRaises(TimeoutError):
+                async with asyncio.timeout(0.5):
+                    await backend.spare()
+        self.assertEqual(len(pool._in_use_connections), 0)
+        async with asyncio.timeout(1.0):
+            taken = [await _acquire(pool), await _acquire(pool)]
+        for connection in taken:
+            await pool.release(connection)
 
     async def test_a_lost_connection_reads_the_clock_again(self):
         backend = await self.open()
@@ -890,6 +934,34 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
                 break
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
+
+    async def test_threads_kept_at_a_stop_record_their_outcomes_where_connections_open_slowly(self):
+        from redis.asyncio.connection import Connection
+
+        @self.app.task(max_attempts=1)
+        def steady(i):
+            time.sleep(3.0)
+
+        jobs = [await steady.aenqueue(i) for i in range(6)]
+        original = Connection._connect
+
+        async def slowly(connection):
+            await asyncio.sleep(1.5)
+            await original(connection)
+
+        worker = self.app.worker(
+            concurrency=6, poll_maximum=0.05, shutdown_timeout=3.0, handle_signals=False
+        )
+        with mock.patch.object(Connection, "_connect", slowly):
+            runner = asyncio.create_task(worker.start())
+            while JobStatus.QUEUED in [(await job.arefresh()).status for job in jobs]:
+                await asyncio.sleep(0.05)
+            pool = self.app.backend._inner._client.connection_pool
+            await on_backend_loop(self.app, pool.disconnect(inuse_connections=False))
+            worker.stop()
+            await asyncio.wait_for(runner, 15)
+        statuses = [(await job.arefresh()).status for job in jobs]
+        self.assertEqual(statuses, [JobStatus.SUCCESS] * 6)
 
     async def test_a_worker_runs_jobs_and_retries_against_redis(self):
         attempts = []

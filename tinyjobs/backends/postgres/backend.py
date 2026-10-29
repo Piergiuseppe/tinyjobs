@@ -25,10 +25,12 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Generator, Iterator,
 from urllib.parse import unquote
 
 import psycopg
+import psycopg.sql
 from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
+from psycopg_pool.pool_async import AddConnection
 
 from ...clock import Clock, FollowingClock, elapsed
 from ...deadlines import left as _left
@@ -62,7 +64,6 @@ from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, Tables
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MIN_CONNECTIONS = 1
 DEFAULT_MAX_CONNECTIONS = 10
-WORKER_CONNECTIONS = 3
 SPARE_CONNECTIONS = 2
 DEFAULT_POOL_TIMEOUT = 20.0
 DEFAULT_STATEMENT_TIMEOUT = 30.0
@@ -323,7 +324,7 @@ class PostgresBackend(BaseBackend):
         schema: str | None = None,
         clock: Clock | None = None,
         min_connections: int = DEFAULT_MIN_CONNECTIONS,
-        max_connections: int | None = None,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         pool_timeout: float = DEFAULT_POOL_TIMEOUT,
         statement_timeout: float | None = DEFAULT_STATEMENT_TIMEOUT,
         notify: bool = True,
@@ -381,26 +382,23 @@ class PostgresBackend(BaseBackend):
         self._largest = max_connections
         self._smallest = min_connections
         self._demanding = threading.Lock()
-        self._expected = 0
-        self._attached = 0
-        self._spared = False
-        self._stopping = False
+        self._reserved: dict[object, int] = {}
         self._sizes = self._wanted()
         self._pool = self._new_pool()
 
-    def expect(self, concurrency: int) -> None:
+    def reserve(self, owner: object, jobs: int) -> int:
         with self._demanding:
-            self._expected += concurrency
-            self._attached += (concurrency > 0) - (concurrency < 0)
+            if jobs < 0:
+                self._reserved.pop(owner, None)
+            else:
+                self._reserved[owner] = jobs + SPARE_CONNECTIONS
+            reserved = sum(self._reserved.values())
+        return max(1, math.ceil(reserved / self._largest))
 
     def _wanted(self) -> tuple[int, int]:
-        largest = self._largest
-        if largest is None:
-            with self._demanding:
-                demand = self._expected + WORKER_CONNECTIONS * self._attached
-            largest = max(DEFAULT_MAX_CONNECTIONS, demand)
-        smallest = max(self._smallest, SPARE_CONNECTIONS) if self._spared else self._smallest
-        return min(smallest, largest), largest
+        with self._demanding:
+            reserved = sum(self._reserved.values())
+        return min(max(self._smallest, reserved), self._largest), self._largest
 
     async def _resized(self) -> None:
         wanted = self._wanted()
@@ -409,11 +407,7 @@ class PostgresBackend(BaseBackend):
             await self._pool.resize(*wanted)
 
     async def spare(self) -> None:
-        if self._closed or self._stopping:
-            return
-        self._stopping = True
-        if self._idle() < SPARE_CONNECTIONS:
-            self._spared = True
+        if not self._closed:
             await self._resized()
 
     def _new_pool(self) -> AsyncConnectionPool:
@@ -1930,7 +1924,7 @@ class PostgresBackend(BaseBackend):
         return clock.now()
 
     def _refreshable(self) -> bool:
-        return not self._reading.locked() and not self._stopping and self._idle() > 1
+        return not self._reading.locked() and not self._reserved and self._idle() > 1
 
     def _idle(self) -> int:
         if self._closed:
@@ -2032,11 +2026,13 @@ def _check_held(connection: Any) -> None:
 def _parsed(conninfo: str) -> dict[str, Any]:
     if "\x00" in conninfo:
         raise ConfigurationError("the postgres url is not valid: it holds a NUL character")
+    reason = None
     try:
         parsed = conninfo_to_dict(conninfo)
     except psycopg.ProgrammingError as error:
         reason = _unrevealing(conninfo, str(error).strip())
-        raise ConfigurationError(f"the postgres url is not valid: {reason}") from None
+    if reason is not None:
+        raise ConfigurationError(f"the postgres url is not valid: {reason}")
     ports = str(parsed.get("port") or "").split(",")
     if (_userinfo_secret(conninfo) and not parsed.get("password")) or "@" in str(
         parsed.get("host") or ""
@@ -2328,6 +2324,16 @@ class _Pool(AsyncConnectionPool):
         self._adding: set[asyncio.Task] = set()
         self._stopping = False
 
+    async def resize(self, min_size: int, max_size: int | None = None) -> None:
+        min_size, max_size = self._check_size(min_size, max_size)
+        async with self._lock:
+            self._min_size = min_size
+            self._max_size = max_size
+            missing = max(0, min_size - self._nconns)
+            self._nconns += missing
+        for _ in range(missing):
+            self.run_task(AddConnection(self))
+
     async def _add_connection(self, *args: Any, **kwargs: Any) -> None:
         if self._stopping:
             return
@@ -2382,11 +2388,22 @@ class _Answering(psycopg.AsyncConnection):
     orphaned: Callable[[int, Any, "_Mark"], None] | None = None
     mark: "_Mark | None" = None
 
+    heard: float = 0.0
+    silent: bool = False
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.cursor_factory = _Marked
-    heard: float = 0.0
-    silent: bool = False
+
+    def _exec_command(self, command: Any, *args: Any, **kwargs: Any) -> Any:
+        mark = self.mark
+        if mark is not None and not self.closed:
+            if isinstance(command, str):
+                command = command.encode(self.pgconn._encoding)
+            elif isinstance(command, psycopg.sql.Composable):
+                command = command.as_bytes(self)
+            command = mark.token.encode() + bytes(command)
+        return super()._exec_command(command, *args, **kwargs)
 
     async def wait(self, gen: Any, *args: Any, **kwargs: Any) -> Any:
         if args or kwargs:

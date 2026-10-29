@@ -226,10 +226,9 @@ class ManagedBackend:
         if method is not None:
             await self._forward(method)
 
-    def expect(self, workers: int) -> None:
-        method = getattr(self._inner, "expect", None)
-        if method is not None:
-            method(workers)
+    def reserve(self, owner: object, jobs: int) -> int:
+        method = getattr(self._inner, "reserve", None)
+        return 1 if method is None else method(owner, jobs)
 
     @property
     def wakes_workers(self) -> bool:

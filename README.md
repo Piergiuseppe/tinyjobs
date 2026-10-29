@@ -422,9 +422,10 @@ Two things are worth knowing before you hit them:
 
 **Timeouts on sync tasks are advisory.** You can't kill a running Python thread. When a threaded task
 exceeds its timeout the job is marked failed and the worker moves on, but the thread keeps going until
-the function returns. The timeout counts from when the job's thread starts, so a job waiting for a
-free thread is never failed before it runs. Pass timeouts to the library you are calling, or write
-the task as `async def` where cancellation actually works.
+the function returns. That thread counts against `concurrency` until it does, so the worker claims
+one job fewer and never holds a job it has no thread for, and a warning names the task. The timeout
+counts from when the job's thread starts, so a job is never failed before it runs. Pass timeouts to
+the library you are calling, or write the task as `async def` where cancellation actually works.
 
 **Arguments are serialized as JSON**, extended with tags for `datetime`, `date`, `Decimal`, `UUID`,
 `Path`, `set`, `tuple`, `bytes` and non-string dict keys. Pickle is available behind
@@ -564,8 +565,8 @@ can become it, the same rule as below, or the enqueue raises `ConfigurationError
 with `client_encoding` `SQL_ASCII` is refused too. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
-Each process holds at most 10 connections, or while workers run their concurrency plus three each
-(`max_connections=` fixes it), plus one for `LISTEN`, and opens a short-lived one to ask about a
+Each process holds at most 10 connections (`max_connections=`), whatever its workers run, plus one
+for `LISTEN`, and opens a short-lived one to ask about a
 statement silent for ten seconds when none is idle. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
 connections are named `tinyjobs` in `pg_stat_activity`. The tables and their schema must belong to
@@ -740,7 +741,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1485 tests, no test dependencies. The one that matters most is
+1493 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

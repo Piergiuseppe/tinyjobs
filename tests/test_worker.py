@@ -332,6 +332,43 @@ class TimeoutTests(WorkerTestCase):
         self.assertEqual([context["message"] for context in failures], [])
 
 
+    async def test_a_thread_still_running_after_its_timeout_keeps_its_place_from_the_next_job(self):
+        import threading
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+
+        @self.app.task(timeout=0.1, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        @self.app.task(timeout=0.3, max_attempts=1)
+        def charge():
+            return "charged"
+
+        first = await runaway.aenqueue()
+        await asyncio.sleep(0.01)
+        job = await charge.aenqueue()
+        worker = self.make_worker(concurrency=1, lease_seconds=2.0)
+        runner = asyncio.create_task(worker.start())
+        try:
+            with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+                while await self.status_of(first) is not JobStatus.FAILED:
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(1.0)
+            self.assertIs(await self.status_of(job), JobStatus.QUEUED)
+            self.assertTrue(any("thread still runs" in line for line in logs.output))
+            held.set()
+            deadline = time.monotonic() + SETTLE_TIMEOUT
+            while await self.status_of(job) is not JobStatus.SUCCESS:
+                self.assertLess(time.monotonic(), deadline)
+                await asyncio.sleep(0.02)
+        finally:
+            held.set()
+            worker.stop()
+            await asyncio.wait_for(runner, 10)
+
+
 class UndecodableJobTests(WorkerTestCase):
     async def test_a_payload_the_worker_cannot_decode_fails_the_job(self):
         @self.app.task(max_attempts=1)
@@ -2291,7 +2328,7 @@ class ShutdownOutcomeTests(WorkerTestCase):
         stored = await self.app.aget(job.id)
         self.assertEqual((stored.status, stored.attempts), (JobStatus.SUCCESS, 1))
 
-    async def test_a_job_queued_behind_a_busy_thread_is_released_without_running_here(self):
+    async def test_a_job_behind_a_busy_thread_stays_queued_and_never_runs_here(self):
         await self.app.ready()
         ran: list[str] = []
 
@@ -2307,15 +2344,17 @@ class ShutdownOutcomeTests(WorkerTestCase):
         def waiting():
             ran.append("waiting")
 
-        await stuck.aenqueue()
+        first = await stuck.aenqueue()
         await long.aenqueue()
         queued = await waiting.aenqueue()
         worker = self.make_worker(concurrency=2, shutdown_timeout=0.5)
         runner = asyncio.create_task(worker.start())
         deadline = time.monotonic() + 5
-        while await self.status_of(queued) is not JobStatus.RUNNING:
+        while await self.status_of(first) is not JobStatus.FAILED:
             self.assertLess(time.monotonic(), deadline)
             await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)
+        self.assertIs(await self.status_of(queued), JobStatus.QUEUED)
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
         self.assertEqual(ran, [])
@@ -2412,6 +2451,29 @@ class ShutdownOutcomeTests(WorkerTestCase):
         self.assertTrue(any("leaves them behind" in line for line in logs.output))
         self.assertFalse(any("could not release" in line for line in logs.output))
         self.assertIs(await self.status_of(job), JobStatus.RUNNING)
+
+
+class ClosedDuringClaimTests(WorkerTestCase):
+    async def test_a_claim_failing_as_the_app_closes_stops_the_worker_cleanly(self):
+        await self.app.ready()
+        backend = self.app.backend
+
+        async def claim(**_):
+            self.app._backend = None
+            self.app._closed = True
+            raise ConnectionResetError("the backend went away mid-claim")
+
+        worker = self.make_worker(concurrency=1, shutdown_timeout=1.0)
+        try:
+            with (
+                mock.patch.object(backend, "claim", claim),
+                self.assertLogs("tinyjobs.worker", "INFO") as logs,
+            ):
+                await asyncio.wait_for(worker.start(), 5)
+        finally:
+            self.app._backend = backend
+            self.app._closed = False
+        self.assertTrue(any("is stopping" in line for line in logs.output))
 
 
 class HeartbeatAnswerTests(WorkerTestCase):
@@ -2628,14 +2690,28 @@ class ShutdownReleaseTests(WorkerTestCase):
             await asyncio.wait_for(runner, timeout=10)
         self.assertEqual(len(asked), 1)
 
-    async def test_a_worker_tells_the_backend_how_many_jobs_it_runs_at_once(self):
+    async def test_a_stop_reserves_a_connection_for_each_running_job_until_the_worker_returns(self):
         await self.app.ready()
         backend = self.app.backend
-        told: list[int] = []
+        told: list[tuple[object, int]] = []
+        held = asyncio.Event()
+
+        @self.app.task
+        async def slow():
+            held.set()
+            await asyncio.sleep(0.3)
+
+        await slow.aenqueue()
+        await slow.aenqueue()
         worker = self.make_worker(concurrency=7)
-        with mock.patch.object(backend, "expect", told.append, create=True):
-            await self.run_briefly(worker, 0.3)
-        self.assertEqual(told, [7, -7])
+        reserving = lambda owner, jobs: told.append((owner, jobs)) or 1
+        with mock.patch.object(backend, "reserve", reserving, create=True):
+            runner = asyncio.create_task(worker.start())
+            await held.wait()
+            await asyncio.sleep(0.05)
+            worker.stop()
+            await asyncio.wait_for(runner, 10)
+        self.assertEqual(told, [(worker, 2), (worker, -1)])
 
     async def test_a_claim_without_an_answer_is_a_warning_not_an_error(self):
         await self.app.ready()

@@ -1045,10 +1045,15 @@ transaction, through `sync_to_async(thread_sensitive=True)`.
 ### Connections
 
 Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_connections=`), plus the
-listening one. While workers run on it, the pool grows to their concurrency plus three connections
-each, unless `max_connections=` is given: with three workers of 16 jobs on a link adding 300 ms each
-way, 300 jobs ran without a failed claim, where each worker used to log one with its traceback. Every pooled connection is set to read committed, a 30 second `statement_timeout` and
-a one minute `idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
+listening one, whatever its workers run. Growing it with their concurrency bought nothing: with three
+workers of 16 jobs on a 40 connection server, over a link adding 300 ms each way, 1200 jobs took 67.3
+seconds with at most 32 connections, no warning and none of 270 other connections refused; grown,
+they took 66.2 seconds with 36, 15 warnings and 107 of 267 refused. Claims did not starve behind the
+outcome writes either: no worker logged a failed claim. Resizing the pool opens only the connections
+it lacks, never past `max_connections=`: psycopg's own resize opens one per step of the minimum,
+which with both connections of a two connection pool busy opened a third. Every pooled connection
+is set to read committed, a 30 second `statement_timeout` and a one minute
+`idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
 trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
 call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
 instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements
@@ -1107,7 +1112,7 @@ start time, before the next statement this backend sends, so a statement left wa
 never applies afterwards. Every statement tinyjobs sends on a pooled connection starts with a
 comment carrying a secret random token of that connection, `/* tinyjobs <token> */`, first so
 `track_activity_query_size` never cuts it, and the same for every statement so prepared statements
-still work; each pooled connection also holds a session advisory lock on a secret random key. A
+still work, including the `BEGIN`, `COMMIT` and `ROLLBACK` psycopg sends itself; each pooled connection also holds a session advisory lock on a secret random key. A
 backend is ended, as the login role and in the same statement that looks, only while its current or
 last statement carries the token, whatever its state and whenever it arrived: running, idle with the
 statement still on its way, or a statement that reached the server after the cut. Where the role
@@ -1117,7 +1122,9 @@ hands the backend to another client, whose statements carry no token, so another
 ended; neither clock takes part. Through a proxy that delivered the statement three seconds late,
 past the cut, onto a row lock, the statement was ended and the job stayed `running`, where it used to
 land as `success` once the lock was let go; through a session pooler that handed our backend to
-another process, that process's three second statement ran to its end. A claim delayed on its way
+another process, that process's three second statement ran to its end. A `COMMIT` that reached the
+server late, after the cut, now carries the token too: it used to show as a bare `COMMIT`, was never
+ended and applied all 100 jobs of a cut batch enqueue; it is ended and none apply. A claim delayed on its way
 is then handed back by the sweep of unanswered claims.
 The next statement waits for a pass already running rather than going ahead of it, and a backend
 not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
@@ -1357,10 +1364,18 @@ can only mark the job `TIMEOUT` and move on. The thread keeps running until the 
 it keeps occupying a pool slot. The timeout counts from when the thread starts, so a job waiting
 for a free thread behind one that timed out is never recorded as timed out before it ran: it used to
 be failed with `TIMEOUT` while queued and then run anyway, and with retries left it ran again.
+A thread still running after its job ended counts against `concurrency` until it returns, and a
+warning names its task, so the worker claims only jobs it has a thread for and a drain waits for the
+thread before it claims again. A job with a 0.3 second timeout claimed behind such a thread used to
+stay `running` for as long as the thread ran, its lease renewed so no other worker could take it; it
+now stays `queued` for any other worker, and ran here once the thread returned. With two workers of
+concurrency 2, one holding two runaway threads, all six quick jobs ran on the other, where two were
+held `running` after 24 seconds.
 
 This catches people out, so, plainly:
 
-- A sync task stuck in an infinite loop leaks a thread for the life of the process.
+- A sync task stuck in an infinite loop leaks a thread, and the job slot with it, for the life of
+  the process.
 - A blocking socket read with no timeout of its own blocks past your `timeout=`.
 
 Mitigations, in order of preference: pass timeouts to the library you are calling (every HTTP client
@@ -1384,7 +1399,9 @@ adding 300 ms each way, closing while one was being opened took under 0.01 secon
 logged, where it took 1.0 and `psycopg_pool` logged that it could not stop its task. A
 backend that went silent is not asked to end what it left behind at close; one that still answers
 gets half a second a pass for it. Once the stop is
-asked the backend opens spare connections for the releases unless two sit idle, the heartbeat stops renewing the jobs
+asked the backend keeps a connection open for each running job plus two for the releases and the
+heartbeat, within the pool size, and opens those it lacks, so outcomes written as threads return
+need not connect first; the heartbeat stops renewing the jobs
 about to be released, and a clock reading that falls due is taken beside a call rather than before
 it. Over a link that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on
 Postgres and on Redis, with the worker back after 1.61 seconds, where every run used to log all
@@ -1403,17 +1420,19 @@ cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 
 A job running in a thread cannot be stopped, and releasing it would let another worker run it while
 the thread still does. So at shutdown the worker leaves such a job running instead: it keeps its
 lease renewed, records its outcome when the thread returns, within the release share of the timeout
-from that moment, and returns after that. It keeps the job as soon as the jobs' share ends, so a
+from that moment, once more for each further pool's worth of running jobs, and returns after that.
+Over a link adding 300 ms each way, six such jobs with `--shutdown-timeout 3` or `5` were all
+recorded on Redis and on Postgres, and twelve on Postgres's ten connections, where two to four of
+six used to lose their outcome and run again, or be marked failed with `max_attempts=1`. It keeps the job as soon as the jobs' share ends, so a
 thread that returns while another job's cleanup still holds the wait is recorded too: beside such a
 job it ended `success`, where it used to stay `running`. A drain does the same: stopped while its
 job runs in a thread, it waits for the thread and records the outcome, where it used to release the
 job, which another worker then claimed while the thread still ran it. A second signal does not change this: it ends the wait at
 once and keeps such a job the same way, where its thread used to be waited for under the cut
 deadline, so its outcome was given up and the job ran again; with `SIGTERM` then `SIGINT` the job now
-ran once and was recorded. A `def` job still queued in the thread pool behind a busy thread is taken
-out of the pool before it is released, so it never runs here afterwards; one whose call has started
-is kept like a running one. It used to be released and still run here once a thread freed up,
-while another worker ran it too. With a 20 second
+ran once and was recorded. A `def` job is not claimed while no thread is free for it; one still
+queued in the thread pool at shutdown is taken out of the pool before it is released, so it never
+runs here afterwards, and one whose call has started is kept like a running one. With a 20 second
 `def` job and the server cut off, the worker exited 17.4 seconds after the signal, once the thread was
 done and its outcome had been given up; before, the job was released while its thread kept running.
 
