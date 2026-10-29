@@ -196,6 +196,77 @@ class DrainTests(unittest.TestCase):
         self.assertIs(job.refresh().status, JobStatus.SUCCESS)
         self.assertEqual((self.calls, returned), (["charged"], []))
 
+    def test_a_drain_adds_no_more_than_its_spare_threads_beside_timed_out_ones(self):
+        import threading
+        import time
+
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+        peak = [0]
+
+        def watch():
+            while not held.is_set():
+                live = sum(t.name.startswith("tinyjobs_") for t in threading.enumerate())
+                peak[0] = max(peak[0], live)
+                time.sleep(0.005)
+
+        @self.app.task(timeout=0.05, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        jobs = [runaway.enqueue() for _ in range(DRAIN_SPARE_THREADS + 4)]
+        threading.Thread(target=watch, daemon=True).start()
+        release = threading.Timer(1.0, held.set)
+        release.start()
+        self.addCleanup(release.cancel)
+        self.assertEqual(self.app.drain(), len(jobs))
+        self.assertLessEqual(peak[0], DRAIN_SPARE_THREADS + 1)
+        cut = {job.refresh().status for job in jobs[: DRAIN_SPARE_THREADS + 1]}
+        self.assertEqual(cut, {JobStatus.FAILED})
+
+    def test_a_drain_warns_that_a_new_thread_takes_the_place_of_a_timed_out_one(self):
+        import threading
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+
+        @self.app.task(timeout=0.05, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        runaway.enqueue()
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            self.assertEqual(self.app.drain(), 1)
+        warning = next(line for line in logs.output if "still runs" in line)
+        self.assertIn("a new thread takes its place", warning)
+
+    def test_a_job_whose_thread_cannot_start_fails_and_the_next_one_runs(self):
+        import threading
+        from unittest import mock
+
+        original = threading.Thread.start
+        refused: list[str] = []
+
+        def start(thread):
+            if thread.name.startswith("tinyjobs_") and not refused:
+                refused.append(thread.name)
+                raise RuntimeError("can't start new thread")
+            return original(thread)
+
+        @self.app.task(max_attempts=1)
+        def charge():
+            self.calls.append("charged")
+
+        first, second = charge.enqueue(), charge.enqueue()
+        with mock.patch.object(threading.Thread, "start", start):
+            self.assertEqual(self.app.drain(), 2)
+        self.assertEqual(len(refused), 1)
+        self.assertIs(first.refresh().status, JobStatus.FAILED)
+        self.assertIs(second.refresh().status, JobStatus.SUCCESS)
+        self.assertEqual(self.calls, ["charged"])
+
     def test_an_eager_job_past_its_timeout_returns_while_its_thread_still_runs(self):
         import threading
         import time

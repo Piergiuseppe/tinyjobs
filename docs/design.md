@@ -732,7 +732,9 @@ to it would otherwise need two releases in lockstep. It depends on nothing but t
 it can move out later without touching a line. The client library is an extra, `tinyjobs[redis]`, and
 is imported only when a `redis://` URL is used, so the core stays dependency-free. A url redis-py
 cannot read raises `ConfigurationError`, without its reason once the url holds a password, since
-that reason may quote part of it.
+that reason may quote part of it. So does a connection option the client does not take, named
+unless the url holds a password: a raw `?` in the password made the rest of the url such an option,
+which redis-py raised at the first command as a `TypeError` quoting the password.
 
 ### Atomicity
 
@@ -1138,7 +1140,11 @@ cancellation even when the server answers the cancel with another error, so it i
 database works too. Every connection unused for ten seconds beyond the minimum closes together,
 not one per interval, and a connection that failed to open is not retried once no caller waits
 for it: four workers of 16 on a 40-slot server peaked at 29 sessions of theirs instead of 36, and
-refused none of the app's own instead of 8 in 265.
+refused none of the app's own instead of 8 in 265. Callers kept waiting a quarter of a second get
+connections opened for all of them at once, up to the maximum, rather than one after another: four
+callers behind connects of 0.6 seconds were all served within 0.94 seconds instead of 1.83, and over
+a link adding 300 ms each way bursts of 150 jobs after 13 idle seconds took 9.6 seconds instead of
+10.1, 9.55 before the pool gave idle connections back, with the same peak of 20 to 21 sessions.
 Every connection is replaced after half an hour. Deadlocks, serialization
 failures and a session the server closed under `idle_session_timeout`, which it only does while
 waiting for a command, so before the statement ran, are retried three times with a warning, except inside the caller's transaction, which only
@@ -1376,7 +1382,11 @@ A thread still running after its job ended counts against `concurrency` until it
 warning names its task, so the worker claims only jobs it has a thread for; a drain or an eager
 call runs the next job on a thread added in its place and drops it once the old one returns: a
 drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
-0.51, where they waited 3.0 and 4.0 for the thread. The threads are daemon threads, so a process
+0.51, where they waited 3.0 and 4.0 for the thread. It adds eight such threads at most, then waits
+for one to return before running another job in a thread: 60 jobs hanging past a 0.05 second timeout
+held 9 threads, where they held one each. A thread that fails to start fails its job, where the job
+was handed back as if the threads were shut down and the pool counted the dead thread, so no later
+job ran. The threads are daemon threads, so a process
 whose worker stopped with one still running exits, with a warning naming them, where it used to
 hang at interpreter exit until killed.
 A job with a 0.3 second timeout claimed behind such a thread used to
@@ -1423,18 +1433,30 @@ Postgres and on Redis, with the worker back after 1.61 seconds, where every run 
 eight unreleased and Redis left them `running` until their lease ran out. A second `SIGINT`
 ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
 the second signal with the server cut off, where it took 6.6. The process itself exits within the
-timeout: a wake-up still on its way at exit drops its connection instead of asking the server to stop
-it, which over that link cost another second, so with a 3 second timeout it exited 2.65 seconds after
-the signal rather than 3.6, and with 5 seconds and 16 jobs after 4.4 rather than 5.3.
+timeout: a wake-up still on its way at exit drops its connection, without the pool's warning about
+it, instead of asking the server to stop it, which over that link cost another second, so with a 3
+second timeout it exited 2.65 seconds after the signal rather than 3.6, and with 5 seconds and 16 jobs
+after 4.4 rather than 5.3.
 
 A job whose outcome is being written when the jobs' share ends is not cancelled: the write keeps
 its deadline, which ends a second before the timeout, or half the release share when that is
 shorter, and the check of a write whose answer is lost gets the rest. With a 2 second timeout and the
 outcome held on a row lock for 1.3 seconds, it was recorded and its hooks ran, where it used to be
 cut and left `running` for its lease. Outcomes that would wait for a connection go out together, in
-one statement on Postgres and one pipelined round trip on Redis: over a link adding 300 ms each way,
-four jobs ending just before a 3 second stop were all recorded with their hooks run, where Postgres
-lost 6 of 16 and Redis left every one `running` with no hook.
+one pipelined round trip of their own statements on both backends: over a link adding 300 ms each
+way, four jobs ending just before a 3 second stop were all recorded with their hooks run, where
+Postgres lost 6 of 16 and Redis left every one `running` with no hook. Each outcome keeps its own
+answer, so of two claims of one job in a batch only the live one lands, where both read as written
+and the stale one's failure was stored; an outcome its text cannot encode, or that the server
+refuses, fails alone and the rest of its batch lands: 29 of 29 beside such a poison outcome, where
+26 or, on Redis, 5 landed and the others stayed `running`. Texts holding a lone surrogate are
+stored escaped. An outcome is cut at its own deadline: one with less than five seconds left goes in
+a batch of its own, and the others share one cut at the earliest deadline among them, so a cut job
+stays `running` as when written alone, where a batch without a deadline wrote it `success`. A retry
+due in a batch wakes its listeners as when written alone, which took 0.10 seconds where it timed out
+after 1.5. Closing the backend settles outcomes still waiting for a batch with the close error,
+where two calls never returned. On Redis a script missing from the server is loaded once per batch
+and the batch sent again, one load where twenty of them took 6.1 seconds over that link.
 A cancelled job still awaiting in its cleanup when the timeout
 ends is cancelled once more and left behind, logged, for the reaper: with `--shutdown-timeout 4` and a
 cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 18.0.

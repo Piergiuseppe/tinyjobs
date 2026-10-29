@@ -30,10 +30,9 @@ from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
-from psycopg_pool.pool_async import AddConnection, AttemptWithBackoff
+from psycopg_pool.pool_async import AddConnection, AttemptWithBackoff, MaintenanceTask
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...deadlines import bounded
 from ...deadlines import left as _left
 from ...deadlines import until
 from ...exceptions import ConfigurationError, UnsupportedCapabilityError
@@ -51,6 +50,7 @@ from ...runtime import spared_until_close
 from ...sheltered import sheltered
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
+from ..batching import AGAIN, Batches, Entry
 from .queries import NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
 from .records import (
     JOB_COLUMNS,
@@ -86,6 +86,8 @@ UNREBUILT = (
     errors.ObjectInUse,
 )
 MAX_IDLE_SECONDS = 10.0
+POOL_WORKERS = 8
+WIDEN_SECONDS = 0.25
 MAX_LIFETIME_SECONDS = 1800.0
 NOTIFY_SECONDS = 0.05
 LISTEN_RETRY_SECONDS = 1.0
@@ -388,8 +390,7 @@ class PostgresBackend(BaseBackend):
         self._smallest = min_connections
         self._demanding = threading.Lock()
         self._reserved: dict[object, int] = {}
-        self._settling: list[_Settling] = []
-        self._flushing: asyncio.Task | None = None
+        self._batches = Batches(self._settled_batch, SETTLE_BATCH)
         self._alone = 0
         self._sizes = self._wanted()
         self._pool = self._new_pool()
@@ -426,6 +427,7 @@ class PostgresBackend(BaseBackend):
             max_size=largest,
             timeout=self._pool_timeout,
             max_idle=MAX_IDLE_SECONDS,
+            num_workers=POOL_WORKERS,
             max_lifetime=MAX_LIFETIME_SECONDS,
             open=False,
             kwargs=self._pooled_options(),
@@ -866,10 +868,6 @@ class PostgresBackend(BaseBackend):
         await sheltered(self._closing)
 
     async def _shut(self) -> None:
-        flushing, self._flushing = self._flushing, None
-        if flushing is not None and not flushing.done():
-            flushing.cancel()
-            await asyncio.wait({flushing})
         waking, self._waking = self._waking, None
         if waking is not None:
             waking.cancel()
@@ -904,6 +902,7 @@ class PostgresBackend(BaseBackend):
                         await asyncio.sleep(GHOST_SECONDS)
         await self._pool.stop_connecting()
         await self._pool.close(timeout=POOL_STOP_SECONDS)
+        await self._batches.close(PoolClosed("the backend was closed"), SETTLE_PASS_SECONDS)
 
     async def wait_for_jobs(
         self, *, worker_id: str, queues: Sequence[str], timeout: float
@@ -1207,7 +1206,6 @@ class PostgresBackend(BaseBackend):
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return await self._outcome(
-            "success",
             self._queries.complete,
             await self._finishing(job, ExecutionStatus.SUCCESS, None, result=result),
         )
@@ -1223,74 +1221,44 @@ class PostgresBackend(BaseBackend):
             job, execution_status, error, summary=_storable(error.summary), run_at=retry_at
         )
         if retry_at is None:
-            return await self._outcome("failed", self._queries.fail, parameters)
-        changed = await self._outcome("queued", self._queries.reschedule, parameters)
+            return await self._outcome(self._queries.fail, parameters)
+        changed = await self._outcome(self._queries.reschedule, parameters)
         if changed and retry_at <= parameters["now"]:
             await self._wake({job.queue})
         return changed
 
-    async def _outcome(self, kind: str, query: str, parameters: dict[str, Any]) -> bool:
-        if not self._settling and self._idle() > self._alone:
+    async def _outcome(self, query: str, parameters: dict[str, Any]) -> bool:
+        if self._closed or (not self._batches.waiting and self._idle() > self._alone):
             self._alone += 1
             try:
                 return await self._changed(query, parameters)
             finally:
                 self._alone -= 1
-        entry = _Settling(kind, parameters, time.monotonic() + _left())
-        self._settling.append(entry)
-        if self._flushing is None or self._flushing.done():
-            self._flushing = asyncio.get_running_loop().create_task(
-                self._flush(), context=contextvars.Context()
-            )
+        return await self._batches.submit((query, parameters))
+
+    async def _settled_batch(self, take: Callable[[], list[Entry]]) -> list[Any]:
+        if self._orphans:
+            await self._swept_within()
+        batch: list[Entry] = []
         try:
-            return await asyncio.shield(entry.future)
-        except BaseException:
-            entry.future.add_done_callback(_settled)
-            if not entry.sent and entry in self._settling:
-                self._settling.remove(entry)
-            raise
+            async with self._connection() as connection:
+                batch = take()
+                if not batch:
+                    return []
+                answers = await _pipelined(connection, [entry.payload for entry in batch])
+        except RETRIED_ERRORS as error:
+            if not batch:
+                raise
+            answers = [error] * len(batch)
+        return [self._answered_by(entry, answer) for entry, answer in zip(batch, answers)]
 
-    async def _flush(self) -> None:
-        while self._settling and not self._closed:
-            batch: list[_Settling] = []
-            try:
-                async with bounded(max(entry.at for entry in self._settling)):
-                    rows = await self._flushed(batch)
-            except BaseException as error:
-                now = time.monotonic()
-                late = [entry for entry in self._settling if entry.at <= now]
-                for entry in (*batch, *late):
-                    entry.fail(error)
-                self._settling[:] = [entry for entry in self._settling if entry.at > now]
-                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                continue
-            changed = {row["id"] for row in rows}
-            await self._wake({row["queue"] for row, entry in _matched(rows, batch) if entry.due})
-            for entry in batch:
-                if not entry.future.done():
-                    entry.future.set_result(entry.parameters["id"] in changed)
-        for entry in self._settling:
-            entry.fail(PoolClosed("the backend was closed"))
-        self._settling.clear()
-
-    async def _flushed(self, batch: list[_Settling]) -> list[dict[str, Any]]:
-        for attempt in range(RETRIES):
-            try:
-                if self._orphans:
-                    await self._swept_within()
-                async with self._connection() as connection:
-                    if not batch:
-                        batch.extend(self._settling[:SETTLE_BATCH])
-                        del self._settling[: len(batch)]
-                        for entry in batch:
-                            entry.sent = True
-                    return await _fetch(connection, self._queries.settle_many, _outcomes(batch))
-            except RETRIED_ERRORS as error:
-                if attempt == RETRIES - 1:
-                    raise
-                logger.warning("retrying a postgres statement after %s", error)
-        raise AssertionError("unreachable")
+    def _answered_by(self, entry: Entry, answer: Any) -> Any:
+        if not isinstance(answer, BaseException):
+            return int(answer[0]["changed"]) == 1
+        if isinstance(answer, RETRIED_ERRORS) and entry.attempts < RETRIES:
+            logger.warning("retrying a postgres statement after %s", answer)
+            return AGAIN
+        return answer
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         now = await self._now()
@@ -2376,7 +2344,9 @@ def _noticed(queue: str) -> str:
 
 
 def _storable(text: str) -> str:
-    return text.replace("\x00", "\\x00")
+    return (
+        text.replace("\x00", "\\x00").encode("utf-8", "backslashreplace").decode("utf-8")
+    )
 
 
 def _connection_of(tx: Any) -> Any:
@@ -2392,6 +2362,9 @@ _ADDING: contextvars.ContextVar["_Pool | None"] = contextvars.ContextVar(
 
 class _Abandoned(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args if isinstance(record.args, tuple) else ()
+        if any(isinstance(argument, _Answering) and argument.dropped for argument in arguments):
+            return False
         pool = _ADDING.get()
         return pool is None or not pool._stopping
 
@@ -2404,6 +2377,35 @@ class _Pool(AsyncConnectionPool):
         super().__init__(*args, **kwargs)
         self._adding: set[asyncio.Task] = set()
         self._stopping = False
+        self._opening = 0
+        self._widening: asyncio.TimerHandle | None = None
+
+    def run_task(self, task: Any) -> None:
+        if isinstance(task, AddConnection):
+            self._opening += 1
+        super().run_task(task)
+
+    def _maybe_grow_pool(self) -> None:
+        super()._maybe_grow_pool()
+        if self._widening is None and self._starved():
+            self._widening = asyncio.get_running_loop().call_later(
+                WIDEN_SECONDS, self.run_task, _Widen(self)
+            )
+
+    def _starved(self) -> int:
+        return sum(1 for client in self._waiting if client.conn is None and client.error is None)
+
+    async def widen(self) -> None:
+        async with self._lock:
+            self._widening = None
+            if self._closed or self._stopping:
+                return
+            starved = self._starved()
+            for _ in range(min(self._max_size - self._nconns, starved - self._opening)):
+                self._nconns += 1
+                self.run_task(AddConnection(self))
+            if starved:
+                self._maybe_grow_pool()
 
     async def resize(self, min_size: int, max_size: int | None = None) -> None:
         min_size, max_size = self._check_size(min_size, max_size)
@@ -2431,6 +2433,12 @@ class _Pool(AsyncConnectionPool):
     async def _add_connection(
         self, attempt: AttemptWithBackoff | None, growing: bool = False
     ) -> None:
+        try:
+            await self._added(attempt, growing)
+        finally:
+            self._opening -= 1
+
+    async def _added(self, attempt: AttemptWithBackoff | None, growing: bool) -> None:
         if self._stopping or (attempt is not None and await self._unneeded(growing)):
             return
         context = contextvars.copy_context()
@@ -2463,11 +2471,19 @@ class _Pool(AsyncConnectionPool):
 
     async def stop_connecting(self) -> None:
         self._stopping = True
+        if self._widening is not None:
+            self._widening.cancel()
+            self._widening = None
         adding = tuple(self._adding)
         for task in adding:
             task.cancel()
         if adding:
             await asyncio.wait(adding)
+
+
+class _Widen(MaintenanceTask):
+    async def _run(self, pool: Any) -> None:
+        await pool.widen()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2498,6 +2514,7 @@ class _Answering(psycopg.AsyncConnection):
 
     heard: float = 0.0
     silent: bool = False
+    dropped: bool = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -2534,6 +2551,7 @@ class _Answering(psycopg.AsyncConnection):
             return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
             if _DROPPED.get():
+                self.dropped = True
                 self.pgconn.finish()
             elif self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 await self._stopped(gen)
@@ -2774,56 +2792,94 @@ async def _asking(
     return await cursor.fetchone() is None
 
 
-class _Settling:
-    __slots__ = ("kind", "parameters", "at", "future", "sent")
-
-    def __init__(self, kind: str, parameters: dict[str, Any], at: float) -> None:
-        self.kind = kind
-        self.parameters = parameters
-        self.at = at
-        self.future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        self.sent = False
-
-    @property
-    def due(self) -> bool:
-        return self.kind == "queued" and self.parameters["run_at"] <= self.parameters["now"]
-
-    def fail(self, error: BaseException) -> None:
-        if self.future.done():
-            return
-        if isinstance(error, asyncio.CancelledError):
-            self.future.cancel()
-        else:
-            self.future.set_exception(error)
-
-
-def _outcomes(batch: list[_Settling]) -> dict[str, Any]:
-    def each(name: str) -> list[Any]:
-        return [entry.parameters.get(name) for entry in batch]
-
-    return {
-        "ids": each("id"),
-        "workers": each("worker"),
-        "claims": each("claims"),
-        "nows": each("now"),
-        "kinds": [entry.kind for entry in batch],
-        "results": each("result"),
-        "summaries": each("summary"),
-        "run_ats": each("run_at"),
-        "execution_statuses": each("execution_status"),
-        "error_types": each("error_type"),
-        "tracebacks": each("traceback"),
-    }
+async def _pipelined(
+    connection: psycopg.AsyncConnection, statements: list[tuple[str, dict[str, Any]]]
+) -> list[Any]:
+    if not psycopg.AsyncPipeline.is_supported():
+        return [await _one(connection, query, parameters) for query, parameters in statements]
+    answers: list[Any] = [None] * len(statements)
+    texts: list[tuple[int, bytes]] = []
+    literal = psycopg.AsyncClientCursor(connection)
+    mark = getattr(connection, "mark", None)
+    token = b"" if mark is None else mark.token.encode()
+    encoding = connection.info.encoding
+    for index, (query, parameters) in enumerate(statements):
+        try:
+            texts.append((index, token + literal.mogrify(query, parameters).encode(encoding)))
+        except Exception as error:
+            answers[index] = error
+    if texts:
+        pgconn = connection.pgconn
+        try:
+            results = await connection.wait(_pipeline(pgconn, [text for _, text in texts]))
+        except BaseException:
+            if pgconn.pipeline_status != pq.PipelineStatus.OFF:
+                pgconn.finish()
+            raise
+        for (index, _), result in zip(texts, results):
+            answers[index] = _answer(result, encoding)
+    return answers
 
 
-def _matched(
-    rows: list[dict[str, Any]], batch: list[_Settling]
-) -> Iterator[tuple[dict[str, Any], _Settling]]:
-    entries = {entry.parameters["id"]: entry for entry in batch}
-    for row in rows:
-        entry = entries.get(row["id"])
-        if entry is not None:
-            yield row, entry
+async def _one(
+    connection: psycopg.AsyncConnection, query: str, parameters: dict[str, Any]
+) -> Any:
+    try:
+        return await _fetch(connection, query, parameters)
+    except psycopg.OperationalError:
+        raise
+    except Exception as error:
+        return error
+
+
+def _pipeline(pgconn: Any, statements: list[bytes]) -> Generator[Any, Any, list[list[Any]]]:
+    pgconn.enter_pipeline_mode()
+    for statement in statements:
+        pgconn.send_query_params(statement, None)
+        pgconn.pipeline_sync()
+    while pgconn.flush() != 0:
+        while not (ready := (yield waiting.Wait.RW)):
+            continue
+        if ready & waiting.Ready.R:
+            pgconn.consume_input()
+    answers = []
+    for _ in statements:
+        results = []
+        while (result := (yield from _result(pgconn))) is not None:
+            results.append(result)
+        answers.append(results)
+        yield from _result(pgconn)
+    pgconn.exit_pipeline_mode()
+    return answers
+
+
+def _result(pgconn: Any) -> Generator[Any, Any, Any]:
+    while pgconn.is_busy():
+        while not (yield waiting.Wait.R):
+            continue
+        pgconn.consume_input()
+    return pgconn.get_result()
+
+
+def _answer(results: list[Any], encoding: str) -> Any:
+    rows: list[dict[str, Any]] = []
+    for result in results:
+        if result.status == pq.ExecStatus.FATAL_ERROR:
+            return errors.error_from_result(result, encoding=encoding)
+        if result.status == pq.ExecStatus.TUPLES_OK:
+            names = [result.fname(column).decode(encoding) for column in range(result.nfields)]
+            rows = [
+                {
+                    name: _text(result.get_value(row, column), encoding)
+                    for column, name in enumerate(names)
+                }
+                for row in range(result.ntuples)
+            ]
+    return rows
+
+
+def _text(value: bytes | None, encoding: str) -> str | None:
+    return None if value is None else value.decode(encoding)
 
 
 async def _fetch(

@@ -524,6 +524,83 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(await backend.complete(jobs[0], None))
 
+    async def single(self) -> RedisBackend:
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=1)
+        self.opened.append(backend)
+        await backend.setup()
+        return backend
+
+    async def claimed(self, backend: RedisBackend, count: int) -> list:
+        for _ in range(count):
+            await backend.enqueue(make_job())
+        return await backend.claim(
+            worker_id="w", queues=["default"], limit=count, lease_seconds=60
+        )
+
+    async def test_an_outcome_its_text_cannot_encode_leaves_the_rest_of_its_batch(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.models import ExecutionError
+
+        backend = await self.single()
+        good, bad = await self.claimed(backend, 2)
+        hostile = b"no such file: report-\xff.csv".decode("utf-8", "surrogateescape")
+        error = ExecutionError("FileNotFoundError", hostile, f"Traceback: {hostile}")
+        pool = backend._client.connection_pool
+        held = await _acquire(pool)
+        writes = asyncio.gather(backend.complete(good, None), backend.fail(bad, error, None))
+        await asyncio.sleep(0.2)
+        await pool.release(held)
+        self.assertEqual(await writes, [True, True])
+        stored = await backend.get(bad.id)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertIn("report-\\udcff.csv", stored.last_error)
+        self.assertEqual((await backend.get(good.id)).status, JobStatus.SUCCESS)
+
+    async def test_closing_settles_outcomes_still_waiting_for_their_batch(self):
+        backend = await self.open()
+        first, second = await self.claimed(backend, 2)
+        borrowed = backend._borrowed
+
+        async def slow():
+            await asyncio.sleep(1.0)
+            return await borrowed()
+
+        with mock.patch.object(backend, "_spare_connections", lambda: 0), mock.patch.object(
+            backend, "_borrowed", slow
+        ):
+            sending = asyncio.ensure_future(backend.complete(first, None))
+            await asyncio.sleep(0.2)
+            waiting = asyncio.ensure_future(backend.complete(second, None))
+            await asyncio.sleep(0.2)
+            await asyncio.wait_for(backend.close(), 10)
+        done, pending = await asyncio.wait((sending, waiting), timeout=5)
+        for write in pending:
+            write.cancel()
+        self.assertEqual(len(done), 2)
+        for write in done:
+            self.assertFalse(write.cancelled())
+            self.assertIsInstance(write.exception(), RedisConnectionError)
+
+    async def test_a_script_missing_from_the_server_is_loaded_once_for_its_batch(self):
+        backend = await self.open()
+        jobs = await self.claimed(backend, 10)
+        script = backend._scripts._scripts["complete"]
+        known, script.sha = script.sha, "0" * 40
+        loads: list[str] = []
+        load = backend._scripts.load
+
+        async def counted(name):
+            loads.append(name)
+            await load(name)
+            script.sha = known
+
+        with mock.patch.object(backend, "_spare_connections", lambda: 0), mock.patch.object(
+            backend._scripts, "load", counted
+        ):
+            results = await asyncio.gather(*(backend.complete(job, None) for job in jobs))
+        self.assertEqual(results, [True] * 10)
+        self.assertEqual(loads, ["complete"])
+
     async def test_a_lost_connection_reads_the_clock_again(self):
         backend = await self.open()
         reads = await self.counted_reads(backend)
@@ -1173,6 +1250,16 @@ class RedisUrlTests(unittest.TestCase):
             text = revealed(caught.exception)
             for piece in {secret, *secret.replace("#", "/").split("/")}:
                 self.assertNotIn(piece, text)
+
+    def test_a_password_holding_a_question_mark_is_refused_without_the_password(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://app:123?TopSecretPw@127.0.0.1:6379/0?db=0")
+        self.assertNotIn("TopSecretPw", revealed(caught.exception))
+
+    def test_an_option_the_redis_client_does_not_take_is_named(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?sockettimeout=2")
+        self.assertIn("sockettimeout", str(caught.exception))
 
     def test_a_url_without_a_password_keeps_its_reason(self):
         with self.assertRaises(ConfigurationError) as caught:

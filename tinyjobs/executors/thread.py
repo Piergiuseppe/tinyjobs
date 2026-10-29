@@ -33,17 +33,18 @@ class ThreadExecutor(Executor):
         concurrency: int,
         freed: Callable[[], None] | None = None,
         *,
-        replacing: bool = False,
+        spares: int = 0,
     ) -> None:
         self._pool = _Threads(concurrency)
         self._threaded: dict[asyncio.Task | None, Future] = {}
         self._strays: dict[Future, str] = {}
+        self._replaced: set[Future] = set()
         self._freed = freed
-        self._replacing = replacing
+        self._spares = spares
 
     @property
     def strays(self) -> int:
-        return len(self._strays)
+        return len(self._strays) - len(self._replaced)
 
     def stray_names(self) -> list[str]:
         return sorted(self._strays.values())
@@ -60,6 +61,8 @@ class ThreadExecutor(Executor):
         try:
             running = self._pool.submit(call)
         except RuntimeError as error:
+            if not self._pool.closed:
+                raise
             raise ExecutorClosedError(EXECUTOR_CLOSED_MESSAGE) from error
         owner = asyncio.current_task()
         self._threaded[owner] = running
@@ -85,19 +88,35 @@ class ThreadExecutor(Executor):
 
     def _stray(self, loop: asyncio.AbstractEventLoop, running: Future, task: "Task") -> None:
         self._strays[running] = task.name
-        if self._replacing:
+        if len(self._replaced) < self._spares:
+            self._replaced.add(running)
             self._pool.widen(1)
-        logger.warning(
-            "%s ended while its thread still runs; %d job thread(s) are taken this way, "
-            "so the worker runs that many fewer jobs until they return",
-            task.name,
-            len(self._strays),
-        )
+            logger.warning(
+                "%s ended while its thread still runs; a new thread takes its place, "
+                "%d of %d such thread(s) are in use until the old ones return",
+                task.name,
+                len(self._replaced),
+                self._spares,
+            )
+        else:
+            logger.warning(
+                "%s ended while its thread still runs; %d job thread(s) are taken this way, "
+                "so that many fewer jobs run at once until they return",
+                task.name,
+                self.strays,
+            )
         running.add_done_callback(partial(_returned, loop, partial(self._back, running)))
 
     def _back(self, running: Future) -> None:
-        if self._strays.pop(running, None) is not None and self._replacing:
+        if self._strays.pop(running, None) is not None and running in self._replaced:
+            self._replaced.discard(running)
             self._pool.widen(-1)
+        for stray in self._strays:
+            if len(self._replaced) >= self._spares:
+                break
+            if stray not in self._replaced:
+                self._replaced.add(stray)
+                self._pool.widen(1)
         if self._freed is not None:
             self._freed()
 
@@ -122,6 +141,10 @@ class _Threads:
         self._closed = False
         self._names = itertools.count()
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
     def submit(self, call: Callable[[], Any]) -> Future:
         future: Future = Future()
         with self._lock:
@@ -129,23 +152,30 @@ class _Threads:
                 raise RuntimeError("cannot schedule new futures after shutdown")
             self._waiting += 1
             self._work.put((future, call))
-            self._grow()
+            try:
+                self._grow()
+            except RuntimeError:
+                if self._threads:
+                    return future
+                future.cancel()
+                raise
         return future
 
     def widen(self, change: int) -> None:
         with self._lock:
             self._size += change
             if not self._closed:
-                self._grow()
+                with suppress(RuntimeError):
+                    self._grow()
 
     def _grow(self) -> None:
         while self._waiting > self._idle and len(self._threads) < self._size:
             thread = threading.Thread(
                 target=self._serve, name=f"tinyjobs_{next(self._names)}", daemon=True
             )
+            thread.start()
             self._threads.add(thread)
             self._idle += 1
-            thread.start()
 
     def _serve(self) -> None:
         while True:

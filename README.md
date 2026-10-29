@@ -424,7 +424,8 @@ Two things are worth knowing before you hit them:
 exceeds its timeout the job is marked failed and the worker moves on, but the thread keeps going until
 the function returns. That thread counts against `concurrency` until it does, so the worker claims
 one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
-an eager call runs the next job beside it instead, and the process exits without waiting for it.
+an eager call runs the next job beside it instead, on up to eight extra threads, and the process
+exits without waiting for it.
 The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
 timeouts to the library you are calling, or write the task as `async def` where cancellation actually
 works.
@@ -746,7 +747,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1509 tests, no test dependencies. The one that matters most is
+1526 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

@@ -7,9 +7,8 @@ import inspect
 import logging
 import math
 import threading
-import time
 from contextlib import suppress
-from typing import Any, Awaitable, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Sequence, TypeVar
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -17,8 +16,6 @@ from redis.exceptions import NoScriptError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...deadlines import bounded
-from ...deadlines import left as _left
 from ...exceptions import ConfigurationError
 from ...models import (
     Execution,
@@ -32,6 +29,7 @@ from ...models import (
 from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
+from ..batching import AGAIN, Batches, Entry
 from .keys import Keys
 from .records import (
     execution_from,
@@ -52,6 +50,7 @@ LIST_CHUNK = 200
 CLOCK_SECONDS = 5.0
 SPARE_CONNECTIONS = 2
 SETTLE_BATCH = 100
+CLOSE_SECONDS = 0.5
 
 logger = logging.getLogger("tinyjobs.redis")
 
@@ -86,8 +85,8 @@ class RedisBackend(BaseBackend):
         self._refreshing: asyncio.Task | None = None
         self._reserving = threading.Lock()
         self._reserved: dict[object, int] = {}
-        self._settling: list[_Settling] = []
-        self._flushing: asyncio.Task | None = None
+        self._batches = Batches(self._settled_batch, SETTLE_BATCH)
+        self._closed = False
         self._alone = 0
         self._returning = asyncio.Event()
         self._keys = Keys(prefix)
@@ -112,6 +111,8 @@ class RedisBackend(BaseBackend):
             )
         except ValueError as error:
             reason = _url_reason(url, error)
+        else:
+            reason = _unknown_options(url, pool)
         if reason is not None:
             raise ConfigurationError(f"the redis url is not valid: {reason}")
         client = Redis(
@@ -129,10 +130,8 @@ class RedisBackend(BaseBackend):
             )
 
     async def close(self) -> None:
-        flushing, self._flushing = self._flushing, None
-        if flushing is not None and not flushing.done():
-            flushing.cancel()
-            await asyncio.wait({flushing})
+        self._closed = True
+        await self._batches.close(RedisConnectionError("the backend was closed"), CLOSE_SECONDS)
         refreshing, self._refreshing = self._refreshing, None
         if refreshing is not None and not refreshing.done():
             refreshing.cancel()
@@ -238,10 +237,10 @@ class RedisBackend(BaseBackend):
                 job.id,
                 job.worker_id or "",
                 job.claims,
-                error.summary,
+                _storable(error.summary),
                 str(execution_status),
-                error.type,
-                error.traceback,
+                _storable(error.type),
+                _storable(error.traceback),
                 "" if retry_at is None else number(retry_at),
             )
         )
@@ -414,27 +413,15 @@ class RedisBackend(BaseBackend):
 
     async def _outcome(self, name: str, *arguments: Any) -> Any:
         now = await self._now()
-        alone = self._client.connection is not None
-        if alone or (not self._settling and self._spare_connections() > self._alone):
+        alone = self._client.connection is not None or self._closed
+        if alone or (not self._batches.waiting and self._spare_connections() > self._alone):
             self._alone += 1
             try:
                 return await self._script(name, now, *arguments)
             finally:
                 self._alone -= 1
                 self._returning.set()
-        entry = _Settling(name, now, arguments, time.monotonic() + _left())
-        self._settling.append(entry)
-        if self._flushing is None or self._flushing.done():
-            self._flushing = asyncio.get_running_loop().create_task(
-                self._flush(), context=contextvars.Context()
-            )
-        try:
-            return await asyncio.shield(entry.future)
-        except BaseException:
-            entry.future.add_done_callback(_consumed)
-            if not entry.sent and entry in self._settling:
-                self._settling.remove(entry)
-            raise
+        return await self._batches.submit((name, now, arguments))
 
     def _spare_connections(self) -> int:
         pool = self._client.connection_pool
@@ -453,41 +440,48 @@ class RedisBackend(BaseBackend):
             self._returning.clear()
             await self._returning.wait()
 
-    async def _flush(self) -> None:
+    async def _settled_batch(self, take: Callable[[], list[Entry]]) -> list[Any]:
         following = isinstance(self._clock, FollowingClock)
-        while self._settling:
-            batch = self._settling[:SETTLE_BATCH]
-            del self._settling[: len(batch)]
-            for entry in batch:
-                entry.sent = True
+        encoder = self._client.connection_pool.get_encoder()
+        pipeline = self._client.pipeline(transaction=False)
+        try:
+            pipeline.connection = await self._borrowed()
+            batch = take()
+            answers: list[Any] = [None] * len(batch)
+            queued: list[int] = []
+            for index, entry in enumerate(batch):
+                name, now, arguments = entry.payload
+                try:
+                    for argument in arguments:
+                        encoder.encode(argument)
+                except Exception as error:
+                    answers[index] = error
+                    continue
+                self._scripts.queue(pipeline, name, now, *arguments, following=following)
+                queued.append(index)
+            if not queued:
+                return answers
+            results = await self._forgetting(pipeline.execute(raise_on_error=False))
+        finally:
+            await pipeline.reset()
+        missing: dict[str, list[int]] = {}
+        for index, result in zip(queued, results):
+            entry = batch[index]
+            if isinstance(result, NoScriptError) and entry.attempts == 1:
+                missing.setdefault(entry.payload[0], []).append(index)
+            else:
+                answers[index] = result
+                entry.settle(result)
+        for name, indexes in missing.items():
             try:
-                async with bounded(max(entry.at for entry in batch)):
-                    pipeline = self._client.pipeline(transaction=False)
-                    pipeline.connection = await self._borrowed()
-                    for entry in batch:
-                        self._scripts.queue(
-                            pipeline, entry.name, entry.now, *entry.arguments, following=following
-                        )
-                    answers = await self._forgetting(pipeline.execute(raise_on_error=False))
-            except BaseException as error:
-                for entry in batch:
-                    entry.fail(error)
-                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
-                    raise
-                continue
-            for entry, answer in zip(batch, answers):
-                if isinstance(answer, NoScriptError) and not entry.reloaded:
-                    entry.sent, entry.reloaded = False, True
-                    self._settling.insert(0, entry)
-                    await self._loaded(entry.name)
-                elif isinstance(answer, BaseException):
-                    entry.fail(answer)
-                elif not entry.future.done():
-                    entry.future.set_result(answer)
-
-    async def _loaded(self, name: str) -> None:
-        with suppress(Exception):
-            await self._scripts.load(name)
+                await self._scripts.load(name)
+            except Exception as error:
+                for index in indexes:
+                    answers[index] = error
+            else:
+                for index in indexes:
+                    answers[index] = AGAIN
+        return answers
 
     async def _script(self, name: str, now: float, *arguments: Any) -> Any:
         following = isinstance(self._clock, FollowingClock)
@@ -662,30 +656,8 @@ def _mend(pool: Any) -> None:
         pool.__class__ = _unwedged(type(pool))
 
 
-def _consumed(future: asyncio.Future[Any]) -> None:
-    if not future.cancelled():
-        future.exception()
-
-
-class _Settling:
-    __slots__ = ("name", "now", "arguments", "at", "future", "sent", "reloaded")
-
-    def __init__(self, name: str, now: float, arguments: tuple[Any, ...], at: float) -> None:
-        self.name = name
-        self.now = now
-        self.arguments = arguments
-        self.at = at
-        self.future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self.sent = False
-        self.reloaded = False
-
-    def fail(self, error: BaseException) -> None:
-        if self.future.done():
-            return
-        if isinstance(error, asyncio.CancelledError):
-            self.future.cancel()
-        else:
-            self.future.set_exception(error)
+def _storable(text: str) -> str:
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _url_reason(url: str, error: ValueError) -> str:
@@ -695,6 +667,28 @@ def _url_reason(url: str, error: ValueError) -> str:
             "percent-encode the password's reserved characters"
         )
     return str(error)
+
+
+def _unknown_options(url: str, pool: Any) -> str | None:
+    accepted: set[str] = set()
+    for kind in pool.connection_class.__mro__:
+        if kind is object:
+            return None
+        if "__init__" not in vars(kind):
+            continue
+        parameters = inspect.signature(kind.__init__).parameters.values()
+        accepted.update(parameter.name for parameter in parameters)
+        if not any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters):
+            break
+    unknown = sorted(set(pool.connection_kwargs) - accepted)
+    if not unknown:
+        return None
+    if "@" in url:
+        return (
+            "it holds a connection option the redis client does not take, its name hidden "
+            "since the url holds a password; percent-encode the password's reserved characters"
+        )
+    return f"the redis client takes no connection option named {', '.join(unknown)}"
 
 
 def _unopened(pool: Any, wanted: int) -> list[Any]:

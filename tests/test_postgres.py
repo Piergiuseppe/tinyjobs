@@ -2592,6 +2592,18 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 0.3)
         self.assertEqual(asked, [])
 
+    async def test_a_wake_up_cut_at_exit_drops_its_connection_without_a_pool_warning(self):
+        self.backend._queries.notify = (
+            "SELECT pg_catalog.pg_sleep(5), %(channel)s::text, %(queues)s::text[]"
+        )
+        with self.assertNoLogs("psycopg.pool", "WARNING"):
+            sending = asyncio.ensure_future(self.backend._send(["default"]))
+            await asyncio.sleep(0.3)
+            sending.cancel()
+            await asyncio.wait({sending})
+            await asyncio.sleep(0.2)
+        self.assertIsNone(await self.backend.get("missing"))
+
     async def test_a_failed_wake_up_still_stores_the_job(self):
         self.backend._queries.notify = "SELECT this_is_not_sql("
         job = await self.enqueue()
@@ -5966,7 +5978,7 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
         self.prefix = new_prefix()
         self.addAsyncCleanup(drop, self.prefix)
 
-    async def test_outcomes_waiting_for_a_connection_are_written_in_one_statement(self):
+    async def test_outcomes_waiting_for_a_connection_are_sent_in_one_round_trip(self):
         from tinyjobs.models import ExecutionError
         from tinyjobs.status import ExecutionStatus
 
@@ -5981,14 +5993,14 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
             worker_id="w", queues=["default"], limit=4, lease_seconds=60
         )
         error = ExecutionError("ValueError", "bad", "Traceback: bad")
-        statements: list[str] = []
-        real = postgres_backend._fetch
+        sent: list[list[str]] = []
+        real = postgres_backend._pipelined
 
-        async def counted(connection, query, parameters):
-            statements.append(query)
-            return await real(connection, query, parameters)
+        async def counted(connection, statements):
+            sent.append([query for query, _ in statements])
+            return await real(connection, statements)
 
-        with mock.patch.object(postgres_backend, "_fetch", counted):
+        with mock.patch.object(postgres_backend, "_pipelined", counted):
             async with backend._connection():
                 writes = asyncio.gather(
                     backend.complete(first, b"one"),
@@ -5998,7 +6010,10 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await asyncio.sleep(0.2)
             self.assertEqual(await writes, [True, True, True, True])
-        self.assertEqual(statements, [backend._queries.settle_many])
+        queries = backend._queries
+        self.assertEqual(
+            sent, [[queries.complete, queries.complete, queries.fail, queries.reschedule]]
+        )
         stored = [await backend.get(job.id) for job in (first, second, third, fourth)]
         self.assertEqual(
             [job.status for job in stored],
@@ -6017,6 +6032,181 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(histories[1][-1].traceback, "Traceback: bad")
         self.assertFalse(await backend.complete(first, b"again"))
 
+    async def test_outcomes_each_under_its_own_deadline_still_share_one_round_trip(self):
+        from tinyjobs.deadlines import until
+
+        backend = await self.batched()
+        for _ in range(4):
+            await backend.enqueue(make_job())
+        jobs = await backend.claim(worker_id="w", queues=["default"], limit=4, lease_seconds=60)
+        sent: list[int] = []
+        real = postgres_backend._pipelined
+
+        async def counted(connection, statements):
+            sent.append(len(statements))
+            return await real(connection, statements)
+
+        async def completed(job, seconds):
+            with until(time.monotonic() + seconds):
+                return await backend.complete(job, None)
+
+        with mock.patch.object(postgres_backend, "_pipelined", counted):
+            async with backend._connection():
+                writes = asyncio.gather(
+                    *(completed(job, 30 + index) for index, job in enumerate(jobs))
+                )
+                await asyncio.sleep(0.2)
+            self.assertEqual(await writes, [True] * 4)
+        self.assertEqual(sent, [4])
+
+    async def batched(self, **options) -> PostgresBackend:
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, max_connections=1, notify=False, **options
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        return backend
+
+    async def claimed(self, backend: PostgresBackend, count: int = 1) -> list:
+        for _ in range(count):
+            await backend.enqueue(make_job())
+        return await backend.claim(
+            worker_id="w", queues=["default"], limit=count, lease_seconds=60
+        )
+
+    async def test_two_claims_of_one_job_in_one_batch_each_get_their_own_answer(self):
+        from tinyjobs.models import ExecutionError
+        from tinyjobs.status import ExecutionStatus
+
+        backend = await self.batched()
+        [stale] = await self.claimed(backend)
+        await sql(
+            f'UPDATE "{self.prefix}_jobs" SET status = \'queued\', worker_id = NULL, '
+            "lease_expires_at = NULL, run_at = 0 WHERE id = %(id)s",
+            {"id": stale.id},
+        )
+        [fresh] = await backend.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60
+        )
+        error = ExecutionError("ValueError", "stale attempt", "Traceback: stale")
+        async with backend._connection():
+            writes = asyncio.gather(
+                backend.fail(stale, error, None), backend.complete(fresh, b"fresh")
+            )
+            await asyncio.sleep(0.2)
+        self.assertEqual(await writes, [False, True])
+        history = {item.claim: item for item in await backend.executions(fresh.id)}
+        self.assertEqual(history[fresh.claims].status, ExecutionStatus.SUCCESS)
+        self.assertIsNone(history[fresh.claims].error_type)
+
+    async def test_an_outcome_its_text_cannot_encode_leaves_the_rest_of_its_batch(self):
+        from tinyjobs.models import ExecutionError
+
+        backend = await self.batched()
+        good, bad = await self.claimed(backend, 2)
+        hostile = b"no such file: report-\xff.csv".decode("utf-8", "surrogateescape")
+        error = ExecutionError("FileNotFoundError", hostile, f"Traceback: {hostile}")
+        async with backend._connection():
+            writes = asyncio.gather(
+                backend.complete(good, None), backend.fail(bad, error, None)
+            )
+            await asyncio.sleep(0.2)
+        self.assertEqual(await writes, [True, True])
+        stored = await backend.get(bad.id)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertIn("report-\\udcff.csv", stored.last_error)
+        self.assertEqual((await backend.get(good.id)).status, JobStatus.SUCCESS)
+
+    async def test_a_failure_whose_text_holds_a_lone_surrogate_is_stored(self):
+        from tinyjobs.models import ExecutionError
+
+        backend = await self.batched()
+        [job] = await self.claimed(backend)
+        hostile = b"report-\xff.csv".decode("utf-8", "surrogateescape")
+        self.assertTrue(
+            await backend.fail(job, ExecutionError("OSError", hostile, hostile), None)
+        )
+        [execution] = await backend.executions(job.id)
+        self.assertEqual(execution.traceback, "report-\\udcff.csv")
+
+    async def test_closing_settles_outcomes_still_waiting_for_their_batch(self):
+        backend = await self.batched()
+        jobs = await self.claimed(backend, 2)
+        async with backend._connection():
+            writes = [asyncio.ensure_future(backend.complete(job, None)) for job in jobs]
+            await asyncio.sleep(0.2)
+            closing = asyncio.ensure_future(backend.close())
+            await asyncio.sleep(0.2)
+        await asyncio.wait_for(closing, 10)
+        done, pending = await asyncio.wait(writes, timeout=5)
+        for write in pending:
+            write.cancel()
+        self.assertEqual(len(done), 2)
+        for write in done:
+            self.assertFalse(write.cancelled())
+            self.assertIsInstance(write.exception(), PoolClosed)
+
+    async def test_a_batched_outcome_is_cut_at_its_own_deadline(self):
+        from tinyjobs.deadlines import bounded
+
+        backend = await self.batched()
+        free, locked = await self.claimed(backend, 2)
+        holder = await psycopg.AsyncConnection.connect(POSTGRES_URL)
+        self.addAsyncCleanup(holder.close)
+        await holder.execute(
+            f'SELECT 1 FROM "{self.prefix}_jobs" WHERE id = %s FOR UPDATE', (locked.id,)
+        )
+
+        async def short() -> None:
+            async with bounded(time.monotonic() + 0.5):
+                await backend.complete(locked, None)
+
+        async with backend._connection():
+            plain = asyncio.ensure_future(backend.complete(free, None))
+            cut = asyncio.ensure_future(short())
+            await asyncio.sleep(0.1)
+        with self.assertRaises(TimeoutError):
+            await cut
+        await asyncio.sleep(1.0)
+        await holder.rollback()
+        self.assertTrue(await asyncio.wait_for(plain, 10))
+        await asyncio.sleep(0.3)
+        self.assertEqual((await backend.get(locked.id)).status, JobStatus.RUNNING)
+
+    async def test_a_due_retry_in_a_batch_answers_before_its_wake_up_is_sent(self):
+        from tinyjobs.deadlines import bounded
+        from tinyjobs.models import ExecutionError
+
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix, max_connections=1)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        done, retried = await self.claimed(backend, 2)
+        await asyncio.sleep(0.2)
+        sent = backend._send
+        wakes: list[list[str]] = []
+
+        async def slow(queues):
+            wakes.append(list(queues))
+            await asyncio.sleep(3.0)
+            await sent(queues)
+
+        async def timed(call) -> float:
+            started = time.monotonic()
+            async with bounded(time.monotonic() + 1.0):
+                self.assertTrue(await call)
+            return time.monotonic() - started
+
+        error = ExecutionError("ValueError", "bad", "tb")
+        with mock.patch.object(backend, "_send", slow):
+            async with backend._connection():
+                writes = asyncio.gather(
+                    timed(backend.complete(done, None)),
+                    timed(backend.fail(retried, error, time.time() - 1)),
+                )
+                await asyncio.sleep(0.1)
+            took = await writes
+        self.assertLess(max(took), 0.9)
+        self.assertEqual(wakes, [["default"]])
 
     async def test_outcomes_ready_at_a_stop_land_together_on_a_slow_link(self):
         app = TinyJobs(POSTGRES_URL, prefix=self.prefix, max_connections=1)
@@ -6034,16 +6224,21 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
             hooked.append(job.id)
 
         jobs = [await steady.aenqueue(i) for i in range(4)]
-        real = postgres_backend._fetch
-        outcomes = {backend._queries.complete, getattr(backend._queries, "settle_many", None)}
+        real, pipelined = postgres_backend._fetch, postgres_backend._pipelined
 
         async def slow(connection, query, parameters):
-            if query in outcomes:
+            if query == backend._queries.complete:
                 await asyncio.sleep(0.7)
             return await real(connection, query, parameters)
 
+        async def slow_together(connection, statements):
+            await asyncio.sleep(0.7)
+            return await pipelined(connection, statements)
+
         worker = app.worker(concurrency=4, handle_signals=False, shutdown_timeout=3.0)
-        with mock.patch.object(postgres_backend, "_fetch", slow):
+        with mock.patch.object(postgres_backend, "_fetch", slow), mock.patch.object(
+            postgres_backend, "_pipelined", slow_together, create=True
+        ):
             runner = asyncio.create_task(worker.start())
             while JobStatus.QUEUED in [(await app.aget(job.id)).status for job in jobs]:
                 await asyncio.sleep(0.05)
@@ -6066,6 +6261,33 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(backend.close)
         await backend.setup()
         return backend
+
+    async def test_callers_kept_waiting_on_slow_connects_get_them_opened_together(self):
+        backend = await self.open(min_connections=1, max_connections=4)
+        await backend.get("missing")
+        real = postgres_backend._Answering.connect.__func__
+
+        async def slowly(cls, *args, **kwargs):
+            await asyncio.sleep(0.6)
+            return await real(cls, *args, **kwargs)
+
+        entered: list[float] = []
+        release = asyncio.Event()
+
+        async def hold():
+            async with backend._connection():
+                entered.append(time.monotonic())
+                await release.wait()
+
+        with mock.patch.object(postgres_backend._Answering, "connect", classmethod(slowly)):
+            started = time.monotonic()
+            holders = [asyncio.ensure_future(hold()) for _ in range(4)]
+            while len(entered) < 4 and time.monotonic() - started < 5:
+                await asyncio.sleep(0.02)
+            release.set()
+            await asyncio.gather(*holders)
+        self.assertEqual(len(entered), 4)
+        self.assertLess(max(entered) - started, 1.3)
 
     async def test_the_pool_stays_at_ten_whatever_its_workers_run(self):
         app = TinyJobs(POSTGRES_URL, prefix=self.prefix)
