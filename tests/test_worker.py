@@ -369,6 +369,50 @@ class TimeoutTests(WorkerTestCase):
             await asyncio.wait_for(runner, 10)
 
 
+class StrayAtExitTests(unittest.TestCase):
+    def test_a_process_whose_worker_left_a_stuck_thread_exits(self):
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as folder:
+            script = f"""
+import asyncio, threading
+from tinyjobs import TinyJobs, JobStatus
+app = TinyJobs("sqlite:///{Path(folder) / 'jobs.db'}")
+
+@app.task(timeout=0.2, max_attempts=1)
+def stuck():
+    threading.Event().wait()
+
+async def main():
+    job = await stuck.aenqueue()
+    worker = app.worker(concurrency=1, handle_signals=False, shutdown_timeout=1.0)
+    running = asyncio.create_task(worker.start())
+    while (await app.aget(job.id)).status is not JobStatus.FAILED:
+        await asyncio.sleep(0.02)
+    worker.stop()
+    await running
+    await app.aclose()
+
+asyncio.run(main())
+"""
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=dict(os.environ, PYTHONPATH=os.getcwd()),
+            )
+            try:
+                output, _ = process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                self.fail(f"the process did not exit: {output[-800:]}")
+        self.assertEqual(process.returncode, 0, output[-800:])
+        self.assertIn("still running after their job ended (__main__.stuck)", output)
+
+
 class UndecodableJobTests(WorkerTestCase):
     async def test_a_payload_the_worker_cannot_decode_fails_the_job(self):
         @self.app.task(max_attempts=1)
@@ -2712,6 +2756,22 @@ class ShutdownReleaseTests(WorkerTestCase):
             worker.stop()
             await asyncio.wait_for(runner, 10)
         self.assertEqual(told, [(worker, 2), (worker, -1)])
+
+    async def test_a_stop_outside_a_run_reserves_nothing(self):
+        await self.app.ready()
+        backend = self.app.backend
+        told: list[tuple[object, int]] = []
+        early, worker = self.make_worker(concurrency=3), self.make_worker(concurrency=3)
+        reserving = lambda owner, jobs: told.append((owner, jobs)) or 1
+        with mock.patch.object(backend, "reserve", reserving, create=True):
+            early.stop()
+            await asyncio.sleep(0.05)
+            self.assertEqual(told, [])
+            await self.run_briefly(worker, 0.2)
+            self.assertEqual(told, [(worker, 0), (worker, -1)])
+            worker.stop()
+            await asyncio.sleep(0.05)
+        self.assertEqual(told, [(worker, 0), (worker, -1)])
 
     async def test_a_claim_without_an_answer_is_a_warning_not_an_error(self):
         await self.app.ready()

@@ -730,7 +730,9 @@ the reason the backend seam exists.
 Bundled rather than a separate `tinyjobs-redis` package: until the protocol freezes at v1.0, a change
 to it would otherwise need two releases in lockstep. It depends on nothing but the public protocol, so
 it can move out later without touching a line. The client library is an extra, `tinyjobs[redis]`, and
-is imported only when a `redis://` URL is used, so the core stays dependency-free.
+is imported only when a `redis://` URL is used, so the core stays dependency-free. A url redis-py
+cannot read raises `ConfigurationError`, without its reason once the url holds a password, since
+that reason may quote part of it.
 
 ### Atomicity
 
@@ -1112,26 +1114,32 @@ start time, before the next statement this backend sends, so a statement left wa
 never applies afterwards. Every statement tinyjobs sends on a pooled connection starts with a
 comment carrying a secret random token of that connection, `/* tinyjobs <token> */`, first so
 `track_activity_query_size` never cuts it, and the same for every statement so prepared statements
-still work, including the `BEGIN`, `COMMIT` and `ROLLBACK` psycopg sends itself; each pooled connection also holds a session advisory lock on a secret random key. A
+still work, including the `BEGIN`, `COMMIT` and `ROLLBACK` psycopg sends itself on Postgres 16
+and later; each pooled connection also holds a session advisory lock on a secret random key. A
 backend is ended, as the login role and in the same statement that looks, only while its current or
 last statement carries the token, whatever its state and whenever it arrived: running, idle with the
 statement still on its way, or a statement that reached the server after the cut. Where the role
-sees no statement text, with `track_activities` off, the lock stands in for the token. Nothing else
+sees no statement text, with `track_activities` off, the lock stands in for the token, and the same
+for a bare transaction command: before 16, `pg_stat_statements` keys those by their text, so a token
+on them added two entries per connection, 40 after 20 short runs where there are now 2. Nothing else
 runs our token or holds our lock, and PgBouncer's reset (`DISCARD ALL`) drops the lock before it
 hands the backend to another client, whose statements carry no token, so another client is never
 ended; neither clock takes part. Through a proxy that delivered the statement three seconds late,
 past the cut, onto a row lock, the statement was ended and the job stayed `running`, where it used to
 land as `success` once the lock was let go; through a session pooler that handed our backend to
 another process, that process's three second statement ran to its end. A `COMMIT` that reached the
-server late, after the cut, now carries the token too: it used to show as a bare `COMMIT`, was never
-ended and applied all 100 jobs of a cut batch enqueue; it is ended and none apply. A claim delayed on its way
+server late, after the cut, is ended too, by its token or, before 16, by the lock: it used to be
+left to apply all 100 jobs of a cut batch enqueue; none apply. A claim delayed on its way
 is then handed back by the sweep of unanswered claims.
 The next statement waits for a pass already running rather than going ahead of it, and a backend
 not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
 cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
-database works too. A connection beyond the minimum closes after five idle
-minutes, and every connection is replaced after half an hour. Deadlocks, serialization
+database works too. Every connection unused for ten seconds beyond the minimum closes together,
+not one per interval, and a connection that failed to open is not retried once no caller waits
+for it: four workers of 16 on a 40-slot server peaked at 29 sessions of theirs instead of 36, and
+refused none of the app's own instead of 8 in 265.
+Every connection is replaced after half an hour. Deadlocks, serialization
 failures and a session the server closed under `idle_session_timeout`, which it only does while
 waiting for a command, so before the statement ran, are retried three times with a warning, except inside the caller's transaction, which only
 the caller can retry. Before using a pooled connection, tinyjobs reads what the server already sent on
@@ -1335,7 +1343,7 @@ the interesting decisions are in the dispatch.
 | Task kind                    | Executor                | Timeout        | Notes                          |
 | ---------------------------- | ----------------------- | -------------- | ------------------------------ |
 | `async def`                  | worker event loop       | hard           | `asyncio.timeout`, real cancel |
-| `def`                        | `ThreadPoolExecutor`    | **soft**       | see below                      |
+| `def`                        | daemon thread pool      | **soft**       | see below                      |
 
 A single worker process runs an event loop plus a thread pool. Async and sync tasks share the process
 without either starving the other. A process executor for tasks declared `isolated=True` is planned,
@@ -1365,8 +1373,13 @@ it keeps occupying a pool slot. The timeout counts from when the thread starts, 
 for a free thread behind one that timed out is never recorded as timed out before it ran: it used to
 be failed with `TIMEOUT` while queued and then run anyway, and with retries left it ran again.
 A thread still running after its job ended counts against `concurrency` until it returns, and a
-warning names its task, so the worker claims only jobs it has a thread for and a drain waits for the
-thread before it claims again. A job with a 0.3 second timeout claimed behind such a thread used to
+warning names its task, so the worker claims only jobs it has a thread for; a drain or an eager
+call runs the next job on a thread added in its place and drops it once the old one returns: a
+drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
+0.51, where they waited 3.0 and 4.0 for the thread. The threads are daemon threads, so a process
+whose worker stopped with one still running exits, with a warning naming them, where it used to
+hang at interpreter exit until killed.
+A job with a 0.3 second timeout claimed behind such a thread used to
 stay `running` for as long as the thread ran, its lease renewed so no other worker could take it; it
 now stays `queued` for any other worker, and ran here once the thread returned. With two workers of
 concurrency 2, one holding two runaway threads, all six quick jobs ran on the other, where two were
@@ -1401,19 +1414,28 @@ backend that went silent is not asked to end what it left behind at close; one t
 gets half a second a pass for it. Once the stop is
 asked the backend keeps a connection open for each running job plus two for the releases and the
 heartbeat, within the pool size, and opens those it lacks, so outcomes written as threads return
-need not connect first; the heartbeat stops renewing the jobs
+need not connect first; on Redis the idle connections stay free for other calls meanwhile, where a
+call waited a second behind them, and a stop asked outside a run reserves nothing;
+the heartbeat stops renewing the jobs
 about to be released, and a clock reading that falls due is taken beside a call rather than before
 it. Over a link that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on
 Postgres and on Redis, with the worker back after 1.61 seconds, where every run used to log all
 eight unreleased and Redis left them `running` until their lease ran out. A second `SIGINT`
 ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
-the second signal with the server cut off, where it took 6.6.
+the second signal with the server cut off, where it took 6.6. The process itself exits within the
+timeout: a wake-up still on its way at exit drops its connection instead of asking the server to stop
+it, which over that link cost another second, so with a 3 second timeout it exited 2.65 seconds after
+the signal rather than 3.6, and with 5 seconds and 16 jobs after 4.4 rather than 5.3.
 
 A job whose outcome is being written when the jobs' share ends is not cancelled: the write keeps
 its deadline, which ends a second before the timeout, or half the release share when that is
 shorter, and the check of a write whose answer is lost gets the rest. With a 2 second timeout and the
 outcome held on a row lock for 1.3 seconds, it was recorded and its hooks ran, where it used to be
-cut and left `running` for its lease. A cancelled job still awaiting in its cleanup when the timeout
+cut and left `running` for its lease. Outcomes that would wait for a connection go out together, in
+one statement on Postgres and one pipelined round trip on Redis: over a link adding 300 ms each way,
+four jobs ending just before a 3 second stop were all recorded with their hooks run, where Postgres
+lost 6 of 16 and Redis left every one `running` with no hook.
+A cancelled job still awaiting in its cleanup when the timeout
 ends is cancelled once more and left behind, logged, for the reaper: with `--shutdown-timeout 4` and a
 cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 18.0.
 

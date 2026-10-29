@@ -47,6 +47,17 @@ class Scripts:
         stamp = ("~" if following else "") + repr(float(now))
         return await self._scripts[name](keys=[self._root], args=[stamp, *arguments])
 
+    def queue(
+        self, pipeline: Any, name: str, now: float, *arguments: Any, following: bool = False
+    ) -> None:
+        stamp = ("~" if following else "") + repr(float(now))
+        pipeline.execute_command(
+            "EVALSHA", self._scripts[name].sha, 1, self._root, stamp, *arguments
+        )
+
+    async def load(self, name: str) -> None:
+        await self._client.script_load(self._sources[name])
+
     async def run_once(
         self, name: str, now: float, *arguments: Any, following: bool = False
     ) -> Any:

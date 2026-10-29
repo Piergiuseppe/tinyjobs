@@ -88,6 +88,7 @@ class Worker:
         self._releases: set[asyncio.Future] = set()
         self._unreleased: list[Job] = []
         self._finished = threading.Event()
+        self._serving = False
         self._prepare_run()
 
     def _prepare_run(self) -> None:
@@ -142,9 +143,11 @@ class Worker:
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
         self._app.attach(self)
+        self._serving = True
         try:
             await self._serve()
         finally:
+            self._serving = False
             if self._reserved is not None:
                 self._reserved(self, -1)
             closing = self._app.detach(self)
@@ -200,6 +203,15 @@ class Worker:
                     self._sparing.cancel()
                     await asyncio.gather(self._sparing, return_exceptions=True)
                 self._executors.shutdown()
+                strays = self._executors.stray_names()
+                if strays:
+                    logger.warning(
+                        "worker %s stops with %d job thread(s) still running after their job "
+                        "ended (%s); the process exits without waiting for them",
+                        self._id,
+                        len(strays),
+                        ", ".join(strays),
+                    )
                 logger.info("worker %s stopped", self._id)
 
     def _freed(self) -> None:
@@ -728,6 +740,8 @@ class Worker:
             self._spare()
 
     def _spare(self) -> None:
+        if not self._serving:
+            return
         try:
             backend = self._app.backend
             asyncio.get_running_loop()

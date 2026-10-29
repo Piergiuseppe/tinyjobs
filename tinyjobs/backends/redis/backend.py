@@ -7,13 +7,19 @@ import inspect
 import logging
 import math
 import threading
+import time
+from contextlib import suppress
 from typing import Any, Awaitable, Sequence, TypeVar
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import NoScriptError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
+from ...deadlines import bounded
+from ...deadlines import left as _left
+from ...exceptions import ConfigurationError
 from ...models import (
     Execution,
     ExecutionError,
@@ -45,6 +51,7 @@ ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
 CLOCK_SECONDS = 5.0
 SPARE_CONNECTIONS = 2
+SETTLE_BATCH = 100
 
 logger = logging.getLogger("tinyjobs.redis")
 
@@ -79,6 +86,10 @@ class RedisBackend(BaseBackend):
         self._refreshing: asyncio.Task | None = None
         self._reserving = threading.Lock()
         self._reserved: dict[object, int] = {}
+        self._settling: list[_Settling] = []
+        self._flushing: asyncio.Task | None = None
+        self._alone = 0
+        self._returning = asyncio.Event()
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -94,9 +105,15 @@ class RedisBackend(BaseBackend):
         **options: Any,
     ) -> "RedisBackend":
         single_connection_client = options.pop("single_connection_client", False)
-        pool = BlockingConnectionPool.from_url(
-            url, max_connections=max_connections, timeout=pool_timeout, **options
-        )
+        reason = None
+        try:
+            pool = BlockingConnectionPool.from_url(
+                url, max_connections=max_connections, timeout=pool_timeout, **options
+            )
+        except ValueError as error:
+            reason = _url_reason(url, error)
+        if reason is not None:
+            raise ConfigurationError(f"the redis url is not valid: {reason}")
         client = Redis(
             connection_pool=pool, single_connection_client=single_connection_client
         )
@@ -112,6 +129,10 @@ class RedisBackend(BaseBackend):
             )
 
     async def close(self) -> None:
+        flushing, self._flushing = self._flushing, None
+        if flushing is not None and not flushing.done():
+            flushing.cancel()
+            await asyncio.wait({flushing})
         refreshing, self._refreshing = self._refreshing, None
         if refreshing is not None and not refreshing.done():
             refreshing.cancel()
@@ -135,14 +156,17 @@ class RedisBackend(BaseBackend):
         pool = client.connection_pool
         with self._reserving:
             wanted = sum(self._reserved.values()) or SPARE_CONNECTIONS
-        count = min(wanted, pool.max_connections - len(pool._in_use_connections))
-        taking = [asyncio.ensure_future(_acquire(pool)) for _ in range(count)]
+        opening = {
+            asyncio.ensure_future(connection.connect()): connection
+            for connection in _unopened(pool, wanted)
+        }
         try:
-            await asyncio.gather(*taking)
+            if opening:
+                await asyncio.gather(*opening)
         finally:
-            for task in taking:
+            for task in opening:
                 task.cancel()
-            await asyncio.shield(_returned(pool, taking))
+            await asyncio.shield(_opened(pool, opening))
 
     async def enqueue(self, job: Job) -> Job:
         return (await self.enqueue_many([job]))[0]
@@ -191,7 +215,7 @@ class RedisBackend(BaseBackend):
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return bool(
-            await self._run(
+            await self._outcome(
                 "complete",
                 job.id,
                 job.worker_id or "",
@@ -209,7 +233,7 @@ class RedisBackend(BaseBackend):
         execution_status: ExecutionStatus = ExecutionStatus.FAILED,
     ) -> bool:
         return bool(
-            await self._run(
+            await self._outcome(
                 "fail",
                 job.id,
                 job.worker_id or "",
@@ -388,6 +412,83 @@ class RedisBackend(BaseBackend):
     async def _run(self, name: str, *arguments: Any) -> Any:
         return await self._script(name, await self._now(), *arguments)
 
+    async def _outcome(self, name: str, *arguments: Any) -> Any:
+        now = await self._now()
+        alone = self._client.connection is not None
+        if alone or (not self._settling and self._spare_connections() > self._alone):
+            self._alone += 1
+            try:
+                return await self._script(name, now, *arguments)
+            finally:
+                self._alone -= 1
+                self._returning.set()
+        entry = _Settling(name, now, arguments, time.monotonic() + _left())
+        self._settling.append(entry)
+        if self._flushing is None or self._flushing.done():
+            self._flushing = asyncio.get_running_loop().create_task(
+                self._flush(), context=contextvars.Context()
+            )
+        try:
+            return await asyncio.shield(entry.future)
+        except BaseException:
+            entry.future.add_done_callback(_consumed)
+            if not entry.sent and entry in self._settling:
+                self._settling.remove(entry)
+            raise
+
+    def _spare_connections(self) -> int:
+        pool = self._client.connection_pool
+        return sum(1 for connection in pool._available_connections if connection.is_connected)
+
+    async def _borrowed(self) -> Any:
+        pool = self._client.connection_pool
+        while True:
+            for connection in reversed(pool._available_connections):
+                if connection.is_connected:
+                    pool._available_connections.remove(connection)
+                    pool._in_use_connections.add(connection)
+                    return connection
+            if not self._alone:
+                return None
+            self._returning.clear()
+            await self._returning.wait()
+
+    async def _flush(self) -> None:
+        following = isinstance(self._clock, FollowingClock)
+        while self._settling:
+            batch = self._settling[:SETTLE_BATCH]
+            del self._settling[: len(batch)]
+            for entry in batch:
+                entry.sent = True
+            try:
+                async with bounded(max(entry.at for entry in batch)):
+                    pipeline = self._client.pipeline(transaction=False)
+                    pipeline.connection = await self._borrowed()
+                    for entry in batch:
+                        self._scripts.queue(
+                            pipeline, entry.name, entry.now, *entry.arguments, following=following
+                        )
+                    answers = await self._forgetting(pipeline.execute(raise_on_error=False))
+            except BaseException as error:
+                for entry in batch:
+                    entry.fail(error)
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                continue
+            for entry, answer in zip(batch, answers):
+                if isinstance(answer, NoScriptError) and not entry.reloaded:
+                    entry.sent, entry.reloaded = False, True
+                    self._settling.insert(0, entry)
+                    await self._loaded(entry.name)
+                elif isinstance(answer, BaseException):
+                    entry.fail(answer)
+                elif not entry.future.done():
+                    entry.future.set_result(answer)
+
+    async def _loaded(self, name: str) -> None:
+        with suppress(Exception):
+            await self._scripts.load(name)
+
     async def _script(self, name: str, now: float, *arguments: Any) -> Any:
         following = isinstance(self._clock, FollowingClock)
         return await self._forgetting(
@@ -561,11 +662,67 @@ def _mend(pool: Any) -> None:
         pool.__class__ = _unwedged(type(pool))
 
 
-async def _returned(pool: Any, taking: list[asyncio.Future]) -> None:
-    await asyncio.wait(taking)
-    for task in taking:
-        if not task.cancelled() and task.exception() is None:
-            await pool.release(task.result())
+def _consumed(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+class _Settling:
+    __slots__ = ("name", "now", "arguments", "at", "future", "sent", "reloaded")
+
+    def __init__(self, name: str, now: float, arguments: tuple[Any, ...], at: float) -> None:
+        self.name = name
+        self.now = now
+        self.arguments = arguments
+        self.at = at
+        self.future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self.sent = False
+        self.reloaded = False
+
+    def fail(self, error: BaseException) -> None:
+        if self.future.done():
+            return
+        if isinstance(error, asyncio.CancelledError):
+            self.future.cancel()
+        else:
+            self.future.set_exception(error)
+
+
+def _url_reason(url: str, error: ValueError) -> str:
+    if "@" in url:
+        return (
+            "its error is hidden, since the url holds a password; check the port and "
+            "percent-encode the password's reserved characters"
+        )
+    return str(error)
+
+
+def _unopened(pool: Any, wanted: int) -> list[Any]:
+    available = pool._available_connections
+    ready = len(pool._in_use_connections) + sum(1 for c in available if c.is_connected)
+    taken: list[Any] = []
+    for _ in range(max(0, min(wanted, pool.max_connections) - ready)):
+        closed = next((c for c in available if not c.is_connected), None)
+        if closed is not None:
+            available.remove(closed)
+        elif len(available) + len(pool._in_use_connections) < pool.max_connections:
+            closed = pool.make_connection()
+        else:
+            break
+        pool._in_use_connections.add(closed)
+        taken.append(closed)
+    return taken
+
+
+async def _opened(pool: Any, opening: dict[asyncio.Future, Any]) -> None:
+    if not opening:
+        return
+    await asyncio.wait(opening)
+    for task, connection in opening.items():
+        if task.cancelled() or task.exception() is not None:
+            with suppress(Exception):
+                await connection.disconnect()
+        await pool.release(connection)
 
 
 async def _acquire(pool: Any) -> Any:

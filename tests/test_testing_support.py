@@ -170,16 +170,18 @@ class DrainTests(unittest.TestCase):
         self.assertEqual((job.refresh().status, job.attempts), (JobStatus.FAILED, 3))
         self.assertEqual(self.calls, ["try"] * 3)
 
-    def test_a_drain_claims_nothing_while_a_timed_out_thread_still_runs(self):
+    def test_a_drain_runs_the_next_job_beside_a_timed_out_thread_and_returns(self):
         import threading
         import time
 
         held = threading.Event()
         self.addCleanup(held.set)
+        returned: list[str] = []
 
-        @self.app.task(timeout=0.1, max_attempts=1)
+        @self.app.task(timeout=0.2, max_attempts=1)
         def runaway():
             held.wait(10)
+            returned.append("runaway")
 
         @self.app.task(timeout=0.3)
         def charge():
@@ -187,20 +189,30 @@ class DrainTests(unittest.TestCase):
 
         first = runaway.enqueue()
         job = charge.enqueue()
-        drained: list[int] = []
-        draining = threading.Thread(target=lambda: drained.append(self.app.drain()))
-        draining.start()
-        self.addCleanup(draining.join, 10)
-        deadline = time.monotonic() + 10
-        while first.refresh().status is not JobStatus.FAILED:
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.02)
-        time.sleep(0.5)
-        self.assertIs(job.refresh().status, JobStatus.QUEUED)
-        held.set()
-        draining.join(10)
-        self.assertEqual(drained, [2])
+        started = time.monotonic()
+        self.assertEqual(self.app.drain(), 2)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIs(first.refresh().status, JobStatus.FAILED)
         self.assertIs(job.refresh().status, JobStatus.SUCCESS)
+        self.assertEqual((self.calls, returned), (["charged"], []))
+
+    def test_an_eager_job_past_its_timeout_returns_while_its_thread_still_runs(self):
+        import threading
+        import time
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+        app = TinyJobs("memory://", eager=True)
+        self.addCleanup(app.close)
+
+        @app.task(timeout=0.2, max_attempts=1)
+        def partner():
+            held.wait(10)
+
+        started = time.monotonic()
+        job = partner.enqueue()
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIs(job.status, JobStatus.FAILED)
 
     def test_an_unknown_task_raises_and_stays_queued(self):
         job = self.app.send("elsewhere.task")

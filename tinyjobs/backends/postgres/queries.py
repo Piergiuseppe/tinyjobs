@@ -404,6 +404,53 @@ class Queries:
             SELECT count(*) AS changed FROM changed
         """
 
+        self.settle_many = f"""
+            WITH settled AS (
+                SELECT * FROM ROWS FROM (
+                    pg_catalog.unnest(%(ids)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(workers)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(claims)s::pg_catalog.int4[]),
+                    pg_catalog.unnest(%(nows)s::pg_catalog.float8[]),
+                    pg_catalog.unnest(%(kinds)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(results)s::pg_catalog.bytea[]),
+                    pg_catalog.unnest(%(summaries)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(run_ats)s::pg_catalog.float8[]),
+                    pg_catalog.unnest(%(execution_statuses)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(error_types)s::pg_catalog.text[]),
+                    pg_catalog.unnest(%(tracebacks)s::pg_catalog.text[])
+                ) AS settled (id, worker, claims, now, kind, result, summary, run_at,
+                              execution_status, error_type, traceback)
+            ),
+            changed AS (
+                UPDATE {jobs} AS job
+                   SET status = settled.kind,
+                       finished_at = CASE WHEN settled.kind = 'queued' THEN job.finished_at
+                                          ELSE settled.now END,
+                       result = CASE WHEN settled.kind = 'success' THEN settled.result
+                                     ELSE job.result END,
+                       last_error = CASE WHEN settled.kind = 'success' THEN NULL
+                                         ELSE settled.summary END,
+                       run_at = CASE WHEN settled.kind = 'queued' THEN settled.run_at
+                                     ELSE job.run_at END,
+                       worker_id = CASE WHEN settled.kind = 'queued' THEN NULL
+                                        ELSE job.worker_id END,
+                       lease_expires_at = NULL, hand_backs = 0
+                  FROM settled
+                 WHERE job.id = settled.id AND job.status = 'running'
+                   AND job.worker_id = settled.worker AND job.claims = settled.claims
+                RETURNING job.id, job.claims, job.queue
+            ),
+            closed AS (
+                UPDATE {executions} AS execution
+                   SET status = settled.execution_status, finished_at = settled.now,
+                       error_type = settled.error_type, traceback = settled.traceback
+                  FROM changed
+                  JOIN settled ON settled.id = changed.id
+                 WHERE execution.job_id = changed.id AND execution.claim = changed.claims
+            )
+            SELECT id, queue FROM changed
+        """
+
         self.release_many = f"""
             WITH changed AS (
                 UPDATE {jobs} AS job

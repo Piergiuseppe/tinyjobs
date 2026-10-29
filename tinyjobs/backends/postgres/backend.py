@@ -30,9 +30,10 @@ from psycopg import errors, pq, waiting
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
-from psycopg_pool.pool_async import AddConnection
+from psycopg_pool.pool_async import AddConnection, AttemptWithBackoff
 
 from ...clock import Clock, FollowingClock, elapsed
+from ...deadlines import bounded
 from ...deadlines import left as _left
 from ...deadlines import until
 from ...exceptions import ConfigurationError, UnsupportedCapabilityError
@@ -84,7 +85,7 @@ UNREBUILT = (
     errors.DeadlockDetected,
     errors.ObjectInUse,
 )
-MAX_IDLE_SECONDS = 300.0
+MAX_IDLE_SECONDS = 10.0
 MAX_LIFETIME_SECONDS = 1800.0
 NOTIFY_SECONDS = 0.05
 LISTEN_RETRY_SECONDS = 1.0
@@ -119,8 +120,8 @@ RUNNING = (
 _LEFT: contextvars.ContextVar[tuple[int, Any] | None] = contextvars.ContextVar(
     "tinyjobs_postgres_left", default=None
 )
-_PROBING: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "tinyjobs_postgres_probing", default=False
+_DROPPED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tinyjobs_postgres_dropped", default=False
 )
 ALIVE = """
     SELECT pid, backend_start, state, state_change,
@@ -163,24 +164,25 @@ ORPHANED = """
                    SELECT oid FROM pg_catalog.pg_roles
                     WHERE rolname OPERATOR(pg_catalog.=) SESSION_USER
                ) THEN true
-               WHEN CASE
-                   WHEN activity.state IS NULL
-                     OR activity.state OPERATOR(pg_catalog.=) 'disabled'
-                   THEN EXISTS (
-                       SELECT FROM pg_catalog.pg_locks AS held
-                        WHERE held.pid OPERATOR(pg_catalog.=) activity.pid
-                          AND held.locktype OPERATOR(pg_catalog.=) 'advisory' AND held.granted
-                          AND held.database OPERATOR(pg_catalog.=) (
-                              SELECT oid FROM pg_catalog.pg_database
-                               WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
-                          )
-                          AND held.classid OPERATOR(pg_catalog.=) orphan.high::pg_catalog.oid
-                          AND held.objid OPERATOR(pg_catalog.=) orphan.low::pg_catalog.oid
-                          AND held.objsubid OPERATOR(pg_catalog.=) 1
-                   )
-                   ELSE pg_catalog.left(activity.query, pg_catalog.length(orphan.token))
-                        OPERATOR(pg_catalog.=) orphan.token
-               END
+               WHEN pg_catalog.left(activity.query, pg_catalog.length(orphan.token))
+                    OPERATOR(pg_catalog.=) orphan.token
+               THEN pg_catalog.pg_terminate_backend(activity.pid, %(wait)s)
+               WHEN (
+                   activity.state IS NULL
+                   OR activity.state OPERATOR(pg_catalog.=) 'disabled'
+                   OR activity.query OPERATOR(pg_catalog.~) %(bare)s
+               ) AND EXISTS (
+                   SELECT FROM pg_catalog.pg_locks AS held
+                    WHERE held.pid OPERATOR(pg_catalog.=) activity.pid
+                      AND held.locktype OPERATOR(pg_catalog.=) 'advisory' AND held.granted
+                      AND held.database OPERATOR(pg_catalog.=) (
+                          SELECT oid FROM pg_catalog.pg_database
+                           WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+                      )
+                      AND held.classid OPERATOR(pg_catalog.=) orphan.high::pg_catalog.oid
+                      AND held.objid OPERATOR(pg_catalog.=) orphan.low::pg_catalog.oid
+                      AND held.objsubid OPERATOR(pg_catalog.=) 1
+               )
                THEN pg_catalog.pg_terminate_backend(activity.pid, %(wait)s)
                ELSE true
            END AS settled
@@ -196,6 +198,8 @@ ORPHANED = """
        AND activity.backend_start OPERATOR(pg_catalog.=) orphan.born
 """
 FENCING = "pg_catalog.pg_advisory_lock(%(fence)s::bigint) AS fenced"
+BARE_COMMANDS = r"^(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\y"
+TAGGED_COMMANDS_VERSION = 160000
 ENDING_CLAIM_MILLISECONDS = 1000
 CUT_SECONDS = 0.5
 CONNECT_SECONDS = 5
@@ -277,6 +281,7 @@ ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
 RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.IdleSessionTimeout)
 RETRIES = 3
+SETTLE_BATCH = 100
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
 PIPELINED = psycopg.Pipeline.is_supported()
@@ -383,6 +388,9 @@ class PostgresBackend(BaseBackend):
         self._smallest = min_connections
         self._demanding = threading.Lock()
         self._reserved: dict[object, int] = {}
+        self._settling: list[_Settling] = []
+        self._flushing: asyncio.Task | None = None
+        self._alone = 0
         self._sizes = self._wanted()
         self._pool = self._new_pool()
 
@@ -858,6 +866,10 @@ class PostgresBackend(BaseBackend):
         await sheltered(self._closing)
 
     async def _shut(self) -> None:
+        flushing, self._flushing = self._flushing, None
+        if flushing is not None and not flushing.done():
+            flushing.cancel()
+            await asyncio.wait({flushing})
         waking, self._waking = self._waking, None
         if waking is not None:
             waking.cancel()
@@ -1127,6 +1139,7 @@ class PostgresBackend(BaseBackend):
                         "highs": [mark.fence >> 32 for mark in marks],
                         "lows": [mark.fence & 0xFFFFFFFF for mark in marks],
                         "wait": ENDING_CLAIM_MILLISECONDS,
+                        "bare": BARE_COMMANDS,
                     },
                 )
                 settled = [(row["pid"], row["born"]) for row in rows if row["settled"]]
@@ -1193,7 +1206,8 @@ class PostgresBackend(BaseBackend):
         return [row["id"] for row in rows]
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
-        return await self._changed(
+        return await self._outcome(
+            "success",
             self._queries.complete,
             await self._finishing(job, ExecutionStatus.SUCCESS, None, result=result),
         )
@@ -1209,8 +1223,74 @@ class PostgresBackend(BaseBackend):
             job, execution_status, error, summary=_storable(error.summary), run_at=retry_at
         )
         if retry_at is None:
-            return await self._changed(self._queries.fail, parameters)
-        return await self._requeued(job, self._queries.reschedule, parameters)
+            return await self._outcome("failed", self._queries.fail, parameters)
+        changed = await self._outcome("queued", self._queries.reschedule, parameters)
+        if changed and retry_at <= parameters["now"]:
+            await self._wake({job.queue})
+        return changed
+
+    async def _outcome(self, kind: str, query: str, parameters: dict[str, Any]) -> bool:
+        if not self._settling and self._idle() > self._alone:
+            self._alone += 1
+            try:
+                return await self._changed(query, parameters)
+            finally:
+                self._alone -= 1
+        entry = _Settling(kind, parameters, time.monotonic() + _left())
+        self._settling.append(entry)
+        if self._flushing is None or self._flushing.done():
+            self._flushing = asyncio.get_running_loop().create_task(
+                self._flush(), context=contextvars.Context()
+            )
+        try:
+            return await asyncio.shield(entry.future)
+        except BaseException:
+            entry.future.add_done_callback(_settled)
+            if not entry.sent and entry in self._settling:
+                self._settling.remove(entry)
+            raise
+
+    async def _flush(self) -> None:
+        while self._settling and not self._closed:
+            batch: list[_Settling] = []
+            try:
+                async with bounded(max(entry.at for entry in self._settling)):
+                    rows = await self._flushed(batch)
+            except BaseException as error:
+                now = time.monotonic()
+                late = [entry for entry in self._settling if entry.at <= now]
+                for entry in (*batch, *late):
+                    entry.fail(error)
+                self._settling[:] = [entry for entry in self._settling if entry.at > now]
+                if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                continue
+            changed = {row["id"] for row in rows}
+            await self._wake({row["queue"] for row, entry in _matched(rows, batch) if entry.due})
+            for entry in batch:
+                if not entry.future.done():
+                    entry.future.set_result(entry.parameters["id"] in changed)
+        for entry in self._settling:
+            entry.fail(PoolClosed("the backend was closed"))
+        self._settling.clear()
+
+    async def _flushed(self, batch: list[_Settling]) -> list[dict[str, Any]]:
+        for attempt in range(RETRIES):
+            try:
+                if self._orphans:
+                    await self._swept_within()
+                async with self._connection() as connection:
+                    if not batch:
+                        batch.extend(self._settling[:SETTLE_BATCH])
+                        del self._settling[: len(batch)]
+                        for entry in batch:
+                            entry.sent = True
+                    return await _fetch(connection, self._queries.settle_many, _outcomes(batch))
+            except RETRIED_ERRORS as error:
+                if attempt == RETRIES - 1:
+                    raise
+                logger.warning("retrying a postgres statement after %s", error)
+        raise AssertionError("unreachable")
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         now = await self._now()
@@ -1795,7 +1875,7 @@ class PostgresBackend(BaseBackend):
     async def _working(self, pid: int, born: Any, quiet: float, patience: float) -> bool:
         started = time.monotonic()
         budget = max(patience - quiet, _silence(patience))
-        probing = _PROBING.set(True)
+        dropped = _DROPPED.set(True)
         try:
             verdict = await self._asked_pooled(
                 pid, born, quiet, patience, min(PROBE_POOL_SECONDS, budget)
@@ -1807,7 +1887,7 @@ class PostgresBackend(BaseBackend):
                     pid, born, quiet, patience, left if last else PROBE_SECONDS
                 )
         finally:
-            _PROBING.reset(probing)
+            _DROPPED.reset(dropped)
         quiet += time.monotonic() - started
         return quiet < patience if verdict is None else verdict
 
@@ -1894,6 +1974,7 @@ class PostgresBackend(BaseBackend):
                 self._waking = None
 
     async def _send(self, queues: Sequence[str]) -> None:
+        _DROPPED.set(True)
         try:
             await self._rows(
                 self._queries.notify,
@@ -2334,13 +2415,28 @@ class _Pool(AsyncConnectionPool):
         for _ in range(missing):
             self.run_task(AddConnection(self))
 
-    async def _add_connection(self, *args: Any, **kwargs: Any) -> None:
-        if self._stopping:
+    async def _shrink_pool(self) -> None:
+        closing = []
+        async with self._lock:
+            unused = self._nconns_min
+            self._nconns_min = len(self._pool)
+            while self._nconns > self._min_size and unused > 0 and self._pool:
+                closing.append(self._pool.popleft())
+                self._nconns -= 1
+                self._nconns_min -= 1
+                unused -= 1
+        for connection in closing:
+            await self._close_connection(connection)
+
+    async def _add_connection(
+        self, attempt: AttemptWithBackoff | None, growing: bool = False
+    ) -> None:
+        if self._stopping or (attempt is not None and await self._unneeded(growing)):
             return
         context = contextvars.copy_context()
         context.run(_ADDING.set, self)
         adding = asyncio.get_running_loop().create_task(
-            super()._add_connection(*args, **kwargs), context=context
+            super()._add_connection(attempt, growing), context=context
         )
         self._adding.add(adding)
         adding.add_done_callback(self._adding.discard)
@@ -2352,6 +2448,18 @@ class _Pool(AsyncConnectionPool):
             raise
         if not adding.cancelled():
             adding.result()
+
+    async def _unneeded(self, growing: bool) -> bool:
+        async with self._lock:
+            waiting = any(
+                client.conn is None and client.error is None for client in self._waiting
+            )
+            if self._nconns <= self._min_size or waiting:
+                return False
+            self._nconns -= 1
+            if growing:
+                self._growing = False
+            return True
 
     async def stop_connecting(self) -> None:
         self._stopping = True
@@ -2397,7 +2505,11 @@ class _Answering(psycopg.AsyncConnection):
 
     def _exec_command(self, command: Any, *args: Any, **kwargs: Any) -> Any:
         mark = self.mark
-        if mark is not None and not self.closed:
+        if (
+            mark is not None
+            and not self.closed
+            and self.pgconn.server_version >= TAGGED_COMMANDS_VERSION
+        ):
             if isinstance(command, str):
                 command = command.encode(self.pgconn._encoding)
             elif isinstance(command, psycopg.sql.Composable):
@@ -2421,7 +2533,7 @@ class _Answering(psycopg.AsyncConnection):
         try:
             return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
-            if _PROBING.get():
+            if _DROPPED.get():
                 self.pgconn.finish()
             elif self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 await self._stopped(gen)
@@ -2660,6 +2772,58 @@ async def _asking(
         {"pid": pid, "born": born, "seen": row["state_change"], "wait": ENDING_MILLISECONDS},
     )
     return await cursor.fetchone() is None
+
+
+class _Settling:
+    __slots__ = ("kind", "parameters", "at", "future", "sent")
+
+    def __init__(self, kind: str, parameters: dict[str, Any], at: float) -> None:
+        self.kind = kind
+        self.parameters = parameters
+        self.at = at
+        self.future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self.sent = False
+
+    @property
+    def due(self) -> bool:
+        return self.kind == "queued" and self.parameters["run_at"] <= self.parameters["now"]
+
+    def fail(self, error: BaseException) -> None:
+        if self.future.done():
+            return
+        if isinstance(error, asyncio.CancelledError):
+            self.future.cancel()
+        else:
+            self.future.set_exception(error)
+
+
+def _outcomes(batch: list[_Settling]) -> dict[str, Any]:
+    def each(name: str) -> list[Any]:
+        return [entry.parameters.get(name) for entry in batch]
+
+    return {
+        "ids": each("id"),
+        "workers": each("worker"),
+        "claims": each("claims"),
+        "nows": each("now"),
+        "kinds": [entry.kind for entry in batch],
+        "results": each("result"),
+        "summaries": each("summary"),
+        "run_ats": each("run_at"),
+        "execution_statuses": each("execution_status"),
+        "error_types": each("error_type"),
+        "tracebacks": each("traceback"),
+    }
+
+
+def _matched(
+    rows: list[dict[str, Any]], batch: list[_Settling]
+) -> Iterator[tuple[dict[str, Any], _Settling]]:
+    entries = {entry.parameters["id"]: entry for entry in batch}
+    for row in rows:
+        entry = entries.get(row["id"])
+        if entry is not None:
+            yield row, entry
 
 
 async def _fetch(

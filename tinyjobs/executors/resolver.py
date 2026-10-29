@@ -19,13 +19,17 @@ class ExecutorResolver:
         concurrency: int,
         async_concurrency: int | None = None,
         freed: Callable[[], None] | None = None,
+        replacing: bool = False,
     ):
         self._coroutine = CoroutineExecutor(async_concurrency or concurrency)
-        self._thread = ThreadExecutor(concurrency, freed)
+        self._thread = ThreadExecutor(concurrency, freed, replacing=replacing)
 
     @property
     def strays(self) -> int:
         return self._thread.strays
+
+    def stray_names(self) -> list[str]:
+        return self._thread.stray_names()
 
     def resolve(self, task: "Task") -> Executor:
         return self._coroutine if task.is_coroutine else self._thread

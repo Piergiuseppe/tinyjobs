@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import math
 import os
@@ -32,6 +33,7 @@ from tests.support import (
     fork_without_warning,
     later_by,
     race_open_and_close,
+    revealed,
     skewed,
 )
 
@@ -2571,6 +2573,25 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         backend._shut, backend._closing = shut, None
         self.assertEqual([context["message"] for context in failures], [])
 
+    async def test_a_wake_up_cut_at_exit_drops_its_connection_without_a_cancel_request(self):
+        self.backend._queries.notify = (
+            "SELECT pg_catalog.pg_sleep(5), %(channel)s::text, %(queues)s::text[]"
+        )
+        asked: list[int] = []
+
+        async def slow_stop(connection, gen):
+            asked.append(1)
+            await asyncio.sleep(1)
+
+        with mock.patch.object(postgres_backend._Answering, "_stopped", slow_stop):
+            sending = asyncio.ensure_future(self.backend._send(["default"]))
+            await asyncio.sleep(0.3)
+            started = time.monotonic()
+            sending.cancel()
+            await asyncio.wait({sending})
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(asked, [])
+
     async def test_a_failed_wake_up_still_stores_the_job(self):
         self.backend._queries.notify = "SELECT this_is_not_sql("
         job = await self.enqueue()
@@ -2694,19 +2715,6 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await quiet.fail(failed, ERROR, None)
         await quiet.requeue(failed.id)
         self.assertEqual(await self.heard(listener), [])
-
-
-def revealed(error: BaseException) -> str:
-    texts: list[str] = []
-    pending, seen = [error], set()
-    while pending:
-        link = pending.pop()
-        if link is None or id(link) in seen:
-            continue
-        seen.add(id(link))
-        texts.extend((repr(link), str(link), repr(link.args)))
-        pending.extend((link.__cause__, link.__context__))
-    return "\n".join(texts)
 
 
 @requires_postgres
@@ -4995,7 +5003,7 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(backend.get("x"), backend.get("y"))
             frozen.set()
             started = time.monotonic()
-            postgres_backend._PROBING.set(True)
+            postgres_backend._DROPPED.set(True)
             verdict = await backend._asked_pooled(1, None, 20.0, 300.0)
             elapsed = time.monotonic() - started
         self.assertIsNone(verdict)
@@ -5730,6 +5738,7 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
             "get": lambda: backend.get(other.id),
             "setup": backend.setup,
         }
+        [(version,)] = await sql("SELECT current_setting('server_version_num')::int")
         for name, call in calls.items():
             await call()
             pids = [connection.pid for connection in list(backend._pool._pool)]
@@ -5738,7 +5747,50 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(rows, name)
             for (query,) in rows:
-                self.assertTrue(query.startswith("/* tinyjobs "), (name, query))
+                self.assertTrue(
+                    query.startswith("/* tinyjobs ")
+                    or (version < 160000 and query in ("BEGIN", "COMMIT", "ROLLBACK")),
+                    (name, query),
+                )
+
+    async def test_transaction_commands_go_without_the_token_before_postgres_16(self):
+        ours = await self.marked()
+        with mock.patch.object(
+            postgres_backend, "TAGGED_COMMANDS_VERSION", 10**7, create=True
+        ):
+            async with ours.transaction():
+                await ours.execute("SELECT 1")
+        [(query,)] = await sql(
+            "SELECT query FROM pg_stat_activity WHERE pid = %(pid)s", {"pid": ours.pid}
+        )
+        self.assertEqual(query, "COMMIT")
+        async with ours.transaction():
+            await ours.execute("SELECT 1")
+        [(query,)] = await sql(
+            "SELECT query FROM pg_stat_activity WHERE pid = %(pid)s", {"pid": ours.pid}
+        )
+        self.assertEqual(
+            query.startswith("/* tinyjobs "), ours.pgconn.server_version >= 160000, query
+        )
+
+    async def test_our_bare_commit_on_a_backend_holding_our_fence_is_ended(self):
+        ours = await self.marked()
+        await self.unmarked(ours, "BEGIN")
+        await self.unmarked(ours, "COMMIT")
+        self.orphan(ours)
+        await self.backend.get(self.job.id)
+        self.assertEqual(self.backend._orphans, {})
+        self.assertFalse(await self.alive(ours.pid, ours.born))
+
+    async def test_a_bare_commit_on_a_backend_reset_for_another_client_is_not_ended(self):
+        ours = await self.marked()
+        self.orphan(ours)
+        await self.unmarked(ours, "DISCARD ALL")
+        await self.unmarked(ours, "BEGIN")
+        await self.unmarked(ours, "COMMIT")
+        await self.backend.get(self.job.id)
+        self.assertEqual(self.backend._orphans, {})
+        self.assertTrue(await self.alive(ours.pid, ours.born))
 
     async def test_a_backend_that_never_ran_our_statements_is_never_ended(self):
         other, pid, born = await self.session()
@@ -5909,6 +5961,101 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs((await self.backend.get(self.job.id)).status, JobStatus.QUEUED)
 
 @requires_postgres
+class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.prefix = new_prefix()
+        self.addAsyncCleanup(drop, self.prefix)
+
+    async def test_outcomes_waiting_for_a_connection_are_written_in_one_statement(self):
+        from tinyjobs.models import ExecutionError
+        from tinyjobs.status import ExecutionStatus
+
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, max_connections=1, notify=False
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        for _ in range(4):
+            await backend.enqueue(make_job())
+        first, second, third, fourth = await backend.claim(
+            worker_id="w", queues=["default"], limit=4, lease_seconds=60
+        )
+        error = ExecutionError("ValueError", "bad", "Traceback: bad")
+        statements: list[str] = []
+        real = postgres_backend._fetch
+
+        async def counted(connection, query, parameters):
+            statements.append(query)
+            return await real(connection, query, parameters)
+
+        with mock.patch.object(postgres_backend, "_fetch", counted):
+            async with backend._connection():
+                writes = asyncio.gather(
+                    backend.complete(first, b"one"),
+                    backend.complete(second, None),
+                    backend.fail(third, error, None),
+                    backend.fail(fourth, error, time.time() + 60, ExecutionStatus.TIMEOUT),
+                )
+                await asyncio.sleep(0.2)
+            self.assertEqual(await writes, [True, True, True, True])
+        self.assertEqual(statements, [backend._queries.settle_many])
+        stored = [await backend.get(job.id) for job in (first, second, third, fourth)]
+        self.assertEqual(
+            [job.status for job in stored],
+            [JobStatus.SUCCESS, JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.QUEUED],
+        )
+        self.assertEqual(stored[0].result_payload, b"one")
+        self.assertEqual((stored[2].last_error, stored[3].last_error), ("ValueError: bad",) * 2)
+        self.assertIsNone(stored[3].worker_id)
+        self.assertIsNotNone(stored[2].finished_at)
+        self.assertIsNone(stored[3].finished_at)
+        histories = [await backend.executions(job.id) for job in (first, third, fourth)]
+        self.assertEqual(
+            [history[-1].status for history in histories],
+            [ExecutionStatus.SUCCESS, ExecutionStatus.FAILED, ExecutionStatus.TIMEOUT],
+        )
+        self.assertEqual(histories[1][-1].traceback, "Traceback: bad")
+        self.assertFalse(await backend.complete(first, b"again"))
+
+
+    async def test_outcomes_ready_at_a_stop_land_together_on_a_slow_link(self):
+        app = TinyJobs(POSTGRES_URL, prefix=self.prefix, max_connections=1)
+        self.addAsyncCleanup(app.aclose)
+        await app.ready()
+        backend = app.backend._inner
+        hooked: list[str] = []
+
+        @app.task
+        async def steady(i):
+            await asyncio.sleep(1.0)
+
+        @app.on_job_success
+        def noted(job, *rest):
+            hooked.append(job.id)
+
+        jobs = [await steady.aenqueue(i) for i in range(4)]
+        real = postgres_backend._fetch
+        outcomes = {backend._queries.complete, getattr(backend._queries, "settle_many", None)}
+
+        async def slow(connection, query, parameters):
+            if query in outcomes:
+                await asyncio.sleep(0.7)
+            return await real(connection, query, parameters)
+
+        worker = app.worker(concurrency=4, handle_signals=False, shutdown_timeout=3.0)
+        with mock.patch.object(postgres_backend, "_fetch", slow):
+            runner = asyncio.create_task(worker.start())
+            while JobStatus.QUEUED in [(await app.aget(job.id)).status for job in jobs]:
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.3)
+            worker.stop()
+            await asyncio.wait_for(runner, 15)
+        statuses = [(await app.aget(job.id)).status for job in jobs]
+        self.assertEqual(statuses, [JobStatus.SUCCESS] * 4)
+        self.assertEqual(sorted(hooked), sorted(job.id for job in jobs))
+
+
+@requires_postgres
 class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.prefix = new_prefix()
@@ -5968,6 +6115,37 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.3)
             self.assertEqual(backend._pool.get_stats()["pool_size"], 2)
         backend.reserve(self, -1)
+
+    async def test_idle_connections_above_the_minimum_are_given_back_together(self):
+        with mock.patch.object(postgres_backend, "MAX_IDLE_SECONDS", 0.4):
+            backend = await self.open(min_connections=1)
+        async with contextlib.AsyncExitStack() as stack:
+            for _ in range(5):
+                await stack.enter_async_context(backend._pool.connection())
+        self.assertEqual(backend._pool.get_stats()["pool_size"], 5)
+        await asyncio.sleep(1.3)
+        self.assertEqual(backend._pool.get_stats()["pool_size"], 1)
+
+    async def test_a_failed_connection_nobody_waits_for_any_more_is_not_retried(self):
+        backend = await self.open(min_connections=1, max_connections=3)
+        pool = backend._pool
+        attempts: list[float] = []
+
+        async def refused(*args, **kwargs):
+            attempts.append(time.monotonic())
+            raise psycopg.OperationalError("refused")
+
+        with mock.patch.object(pool, "_connect", refused):
+            async with pool.connection():
+                with self.assertRaises(PoolTimeout):
+                    await pool.getconn(timeout=0.2)
+                await asyncio.sleep(2.5)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(pool.get_stats()["pool_size"], 1)
+        self.assertFalse(pool._growing)
+
+    async def test_a_pool_gives_back_idle_connections_within_seconds(self):
+        self.assertLessEqual(postgres_backend.MAX_IDLE_SECONDS, 10.0)
 
     async def test_one_worker_stopping_leaves_the_others_on_its_app_as_they_were(self):
         app = TinyJobs(POSTGRES_URL, prefix=self.prefix)

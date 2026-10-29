@@ -423,9 +423,11 @@ Two things are worth knowing before you hit them:
 **Timeouts on sync tasks are advisory.** You can't kill a running Python thread. When a threaded task
 exceeds its timeout the job is marked failed and the worker moves on, but the thread keeps going until
 the function returns. That thread counts against `concurrency` until it does, so the worker claims
-one job fewer and never holds a job it has no thread for, and a warning names the task. The timeout
-counts from when the job's thread starts, so a job is never failed before it runs. Pass timeouts to
-the library you are calling, or write the task as `async def` where cancellation actually works.
+one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
+an eager call runs the next job beside it instead, and the process exits without waiting for it.
+The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
+timeouts to the library you are calling, or write the task as `async def` where cancellation actually
+works.
 
 **Arguments are serialized as JSON**, extended with tags for `datetime`, `date`, `Decimal`, `UUID`,
 `Path`, `set`, `tuple`, `bytes` and non-string dict keys. Pickle is available behind
@@ -567,7 +569,10 @@ with `client_encoding` `SQL_ASCII` is refused too. In Django, add
 
 Each process holds at most 10 connections (`max_connections=`), whatever its workers run, plus one
 for `LISTEN`, and opens a short-lived one to ask about a
-statement silent for ten seconds when none is idle. Every statement times out after 30 seconds
+statement silent for ten seconds when none is idle, so size the server's `max_connections` or the
+PgBouncer pool at 12 per process. Connections beyond the minimum go back after ten idle seconds:
+two workers behind a PgBouncer pool of 20 hand the app a server within 20 seconds of a burst,
+where they used to hold all 20 and keep asking for more. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
 connections are named `tinyjobs` in `pg_stat_activity`. The tables and their schema must belong to
 the connecting role or a role that can become it (`SET` on Postgres 16 and later), every role that
@@ -741,7 +746,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1493 tests, no test dependencies. The one that matters most is
+1509 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

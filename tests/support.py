@@ -756,3 +756,16 @@ class LoopBoundAppCases:
         asyncio.run(self.app.aclose())
         own.join(5)
         self.assertFalse(own.is_alive())
+
+
+def revealed(error: BaseException) -> str:
+    texts: list[str] = []
+    pending, seen = [error], set()
+    while pending:
+        link = pending.pop()
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        texts.extend((repr(link), str(link), repr(link.args)))
+        pending.extend((link.__cause__, link.__context__))
+    return "\n".join(texts)
