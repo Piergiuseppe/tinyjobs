@@ -639,11 +639,13 @@ that holds it now. A plugin gets `worker_id` only when its `heartbeat` names tha
 older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it.
 `heartbeat` returns the ids whose lease it renewed; a job missing from that answer, and not already
 recording its outcome, is logged once as no longer held, by id, and left out of later heartbeats. A
-heartbeat that runs out of time or hits a transient error is a one-line warning, not a traceback.
+heartbeat or a claim that runs out of time or hits a transient error is a one-line warning, not a
+traceback.
 An answer that is not a collection of ids, such as a plugin's count, is logged once and the worker
 keeps beating without tracking lost leases; a count used to end the heartbeats silently. A heartbeat
 unanswered after a quarter of the lease is joined by a second one, without cutting the first, and
-the two get until the lease they renew would lapse. A cut call costs Redis its connection, and a
+the two get until the lease they renew would lapse: with the first call of every heartbeat never
+answering, the second renewed the lease with no warning. A cut call costs Redis its connection, and a
 fresh one three round trips more, so on a slow link one late heartbeat used to make every later one
 late too.
 On Redis over a link adding 300 ms each way, with a 6 second lease and eight jobs at a time, 218
@@ -761,8 +763,10 @@ Every machine keeps Redis's time. The app's default clock is a `FollowingClock`:
 has read Redis's `TIME`, `now()` is that reading plus the time elapsed since, counted on a clock that
 never steps and keeps counting through a suspend (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on
 macOS). A step of the wall clock therefore changes nothing, whether it lands between two calls or
-during a reading. The backend reads `TIME` again on its first call after thirty seconds, after a
-connection error, and when the wall clock and the elapsed clock disagree by half a second. Only the
+during a reading. The backend reads `TIME` again before a call goes on after a connection error or
+when the wall clock and the elapsed clock disagree by half a second. A reading thirty seconds old,
+or one whose round trip was slow, is read again beside the call that finds it due, which goes on
+with the reading it has, and one a minute old before the call. Only the
 `TIME` command itself is timed, on a connection already taken from the pool and opened. A reading
 whose round trip took more than half a second only renews the reading held when the two agree
 within half that round trip plus a quarter of a second; when they do not, it is taken, and either
@@ -774,8 +778,8 @@ it. A following host marks its `now` with a `~`, and for it the scripts read `TI
 reaper takes the earlier of the two, so it never reaps by a time ahead of Redis's, and a claim or a
 heartbeat stamps the later of the two lease ends, so no lease is written to end before Redis says it
 should. Everything else written in that moment, a delayed `run_at` or a cron slot, is off by the
-stale reading until the next one, at most thirty seconds later; the app also reads again before it
-builds a job whenever a reading is due. The one thing a following host cannot survive is Redis's own
+stale reading until the next one, at most a minute later; the app also reads again before it
+builds a job whenever the reading is not to be trusted. The one thing a following host cannot survive is Redis's own
 time jumping ahead, as after a failover to a node whose clock is ahead: every lease stamped before
 the jump by more than its length looks expired and is reaped, so its job runs again, or fails when it
 has no attempts left. Redis's nodes therefore stay on NTP.
@@ -805,7 +809,11 @@ apps on two servers whose times differ by more than a second raises instead of m
 - **A bounded pool that waits.** redis-py 8 caps its pool at 100 and raises `MaxConnectionsError` the
   moment a caller finds it full, which turned half of 200 concurrent `aenqueue()` calls into errors.
   The backend uses a blocking pool of the same size instead, so 400 concurrent requests to a FastAPI
-  endpoint all succeeded, and a caller only fails after `pool_timeout`.
+  endpoint all succeeded, and a caller only fails after `pool_timeout`. redis-py 5.0.1 connects while
+  holding that pool's lock, so a call cancelled mid-connect held it until `pool_timeout` (2.00 s in
+  the test, 20 s by default), stalled every other call, and kept its connection counted as in use.
+  On 5.0.1 the backend swaps in the 5.0.2 acquire, which connects outside the lock: the cancel
+  returns at once and the connection goes back.
 
 ---
 
@@ -971,7 +979,9 @@ buffers and 4 ms.
 ### Time
 
 As on Redis, every machine follows the server's clock: the backend reads `clock_timestamp()` on
-setup, every thirty seconds and after a connection error, and the statements that decide by time
+setup and after a connection error, and again every thirty seconds beside a call while the pool has
+a second idle connection and no worker on it is stopping, so the reading never takes the connection
+a release needs, or before the call once the reading is a minute old; the statements that decide by time
 compare against the earlier of the caller's `now` and `statement_timestamp()`. A claim or a heartbeat
 stamps the later of the two lease ends. So a host on a stale reading never reaps a live lease and
 never writes one that ends too soon.
@@ -981,7 +991,9 @@ never writes one that ends too soon.
 Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
 `pg_notify` with the queue as payload, cut to its first 1,000 characters so it stays under
 Postgres's limit, at most once per queue every 50 ms; a burst sends one notification and a trailing
-one. A caller with a deadline does not wait for the notification, which is sent on its own: at a
+one. A queue with a trailing notification pending waits for it rather than sending its own: 30
+enqueues 4.4 ms apart sent 5 notifications, two of them 3 ms apart, and now send 4, 50 ms apart.
+A caller with a deadline does not wait for the notification, which is sent on its own: at a
 600 ms round trip a release of eight jobs under a one second deadline returned after 0.61 seconds,
 where waiting for the notification took it past the deadline and the worker logged them unreleased
 though they were queued. The channel is `tinyjobs_` and a hash of the instance id, which always fits in a channel name.
@@ -989,7 +1001,10 @@ So every spelling of one store, by `schema=` or by `search_path`, shares one cha
 never do. Each worker process holds one extra
 connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
 unless it claimed since. A lost listening connection is reopened within a second, and every reopen
-wakes the workers once, since notifications sent meanwhile are gone. A server
+wakes the workers once, since notifications sent meanwhile are gone. Closing while its `LISTEN` is still on
+the way closes that connection instead of sending a cancel, which psycopg waits five seconds for:
+over a link adding 300 ms each way, workers stopped right after going idle used to log a failed
+cancel five seconds after they stopped. A server
 `idle_session_timeout` closes an idle listener too, and it reopens the same way; idle pooled
 connections it closes are replaced, and `psycopg_pool` logs a warning for each. Polling stays as the fallback, so
 `notify=False` or a dropped notification costs latency, never a job.
@@ -1030,7 +1045,9 @@ transaction, through `sync_to_async(thread_sensitive=True)`.
 ### Connections
 
 Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_connections=`), plus the
-listening one. Every pooled connection is set to read committed, a 30 second `statement_timeout` and
+listening one. While workers run on it, the pool grows to their concurrency plus three connections
+each, unless `max_connections=` is given: with three workers of 16 jobs on a link adding 300 ms each
+way, 300 jobs ran without a failed claim, where each worker used to log one with its traceback. Every pooled connection is set to read committed, a 30 second `statement_timeout` and
 a one minute `idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
 trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
 call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
@@ -1087,10 +1104,21 @@ deadline or cancelled sends the server a cancel request and waits for the statem
 within half a second once the deadline has passed. A backend whose stop is not confirmed in that
 time has its connection closed and is ended with `pg_terminate_backend`, matched by process id and
 start time, before the next statement this backend sends, so a statement left waiting on a lock
-never applies afterwards. It is ended only while it runs, as the login role, a statement that
-started before the cut, measured on the server's clock; behind PgBouncer a backend whose statement
-ended may already serve another client, so one gone idle or running a later statement is
-forgotten instead. A claim delayed on its way is then handed back by the sweep of unanswered claims.
+never applies afterwards. Every statement tinyjobs sends on a pooled connection starts with a
+comment carrying a secret random token of that connection, `/* tinyjobs <token> */`, first so
+`track_activity_query_size` never cuts it, and the same for every statement so prepared statements
+still work; each pooled connection also holds a session advisory lock on a secret random key. A
+backend is ended, as the login role and in the same statement that looks, only while its current or
+last statement carries the token, whatever its state and whenever it arrived: running, idle with the
+statement still on its way, or a statement that reached the server after the cut. Where the role
+sees no statement text, with `track_activities` off, the lock stands in for the token. Nothing else
+runs our token or holds our lock, and PgBouncer's reset (`DISCARD ALL`) drops the lock before it
+hands the backend to another client, whose statements carry no token, so another client is never
+ended; neither clock takes part. Through a proxy that delivered the statement three seconds late,
+past the cut, onto a row lock, the statement was ended and the job stayed `running`, where it used to
+land as `success` once the lock was let go; through a session pooler that handed our backend to
+another process, that process's three second statement ran to its end. A claim delayed on its way
+is then handed back by the sweep of unanswered claims.
 The next statement waits for a pass already running rather than going ahead of it, and a backend
 not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
@@ -1117,8 +1145,10 @@ child opens its own.
 
 ### Where the limits are
 
-- **Behind PgBouncer, session pooling only.** Each connection is configured once when opened, and
-  the listener needs a session of its own. Transaction pooling would lose both.
+- **Behind PgBouncer, session pooling only, with its default `server_reset_query`.** Each connection
+  is configured once when opened, and the listener needs a session of its own. Transaction pooling
+  would lose both, and without the reset a backend could reach another client still holding our
+  lock and our last statement, which is what marks it as ours.
 - **A held snapshot stops the cleanup.** A transaction left open anywhere on the server, or a
   replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
   jobs table bloats until it ends.
@@ -1324,7 +1354,9 @@ async tasks, overridable with `--async-concurrency` when the default does not fi
 **A running Python thread cannot be killed.** There is no safe interrupt for arbitrary code; the
 CPython APIs that come close corrupt interpreter state. So for a sync task in a thread pool, a timeout
 can only mark the job `TIMEOUT` and move on. The thread keeps running until the function returns, and
-it keeps occupying a pool slot.
+it keeps occupying a pool slot. The timeout counts from when the thread starts, so a job waiting
+for a free thread behind one that timed out is never recorded as timed out before it ran: it used to
+be failed with `TIMEOUT` while queued and then run anyway, and with retries left it ran again.
 
 This catches people out, so, plainly:
 
@@ -1346,13 +1378,17 @@ statement stopped on the server. Anything still running is then released back to
 call for all of them, a single round trip on Redis, so another worker picks it up immediately rather than waiting for the lease to
 expire; a release that has not landed when the timeout ends is left to its lease. With the server
 cut off and `--shutdown-timeout 3`, the worker returned 3.0 seconds after the signal and the process
-exited after 4.6, the rest spent closing the app: half a second for the cancel of the release cut
-at the deadline and a second for the pool, which waits that long for connections still being
-opened; it took 9.6 before, and under uvicorn with `shutdown_timeout=5` 6.2 rather than 12.2. A
+exited after 3.1; it took 9.6 before, and under uvicorn with `shutdown_timeout=5` 6.2 rather than
+12.2. Closing ends a connection still being opened at once rather than waiting for it: over a link
+adding 300 ms each way, closing while one was being opened took under 0.01 seconds with nothing
+logged, where it took 1.0 and `psycopg_pool` logged that it could not stop its task. A
 backend that went silent is not asked to end what it left behind at close; one that still answers
-gets half a second a pass for it. Over a link
-that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on Postgres and on
-Redis, where seven of them used to be left `running` until their lease ran out. A second `SIGINT`
+gets half a second a pass for it. Once the stop is
+asked the backend opens spare connections for the releases unless two sit idle, the heartbeat stops renewing the jobs
+about to be released, and a clock reading that falls due is taken beside a call rather than before
+it. Over a link that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on
+Postgres and on Redis, with the worker back after 1.61 seconds, where every run used to log all
+eight unreleased and Redis left them `running` until their lease ran out. A second `SIGINT`
 ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
 the second signal with the server cut off, where it took 6.6.
 
@@ -1367,7 +1403,11 @@ cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 
 A job running in a thread cannot be stopped, and releasing it would let another worker run it while
 the thread still does. So at shutdown the worker leaves such a job running instead: it keeps its
 lease renewed, records its outcome when the thread returns, within the release share of the timeout
-from that moment, and returns after that. A second signal does not change this: it ends the wait at
+from that moment, and returns after that. It keeps the job as soon as the jobs' share ends, so a
+thread that returns while another job's cleanup still holds the wait is recorded too: beside such a
+job it ended `success`, where it used to stay `running`. A drain does the same: stopped while its
+job runs in a thread, it waits for the thread and records the outcome, where it used to release the
+job, which another worker then claimed while the thread still ran it. A second signal does not change this: it ends the wait at
 once and keeps such a job the same way, where its thread used to be waited for under the cut
 deadline, so its outcome was given up and the job ran again; with `SIGTERM` then `SIGINT` the job now
 ran once and was recorded. A `def` job still queued in the thread pool behind a busy thread is taken
@@ -1697,7 +1737,11 @@ waiter takes over; a Redis connection is made on the facade's loop and finishes 
 backend made in that race is closed, as is one whose `setup()` fails. An `asyncio.Lock` did this
 before, and it belongs to one loop: two loops connecting at once deadlocked in every trial, and four
 loops racing four threads hung all of them. With the election, 0 of 100 such trials fail on SQLite
-and 0 of 50 on Redis.
+and 0 of 50 on Redis. A connection that never reaches the app's loop, because a close retired that
+loop or cancelled the caller first, ends its election too, so the next caller connects. A 3 s race
+of seven callers hit that 16 to 59 times; the election used to stay open, and when the loop kept
+running every later caller waited on it: on Python 3.14 against a disk-synced Postgres, 1 race in
+69 left all seven stuck until the app was closed, and 0 in 80 do now.
 
 Calling a synchronous method from inside a running loop raises `SynchronousCallInsideEventLoopError`
 and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's

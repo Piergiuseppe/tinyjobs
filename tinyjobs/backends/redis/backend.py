@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import inspect
+import logging
 from typing import Any, Awaitable, Sequence, TypeVar
 
-from redis.asyncio import BlockingConnectionPool, Redis
+from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
@@ -38,6 +41,10 @@ DEFAULT_POOL_TIMEOUT = 20.0
 SCHEMA_VERSION = 2
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
+CLOCK_SECONDS = 5.0
+SPARE_CONNECTIONS = 2
+
+logger = logging.getLogger("tinyjobs.redis")
 
 T = TypeVar("T")
 
@@ -62,10 +69,12 @@ class RedisBackend(BaseBackend):
         prefix: str = DEFAULT_PREFIX,
         clock: Clock | None = None,
     ) -> None:
+        _mend(client.connection_pool)
         self._client = client
         self._clock = FollowingClock() if clock is None else clock
         self._reading = asyncio.Lock()
         self._read = False
+        self._refreshing: asyncio.Task | None = None
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -99,7 +108,27 @@ class RedisBackend(BaseBackend):
             )
 
     async def close(self) -> None:
+        refreshing, self._refreshing = self._refreshing, None
+        if refreshing is not None and not refreshing.done():
+            refreshing.cancel()
+            await asyncio.wait({refreshing})
         await self._client.aclose()
+
+    async def spare(self) -> None:
+        client = self._client
+        await client.initialize()
+        if client.connection is not None:
+            return
+        pool = client.connection_pool
+        taken = await asyncio.gather(
+            *(_acquire(pool) for _ in range(SPARE_CONNECTIONS)), return_exceptions=True
+        )
+        for connection in taken:
+            if not isinstance(connection, BaseException):
+                await pool.release(connection)
+        for connection in taken:
+            if isinstance(connection, BaseException):
+                raise connection
 
     async def enqueue(self, job: Job) -> Job:
         return (await self.enqueue_many([job]))[0]
@@ -353,12 +382,40 @@ class RedisBackend(BaseBackend):
 
     async def _now(self) -> float:
         clock = self._clock
-        if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
+        if not isinstance(clock, FollowingClock):
+            return clock.now()
+        if self._read and clock.trusted and not clock.overdue():
+            if clock.due() and not self._reading.locked():
+                self._refresh()
+            return clock.now()
+        if not self._read or not clock.trusted or clock.due():
             async with self._reading:
-                if not self._read or clock.due():
-                    clock.follow(*await self._forgetting(self._timed()), self._server())
-                    self._read = True
+                if not self._read or not clock.trusted or clock.due():
+                    await self._follow(clock)
         return clock.now()
+
+    async def _follow(self, clock: FollowingClock) -> None:
+        clock.follow(*await self._forgetting(self._timed()), self._server())
+        self._read = True
+
+    def _refresh(self) -> None:
+        if self._refreshing is None or self._refreshing.done():
+            self._refreshing = asyncio.create_task(
+                self._refreshed(), name="tinyjobs-redis-clock", context=contextvars.Context()
+            )
+
+    async def _refreshed(self) -> None:
+        clock = self._clock
+        if not isinstance(clock, FollowingClock):
+            return
+        async with self._reading:
+            if not clock.due():
+                return
+            try:
+                async with asyncio.timeout(CLOCK_SECONDS):
+                    await self._follow(clock)
+            except (RedisConnectionError, RedisTimeoutError, TimeoutError) as error:
+                logger.debug("could not read the server clock: %s", error)
 
     async def _timed(self) -> tuple[float, float, float]:
         client = self._client
@@ -447,6 +504,47 @@ class RedisBackend(BaseBackend):
         if queue is not None:
             return self._keys("index", "queue", queue)
         return self._keys("index", "all")
+
+
+class _Unwedged:
+    async def get_connection(self, command_name: Any = None, *keys: Any, **options: Any) -> Any:
+        pool: Any = self
+        try:
+            async with asyncio.timeout(pool.timeout):
+                async with pool._condition:
+                    await pool._condition.wait_for(pool.can_get_connection)
+                    connection = _take(pool)
+        except TimeoutError as error:
+            raise RedisConnectionError("No connection available.") from error
+        try:
+            await pool.ensure_connection(connection)
+        except BaseException:
+            await pool.release(connection)
+            raise
+        return connection
+
+
+def _take(pool: Any) -> Any:
+    try:
+        connection = pool._available_connections.pop()
+    except IndexError:
+        connection = pool.make_connection()
+    pool._in_use_connections.add(connection)
+    return connection
+
+
+@functools.cache
+def _unwedged(kind: type) -> type:
+    return type(kind.__name__, (_Unwedged, kind), {})
+
+
+def _mend(pool: Any) -> None:
+    if "get_available_connection" in vars(ConnectionPool):
+        return
+    if not isinstance(pool, BlockingConnectionPool):
+        return
+    if type(pool).get_connection is BlockingConnectionPool.get_connection:
+        pool.__class__ = _unwedged(type(pool))
 
 
 async def _acquire(pool: Any) -> Any:

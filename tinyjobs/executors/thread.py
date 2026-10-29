@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from contextvars import copy_context
 from functools import partial
 from typing import Any, TYPE_CHECKING
@@ -27,8 +29,13 @@ class ThreadExecutor(Executor):
         self._threaded: dict[asyncio.Task | None, Future] = {}
 
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
+        loop = asyncio.get_running_loop()
+        started: asyncio.Future[float] = loop.create_future()
         call = partial(
-            copy_context().run, task.function, *payload.args, **payload.kwargs
+            _started,
+            loop,
+            started,
+            partial(copy_context().run, task.function, *payload.args, **payload.kwargs),
         )
         try:
             running = self._pool.submit(call)
@@ -40,8 +47,17 @@ class ThreadExecutor(Executor):
             future = asyncio.wrap_future(running)
             if task.timeout is None:
                 return await future
-            return await asyncio.wait_for(sheltered(future), task.timeout)
+            try:
+                await asyncio.wait({future, started}, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                running.cancel()
+                raise
+            if future.done():
+                return future.result()
+            left = started.result() + task.timeout - time.monotonic()
+            return await asyncio.wait_for(sheltered(future), max(0.0, left))
         finally:
+            started.cancel()
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
 
@@ -53,3 +69,15 @@ class ThreadExecutor(Executor):
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _started(loop: asyncio.AbstractEventLoop, started: asyncio.Future, call: Any) -> Any:
+    began = time.monotonic()
+    with suppress(RuntimeError):
+        loop.call_soon_threadsafe(_began, started, began)
+    return call()
+
+
+def _began(started: asyncio.Future, began: float) -> None:
+    if not started.done():
+        started.set_result(began)

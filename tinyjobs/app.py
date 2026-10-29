@@ -235,10 +235,14 @@ class TinyJobs:
         except Exception as error:
             self._settle(attempt, error)
             raise
-        if raw.capabilities.loop_bound:
-            await self._connect_on_own_loop(raw, attempt)
-        else:
-            await self._attempt(raw, attempt)
+        try:
+            if raw.capabilities.loop_bound:
+                await self._connect_on_own_loop(raw, attempt)
+            else:
+                await self._attempt(raw, attempt)
+        except BaseException:
+            self._settle(attempt, None)
+            raise
 
     async def _elect(self) -> concurrent.futures.Future | None:
         while True:

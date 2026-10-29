@@ -104,6 +104,7 @@ class Worker:
         self._writing = Deadline()
         self._admitting = Deadline()
         self._beating = Deadline()
+        self._sparing: asyncio.Task | None = None
 
     @property
     def id(self) -> str:
@@ -135,14 +136,23 @@ class Worker:
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
         self._app.attach(self)
+        expected = self._expect(self._concurrency)
         try:
             await self._serve()
         finally:
+            expected()
             closing = self._app.detach(self)
             self._prepare_run()
             self._finished.set()
             if closing:
                 await self._app.aclose()
+
+    def _expect(self, count: int):
+        expect = getattr(self._app.backend, "expect", None)
+        if expect is None:
+            return lambda: None
+        expect(count)
+        return partial(expect, -count)
 
     async def _serve(self) -> None:
         watcher = ShutdownWatcher(self._request_stop, self._request_force)
@@ -187,6 +197,9 @@ class Worker:
                     task.cancel()
                 await asyncio.gather(*heartbeat, return_exceptions=True)
                 watcher.uninstall()
+                if self._sparing is not None:
+                    self._sparing.cancel()
+                    await asyncio.gather(self._sparing, return_exceptions=True)
                 self._executors.shutdown()
                 logger.info("worker %s stopped", self._id)
 
@@ -224,6 +237,12 @@ class Worker:
         except AppClosedError:
             logger.info("the app was closed; worker %s is stopping", self._id)
             self._request_stop()
+            return []
+        except (TimeoutError, *self._transient) as error:
+            logger.warning(
+                "claim got no answer in time (%s); backing off", str(error) or type(error).__name__
+            )
+            await self._pause(self._interval.next())
             return []
         except Exception:
             logger.exception("claim failed; backing off")
@@ -429,7 +448,13 @@ class Worker:
         while True:
             await asyncio.sleep(max(0.0, asked + self._beat_seconds - time.monotonic()))
             asked = time.monotonic()
-            beaten = [key for key in self._inflight if key not in self._lost]
+            releasing = self._admitting.left() <= 0
+            kept = {run.key for run in self._running.values() if run.kept}
+            beaten = [
+                key
+                for key in self._inflight
+                if key not in self._lost and (not releasing or key in kept)
+            ]
             job_ids = list({job_id for job_id, _ in beaten})
             if not job_ids:
                 renewed = asked
@@ -580,6 +605,7 @@ class Worker:
             thread = self._executors.keeps(task)
             if thread is not None:
                 stuck[task] = thread
+                self._keep(task, thread)
             elif self._settling.get(run.key) is False:
                 settling.add(task)
             else:
@@ -637,16 +663,17 @@ class Worker:
             len(stuck),
             self._id,
         )
-        loop = asyncio.get_running_loop()
-        window = _release_window(self._configured_shutdown_timeout)
-        for task, thread in stuck.items():
-            run = self._running.get(task)
-            if run is None:
-                continue
-            run.deadline.outer = None
-            run.last.outer = None
-            thread.add_done_callback(partial(_ended_by, loop, run, window))
         await asyncio.gather(*stuck, return_exceptions=True)
+
+    def _keep(self, task: asyncio.Task, thread: Any) -> None:
+        run = self._running.get(task)
+        if run is None or run.kept:
+            return
+        run.kept = True
+        run.deadline.outer = None
+        run.last.outer = None
+        window = _release_window(self._configured_shutdown_timeout)
+        thread.add_done_callback(partial(_ended_by, asyncio.get_running_loop(), run, window))
 
     async def _wait_for(self, event: asyncio.Event) -> None:
         waiters = [
@@ -699,6 +726,30 @@ class Worker:
             self._writing.end(now + timeout - min(VERIFY_SECONDS, window / 2))
         (self._ending if ending is None else ending).end(now + timeout)
         (self._stopping if stopping is None else stopping).set()
+        if (ending is None or ending is self._ending) and self._sparing is None:
+            self._spare()
+
+    def _spare(self) -> None:
+        try:
+            backend = self._app.backend
+            asyncio.get_running_loop()
+        except (BackendNotReadyError, RuntimeError):
+            return
+        spare = getattr(backend, "spare", None)
+        if spare is None:
+            return
+        context = contextvars.copy_context()
+        context.run(current.set, self._ending)
+        self._sparing = asyncio.create_task(
+            self._spared(spare), name="tinyjobs-spare", context=context
+        )
+
+    async def _spared(self, spare: Any) -> None:
+        try:
+            async with bounded(self._admitting.at):
+                await spare()
+        except Exception as error:
+            logger.debug("could not open a spare connection for the releases: %s", error)
 
     def _request_force(self) -> None:
         logger.warning("second signal received; exiting now")
@@ -709,7 +760,11 @@ class Worker:
         self._writing.end(now + RELEASE_SECONDS / 2)
         self._ending.end(now + RELEASE_SECONDS)
         for task, run in tuple(self._running.items()):
-            if self._settling.get(run.key) is False or self._executors.keeps(task):
+            if self._settling.get(run.key) is False:
+                continue
+            thread = self._executors.keeps(task)
+            if thread is not None:
+                self._keep(task, thread)
                 continue
             task.cancel()
 
@@ -719,12 +774,13 @@ def _release_window(timeout: float) -> float:
 
 
 class _Run:
-    __slots__ = ("key", "deadline", "last")
+    __slots__ = ("key", "deadline", "last", "kept")
 
     def __init__(self, key: tuple[str, int], deadline: Deadline, last: Deadline) -> None:
         self.key = key
         self.deadline = deadline
         self.last = last
+        self.kept = False
 
     def close(self, window: float) -> None:
         now = time.monotonic()

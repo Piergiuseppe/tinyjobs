@@ -1182,6 +1182,25 @@ class ClosedAppTests(BackendTestCase):
         self.assertEqual(self.app.run_sync(drain.run, name="drain"), 0)
         self.assertEqual(job.refresh().status, JobStatus.QUEUED)
 
+    def test_a_drain_stopped_while_a_thread_runs_its_job_records_the_outcome(self):
+        from tinyjobs.worker.drain import Drain
+
+        running = threading.Event()
+
+        @self.app.task(name="transfer")
+        def transfer():
+            running.set()
+            time.sleep(0.8)
+            return "sent"
+
+        job = transfer.enqueue()
+        drain = Drain(self.app, shutdown_timeout=0.1)
+        threading.Thread(target=lambda: (running.wait(5), drain.stop())).start()
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            self.app.run_sync(drain.run, name="drain")
+        self.assertEqual(job.refresh().status, JobStatus.SUCCESS)
+        self.assertTrue(any("cannot be stopped" in line for line in logs.output))
+
     def test_a_drain_runs_again_after_it_finished(self):
         from tinyjobs.worker.drain import Drain
 

@@ -216,9 +216,11 @@ def race_open_and_close(case: unittest.TestCase, app: TinyJobs, seconds: float =
         for caller in callers:
             caller.start()
         for caller in callers:
-            caller.join(30)
+            caller.join(max(0.0, deadline + 30 - time.monotonic()))
+        stuck = [caller.name for caller in callers if caller.is_alive()]
         app.close()
         gc.collect()
+    case.assertEqual(stuck, [])
     case.assertEqual(unexpected, [])
 
 
@@ -695,6 +697,35 @@ class LoopBoundAppCases:
             for thread in threads:
                 thread.join(10)
         self.assertEqual(unexpected, [])
+
+    def test_a_connection_that_never_reached_its_loop_lets_the_next_caller_connect(self):
+        import tinyjobs.app as app_module
+        from tinyjobs.exceptions import EventLoopStoppedError
+
+        real = app_module.run_on
+        refused: list[str] = []
+
+        async def refusing(loop, coroutine, name):
+            if name == "connect" and not refused:
+                refused.append(name)
+                coroutine.close()
+                raise EventLoopStoppedError("the loop stopped")
+            return await real(loop, coroutine, name)
+
+        async def connect_twice() -> None:
+            with self.assertRaises(EventLoopStoppedError):
+                await self.app.ready()
+            try:
+                async with asyncio.timeout(5):
+                    await self.handler.aenqueue(1)
+            except TimeoutError:
+                self.app._connecting = None
+                raise
+
+        with mock.patch.object(app_module, "run_on", refusing):
+            asyncio.run(connect_twice())
+        self.assertEqual(refused, ["connect"])
+        self.assertEqual(self.app.counts()["queued"], 1)
 
     def test_closing_during_the_first_connection_does_not_hang_a_caller(self):
         import threading

@@ -334,18 +334,82 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         await backend.reap_expired()
         self.assertEqual(reads, [])
 
-    async def test_the_clock_is_read_again_once_it_is_old(self):
+    async def slow_reads(self, backend) -> list:
+        reads: list = []
+        original = backend._time
+
+        async def slow(connection):
+            reads.append(1)
+            await asyncio.sleep(1.0)
+            return await original(connection)
+
+        backend._time = slow
+        return reads
+
+    async def test_an_old_clock_is_read_again_beside_the_call_that_found_it_old(self):
+        from tinyjobs.backends.redis import backend as module
         from tinyjobs.clock import FOLLOW_SECONDS
 
         backend = await self.open()
-        reads = await self.counted_reads(backend)
+        reads = await self.slow_reads(backend)
         await backend.reap_expired()
         self.assertEqual(reads, [])
-        from tinyjobs.backends.redis import backend as module
-
         with later_by(FOLLOW_SECONDS + 1, module):
+            started = time.monotonic()
             await backend.reap_expired()
+            self.assertLess(time.monotonic() - started, 0.5)
+            await backend._refreshing
+            self.assertFalse(backend._clock.due())
         self.assertEqual(reads, [1])
+
+    async def test_a_clock_left_unread_for_too_long_is_read_before_the_call_goes_on(self):
+        from tinyjobs.backends.redis import backend as module
+        from tinyjobs.clock import FOLLOW_SECONDS
+
+        backend = await self.open()
+        reads = await self.slow_reads(backend)
+        with later_by(2 * FOLLOW_SECONDS + 1, module):
+            started = time.monotonic()
+            await backend.reap_expired()
+            self.assertGreater(time.monotonic() - started, 1.0)
+        self.assertEqual(reads, [1])
+
+    async def test_a_stop_leaves_spare_connections_open_for_the_releases(self):
+        from tinyjobs.backends.redis.backend import SPARE_CONNECTIONS
+
+        backend = await self.open()
+        pool = backend._client.connection_pool
+        await backend.spare()
+        idle = [
+            connection for connection in pool._available_connections if connection.is_connected
+        ]
+        self.assertGreaterEqual(len(idle), SPARE_CONNECTIONS)
+
+    async def test_a_spare_cancelled_while_it_connects_leaves_the_pool_usable(self):
+        from redis.asyncio.connection import Connection
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, pool_timeout=2.0)
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        original = Connection.connect
+        entered = asyncio.Event()
+
+        async def slow(connection):
+            entered.set()
+            await asyncio.sleep(0.5)
+            await original(connection)
+
+        with mock.patch.object(Connection, "connect", slow):
+            spare = asyncio.ensure_future(backend.spare())
+            await entered.wait()
+            started = time.monotonic()
+            spare.cancel()
+            await asyncio.gather(spare, return_exceptions=True)
+            stopped = time.monotonic() - started
+        self.assertLess(stopped, 0.5)
+        self.assertEqual(len(pool._in_use_connections), 0)
+        async with asyncio.timeout(1.0):
+            await backend.setup()
 
     async def test_a_lost_connection_reads_the_clock_again(self):
         backend = await self.open()

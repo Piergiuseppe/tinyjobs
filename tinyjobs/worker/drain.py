@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from contextlib import suppress
 from typing import TYPE_CHECKING, Sequence
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 DRAIN_WORKER_ID = "drain"
 DRAIN_LEASE_SECONDS = 3600.0
 DRAIN_SHUTDOWN_SECONDS = 30.0
+
+logger = logging.getLogger("tinyjobs.worker")
 
 
 class Drain:
@@ -126,6 +129,13 @@ class Drain:
             )
             if not running.done():
                 await asyncio.wait((running,), timeout=self._shutdown_timeout)
+            if not running.done() and self._executors.keeps(running) is not None:
+                logger.warning(
+                    "job %s runs in a thread that cannot be stopped; the drain waits for it "
+                    "and records its outcome",
+                    job.id,
+                )
+                await asyncio.wait((running,))
         finally:
             stopping.cancel()
         if running.done():
@@ -135,6 +145,13 @@ class Drain:
         return False
 
     async def _abandon(self, running: asyncio.Future, job: Job) -> None:
+        if self._executors.keeps(running) is not None:
+            logger.warning(
+                "job %s still runs in a thread that cannot be stopped; it is not released, and "
+                "its outcome is recorded if it returns while the loop runs, else its lease ends",
+                job.id,
+            )
+            return
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
         await sheltered(self._app.backend.release(job))

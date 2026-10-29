@@ -2518,3 +2518,167 @@ class CutOutcomeTests(WorkerTestCase):
             await asyncio.wait_for(runner, timeout=10)
         self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
         self.assertEqual(succeeded, [job.id])
+
+
+class ShutdownReleaseTests(WorkerTestCase):
+    async def test_a_thread_returning_while_another_job_ignores_its_cancel_keeps_its_outcome(self):
+        await self.app.ready()
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        stopped = [0.0]
+
+        @self.app.task
+        def transfer():
+            loop.call_soon_threadsafe(started.set)
+            while not stopped[0]:
+                time.sleep(0.01)
+            time.sleep(max(0.0, stopped[0] + 1.9 - time.monotonic()))
+            return "sent"
+
+        @self.app.task
+        async def stubborn():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.shield(asyncio.sleep(1.0))
+
+        kept = await transfer.aenqueue()
+        await stubborn.aenqueue()
+        backend = self.app.backend
+        worker = self.make_worker(concurrency=2, shutdown_timeout=2.0, lease_seconds=30.0)
+        with (
+            mock.patch.object(backend, "complete", honouring_deadlines(backend.complete)),
+            mock.patch.object(backend, "executions", honouring_deadlines(backend.executions)),
+        ):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            await asyncio.sleep(0.2)
+            stopped[0] = time.monotonic()
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=15)
+        stored = await self.app.aget(kept.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.SUCCESS, 1))
+
+    async def test_a_def_job_waiting_for_a_free_thread_gets_its_whole_timeout(self):
+        await self.app.ready()
+        runs: list[float] = []
+
+        @self.app.task(timeout=0.2)
+        def slow():
+            time.sleep(1.2)
+
+        @self.app.task(timeout=0.3, max_attempts=1)
+        def charge():
+            runs.append(time.monotonic())
+
+        await slow.aenqueue()
+        await asyncio.sleep(0.01)
+        job = await charge.aenqueue()
+        await self.settle(self.make_worker(concurrency=1), [job])
+        executions = await self.app.backend.executions(job.id)
+        self.assertEqual(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual([e.status for e in executions], [ExecutionStatus.SUCCESS])
+
+    async def test_a_job_slow_to_cancel_is_no_longer_renewed_once_the_releases_began(self):
+        await self.app.ready()
+        started = asyncio.Event()
+
+        @self.app.task
+        async def endless():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.shield(asyncio.sleep(1.3))
+
+        job = await endless.aenqueue()
+        backend = self.app.backend
+        real = backend.heartbeat
+        beats: list[tuple[float, list[str]]] = []
+
+        async def counted(job_ids, *args, **kwargs):
+            beats.append((time.monotonic(), list(job_ids)))
+            return await real(job_ids, *args, **kwargs)
+
+        worker = self.make_worker(shutdown_timeout=6.0, lease_seconds=3.0)
+        with mock.patch.object(backend, "heartbeat", counted):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.wait_for(started.wait(), 5)
+            worker.stop()
+            releasing = worker._admitting.at
+            await asyncio.wait_for(runner, timeout=15)
+        self.assertTrue(any(at < releasing and job.id in ids for at, ids in beats))
+        self.assertFalse([at for at, ids in beats if at > releasing + 0.05 and job.id in ids])
+
+    async def test_a_stop_asks_the_backend_once_for_a_spare_connection(self):
+        await self.app.ready()
+        backend = self.app.backend
+        asked: list[float] = []
+
+        async def spare():
+            asked.append(time.monotonic())
+
+        worker = self.make_worker()
+        with mock.patch.object(backend, "spare", spare, create=True):
+            runner = asyncio.create_task(worker.start())
+            await asyncio.sleep(0.3)
+            worker.stop()
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertEqual(len(asked), 1)
+
+    async def test_a_worker_tells_the_backend_how_many_jobs_it_runs_at_once(self):
+        await self.app.ready()
+        backend = self.app.backend
+        told: list[int] = []
+        worker = self.make_worker(concurrency=7)
+        with mock.patch.object(backend, "expect", told.append, create=True):
+            await self.run_briefly(worker, 0.3)
+        self.assertEqual(told, [7, -7])
+
+    async def test_a_claim_without_an_answer_is_a_warning_not_an_error(self):
+        await self.app.ready()
+        backend = self.app.backend
+
+        async def unreachable(*args, **kwargs):
+            raise ConnectionError("store unreachable")
+
+        backend.transient_errors = (ConnectionError,)
+        self.addCleanup(vars(backend).pop, "transient_errors", None)
+        with (
+            mock.patch.object(backend, "claim", unreachable),
+            self.assertNoLogs("tinyjobs.worker", "ERROR"),
+            self.assertLogs("tinyjobs.worker", "WARNING") as logs,
+        ):
+            await self.run_briefly(self.make_worker(), 0.5)
+        self.assertTrue(any("claim got no answer in time" in line for line in logs.output))
+
+    async def test_a_heartbeat_whose_first_call_never_answers_is_hedged_by_a_second(self):
+        await self.app.ready()
+
+        @self.app.task
+        async def slow():
+            await asyncio.sleep(2.3)
+
+        job = await slow.aenqueue()
+        backend = self.app.backend
+        real = backend.heartbeat
+        calls: list[float] = []
+
+        async def first_lost(*args, **kwargs):
+            calls.append(time.monotonic())
+            if len(calls) % 2:
+                await asyncio.Event().wait()
+            return await real(*args, **kwargs)
+
+        worker = self.make_worker(lease_seconds=3.0)
+        with (
+            mock.patch.object(backend, "heartbeat", first_lost),
+            self.assertNoLogs("tinyjobs.worker", "WARNING"),
+        ):
+            await self.settle(worker, [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertGreater(calls[1] - calls[0], 0.6)
+        self.assertLess(calls[1] - calls[0], 1.0)

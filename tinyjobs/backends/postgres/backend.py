@@ -9,6 +9,7 @@ import math
 import re
 import secrets
 import select
+import threading
 import time
 import weakref
 from contextlib import (
@@ -61,6 +62,8 @@ from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, Tables
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MIN_CONNECTIONS = 1
 DEFAULT_MAX_CONNECTIONS = 10
+WORKER_CONNECTIONS = 3
+SPARE_CONNECTIONS = 2
 DEFAULT_POOL_TIMEOUT = 20.0
 DEFAULT_STATEMENT_TIMEOUT = 30.0
 SHORTEST_STATEMENT_SECONDS = 0.001
@@ -153,29 +156,49 @@ CLAIMING = """
 """
 ORPHANED = """
     SELECT orphan.pid, orphan.born,
-           activity.pid IS NULL
-           OR pg_catalog.pg_terminate_backend(activity.pid, %(wait)s) AS settled
+           CASE
+               WHEN activity.pid IS NULL THEN true
+               WHEN activity.usesysid IS DISTINCT FROM (
+                   SELECT oid FROM pg_catalog.pg_roles
+                    WHERE rolname OPERATOR(pg_catalog.=) SESSION_USER
+               ) THEN true
+               WHEN CASE
+                   WHEN activity.state IS NULL
+                     OR activity.state OPERATOR(pg_catalog.=) 'disabled'
+                   THEN EXISTS (
+                       SELECT FROM pg_catalog.pg_locks AS held
+                        WHERE held.pid OPERATOR(pg_catalog.=) activity.pid
+                          AND held.locktype OPERATOR(pg_catalog.=) 'advisory' AND held.granted
+                          AND held.database OPERATOR(pg_catalog.=) (
+                              SELECT oid FROM pg_catalog.pg_database
+                               WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()
+                          )
+                          AND held.classid OPERATOR(pg_catalog.=) orphan.high::pg_catalog.oid
+                          AND held.objid OPERATOR(pg_catalog.=) orphan.low::pg_catalog.oid
+                          AND held.objsubid OPERATOR(pg_catalog.=) 1
+                   )
+                   ELSE pg_catalog.left(activity.query, pg_catalog.length(orphan.token))
+                        OPERATOR(pg_catalog.=) orphan.token
+               END
+               THEN pg_catalog.pg_terminate_backend(activity.pid, %(wait)s)
+               ELSE true
+           END AS settled
       FROM ROWS FROM (
                pg_catalog.unnest(%(pids)s::integer[]),
                pg_catalog.unnest(%(borns)s::pg_catalog.timestamptz[]),
-               pg_catalog.unnest(%(ages)s::pg_catalog.float8[])
-           ) AS orphan (pid, born, age)
+               pg_catalog.unnest(%(tokens)s::pg_catalog.text[]),
+               pg_catalog.unnest(%(highs)s::bigint[]),
+               pg_catalog.unnest(%(lows)s::bigint[])
+           ) AS orphan (pid, born, token, high, low)
       LEFT JOIN pg_catalog.pg_stat_activity AS activity
         ON activity.pid OPERATOR(pg_catalog.=) orphan.pid
        AND activity.backend_start OPERATOR(pg_catalog.=) orphan.born
-       AND activity.state OPERATOR(pg_catalog.=) 'active'
-       AND activity.usesysid OPERATOR(pg_catalog.=) (
-           SELECT oid FROM pg_catalog.pg_roles
-            WHERE rolname OPERATOR(pg_catalog.=) SESSION_USER
-       )
-       AND activity.query_start OPERATOR(pg_catalog.<=) (
-           pg_catalog.statement_timestamp()
-           OPERATOR(pg_catalog.-) pg_catalog.make_interval(secs => orphan.age)
-       )
 """
+FENCING = "pg_catalog.pg_advisory_lock(%(fence)s::bigint) AS fenced"
 ENDING_CLAIM_MILLISECONDS = 1000
 CUT_SECONDS = 0.5
 CONNECT_SECONDS = 5
+CLOCK_SECONDS = 5.0
 ENDABLE = (
     "SELECT pg_catalog.has_function_privilege("
     "'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE') AS may"
@@ -300,7 +323,7 @@ class PostgresBackend(BaseBackend):
         schema: str | None = None,
         clock: Clock | None = None,
         min_connections: int = DEFAULT_MIN_CONNECTIONS,
-        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        max_connections: int | None = None,
         pool_timeout: float = DEFAULT_POOL_TIMEOUT,
         statement_timeout: float | None = DEFAULT_STATEMENT_TIMEOUT,
         notify: bool = True,
@@ -333,7 +356,7 @@ class PostgresBackend(BaseBackend):
         self._hearing = 0
         self._marks: dict[str, int] = {}
         self._ghosts: dict[str, _Ghost] = {}
-        self._orphans: dict[tuple[int, Any], float] = {}
+        self._orphans: dict[tuple[int, Any], _Mark] = {}
         self._fresh = False
         self._unended = False
         self._swept = -math.inf
@@ -355,12 +378,47 @@ class PostgresBackend(BaseBackend):
         self._closing: asyncio.Future[None] | None = None
         self._closed = False
         self._spent = False
-        self._sizes = (min(min_connections, max_connections), max_connections)
+        self._largest = max_connections
+        self._smallest = min_connections
+        self._demanding = threading.Lock()
+        self._expected = 0
+        self._attached = 0
+        self._spared = False
+        self._stopping = False
+        self._sizes = self._wanted()
         self._pool = self._new_pool()
+
+    def expect(self, concurrency: int) -> None:
+        with self._demanding:
+            self._expected += concurrency
+            self._attached += (concurrency > 0) - (concurrency < 0)
+
+    def _wanted(self) -> tuple[int, int]:
+        largest = self._largest
+        if largest is None:
+            with self._demanding:
+                demand = self._expected + WORKER_CONNECTIONS * self._attached
+            largest = max(DEFAULT_MAX_CONNECTIONS, demand)
+        smallest = max(self._smallest, SPARE_CONNECTIONS) if self._spared else self._smallest
+        return min(smallest, largest), largest
+
+    async def _resized(self) -> None:
+        wanted = self._wanted()
+        if wanted != self._sizes:
+            self._sizes = wanted
+            await self._pool.resize(*wanted)
+
+    async def spare(self) -> None:
+        if self._closed or self._stopping:
+            return
+        self._stopping = True
+        if self._idle() < SPARE_CONNECTIONS:
+            self._spared = True
+            await self._resized()
 
     def _new_pool(self) -> AsyncConnectionPool:
         smallest, largest = self._sizes
-        return AsyncConnectionPool(
+        return _Pool(
             self._conninfo,
             min_size=smallest,
             max_size=largest,
@@ -838,6 +896,7 @@ class PostgresBackend(BaseBackend):
                         ):
                             break
                         await asyncio.sleep(GHOST_SECONDS)
+        await self._pool.stop_connecting()
         await self._pool.close(timeout=POOL_STOP_SECONDS)
 
     async def wait_for_jobs(
@@ -872,9 +931,7 @@ class PostgresBackend(BaseBackend):
         }
         while True:
             try:
-                async with await psycopg.AsyncConnection.connect(
-                    self._conninfo, **options
-                ) as connection:
+                async with await _Answering.connect(self._conninfo, **options) as connection:
                     await connection.execute(f'LISTEN "{self._channel}"')
                     self._hear(None)
                     async for notice in connection.notifies():
@@ -961,8 +1018,8 @@ class PostgresBackend(BaseBackend):
                     error,
                 )
 
-    def _orphaned(self, pid: int, born: Any) -> None:
-        self._orphans[pid, born] = time.monotonic()
+    def _orphaned(self, pid: int, born: Any, mark: "_Mark") -> None:
+        self._orphans[pid, born] = mark
         self._fresh = True
         self._swept = -math.inf
 
@@ -1055,29 +1112,39 @@ class PostgresBackend(BaseBackend):
     async def _ended(
         self, connection: psycopg.AsyncConnection, orphans: list[tuple[int, Any]]
     ) -> None:
+        unmarked = [orphan for orphan in orphans if self._orphans.get(orphan) is None]
+        orphans = [orphan for orphan in orphans if orphan not in unmarked]
+        marks = [self._orphans[orphan] for orphan in orphans]
+        for orphan in unmarked:
+            self._orphans.pop(orphan, None)
+        if not orphans:
+            return
         async with _within(connection):
             await connection.execute(UNROLED)
             [endable] = await _fetch(connection, ENDABLE, {})
-            settled = orphans
             if endable["may"]:
-                now = time.monotonic()
                 rows = await _fetch(
                     connection,
                     ORPHANED,
                     {
                         "pids": [pid for pid, _ in orphans],
                         "borns": [born for _, born in orphans],
-                        "ages": [now - self._orphans.get(orphan, now) for orphan in orphans],
+                        "tokens": [mark.token for mark in marks],
+                        "highs": [mark.fence >> 32 for mark in marks],
+                        "lows": [mark.fence & 0xFFFFFFFF for mark in marks],
                         "wait": ENDING_CLAIM_MILLISECONDS,
                     },
                 )
                 settled = [(row["pid"], row["born"]) for row in rows if row["settled"]]
-            elif not self._unended:
-                self._unended = True
-                logger.warning(
-                    "the postgres login role may not run pg_terminate_backend, so a statement "
-                    "that did not stop when its time ran out keeps running until it ends"
-                )
+            else:
+                settled = orphans
+                if not self._unended:
+                    self._unended = True
+                    logger.warning(
+                        "the postgres login role may not run pg_terminate_backend, so a "
+                        "statement that did not stop when its time ran out keeps running "
+                        "until it ends"
+                    )
         for orphan in settled:
             self._orphans.pop(orphan, None)
 
@@ -1676,6 +1743,7 @@ class PostgresBackend(BaseBackend):
             raise
 
     async def _live(self) -> psycopg.AsyncConnection:
+        await self._resized()
         for _ in range(self._sizes[1]):
             connection = await self._pool.getconn(timeout=self._waited())
             if _alive(connection) and getattr(connection, "heard", math.inf) >= self._silenced:
@@ -1706,7 +1774,16 @@ class PostgresBackend(BaseBackend):
                 "SELECT pg_catalog.current_schemas(false)::pg_catalog.text[] AS schemas"
             )
             self._schemas = (await cursor.fetchone())["schemas"]
-        for statement, parameters in self._settings():
+        settings = self._settings()
+        if isinstance(connection, _Answering):
+            mark = _Mark(f"/* tinyjobs {secrets.token_hex(16)} */ ", secrets.randbits(64))
+            connection.mark = mark
+            statement, parameters = settings[0]
+            settings[0] = (
+                f"{statement}, {FENCING}",
+                {**parameters, "fence": mark.fence - (1 << 64 if mark.fence >> 63 else 0)},
+            )
+        for statement, parameters in settings:
             cursor = await connection.execute(statement, parameters)
         if isinstance(connection, _Answering):
             row = await cursor.fetchone()
@@ -1790,7 +1867,8 @@ class PostgresBackend(BaseBackend):
         quiet = [
             queue
             for queue in sorted(queues)
-            if moment - self._woken.get(queue, float("-inf")) >= NOTIFY_SECONDS
+            if queue not in self._waiting
+            and moment - self._woken.get(queue, float("-inf")) >= NOTIFY_SECONDS
         ]
         self._waiting.update(queues.difference(quiet))
         if quiet:
@@ -1839,12 +1917,50 @@ class PostgresBackend(BaseBackend):
 
     async def _now(self) -> float:
         clock = self._clock
-        if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
+        if not isinstance(clock, FollowingClock):
+            return clock.now()
+        if self._read and clock.trusted and not clock.overdue():
+            if clock.due() and self._refreshable():
+                self._refresh()
+            return clock.now()
+        if not self._read or not clock.trusted or clock.due():
             async with _taken(self._reading):
-                if not self._read or clock.due():
-                    clock.follow(*await self._forgetting(_again(self._timed)), self._server())
-                    self._read = True
+                if not self._read or not clock.trusted or clock.due():
+                    await self._follow(clock)
         return clock.now()
+
+    def _refreshable(self) -> bool:
+        return not self._reading.locked() and not self._stopping and self._idle() > 1
+
+    def _idle(self) -> int:
+        if self._closed:
+            return 0
+        stats = self._pool.get_stats()
+        return stats.get("pool_available", 0) - stats.get("requests_waiting", 0)
+
+    async def _follow(self, clock: FollowingClock) -> None:
+        clock.follow(*await self._forgetting(_again(self._timed)), self._server())
+        self._read = True
+
+    def _refresh(self) -> None:
+        refreshing = asyncio.create_task(
+            self._refreshed(), name="tinyjobs-postgres-clock", context=contextvars.Context()
+        )
+        self._sending.add(refreshing)
+        refreshing.add_done_callback(self._sending.discard)
+
+    async def _refreshed(self) -> None:
+        clock = self._clock
+        if self._reading.locked() or not isinstance(clock, FollowingClock):
+            return
+        async with self._reading:
+            if not clock.due():
+                return
+            try:
+                with until(time.monotonic() + CLOCK_SECONDS):
+                    await self._follow(clock)
+            except (psycopg.Error, PoolTimeout, PoolClosed, TimeoutError) as error:
+                logger.debug("could not read the server clock: %s", error)
 
     def _waited(self) -> float:
         left = _left()
@@ -2192,11 +2308,83 @@ def _connection_of(tx: Any) -> Any:
     return tx
 
 
+_ADDING: contextvars.ContextVar["_Pool | None"] = contextvars.ContextVar(
+    "tinyjobs_postgres_adding", default=None
+)
+
+
+class _Abandoned(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        pool = _ADDING.get()
+        return pool is None or not pool._stopping
+
+
+logging.getLogger("psycopg.pool").addFilter(_Abandoned())
+
+
+class _Pool(AsyncConnectionPool):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._adding: set[asyncio.Task] = set()
+        self._stopping = False
+
+    async def _add_connection(self, *args: Any, **kwargs: Any) -> None:
+        if self._stopping:
+            return
+        context = contextvars.copy_context()
+        context.run(_ADDING.set, self)
+        adding = asyncio.get_running_loop().create_task(
+            super()._add_connection(*args, **kwargs), context=context
+        )
+        self._adding.add(adding)
+        adding.add_done_callback(self._adding.discard)
+        try:
+            await asyncio.wait({adding})
+        except asyncio.CancelledError:
+            adding.cancel()
+            await asyncio.wait({adding})
+            raise
+        if not adding.cancelled():
+            adding.result()
+
+    async def stop_connecting(self) -> None:
+        self._stopping = True
+        adding = tuple(self._adding)
+        for task in adding:
+            task.cancel()
+        if adding:
+            await asyncio.wait(adding)
+
+
+@dataclass(frozen=True, slots=True)
+class _Mark:
+    token: str
+    fence: int
+
+
+class _Marked(psycopg.AsyncCursor):
+    def _convert_query(self, query: Any, params: Any = None) -> Any:
+        converted = super()._convert_query(query, params)
+        mark = getattr(self._conn, "mark", None)
+        if mark is not None:
+            converted.query = mark.token.encode() + converted.query
+        return converted
+
+
+def _cursor_for(connection: psycopg.AsyncConnection) -> type[psycopg.AsyncCursor]:
+    return _Marked if isinstance(connection, _Answering) else psycopg.AsyncCursor
+
+
 class _Answering(psycopg.AsyncConnection):
     pid: int | None = None
     born: Any = None
     working: Callable[[int, Any, float, float], Awaitable[bool]] | None = None
-    orphaned: Callable[[int, Any], None] | None = None
+    orphaned: Callable[[int, Any, "_Mark"], None] | None = None
+    mark: "_Mark | None" = None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cursor_factory = _Marked
     heard: float = 0.0
     silent: bool = False
 
@@ -2272,8 +2460,8 @@ class _Answering(psycopg.AsyncConnection):
             if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 self.silent = True
                 self.pgconn.finish()
-                if self.orphaned is not None and self.pid is not None:
-                    self.orphaned(self.pid, self.born)
+                if self.orphaned is not None and self.pid is not None and self.mark is not None:
+                    self.orphaned(self.pid, self.born, self.mark)
 
 
 def _busy(row: dict[str, Any], quiet: float, patience: float) -> bool:
@@ -2408,8 +2596,8 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
     rows: list[dict[str, Any]] | None = None
     async with (
         connection.lock,
-        psycopg.AsyncCursor(connection, row_factory=dict_row) as checking,
-        psycopg.AsyncCursor(connection, row_factory=dict_row) as cursor,
+        _cursor_for(connection)(connection, row_factory=dict_row) as checking,
+        _cursor_for(connection)(connection, row_factory=dict_row) as cursor,
     ):
         while True:
             try:
