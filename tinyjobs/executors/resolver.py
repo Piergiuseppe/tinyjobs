@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .base import Executor
 from .coroutine import CoroutineExecutor
-from .thread import ThreadExecutor
+from .thread import Spares, ThreadExecutor
 
 if TYPE_CHECKING:
     from ..task import Task
@@ -19,7 +19,7 @@ class ExecutorResolver:
         concurrency: int,
         async_concurrency: int | None = None,
         freed: Callable[[], None] | None = None,
-        spares: int = 0,
+        spares: Spares | None = None,
     ):
         self._coroutine = CoroutineExecutor(async_concurrency or concurrency)
         self._thread = ThreadExecutor(concurrency, freed, spares=spares)

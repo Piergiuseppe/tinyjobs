@@ -24,6 +24,7 @@ from .exceptions import (
     ConfigurationError,
     UnsupportedCapabilityError,
 )
+from .executors import Spares
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -60,6 +61,7 @@ from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
+from .worker.drain import DRAIN_SPARE_THREADS
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -125,12 +127,17 @@ class TinyJobs:
         self._backend_closing: concurrent.futures.Future | None = None
         self._sessions = 0
         self._workers: set[Worker | Drain] = set()
+        self._thread_spares = Spares(DRAIN_SPARE_THREADS)
         self._closing_after: set[Worker | Drain] = set()
         _apps.add(self)
 
     @property
     def url(self) -> str:
         return self._url
+
+    @property
+    def thread_spares(self) -> Spares:
+        return self._thread_spares
 
     @property
     def clock(self) -> Clock:

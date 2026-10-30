@@ -13,7 +13,7 @@ from unittest import mock
 
 import tinyjobs.clock
 from tinyjobs import JobStatus, TinyJobs
-from tinyjobs.exceptions import ConfigurationError
+from tinyjobs.exceptions import AppClosedError, ConfigurationError
 from tinyjobs.runtime import run_on
 from tinyjobs.status import ExecutionStatus
 from tinyjobs.testing import BackendContract
@@ -556,6 +556,50 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("report-\\udcff.csv", stored.last_error)
         self.assertEqual((await backend.get(good.id)).status, JobStatus.SUCCESS)
 
+    async def test_a_batched_outcome_opens_a_free_slot_rather_than_wait_for_one_alone(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.deadlines import bounded
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=10)
+        self.opened.append(backend)
+        await backend.setup()
+        first, second = await self.claimed(backend, 2)
+        pool = backend._client.connection_pool
+        real = backend._script
+
+        async def slow(name, now, *arguments):
+            if name == "complete":
+                held = await _acquire(pool)
+                await asyncio.sleep(2.5)
+                await pool.release(held)
+            return await real(name, now, *arguments)
+
+        with mock.patch.object(backend, "_script", slow):
+            alone = asyncio.ensure_future(backend.complete(first, None))
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            async with bounded(time.monotonic() + 1.0):
+                self.assertTrue(await backend.complete(second, None))
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(await alone)
+
+    async def test_a_batched_outcome_on_a_full_pool_takes_the_next_connection_freed(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.deadlines import bounded
+
+        backend = await self.single()
+        [job] = await self.claimed(backend, 1)
+        pool = backend._client.connection_pool
+        held = await _acquire(pool)
+        writing = asyncio.ensure_future(self.bounded_complete(backend, job, bounded))
+        await asyncio.sleep(0.3)
+        await pool.release(held)
+        self.assertTrue(await asyncio.wait_for(writing, 2))
+
+    async def bounded_complete(self, backend, job, bounded):
+        async with bounded(time.monotonic() + 1.5):
+            return await backend.complete(job, None)
+
     async def test_closing_settles_outcomes_still_waiting_for_their_batch(self):
         backend = await self.open()
         first, second = await self.claimed(backend, 2)
@@ -579,7 +623,18 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(done), 2)
         for write in done:
             self.assertFalse(write.cancelled())
-            self.assertIsInstance(write.exception(), RedisConnectionError)
+            self.assertIsInstance(write.exception(), AppClosedError)
+
+    async def test_an_outcome_after_close_is_refused_and_never_written(self):
+        backend = await self.single()
+        [job] = await self.claimed(backend, 1)
+        await backend.close()
+        with self.assertRaises(AppClosedError):
+            await backend.complete(job, None)
+        pool = backend._client.connection_pool
+        self.assertEqual([c for c in pool._available_connections if c.is_connected], [])
+        reader = await self.single()
+        self.assertEqual((await reader.get(job.id)).status, JobStatus.RUNNING)
 
     async def test_a_script_missing_from_the_server_is_loaded_once_for_its_batch(self):
         backend = await self.open()
@@ -1260,6 +1315,31 @@ class RedisUrlTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError) as caught:
             RedisBackend.from_url("redis://127.0.0.1:6379/0?sockettimeout=2")
         self.assertIn("sockettimeout", str(caught.exception))
+
+    def test_an_unknown_option_is_not_named_when_a_password_is_in_the_query(self):
+        for url in (
+            "redis://127.0.0.1:6379/0?password=s3cr&Zq9=wXy",
+            "unix:///tmp/redis.sock?db=0&password=s3cr&Zq9=wXy",
+        ):
+            with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
+                RedisBackend.from_url(url)
+            self.assertNotIn("Zq9", revealed(caught.exception))
+
+    def test_a_socket_path_holding_part_of_a_password_is_refused(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("unix://:s3cr/Zq9@/tmp/redis.sock")
+        self.assertNotIn("Zq9", revealed(caught.exception))
+        self.assertIn("percent-encode", str(caught.exception))
+        RedisBackend.from_url("unix:///tmp/a@b.sock")
+
+    def test_options_that_would_break_every_call_are_refused(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?decode_responses=true")
+        self.assertIn("decode_responses", str(caught.exception))
+        with self.assertRaises(ConfigurationError):
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?decode_responses=1&timeout=abc")
+        backend = RedisBackend.from_url("redis://127.0.0.1:6379/0?timeout=3")
+        self.assertEqual(backend._client.connection_pool.timeout, 3.0)
 
     def test_a_url_without_a_password_keeps_its_reason(self):
         with self.assertRaises(ConfigurationError) as caught:

@@ -424,8 +424,10 @@ Two things are worth knowing before you hit them:
 exceeds its timeout the job is marked failed and the worker moves on, but the thread keeps going until
 the function returns. That thread counts against `concurrency` until it does, so the worker claims
 one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
-an eager call runs the next job beside it instead, on up to eight extra threads, and the process
-exits without waiting for it.
+an eager call runs the next job beside it instead, on one of eight extra threads the app shares
+across its drains and eager calls; once all eight are taken, a drain hands the next job in a
+thread back and returns, and an eager call returns it `queued`. The process exits without waiting
+for such threads.
 The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
 timeouts to the library you are calling, or write the task as `async def` where cancellation actually
 works.
@@ -569,11 +571,14 @@ with `client_encoding` `SQL_ASCII` is refused too. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
 Each process holds at most 10 connections (`max_connections=`), whatever its workers run, plus one
-for `LISTEN`, and opens a short-lived one to ask about a
-statement silent for ten seconds when none is idle, so size the server's `max_connections` or the
-PgBouncer pool at 12 per process. Connections beyond the minimum go back after ten idle seconds:
-two workers behind a PgBouncer pool of 20 hand the app a server within 20 seconds of a burst,
-where they used to hold all 20 and keep asking for more. Every statement times out after 30 seconds
+for `LISTEN`, and one more, short-lived and shared, to ask about statements silent for ten
+seconds when none is idle, so size the server's `max_connections` or the PgBouncer pool at 12 per
+process plus what the app itself uses. Connections beyond the minimum go back after ten idle
+seconds. Two workers of 32 busy without pause behind a PgBouncer session pool of 25, over a link
+adding 300 ms each way, left the app waiting 1.9 seconds for a server as a rule and 9.2 at most,
+with none refused. A smaller pool makes the app queue behind the workers for as long as they stay
+busy: at 20, the app got 13 queries through in four and a half minutes, and PgBouncer refused one
+after its 120 second `query_wait_timeout`. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
 connections are named `tinyjobs` in `pg_stat_activity`. The tables and their schema must belong to
 the connecting role or a role that can become it (`SET` on Postgres 16 and later), every role that
@@ -747,7 +752,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1526 tests, no test dependencies. The one that matters most is
+1538 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

@@ -520,14 +520,62 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 "SELECT pg_advisory_xact_lock(%(key)s)", {"key": held._tables.lock}
             )
             started = time.monotonic()
-            with mock.patch.object(module, "SETUP_LOCK_SECONDS", 0.2):
-                with self.assertLogs("tinyjobs.postgres", "WARNING") as logs:
-                    await held.setup()
+            with (
+                mock.patch.object(module, "SETUP_LOCK_SECONDS", 0.2),
+                mock.patch.object(module, "SETUP_WAIT_SECONDS", 0.3),
+                self.assertLogs("tinyjobs.postgres", "WARNING") as logs,
+            ):
+                await held.setup()
             self.assertLess(time.monotonic() - started, 3)
             self.assertIn("without it", "\n".join(logs.output))
             await holder.rollback()
         stored = await held.enqueue(make_job())
         self.assertEqual((await held.get(stored.id)).id, stored.id)
+
+    async def test_creating_the_store_waits_quietly_for_a_setup_still_running(self):
+        from tinyjobs.backends.postgres import backend as module
+
+        await drop(self.prefix)
+        late = await self.make_backend(self.clock)
+        self.addAsyncCleanup(late.close)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await holder.execute(
+                "SELECT pg_advisory_xact_lock(%(key)s)", {"key": late._tables.lock}
+            )
+
+            async def released():
+                await asyncio.sleep(1.0)
+                await holder.rollback()
+
+            releasing = asyncio.ensure_future(released())
+            started = time.monotonic()
+            with (
+                mock.patch.object(module, "SETUP_LOCK_SECONDS", 0.3),
+                self.assertNoLogs("tinyjobs.postgres", "WARNING"),
+            ):
+                await late.setup()
+            await releasing
+        self.assertGreater(time.monotonic() - started, 0.9)
+
+    async def test_a_setup_lock_let_go_before_its_holders_are_read_is_taken_quietly(self):
+        await drop(self.prefix)
+        late = await self.make_backend(self.clock)
+        self.addAsyncCleanup(late.close)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await holder.execute(
+                "SELECT pg_advisory_xact_lock(%(key)s)", {"key": late._tables.lock}
+            )
+            real = late._lockers
+
+            async def released(*args, **kwargs):
+                await holder.rollback()
+                return await real(*args, **kwargs)
+
+            with (
+                mock.patch.object(late, "_lockers", released),
+                self.assertNoLogs("tinyjobs.postgres", "WARNING"),
+            ):
+                await late.setup()
 
     async def test_ids_list_in_byte_order_whatever_the_database_collation(self):
         for job_id in ("B-1", "a-1", "_-1"):
@@ -6059,6 +6107,55 @@ class PostgresOutcomeBatchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await writes, [True] * 4)
         self.assertEqual(sent, [4])
 
+    async def test_outcomes_under_short_deadlines_close_together_share_one_round_trip(self):
+        from tinyjobs.deadlines import until
+
+        backend = await self.batched()
+        for _ in range(4):
+            await backend.enqueue(make_job())
+        jobs = await backend.claim(worker_id="w", queues=["default"], limit=4, lease_seconds=60)
+        sent: list[int] = []
+        real = postgres_backend._pipelined
+
+        async def counted(connection, statements):
+            sent.append(len(statements))
+            return await real(connection, statements)
+
+        async def completed(job, seconds):
+            with until(time.monotonic() + seconds):
+                return await backend.complete(job, None)
+
+        with mock.patch.object(postgres_backend, "_pipelined", counted):
+            async with backend._connection():
+                writes = asyncio.gather(
+                    *(completed(job, 3 + index / 10) for index, job in enumerate(jobs))
+                )
+                await asyncio.sleep(0.2)
+            self.assertEqual(await writes, [True] * 4)
+        self.assertEqual(sent, [4])
+
+    async def test_a_batched_result_is_bound_rather_than_written_into_the_statement(self):
+        backend = await self.batched()
+        [job] = await self.claimed(backend)
+        secret = b"BOUND-ONLY-7781"
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await holder.execute(
+                f'SELECT 1 FROM "{self.prefix}_jobs" WHERE id = %s FOR UPDATE', (job.id,)
+            )
+            async with backend._connection():
+                writing = asyncio.ensure_future(backend.complete(job, secret))
+                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.3)
+            seen = await sql(
+                "SELECT query FROM pg_stat_activity WHERE query LIKE %(table)s",
+                {"table": f"%{self.prefix}_jobs%"},
+            )
+            await holder.rollback()
+        self.assertTrue(await writing)
+        texts = [query for (query,) in seen]
+        self.assertTrue(texts)
+        self.assertFalse([text for text in texts if secret.hex() in text or "BOUND" in text])
+
     async def batched(self, **options) -> PostgresBackend:
         backend = PostgresBackend.from_url(
             POSTGRES_URL, prefix=self.prefix, max_connections=1, notify=False, **options
@@ -6261,6 +6358,31 @@ class PostgresPoolSizeTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(backend.close)
         await backend.setup()
         return backend
+
+    async def test_statements_silent_together_share_one_fresh_probe_session(self):
+        backend = await self.open(min_connections=1, max_connections=1)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, autocommit=True) as other:
+            [(born,)] = await (
+                await other.execute(
+                    "SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()"
+                )
+            ).fetchall()
+            pid = other.info.backend_pid
+            real = psycopg.AsyncConnection.connect.__func__
+            opened: list[int] = []
+
+            async def counted(cls, *args, **kwargs):
+                opened.append(1)
+                await asyncio.sleep(0.2)
+                return await real(cls, *args, **kwargs)
+
+            with mock.patch.object(psycopg.AsyncConnection, "connect", classmethod(counted)):
+                verdicts = await asyncio.gather(
+                    *(backend._asked_fresh(pid, born, 0.0, 300.0) for _ in range(6))
+                )
+        self.assertEqual(verdicts, [True] * 6)
+        self.assertEqual(len(opened), 1)
+        self.assertIsNone(backend._probe)
 
     async def test_callers_kept_waiting_on_slow_connects_get_them_opened_together(self):
         backend = await self.open(min_connections=1, max_connections=4)

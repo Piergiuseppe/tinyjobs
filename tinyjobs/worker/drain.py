@@ -40,10 +40,7 @@ class Drain:
         self._prepare_run()
 
     def _prepare_run(self) -> None:
-        self._freed = asyncio.Event()
-        self._executors = ExecutorResolver(
-            concurrency=1, freed=self._freed.set, spares=DRAIN_SPARE_THREADS
-        )
+        self._executors = ExecutorResolver(concurrency=1, spares=self._app.thread_spares)
         self._stopping = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -115,15 +112,16 @@ class Drain:
         except UnknownTaskError:
             await self._app.backend.hand_back(job)
             raise
-        if not task.is_coroutine:
-            try:
-                free = await self._free()
-            except asyncio.CancelledError:
-                await sheltered(self._app.backend.hand_back(job))
-                raise
-            if not free:
-                await sheltered(self._app.backend.hand_back(job))
-                return False
+        if not task.is_coroutine and self._app.thread_spares.full:
+            await sheltered(self._app.backend.hand_back(job))
+            logger.warning(
+                "the drain stops before job %s: %d job thread(s) still run past their "
+                "timeout, so it and the jobs behind it stay queued until they return",
+                job.id,
+                self._app.thread_spares.limit,
+            )
+            self._stopping.set()
+            return False
         running = asyncio.ensure_future(self._attempt(job, task))
         try:
             return await self._settle(running, job)
@@ -133,20 +131,6 @@ class Drain:
         except asyncio.CancelledError:
             await self._abandon(running, job)
             raise
-
-    async def _free(self) -> bool:
-        while self._executors.strays and not self._stopping.is_set():
-            self._freed.clear()
-            waits = (
-                asyncio.ensure_future(self._freed.wait()),
-                asyncio.ensure_future(self._stopping.wait()),
-            )
-            try:
-                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                for waiting in waits:
-                    waiting.cancel()
-        return not self._executors.strays
 
     async def _settle(self, running: asyncio.Future, job: Job) -> bool:
         stopping = asyncio.ensure_future(self._stopping.wait())

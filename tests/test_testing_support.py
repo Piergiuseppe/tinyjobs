@@ -196,35 +196,49 @@ class DrainTests(unittest.TestCase):
         self.assertIs(job.refresh().status, JobStatus.SUCCESS)
         self.assertEqual((self.calls, returned), (["charged"], []))
 
-    def test_a_drain_adds_no_more_than_its_spare_threads_beside_timed_out_ones(self):
+    def test_a_drain_hands_back_a_sync_job_once_its_spare_threads_are_taken(self):
         import threading
-        import time
 
         from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
 
         held = threading.Event()
         self.addCleanup(held.set)
-        peak = [0]
-
-        def watch():
-            while not held.is_set():
-                live = sum(t.name.startswith("tinyjobs_") for t in threading.enumerate())
-                peak[0] = max(peak[0], live)
-                time.sleep(0.005)
 
         @self.app.task(timeout=0.05, max_attempts=1)
         def runaway():
             held.wait(10)
 
+        before = _job_threads()
+        jobs = [runaway.enqueue() for _ in range(DRAIN_SPARE_THREADS + 2)]
+        ran: list[int] = []
+        draining = threading.Thread(target=lambda: ran.append(self.app.drain()), daemon=True)
+        draining.start()
+        draining.join(3)
+        self.assertFalse(draining.is_alive())
+        self.assertEqual(ran, [DRAIN_SPARE_THREADS])
+        late = [job.refresh() for job in jobs[DRAIN_SPARE_THREADS:]]
+        self.assertEqual({job.status for job in late}, {JobStatus.QUEUED})
+        self.assertEqual({job.worker_id for job in late}, {None})
+        self.assertLessEqual(_job_threads() - before, DRAIN_SPARE_THREADS)
+
+    def test_eager_calls_share_the_apps_spare_threads(self):
+        import threading
+
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+        app = TinyJobs("memory://", eager=True)
+        self.addCleanup(app.close)
+
+        @app.task(timeout=0.05, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        before = _job_threads()
         jobs = [runaway.enqueue() for _ in range(DRAIN_SPARE_THREADS + 4)]
-        threading.Thread(target=watch, daemon=True).start()
-        release = threading.Timer(1.0, held.set)
-        release.start()
-        self.addCleanup(release.cancel)
-        self.assertEqual(self.app.drain(), len(jobs))
-        self.assertLessEqual(peak[0], DRAIN_SPARE_THREADS + 1)
-        cut = {job.refresh().status for job in jobs[: DRAIN_SPARE_THREADS + 1]}
-        self.assertEqual(cut, {JobStatus.FAILED})
+        self.assertLessEqual(_job_threads() - before, DRAIN_SPARE_THREADS)
+        self.assertEqual(jobs[-1].status, JobStatus.QUEUED)
 
     def test_a_drain_warns_that_a_new_thread_takes_the_place_of_a_timed_out_one(self):
         import threading
@@ -290,6 +304,12 @@ class DrainTests(unittest.TestCase):
         with self.assertRaises(UnknownTaskError):
             self.app.drain()
         self.assertIs(job.refresh().status, JobStatus.QUEUED)
+
+
+def _job_threads() -> int:
+    import threading
+
+    return sum(thread.name.startswith("tinyjobs_") for thread in threading.enumerate())
 
 
 if __name__ == "__main__":

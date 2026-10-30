@@ -27,13 +27,33 @@ EXECUTOR_CLOSED_MESSAGE = (
 )
 
 
+class Spares:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._taken = 0
+        self._lock = threading.Lock()
+
+    @property
+    def full(self) -> bool:
+        return self._taken >= self.limit
+
+    def take(self) -> int:
+        with self._lock:
+            self._taken += 1
+            return self._taken
+
+    def give(self, _: object = None) -> None:
+        with self._lock:
+            self._taken -= 1
+
+
 class ThreadExecutor(Executor):
     def __init__(
         self,
         concurrency: int,
         freed: Callable[[], None] | None = None,
         *,
-        spares: int = 0,
+        spares: Spares | None = None,
     ) -> None:
         self._pool = _Threads(concurrency)
         self._threaded: dict[asyncio.Task | None, Future] = {}
@@ -88,15 +108,17 @@ class ThreadExecutor(Executor):
 
     def _stray(self, loop: asyncio.AbstractEventLoop, running: Future, task: "Task") -> None:
         self._strays[running] = task.name
-        if len(self._replaced) < self._spares:
+        if self._spares is not None:
             self._replaced.add(running)
             self._pool.widen(1)
+            taken = self._spares.take()
+            running.add_done_callback(self._spares.give)
             logger.warning(
                 "%s ended while its thread still runs; a new thread takes its place, "
-                "%d of %d such thread(s) are in use until the old ones return",
+                "%d of the %d such thread(s) allowed are in use until the old ones return",
                 task.name,
-                len(self._replaced),
-                self._spares,
+                taken,
+                self._spares.limit,
             )
         else:
             logger.warning(
@@ -111,12 +133,6 @@ class ThreadExecutor(Executor):
         if self._strays.pop(running, None) is not None and running in self._replaced:
             self._replaced.discard(running)
             self._pool.widen(-1)
-        for stray in self._strays:
-            if len(self._replaced) >= self._spares:
-                break
-            if stray not in self._replaced:
-                self._replaced.add(stray)
-                self._pool.widen(1)
         if self._freed is not None:
             self._freed()
 

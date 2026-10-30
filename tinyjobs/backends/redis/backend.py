@@ -9,6 +9,7 @@ import math
 import threading
 from contextlib import suppress
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
+from urllib.parse import urlsplit
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -16,7 +17,7 @@ from redis.exceptions import NoScriptError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...exceptions import ConfigurationError
+from ...exceptions import AppClosedError, ConfigurationError
 from ...models import (
     Execution,
     ExecutionError,
@@ -50,6 +51,7 @@ LIST_CHUNK = 200
 CLOCK_SECONDS = 5.0
 SPARE_CONNECTIONS = 2
 SETTLE_BATCH = 100
+CLOSED_MESSAGE = "the redis backend was closed"
 CLOSE_SECONDS = 0.5
 
 logger = logging.getLogger("tinyjobs.redis")
@@ -88,7 +90,6 @@ class RedisBackend(BaseBackend):
         self._batches = Batches(self._settled_batch, SETTLE_BATCH)
         self._closed = False
         self._alone = 0
-        self._returning = asyncio.Event()
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -112,7 +113,7 @@ class RedisBackend(BaseBackend):
         except ValueError as error:
             reason = _url_reason(url, error)
         else:
-            reason = _unknown_options(url, pool)
+            reason = _refused(url, pool)
         if reason is not None:
             raise ConfigurationError(f"the redis url is not valid: {reason}")
         client = Redis(
@@ -131,7 +132,7 @@ class RedisBackend(BaseBackend):
 
     async def close(self) -> None:
         self._closed = True
-        await self._batches.close(RedisConnectionError("the backend was closed"), CLOSE_SECONDS)
+        await self._batches.close(AppClosedError(CLOSED_MESSAGE), CLOSE_SECONDS)
         refreshing, self._refreshing = self._refreshing, None
         if refreshing is not None and not refreshing.done():
             refreshing.cancel()
@@ -420,7 +421,6 @@ class RedisBackend(BaseBackend):
                 return await self._script(name, now, *arguments)
             finally:
                 self._alone -= 1
-                self._returning.set()
         return await self._batches.submit((name, now, arguments))
 
     def _spare_connections(self) -> int:
@@ -429,16 +429,12 @@ class RedisBackend(BaseBackend):
 
     async def _borrowed(self) -> Any:
         pool = self._client.connection_pool
-        while True:
-            for connection in reversed(pool._available_connections):
-                if connection.is_connected:
-                    pool._available_connections.remove(connection)
-                    pool._in_use_connections.add(connection)
-                    return connection
-            if not self._alone:
-                return None
-            self._returning.clear()
-            await self._returning.wait()
+        for connection in reversed(pool._available_connections):
+            if connection.is_connected:
+                pool._available_connections.remove(connection)
+                pool._in_use_connections.add(connection)
+                return connection
+        return await _acquire(pool)
 
     async def _settled_batch(self, take: Callable[[], list[Entry]]) -> list[Any]:
         following = isinstance(self._clock, FollowingClock)
@@ -484,6 +480,8 @@ class RedisBackend(BaseBackend):
         return answers
 
     async def _script(self, name: str, now: float, *arguments: Any) -> Any:
+        if self._closed:
+            raise AppClosedError(CLOSED_MESSAGE)
         following = isinstance(self._clock, FollowingClock)
         return await self._forgetting(
             self._scripts.run(name, now, *arguments, following=following)
@@ -660,8 +658,12 @@ def _storable(text: str) -> str:
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
+def _secret(url: str) -> bool:
+    return "@" in url or "password" in url.lower()
+
+
 def _url_reason(url: str, error: ValueError) -> str:
-    if "@" in url:
+    if _secret(url):
         return (
             "its error is hidden, since the url holds a password; check the port and "
             "percent-encode the password's reserved characters"
@@ -669,26 +671,45 @@ def _url_reason(url: str, error: ValueError) -> str:
     return str(error)
 
 
-def _unknown_options(url: str, pool: Any) -> str | None:
+def _refused(url: str, pool: Any) -> str | None:
+    options = pool.connection_kwargs
+    split = urlsplit(url)
+    if split.scheme == "unix" and split.netloc and "@" in split.path:
+        return (
+            "its socket path is hidden, since the url holds a password; percent-encode the "
+            "password's reserved characters"
+        )
+    unknown = _unknown_options(pool)
+    if unknown:
+        if _secret(url):
+            return (
+                "it holds a connection option the redis client does not take, its name "
+                "hidden since the url holds a password; percent-encode the password's "
+                "reserved characters"
+            )
+        return f"the redis client takes no connection option named {', '.join(unknown)}"
+    if options.get("decode_responses"):
+        return "tinyjobs reads raw bytes from redis, so decode_responses cannot be set"
+    if isinstance(pool.timeout, str):
+        try:
+            pool.timeout = float(pool.timeout)
+        except ValueError:
+            return "its timeout is not a number of seconds"
+    return None
+
+
+def _unknown_options(pool: Any) -> list[str]:
     accepted: set[str] = set()
     for kind in pool.connection_class.__mro__:
         if kind is object:
-            return None
+            return []
         if "__init__" not in vars(kind):
             continue
         parameters = inspect.signature(kind.__init__).parameters.values()
         accepted.update(parameter.name for parameter in parameters)
         if not any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters):
             break
-    unknown = sorted(set(pool.connection_kwargs) - accepted)
-    if not unknown:
-        return None
-    if "@" in url:
-        return (
-            "it holds a connection option the redis client does not take, its name hidden "
-            "since the url holds a password; percent-encode the password's reserved characters"
-        )
-    return f"the redis client takes no connection option named {', '.join(unknown)}"
+    return sorted(set(pool.connection_kwargs) - accepted)
 
 
 def _unopened(pool: Any, wanted: int) -> list[Any]:

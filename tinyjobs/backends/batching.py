@@ -12,6 +12,7 @@ from ..runtime import spared_until_close
 AGAIN = object()
 PRESSED_SECONDS = 5.0
 _SHARED = object()
+_EXPIRED = object()
 
 
 class Entry:
@@ -36,10 +37,9 @@ class Entry:
 
 
 class _Group:
-    __slots__ = ("deadline", "entries", "task")
+    __slots__ = ("entries", "task")
 
-    def __init__(self, deadline: Deadline | None) -> None:
-        self.deadline = deadline
+    def __init__(self) -> None:
         self.entries: list[Entry] = []
         self.task: asyncio.Task | None = None
 
@@ -61,7 +61,7 @@ class Batches:
 
     async def submit(self, payload: Any) -> Any:
         entry = Entry(payload, _binding(current.get()))
-        self._place(entry, _pressed(entry))
+        self._place(entry, _tier(entry))
         try:
             return await asyncio.shield(entry.future)
         except BaseException:
@@ -73,11 +73,10 @@ class Batches:
             entry.future.add_done_callback(_retrieved)
             raise
 
-    def _place(self, entry: Entry, pressed: bool) -> None:
-        key = id(entry.deadline) if pressed else _SHARED
+    def _place(self, entry: Entry, key: Hashable) -> None:
         group = self._groups.get(key)
         if group is None:
-            group = self._groups[key] = _Group(entry.deadline if pressed else None)
+            group = self._groups[key] = _Group()
         group.entries.append(entry)
         if group.task is None or group.task.done():
             with spared_until_close():
@@ -104,30 +103,30 @@ class Batches:
     async def _flush(self, key: Hashable, group: _Group) -> None:
         try:
             while group.entries and self._closed is None:
-                await self._sent(group)
+                await self._sent(key, group)
         finally:
             if self._groups.get(key) is group and not group.entries:
                 del self._groups[key]
 
-    async def _sent(self, group: _Group) -> None:
+    async def _sent(self, key: Hashable, group: _Group) -> None:
         taken: list[Entry] = []
-        deadline = group.deadline or Deadline(_earliest(group.entries))
+        deadline = Deadline(_earliest(group.entries))
 
         def take() -> list[Entry]:
             batch: list[Entry] = []
             while group.entries and len(batch) < self._size:
                 entry = group.entries.pop(0)
-                if group.deadline is None and _pressed(entry):
-                    self._place(entry, True)
+                tier = _tier(entry)
+                if tier != key:
+                    self._place(entry, tier)
                 else:
                     batch.append(entry)
             for entry in batch:
                 entry.sent = True
                 entry.attempts += 1
             taken.extend(batch)
-            if group.deadline is None:
-                deadline.at = _earliest(batch)
-                timer.reschedule(_expiry(deadline))
+            deadline.at = _earliest(batch)
+            timer.reschedule(_expiry(deadline))
             return batch
 
         try:
@@ -165,8 +164,15 @@ def _binding(deadline: Deadline | None) -> Deadline | None:
     return binding if binding is not None else root
 
 
-def _pressed(entry: Entry) -> bool:
-    return entry.deadline is not None and entry.deadline.left() < PRESSED_SECONDS
+def _tier(entry: Entry) -> Hashable:
+    if entry.deadline is None:
+        return _SHARED
+    left = entry.deadline.left()
+    if left >= PRESSED_SECONDS:
+        return _SHARED
+    if left <= 0:
+        return _EXPIRED
+    return math.floor(math.log2(left))
 
 
 def _earliest(entries: Sequence[Entry]) -> float:

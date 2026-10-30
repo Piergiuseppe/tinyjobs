@@ -27,6 +27,8 @@ from urllib.parse import unquote
 import psycopg
 import psycopg.sql
 from psycopg import errors, pq, waiting
+from psycopg._queries import PostgresQuery
+from psycopg.adapt import Transformer
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolClosed, PoolTimeout
@@ -74,7 +76,7 @@ SAFE_SEARCH_PATH = "pg_catalog, pg_temp"
 TABLE_KINDS = ("jobs", "executions", "schedules", "meta")
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
-SETUP_LOCK_PAUSE = 0.05
+SETUP_WAIT_SECONDS = 60.0
 REBUILD_LOCK_SECONDS = 30
 REBUILD_LOCK_PAUSE = 0.5
 SETUP_ATTEMPTS = 3
@@ -364,6 +366,9 @@ class PostgresBackend(BaseBackend):
         self._hearing = 0
         self._marks: dict[str, int] = {}
         self._ghosts: dict[str, _Ghost] = {}
+        self._probing: asyncio.Lock | None = None
+        self._probe: psycopg.AsyncConnection | None = None
+        self._probers = 0
         self._orphans: dict[tuple[int, Any], _Mark] = {}
         self._fresh = False
         self._unended = False
@@ -804,30 +809,35 @@ class PostgresBackend(BaseBackend):
                 await connection.execute(statement, {})
 
     async def _lock_for_setup(self, connection: psycopg.AsyncConnection) -> None:
-        deadline = time.monotonic() + SETUP_LOCK_SECONDS
-        while True:
+        key = {"key": self._tables.lock}
+        for _ in range(2):
             cursor = await connection.execute(
-                "SELECT pg_catalog.pg_try_advisory_xact_lock(%(key)s) AS taken",
-                {"key": self._tables.lock},
+                "SELECT pg_catalog.pg_try_advisory_xact_lock(%(key)s) AS taken", key
             )
             if (await cursor.fetchone())["taken"]:
                 return
-            if not await self._lockers(connection, SETTERS, self._tables.lock):
-                logger.warning(
-                    "a session whose role cannot become this one holds the tinyjobs setup "
-                    "lock for prefix %r; creating the tables without it",
-                    self._tables.prefix,
-                )
-                return
-            if time.monotonic() >= deadline:
-                logger.warning(
-                    "another session has held the tinyjobs setup lock for prefix %r for "
-                    "%ss; creating the tables without it",
-                    self._tables.prefix,
-                    SETUP_LOCK_SECONDS,
-                )
-                return
-            await asyncio.sleep(SETUP_LOCK_PAUSE)
+            if await self._lockers(connection, SETTERS, self._tables.lock):
+                break
+        else:
+            logger.warning(
+                "a session whose role cannot become this one holds the tinyjobs setup "
+                "lock for prefix %r; creating the tables without it",
+                self._tables.prefix,
+            )
+            return
+        patience = max(SETUP_LOCK_SECONDS, min(SETUP_WAIT_SECONDS, _left() - SETUP_LOCK_SECONDS))
+        try:
+            async with connection.transaction():
+                await connection.execute(f"SET LOCAL lock_timeout = '{int(patience * 1000)}ms'")
+                await connection.execute("SELECT pg_catalog.pg_advisory_xact_lock(%(key)s)", key)
+        except errors.LockNotAvailable:
+            logger.warning(
+                "another session has held the tinyjobs setup lock for prefix %r for "
+                "%.0fs; creating the tables without it",
+                self._tables.prefix,
+                patience,
+            )
+        await connection.execute(f"SET LOCAL lock_timeout = '{SETUP_LOCK_SECONDS}s'")
 
     async def _open(self) -> None:
         failed = self._opening
@@ -1892,15 +1902,35 @@ class PostgresBackend(BaseBackend):
         seconds: float = PROBE_SECONDS,
     ) -> bool | None:
         seen: list[dict[str, Any] | None] = []
+        if self._probing is None:
+            self._probing = asyncio.Lock()
+        self._probers += 1
         try:
-            async with asyncio.timeout(seconds) as limit:
-                async with await psycopg.AsyncConnection.connect(
-                    self._conninfo, **self._direct_options()
-                ) as probe:
-                    await probe.execute(PROBING, {"path": SAFE_SEARCH_PATH})
-                    return await _asking(probe, pid, born, quiet, patience, seen, limit)
+            async with asyncio.timeout(seconds) as limit, self._probing:
+                probe, self._probe = self._probe, None
+                if probe is None or probe.closed:
+                    probe = await psycopg.AsyncConnection.connect(
+                        self._conninfo, **self._direct_options()
+                    )
+                    fresh = True
+                else:
+                    fresh = False
+                try:
+                    if fresh:
+                        await probe.execute(PROBING, {"path": SAFE_SEARCH_PATH})
+                    verdict = await _asking(probe, pid, born, quiet, patience, seen, limit)
+                except BaseException:
+                    await _closed_quietly(probe)
+                    raise
+                self._probe = probe
+                return verdict
         except (TimeoutError, psycopg.Error):
             return False if seen else None
+        finally:
+            self._probers -= 1
+            if not self._probers and self._probe is not None:
+                probe, self._probe = self._probe, None
+                await _closed_quietly(probe)
 
     async def _wake(self, queues: set[str]) -> None:
         if not self._notify or not queues or self._closed or self._channel is None:
@@ -2770,6 +2800,12 @@ async def _driven(connection: psycopg.AsyncConnection, steps: Steps[T]) -> T:
             rows = await cursor.fetchall()
 
 
+async def _closed_quietly(connection: psycopg.AsyncConnection) -> None:
+    connection.pgconn.finish()
+    with suppress(psycopg.Error):
+        await connection.close()
+
+
 async def _asking(
     probe: psycopg.AsyncConnection,
     pid: int,
@@ -2798,16 +2834,29 @@ async def _pipelined(
     if not psycopg.AsyncPipeline.is_supported():
         return [await _one(connection, query, parameters) for query, parameters in statements]
     answers: list[Any] = [None] * len(statements)
-    texts: list[tuple[int, bytes]] = []
-    literal = psycopg.AsyncClientCursor(connection)
+    texts: list[tuple[int, tuple[Any, ...]]] = []
+    adapting = Transformer(connection)
     mark = getattr(connection, "mark", None)
     token = b"" if mark is None else mark.token.encode()
     encoding = connection.info.encoding
     for index, (query, parameters) in enumerate(statements):
+        converted = PostgresQuery(adapting)
         try:
-            texts.append((index, token + literal.mogrify(query, parameters).encode(encoding)))
+            converted.convert(query, parameters)
         except Exception as error:
             answers[index] = error
+            continue
+        texts.append(
+            (
+                index,
+                (
+                    token + bytes(converted.query),
+                    converted.params,
+                    converted.types,
+                    converted.formats,
+                ),
+            )
+        )
     if texts:
         pgconn = connection.pgconn
         try:
@@ -2832,10 +2881,12 @@ async def _one(
         return error
 
 
-def _pipeline(pgconn: Any, statements: list[bytes]) -> Generator[Any, Any, list[list[Any]]]:
+def _pipeline(
+    pgconn: Any, statements: list[tuple[Any, ...]]
+) -> Generator[Any, Any, list[list[Any]]]:
     pgconn.enter_pipeline_mode()
-    for statement in statements:
-        pgconn.send_query_params(statement, None)
+    for query, parameters, types, formats in statements:
+        pgconn.send_query_params(query, parameters, types, formats)
         pgconn.pipeline_sync()
     while pgconn.flush() != 0:
         while not (ready := (yield waiting.Wait.RW)):

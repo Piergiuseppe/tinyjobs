@@ -733,8 +733,13 @@ it can move out later without touching a line. The client library is an extra, `
 is imported only when a `redis://` URL is used, so the core stays dependency-free. A url redis-py
 cannot read raises `ConfigurationError`, without its reason once the url holds a password, since
 that reason may quote part of it. So does a connection option the client does not take, named
-unless the url holds a password: a raw `?` in the password made the rest of the url such an option,
-which redis-py raised at the first command as a `TypeError` quoting the password.
+unless the url holds a password, before the host or as a `password=` option: a raw `?` in the
+password made the rest of the url such an option, which redis-py raised at the first command as a
+`TypeError` quoting the password, and a raw `&` in a `password=` value made the part after it one.
+A `unix://` url whose socket path holds an `@` behind a password is refused too, since redis-py
+took the rest of the password for the path and quoted it when the connection failed. So are
+`decode_responses`, which broke every call, and a `timeout=` that is not a number, which redis-py
+5.0 kept as text and failed every call with; one that is a number is read as one.
 
 ### Atomicity
 
@@ -858,9 +863,14 @@ database. Setup
 then reads the stored schema version and creates nothing when it matches, so a fleet starting at
 once costs a few catalog reads and one `SELECT` each. Otherwise it takes a transaction-scoped
 advisory lock and checks again under it. Any role that may connect can take an advisory lock, so
-one held by a session whose role cannot become setup's own is not waited for, and one held for five
-seconds is waited out rather than obeyed: setup creates the tables without it, and
-a concurrent creation it then trips over sends it round again, up to three times. Between the
+one held by a session whose role cannot become setup's own is not waited for, a lock let go between
+the attempt and the reading of its holders is tried once more before that is concluded, and one
+held for a minute, or what is left of setup's deadline, is waited out rather than obeyed: setup
+creates the tables without it, and a concurrent creation it then trips over sends it round again,
+up to three times. The wait blocks on the lock rather than polling a clock: four workers starting
+together on a fresh prefix over a link adding 300 ms each way started quietly, one after another,
+where three of four created the tables without the lock after five seconds and two of them blamed
+a role that could not become theirs. Between the
 `CREATE` statements and the rows the meta table is seeded with, setup checks the placement and the
 owners once more in the same transaction, so a table another role creates in the gap is caught
 before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
@@ -1076,7 +1086,10 @@ standby or its disk; a deadline would fail a large claim over a slow link, or re
 waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
 server what the statement's backend is doing, on an idle pooled connection when the pool has one,
 which gets a second to take the question and answer it, and otherwise, or when it does not, on a
-fresh connection. The question names the
+fresh connection, one per backend shared by every statement asking at the time, which closes once
+none is: twenty statements silent together behind a held row lock over that slow link kept a
+process at 11 sessions, where each opened a connection of its own and it reached 18. The question
+names the
 backend by its process id and start time, so a reused id is never taken for it, runs as the login
 role, which sees its own sessions even when the url or `ALTER ROLE ... SET role` switches to
 another, and uses only `pg_catalog` operators whatever the url's `search_path`. If the backend is
@@ -1382,9 +1395,13 @@ A thread still running after its job ended counts against `concurrency` until it
 warning names its task, so the worker claims only jobs it has a thread for; a drain or an eager
 call runs the next job on a thread added in its place and drops it once the old one returns: a
 drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
-0.51, where they waited 3.0 and 4.0 for the thread. It adds eight such threads at most, then waits
-for one to return before running another job in a thread: 60 jobs hanging past a 0.05 second timeout
-held 9 threads, where they held one each. A thread that fails to start fails its job, where the job
+0.51, where they waited 3.0 and 4.0 for the thread. The app shares eight such threads among all
+its drains and eager calls; with all eight taken, a drain hands the next job that needs a thread
+back before running it and returns, and an eager call returns it `queued`, so nothing sits
+`running` under the drain's hour-long lease: 60 jobs hanging past a 0.05 second timeout held 8
+threads whether drained or sent eagerly, and the drain returned after 0.45 seconds with 52 left
+queued, where it held 9, waited three minutes holding one claimed job, and eager calls held 60.
+A thread that fails to start fails its job, where the job
 was handed back as if the threads were shut down and the pool counted the dead thread, so no later
 job ran. The threads are daemon threads, so a process
 whose worker stopped with one still running exits, with a warning naming them, where it used to
@@ -1450,12 +1467,23 @@ answer, so of two claims of one job in a batch only the live one lands, where bo
 and the stale one's failure was stored; an outcome its text cannot encode, or that the server
 refuses, fails alone and the rest of its batch lands: 29 of 29 beside such a poison outcome, where
 26 or, on Redis, 5 landed and the others stayed `running`. Texts holding a lone surrogate are
-stored escaped. An outcome is cut at its own deadline: one with less than five seconds left goes in
-a batch of its own, and the others share one cut at the earliest deadline among them, so a cut job
-stays `running` as when written alone, where a batch without a deadline wrote it `success`. A retry
+stored escaped. The statements carry their values as bound parameters, as alone, so a result or a
+traceback never shows in `pg_stat_activity` or in the statement the server logs on an error, where
+the batch wrote them into its text. An outcome is cut at its own deadline: outcomes with five
+seconds or more left share a batch, and those with less share one with others whose time left is
+within a factor of two, each batch cut at the earliest deadline among its outcomes, so a cut job
+stays `running` as when written alone, where a batch without a deadline wrote it `success`. With
+leases of four seconds, eight outcomes waiting for one connection over a 0.7 second round trip
+went out in one batch, where each went alone, two timed out waiting and their jobs ran again. A retry
 due in a batch wakes its listeners as when written alone, which took 0.10 seconds where it timed out
 after 1.5. Closing the backend settles outcomes still waiting for a batch with the close error,
-where two calls never returned. On Redis a script missing from the server is loaded once per batch
+where two calls never returned; on Redis that error is not one a write is retried after, and a
+script is refused once the backend is closed, where the retry reopened a connection on the closed
+client and wrote the outcome after `close()` returned. A Redis batch waits for a connection only
+when the pool is full, and takes the first one any call gives back: beside an outcome written
+alone that held its connection 2.5 seconds, another under a one second deadline was written at
+once, where it waited for that one, timed out after 1.55 seconds and left its job `running`.
+On Redis a script missing from the server is loaded once per batch
 and the batch sent again, one load where twenty of them took 6.1 seconds over that link.
 A cancelled job still awaiting in its cleanup when the timeout
 ends is cancelled once more and left behind, logged, for the reaper: with `--shutdown-timeout 4` and a
