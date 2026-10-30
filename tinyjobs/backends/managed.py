@@ -6,7 +6,7 @@ import inspect
 import time
 from contextlib import suppress
 from functools import partial
-from typing import Any, Collection, Coroutine, Sequence
+from typing import Any, Awaitable, Callable, Collection, Coroutine, Sequence
 
 from ..deadlines import Deadline
 from ..deadlines import current as current_deadline
@@ -44,8 +44,7 @@ class ManagedBackend:
         self._gate = tracked_lock()
         self.capabilities = backend.capabilities
         self._knows_holders = _accepts(getattr(backend, "heartbeat", None), "worker_id")
-        self.claims_by_task = _accepts(getattr(backend, "claim", None), "tasks")
-        self._hands_back_in_place = _accepts(getattr(backend, "hand_back", None), "in_place")
+        self.hands_back_in_place = _accepts(getattr(backend, "hand_back", None), "in_place")
 
     @property
     def alive(self) -> bool:
@@ -86,22 +85,36 @@ class ManagedBackend:
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
+        return await self._claimed(
+            partial(
+                self._inner.claim,
+                worker_id=worker_id,
+                queues=queues,
+                limit=limit,
+                lease_seconds=lease_seconds,
+            )
+        )
+
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        method = getattr(self._inner, "claim_job", None)
+        if method is None:
+            return None
+        jobs = await self._claimed(
+            partial(_listed, method, job_id, worker_id=worker_id, lease_seconds=lease_seconds)
+        )
+        return jobs[0] if jobs else None
+
+    async def _claimed(self, claiming: Callable[[], Awaitable[list[Job]]]) -> list[Job]:
         outcome = self._track()
         if outcome is None:
             raise AppClosedError(CLOSED_MESSAGE)
         decided: dict[int, object] = {}
         try:
             home = self._loop or self._runner.own_loop()
-            coroutine = self._claim_kept(
-                decided,
-                worker_id=worker_id,
-                queues=queues,
-                limit=limit,
-                lease_seconds=lease_seconds,
-                **({} if tasks is None else {"tasks": tasks}),
-            )
+            coroutine = self._claim_kept(decided, claiming)
         except BaseException:
             outcome.cancel()
             raise
@@ -129,10 +142,12 @@ class ManagedBackend:
         outcome.add_done_callback(partial(self._returned, outcome))
         return outcome
 
-    async def _claim_kept(self, decided: dict[int, object], **arguments: Any) -> list[Job]:
+    async def _claim_kept(
+        self, decided: dict[int, object], claiming: Callable[[], Awaitable[list[Job]]]
+    ) -> list[Job]:
         if decided.get(0) is ABANDONED:
             return []
-        jobs = await self._inner.claim(**arguments)
+        jobs = await claiming()
         if decided.setdefault(0, DELIVERED) is DELIVERED:
             return jobs
         await self._hand_back_all(jobs)
@@ -217,7 +232,7 @@ class ManagedBackend:
         return sum(map(bool, released))
 
     async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
-        if in_place and self._hands_back_in_place:
+        if in_place and self.hands_back_in_place:
             return await self._forward(self._inner.hand_back, job, delay, in_place=True)
         method = getattr(self._inner, "hand_back", self._inner.release)
         return await self._forward(method, job, delay)
@@ -324,6 +339,11 @@ class ManagedBackend:
         if self._loop is None:
             return await coroutine
         return await run_on(self._loop, coroutine, name)
+
+
+async def _listed(method: Any, *arguments: Any, **options: Any) -> list[Job]:
+    job = await method(*arguments, **options)
+    return [] if job is None else [job]
 
 
 def _accepts(method: Any, name: str) -> bool:

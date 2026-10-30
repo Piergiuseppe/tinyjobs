@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import sys
@@ -52,6 +53,35 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         if keys:
             await client.delete(*keys)
         await super().asyncTearDown()
+
+    async def test_a_claim_whose_answer_was_lost_hands_its_jobs_back_as_never_claimed(self):
+        real = self.backend._scripts.run
+
+        async def lost(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name in ("claim", "claim_job"):
+                raise RedisConnectionError("the answer was lost")
+            return answer
+
+        for claiming in (self.claim_any, self.claim_by_id):
+            with self.subTest(claiming=claiming.__name__):
+                job = await self.enqueue(run_at=START - 1)
+                with mock.patch.object(self.backend._scripts, "run", lost):
+                    with self.assertRaises(RedisConnectionError):
+                        await claiming(job)
+                self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+                self.backend._swept = -math.inf
+                [again] = await self.claim()
+                self.assertEqual(again.id, job.id)
+                self.assertEqual((again.attempts, again.hand_backs, again.claims), (1, 0, 2))
+                self.assertEqual([e.claim for e in await self.backend.executions(job.id)], [2])
+                self.assertTrue(await self.backend.complete(again, None))
+
+    async def claim_any(self, job):
+        return await self.claim()
+
+    async def claim_by_id(self, job):
+        return await self.backend.claim_job(job.id, worker_id="worker-a", lease_seconds=60.0)
 
     async def test_a_retried_job_takes_its_dedup_key_over_from_a_vanished_holder(self):
         failed = await self.claimed_one(dedup_key="invoice:1")
@@ -1342,6 +1372,29 @@ class RedisUrlTests(unittest.TestCase):
             RedisBackend.from_url("redis://127.0.0.1:6379/0?decode_responses=1&timeout=abc")
         backend = RedisBackend.from_url("redis://127.0.0.1:6379/0?timeout=3")
         self.assertEqual(backend._client.connection_pool.timeout, 3.0)
+
+    def test_options_that_would_send_a_call_twice_are_refused(self):
+        from redis.asyncio import ConnectionPool, Redis
+        from redis.asyncio.retry import Retry
+        from redis.backoff import NoBackoff
+
+        for url, options in (
+            ("redis://127.0.0.1:6379/0?retry_on_timeout=true", {}),
+            ("redis://127.0.0.1:6379/0", {"retry": Retry(NoBackoff(), 3)}),
+            ("redis://127.0.0.1:6379/0", {"retry_on_error": [RedisConnectionError]}),
+        ):
+            with self.subTest(url=url, options=options):
+                with self.assertRaises(ConfigurationError) as caught:
+                    RedisBackend.from_url(url, **options)
+                self.assertIn("retry_on_timeout", str(caught.exception))
+        pool = ConnectionPool.from_url("redis://127.0.0.1:6379/0", retry=Retry(NoBackoff(), 2))
+        with self.assertRaises(ConfigurationError):
+            RedisBackend(Redis(connection_pool=pool))
+        backend = RedisBackend.from_url(
+            "redis://127.0.0.1:6379/0?retry_on_timeout=false", retry=Retry(NoBackoff(), 0)
+        )
+        connection = backend._client.connection_pool.make_connection()
+        self.assertEqual(connection.retry._retries, 0)
 
     def test_a_url_without_a_password_keeps_its_reason(self):
         with self.assertRaises(ConfigurationError) as caught:

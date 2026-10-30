@@ -8,6 +8,8 @@ from redis.asyncio import Redis
 NAMES = (
     "enqueue",
     "claim",
+    "claim_job",
+    "unclaim",
     "complete",
     "fail",
     "release",

@@ -31,6 +31,7 @@ from .queries import (
     ADVANCE_SCHEDULE,
     CANCEL_EXECUTIONS,
     CANCEL_JOB,
+    CLAIM_DUE_ONE,
     CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
     COUNT_BY_QUEUE,
@@ -214,16 +215,15 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
         return await self._call(
-            self._claim_sync,
-            worker_id,
-            tuple(queues),
-            limit,
-            lease_seconds,
-            None if tasks is None else tuple(tasks),
+            self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
         )
+
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        return await self._call(self._claim_job_sync, job_id, worker_id, lease_seconds)
 
     async def heartbeat(
         self,
@@ -417,9 +417,8 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None,
     ) -> list[Job]:
-        if limit <= 0 or not queues or tasks == ():
+        if limit <= 0 or not queues:
             return []
         now = self._clock.now()
         with self._connections.write() as connection:
@@ -430,13 +429,28 @@ class SQLiteBackend(BaseBackend):
                 limit=limit,
                 lease_expires_at=now + lease_seconds,
                 now=now,
-                tasks=tasks,
             )
             for job in jobs:
                 connection.execute(
                     INSERT_EXECUTION, (job.id, job.attempts, job.claims, worker_id, now)
                 )
         return jobs
+
+    def _claim_job_sync(
+        self, job_id: str, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        now = self._clock.now()
+        with self._connections.write() as connection:
+            cursor = connection.execute(
+                CLAIM_DUE_ONE, (worker_id, now + lease_seconds, job_id, now)
+            )
+            if cursor.rowcount != 1:
+                return None
+            job = job_from_row(connection.execute(SELECT_JOB, (job_id,)).fetchone())
+            connection.execute(
+                INSERT_EXECUTION, (job.id, job.attempts, job.claims, worker_id, now)
+            )
+        return job
 
     def _heartbeat_sync(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None

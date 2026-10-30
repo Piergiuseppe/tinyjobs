@@ -388,9 +388,10 @@ app.drain()
 `memory://` is the SQLite backend on a private in-memory database, so tests run the same claim,
 dedup and retries as production. Delays and backoff are respected in eager mode too: advance the clock
 and drain. A failing task is recorded on the job, not raised, as it would be in a worker. An eager
-call returns its job settled: when another drain or eager call in the process took it first, it
-waits for that one to finish it, so it comes back `queued` only while not yet due or, as below,
-while it waits for a thread.
+call returns its job settled: when another drain or eager call in the process runs it, the call
+waits for that one to finish it, except from inside a job a drain runs, where waiting could mean
+waiting on itself and it returns the job `running` at once. It comes back `queued` only while not
+yet due or, for a sync task with a timeout, as below, while it waits for a thread.
 
 ## What you get
 
@@ -429,9 +430,9 @@ the function returns. That thread counts against `concurrency` until it does, so
 one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
 an eager call runs the next job beside it instead, on one of eight extra threads the app shares
 across its drains and eager calls. Only sync tasks with a timeout use them; once all eight are
-taken by threads past their timeout, a drain leaves such jobs queued in their place and runs the
-rest, and an eager call returns such a job `queued`. The process exits without waiting for such
-threads.
+taken by threads past their timeout, a drain stops at the next such job and leaves it and the jobs
+behind it queued in their turn, and an eager call returns such a job `queued`; an eager call of any
+other task still runs its own job. The process exits without waiting for such threads.
 The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
 timeouts to the library you are calling, or write the task as `async def` where cancellation actually
 works.
@@ -608,7 +609,11 @@ mysql = "tinyjobs_mysql:MySQLBackend.from_url"
 Backends declare what they support (`priority`, `delayed`, `dedup`, ...) and asking for something
 unsupported raises when you enqueue rather than failing quietly later. The protocol is `async`, and
 `tinyjobs.testing.BackendContract` is the test suite a backend has to pass, the same one SQLite,
-Postgres and Redis run. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130 lines if
+Postgres and Redis run. Two methods are optional, and their contract tests are skipped without
+them: without `hand_back(in_place=True)` a job a drain has no thread for goes back as a plain
+hand-back, and without `claim_job` an eager call whose job waits behind such a job returns it
+`queued`.
+`tests/test_async_backend.py` implements a minimal in-memory backend in about 130 lines if
 you want a template.
 
 ## Measured
@@ -759,7 +764,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1564 tests, no test dependencies. The one that matters most is
+1576 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

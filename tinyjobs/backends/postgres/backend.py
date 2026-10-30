@@ -1013,20 +1013,40 @@ class PostgresBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        if limit <= 0 or not queues or (tasks is not None and not tasks):
+        if limit <= 0 or not queues:
             return []
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
+        return await self._claimed(
+            worker_id,
+            lease_seconds,
+            partial(self._claiming, wanted=wanted, worker_id=worker_id, limit=limit),
+        )
+
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        self._marks[worker_id] = self._hearing
+        jobs = await self._claimed(
+            worker_id,
+            lease_seconds,
+            partial(self._claiming_one, job_id=job_id, worker_id=worker_id),
+        )
+        return jobs[0] if jobs else None
+
+    async def _claimed(
+        self,
+        worker_id: str,
+        lease_seconds: float,
+        claiming: Callable[..., tuple[str, dict[str, Any]]],
+    ) -> list[Job]:
         with until(time.monotonic() + lease_seconds / 2):
             if self._ghosts or self._orphans:
                 await self._swept_within()
             now = await self._now()
-            query, parameters = self._claiming(
-                now, wanted, worker_id, limit, lease_seconds, tasks
-            )
+            query, parameters = claiming(now=now, lease_seconds=lease_seconds)
             _LEFT.set(None)
             try:
                 rows = await self._retrying(query, parameters)
@@ -1187,21 +1207,32 @@ class PostgresBackend(BaseBackend):
         worker_id: str,
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        if tasks is not None:
-            query = self._queries.claim_tasks
-        elif len(wanted) == 1:
-            query = self._queries.claim_one_queue
-        else:
-            query = self._queries.claim_many_queues
+        query = (
+            self._queries.claim_one_queue
+            if len(wanted) == 1
+            else self._queries.claim_many_queues
+        )
         token = secrets.token_hex(16)
         return query, self._at(
             now,
             queues=wanted,
             queue=wanted[0],
-            tasks=list(tasks or ()),
             limit=limit,
+            worker=worker_id,
+            lease=now + lease_seconds,
+            seconds=lease_seconds,
+            token=token,
+            key=_claim_key(token),
+        )
+
+    def _claiming_one(
+        self, *, now: float, job_id: str, worker_id: str, lease_seconds: float
+    ) -> tuple[str, dict[str, Any]]:
+        token = secrets.token_hex(16)
+        return self._queries.claim_by_id, self._at(
+            now,
+            id=job_id,
             worker=worker_id,
             lease=now + lease_seconds,
             seconds=lease_seconds,

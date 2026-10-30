@@ -13,7 +13,7 @@ SELECT_ACTIVE_BY_DEDUP = f"""
 
 SELECT_CLAIMABLE_IDS = """
     SELECT id FROM jobs
-     WHERE status = 'queued' AND run_at <= ? AND queue IN ({queues}){tasks}
+     WHERE status = 'queued' AND run_at <= ? AND queue IN ({queues})
      ORDER BY priority DESC, run_at ASC
      LIMIT ?
 """
@@ -27,7 +27,7 @@ CLAIM_RETURNING = f"""
            lease_expires_at = ?
      WHERE id IN (
            SELECT id FROM jobs
-            WHERE status = 'queued' AND run_at <= ? AND queue IN ({{queues}}){{tasks}}
+            WHERE status = 'queued' AND run_at <= ? AND queue IN ({{queues}})
             ORDER BY priority DESC, run_at ASC
             LIMIT ?
      )
@@ -42,6 +42,16 @@ CLAIM_ONE = """
            claims = claims + 1,
            lease_expires_at = ?
      WHERE id = ? AND status = 'queued'
+"""
+
+CLAIM_DUE_ONE = """
+    UPDATE jobs
+       SET status = 'running',
+           worker_id = ?,
+           attempts = attempts + 1,
+           claims = claims + 1,
+           lease_expires_at = ?
+     WHERE id = ? AND status = 'queued' AND run_at <= ?
 """
 
 HEARTBEAT = """

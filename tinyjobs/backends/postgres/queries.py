@@ -296,6 +296,15 @@ class Queries:
                  FOR UPDATE SKIP LOCKED
             """
 
+        self.claim_by_id = taking(f"""
+            picked AS (
+                SELECT id FROM {jobs}
+                 WHERE id OPERATOR(pg_catalog.=) %(id)s::pg_catalog.text
+                   AND status = 'queued' AND run_at <= {horizon}
+                 FOR UPDATE SKIP LOCKED
+            )
+        """)
+
         self.claim_one_queue = taking(f"""
             {one_queue},
             picked AS (
@@ -328,17 +337,6 @@ class Queries:
                  CROSS JOIN LATERAL ({oldest_first("ready.name")}) AS due
                  WHERE levels.due
                  LIMIT %(limit)s
-            )
-        """)
-
-        self.claim_tasks = taking(f"""
-            picked AS (
-                SELECT id FROM {jobs}
-                 WHERE status = 'queued' AND queue = ANY(%(queues)b::text[])
-                   AND task = ANY(%(tasks)b::text[]) AND run_at <= {horizon}
-                 ORDER BY priority DESC, run_at ASC
-                 LIMIT %(limit)s
-                 FOR UPDATE SKIP LOCKED
             )
         """)
 

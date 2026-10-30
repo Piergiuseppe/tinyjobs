@@ -26,7 +26,6 @@ class ClaimStrategy(ABC):
         limit: int,
         lease_expires_at: float,
         now: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]: ...
 
 
@@ -40,11 +39,10 @@ class ReturningClaim(ClaimStrategy):
         limit: int,
         lease_expires_at: float,
         now: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        sql = CLAIM_RETURNING.format(queues=_placeholders(queues), tasks=_among(tasks))
+        sql = CLAIM_RETURNING.format(queues=_placeholders(queues))
         rows = connection.execute(
-            sql, (worker_id, lease_expires_at, now, *queues, *(tasks or ()), limit)
+            sql, (worker_id, lease_expires_at, now, *queues, limit)
         ).fetchall()
         return self.ordered([job_from_row(row) for row in rows])
 
@@ -59,10 +57,9 @@ class SelectThenUpdateClaim(ClaimStrategy):
         limit: int,
         lease_expires_at: float,
         now: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        sql = SELECT_CLAIMABLE_IDS.format(queues=_placeholders(queues), tasks=_among(tasks))
-        candidates = connection.execute(sql, (now, *queues, *(tasks or ()), limit)).fetchall()
+        sql = SELECT_CLAIMABLE_IDS.format(queues=_placeholders(queues))
+        candidates = connection.execute(sql, (now, *queues, limit)).fetchall()
         claimed: list[Job] = []
         for candidate in candidates:
             cursor = connection.execute(
@@ -83,7 +80,3 @@ def build_claim_strategy() -> ClaimStrategy:
 
 def _placeholders(values: Sequence[str]) -> str:
     return ", ".join("?" for _ in values)
-
-
-def _among(tasks: Sequence[str] | None) -> str:
-    return "" if tasks is None else f" AND task IN ({_placeholders(tasks)})"

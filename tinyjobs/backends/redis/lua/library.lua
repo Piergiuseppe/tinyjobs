@@ -238,6 +238,20 @@ local function start_execution(job)
   }))
 end
 
+local function take(job, worker, lease_expires_at, token)
+  transition(job, 'running', {
+    worker_id = worker,
+    attempts = tostring(tonumber(job.attempts) + 1),
+    claims = tostring(tonumber(claim_of(job)) + 1),
+    lease_expires_at = lease_expires_at,
+    claim_token = token,
+  })
+  start_execution(job)
+  local held = key('claim', token)
+  redis.call('SADD', held, job.id)
+  redis.call('EXPIRE', held, math.max(1, math.ceil(tonumber(lease_expires_at) - tonumber(NOW))) + 1)
+end
+
 local function close_running_execution(job, status)
   local stored = redis.call('HGET', key('executions', job.id), claim_of(job))
   if stored and cjson.decode(stored).status == 'running' then

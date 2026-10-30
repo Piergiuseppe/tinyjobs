@@ -6,12 +6,16 @@ import functools
 import inspect
 import logging
 import math
+import secrets
 import threading
+import time
 from contextlib import suppress
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import NoScriptError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -53,6 +57,11 @@ SPARE_CONNECTIONS = 2
 SETTLE_BATCH = 100
 CLOSED_MESSAGE = "the redis backend was closed"
 CLOSE_SECONDS = 0.5
+GHOST_SWEEP_SECONDS = 1.0
+REPLAY_MESSAGE = (
+    "tinyjobs sends each redis call once and recovers a lost answer itself, since a call sent "
+    "again could apply twice, so retry, retry_on_timeout and retry_on_error cannot be set"
+)
 
 logger = logging.getLogger("tinyjobs.redis")
 
@@ -79,6 +88,9 @@ class RedisBackend(BaseBackend):
         prefix: str = DEFAULT_PREFIX,
         clock: Clock | None = None,
     ) -> None:
+        if _replays(client.connection_pool.connection_kwargs):
+            raise ConfigurationError(REPLAY_MESSAGE)
+        client.connection_pool.connection_kwargs["retry"] = Retry(NoBackoff(), 0)
         _mend(client.connection_pool)
         self._client = client
         self._clock = FollowingClock() if clock is None else clock
@@ -90,6 +102,8 @@ class RedisBackend(BaseBackend):
         self._batches = Batches(self._settled_batch, SETTLE_BATCH)
         self._closed = False
         self._alone = 0
+        self._ghosts: dict[str, float] = {}
+        self._swept = -math.inf
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -186,23 +200,55 @@ class RedisBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
-        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        if limit <= 0 or not queues or (tasks is not None and not tasks):
+        if limit <= 0 or not queues:
             return []
+        await self._laid()
         now = await self._now()
-        named = [] if tasks is None else list(tasks)
-        claimed = await self._script(
-            "claim",
-            now,
-            worker_id,
-            number(now + lease_seconds),
-            limit,
-            -1 if tasks is None else len(named),
-            *named,
-            *queues,
+        token = secrets.token_hex(16)
+        claimed = await self._haunting(
+            token,
+            lease_seconds,
+            self._script("claim", now, worker_id, number(now + lease_seconds), limit, token, *queues),
         )
         return [job_from_flat(flat) for flat in claimed]
+
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        await self._laid()
+        now = await self._now()
+        token = secrets.token_hex(16)
+        claimed = await self._haunting(
+            token,
+            lease_seconds,
+            self._script("claim_job", now, worker_id, number(now + lease_seconds), job_id, token),
+        )
+        return job_from_flat(claimed[0]) if claimed else None
+
+    async def _haunting(self, token: str, lease_seconds: float, claiming: Awaitable[T]) -> T:
+        try:
+            return await claiming
+        except (RedisConnectionError, RedisTimeoutError):
+            self._ghosts[token] = time.monotonic() + lease_seconds
+            raise
+
+    async def _laid(self) -> None:
+        if not self._ghosts or time.monotonic() - self._swept < GHOST_SWEEP_SECONDS:
+            return
+        self._swept = time.monotonic()
+        for token, deadline in list(self._ghosts.items()):
+            try:
+                await self._run("unclaim", token)
+            except (RedisConnectionError, RedisTimeoutError) as error:
+                logger.warning(
+                    "could not hand back the jobs of a redis claim whose answer never arrived, "
+                    "trying again later: %s",
+                    error,
+                )
+                return
+            if time.monotonic() >= deadline:
+                del self._ghosts[token]
 
     async def heartbeat(
         self,
@@ -701,12 +747,20 @@ def _refused(url: str, pool: Any) -> str | None:
         return f"the redis client takes no connection option named {', '.join(unknown)}"
     if options.get("decode_responses"):
         return "tinyjobs reads raw bytes from redis, so decode_responses cannot be set"
+    if _replays(options):
+        return REPLAY_MESSAGE
     if isinstance(pool.timeout, str):
         try:
             pool.timeout = float(pool.timeout)
         except ValueError:
             return "its timeout is not a number of seconds"
     return None
+
+
+def _replays(options: dict[str, Any]) -> bool:
+    retry = options.get("retry")
+    retries = 0 if retry is None else getattr(retry, "_retries", 0)
+    return bool(retries or options.get("retry_on_timeout") or options.get("retry_on_error"))
 
 
 def _unknown_options(pool: Any) -> list[str]:

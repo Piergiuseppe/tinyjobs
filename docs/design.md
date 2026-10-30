@@ -427,8 +427,9 @@ class Backend(Protocol):
 
     # --- consumer side ---------------------------------------------------
     async def claim(self, *, worker_id: str, queues: Sequence[str],
-                    limit: int, lease_seconds: float,
-                    tasks: Sequence[str] | None = None) -> list[Job]: ...
+                    limit: int, lease_seconds: float) -> list[Job]: ...
+    async def claim_job(self, job_id: str, *, worker_id: str,
+                        lease_seconds: float) -> Job | None: ...
     async def heartbeat(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None = None
     ) -> None: ...
@@ -467,12 +468,17 @@ core does the looping. And since the protocol freezes at v1.0, a seam that is no
 be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
 `enqueue()`) so that simple backends get the correct behaviour for free.
 
-`claim(tasks=...)` takes only jobs of those tasks, in the same order, and `hand_back(in_place=True)`
-returns a job at its old `run_at`; a drain needs both once its spare threads are taken (see
-[Timeouts](#timeouts-are-not-uniform-and-pretending-otherwise-would-be-a-lie)), and on a backend
-without them it stops there instead. Past 100,000 queued
-jobs of other tasks such a claim took 6.7 ms on SQLite, 10.6 ms on Postgres and 99 ms on Redis,
-which walks its ready set inside one script, against 0.4 to 1.2 ms for a plain claim.
+`hand_back(in_place=True)` returns a job at its old `run_at`, so a job a drain has no thread for
+(see [Timeouts](#timeouts-are-not-uniform-and-pretending-otherwise-would-be-a-lie)) keeps its turn,
+and `claim_job` claims one job by its id, only while it is queued and due, so an eager call can run
+its own job behind such a one. Both are optional: a backend without the first gets a plain
+`hand_back`, and without the second the eager call returns its job `queued`. A claim takes no task
+filter to skip past such jobs: past 100,000 queued jobs of other tasks one took 99 ms on Redis,
+which walks its ready set inside one script and so blocks every other client meanwhile, and a
+sequential scan on Postgres, against 0.4 to 1.2 ms for a plain claim. `claim_job` is a lookup by
+primary key, under `FOR UPDATE SKIP LOCKED` on Postgres: 200 rounds of three apps each racing it
+against a plain claim for the same job gave the job to exactly one of them on SQLite, Postgres and
+Redis, and one that finds nothing to claim takes 0.2 to 0.3 ms.
 
 A backend may also declare `transient_errors`, the exception types that mean the store could not be
 reached. When `complete` or `fail` raises one, the worker writes again after 0.25 s, doubling up to
@@ -747,7 +753,14 @@ password made the rest of the url such an option, which redis-py raised at the f
 A `unix://` url whose socket path holds an `@` behind a password is refused too, since redis-py
 took the rest of the password for the path and quoted it when the connection failed. So are
 `decode_responses`, which broke every call, and a `timeout=` that is not a number, which redis-py
-5.0 kept as text and failed every call with; one that is a number is read as one.
+5.0 kept as text and failed every call with; one that is a number is read as one. So are the
+client's own retries (`retry` with any retries, `retry_on_timeout`, `retry_on_error`), on the url,
+as keywords or on a client handed in, and the pool is pinned to none: a call sent again after its
+answer was lost runs its script twice, so one enqueue counted two `queued` jobs and the `complete`
+sent again found the job no longer running, returned false and left the counts at one `queued` and
+one `success`. Refusing them is simpler than making every script safe to run twice, and tinyjobs
+already recovers a lost answer itself: outcomes are written again only after checking the claim,
+and a lost claim is handed back by its token.
 
 ### Atomicity
 
@@ -1415,38 +1428,48 @@ drain behind such a thread finished in 0.5 seconds and an eager call past its ti
 0.51, where they waited 3.0 and 4.0 for the thread. The app shares eight such threads among all
 its drains and eager calls. Only a sync job with a timeout can leave its thread behind, so only
 such a job reserves one of the eight before it starts, and keeps it if it outlives its timeout;
-when running ones hold all eight, the next waits for one to finish or time out, and only once all
-eight are taken by threads past their timeout is it refused. 20 eager calls at once of a task
-sleeping 0.3 seconds all returned `success` whether it had a timeout or not, in 0.94 seconds with
-one, where 12 returned `queued`. With all eight taken, a drain claims only the jobs that need no
-spare thread (`async def` tasks, or sync ones without a timeout), so the others keep their place
-and are never leased to it: behind 500 queued sync jobs with a timeout and one `async def` job, the
-drain ran the async one and leased none of them, where it held all 500 under its hour-long lease
-while the async job ran, and a sync job queued before an `async def` one that ran until a thread
-returned still ran before the sync job queued after it, where it was left `queued` and the later
-one ran. A job refused after it was claimed, while it waited for a thread that then outlived its
-timeout, goes back at once at its old `run_at`, and the drain holds nothing it does not run. A
-job a sync job with a timeout sends eagerly from its own thread needs no spare thread, since the
-thread that sent it waits for it: a chain of 12 nested eager calls ran with no warning, with or
-without a timeout, where 3 of them warned. An eager call whose job another drain in the process
-took waits for that drain to finish it: 20 eager calls beside a thread draining in a loop all
-returned `success`, where 4 returned `running`.
-60 jobs hanging past a 0.05 second timeout held 8 threads whether drained or sent eagerly, and the
-drain returned after 0.45 seconds with 52 left queued, where it held 9, waited three minutes holding
-one claimed job, and eager calls held 60. Eager calls at once took no more: 100 from threads or
-from one `asyncio.gather` held 8, where they held 100, and an `async def` task sent after them ran,
-where it stayed `queued` behind them. A forked child starts with all eight free, where it inherited
-the parent's count and ran no threaded job at all.
-A thread that fails to start fails its job, where the job
-was handed back as if the threads were shut down and the pool counted the dead thread, so no later
-job ran. The threads are daemon threads, so a process
-whose worker stopped with one still running exits, with a warning naming them, where it used to
-hang at interpreter exit until killed.
-A job with a 0.3 second timeout claimed behind such a thread used to
-stay `running` for as long as the thread ran, its lease renewed so no other worker could take it; it
-now stays `queued` for any other worker, and ran here once the thread returned. With two workers of
-concurrency 2, one holding two runaway threads, all six quick jobs ran on the other, where two were
-held `running` after 24 seconds.
+when running ones hold all eight, the next goes back at its old `run_at` and its drain waits for one
+to finish or time out before claiming again, so no drain holds a claim while it waits, and only once
+all eight are taken by threads past their timeout is it refused. 30 threads each sending a job with
+a timeout that sends another eagerly all returned `success`, the slowest in 0.27 seconds, where 8
+failed with `TIMEOUT` after 10.4 seconds and 6 returned `queued`, and a drain killed while it waited
+held no job, where it left its job `running` for the hour its lease lasted. 20 eager calls at once
+of a task sleeping 0.3 seconds all returned `success` whether it had a timeout or not, in 0.94
+seconds with one, where 12 returned `queued`. A refused job goes back at once at its old `run_at`
+and the drain stops there, so it and the jobs behind it keep their turn for a later drain or eager
+call and the drain holds nothing it does not run: behind 500 queued sync jobs with a timeout and one
+`async def` job it returned in 2.1 ms with one hand-back and nothing leased, and the async job waits
+its turn rather than costing every claim the scan above. An eager call whose own job needs no spare
+thread claims that job by its id once the drain stops, so with all eight taken an `async def` or
+untimed sync job sent eagerly still returns `success`. A job run by a job holding one of the app's
+spare threads, whether sent eagerly or drained from inside it, never waits for one: it takes a free
+one or is refused at once, so no job waits on a thread its own caller holds. A job with a timeout
+that sent 40 hanging jobs eagerly held 8 threads, where they held 43; a drain inside such a job
+finished in 0.17 seconds, where it waited 4.08; and a chain of 13 nested eager calls with a timeout
+finished in 0.02 seconds, the 5 past the eight coming back `queued` to their callers and run by the
+drains around them once a thread freed. An eager call whose job another drain in the process is
+running waits for that drain to finish it, but only when the call is not made from inside a job a
+drain runs: such a waiter holds no spare thread and no job anyone could wait on, so no wait can
+close a cycle, where a call made from inside a job could wait on its own job, through a dedup key,
+on a job waiting on it, or on a spare thread its waiter holds. A drain counts its claims in flight,
+so a call that finds its job `running` but not yet entered, or still `queued` under a claim not yet
+committed, waits for those claims first: 4,000 eager calls beside a thread draining in a loop all
+returned `success` on SQLite, Postgres and Redis, sync, async or with a timeout, where Redis
+returned 5 `running` and Postgres 1 `running` and 2 `queued`. A job that sends its own dedup key
+eagerly gets itself back `running` at once, where it waited for itself forever. 60 jobs hanging past
+a 0.05 second timeout held 8 threads whether drained or sent eagerly, and the drain returned after
+0.45 seconds with 52 left queued, where it held 9, waited three minutes holding one claimed job, and
+eager calls held 60. Eager calls at once took no more: 100 from threads or from one `asyncio.gather`
+held 8, where they held 100, and an `async def` task sent after them ran, where it stayed `queued`
+behind them. A forked child starts with all eight free, where it inherited the parent's count and
+ran no threaded job at all. A thread that fails to start fails its job, where the job was handed
+back as if the threads were shut down and the pool counted the dead thread, so no later job ran. The
+threads are daemon threads, so a process whose worker stopped with one still running exits, with a
+warning naming them, where it used to hang at interpreter exit until killed. A job with a 0.3 second
+timeout claimed behind such a thread used to stay `running` for as long as the thread ran, its lease
+renewed so no other worker could take it; it now stays `queued` for any other worker, and ran here
+once the thread returned. With two workers of concurrency 2, one holding two runaway threads, all
+six quick jobs ran on the other, where two were held `running` after 24 seconds.
 
 This catches people out, so, plainly:
 
@@ -1546,7 +1569,7 @@ done and its outcome had been given up; before, the job was released while its t
 
 A claim whose caller is cancelled while it is in flight still lands in the backend, so tinyjobs lets
 it finish and hands its jobs back, as if they were never claimed; otherwise a cancelled drain would
-leave its job `running` for the hour its lease lasts. The claim runs on tinyjobs' own loop, not the
+leave its job `running` until its lease ends. The claim runs on tinyjobs' own loop, not the
 caller's, so this holds when the caller's loop ends with the claim in flight (`asyncio.run`
 returning, Ctrl-C under it) and when the process exits: that loop finishes such claims before it
 stops, including a hand-back sent while that loop is being closed, unless the caller's deadline has
@@ -1562,6 +1585,16 @@ attempt, never recorded as failed. Once the interpreter is exiting, tinyjobs sta
 thread, and the exit closes only the connections no live thread is using, so a worker left running
 in a daemon thread cannot crash the process. A job task cancelled before it starts is released the
 same way as one cancelled while it runs.
+
+A drain leases each job for a minute and renews the lease every 20 seconds while the job runs, so
+the job of a drain killed mid-run comes back within a minute, where its one-hour lease stranded it
+for an hour; and it writes a job's outcome again after an error that means the store could not be
+reached, as a worker does, where it raised and left the job `running`: 3,000 jobs drained through
+six half-second Redis cuts all ended `success`, each run once, where up to 6 stayed `running`. A
+Redis claim carries a token; when its answer is lost, the next claim, once a second at most until
+that lease would end, hands back the jobs still `running` under it as if never claimed, as the sweep
+of unanswered claims does on Postgres, where they stayed `running` until their lease ended and then
+counted as a failed attempt.
 
 A worker or scheduler installs SIGINT and SIGTERM handlers only on the main thread; elsewhere it
 runs without them, since Python delivers signals to the main thread only. Workers on one loop share

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import unittest
 from dataclasses import replace
 
@@ -309,29 +310,9 @@ class BackendContract:
         self.assertEqual((await self.claim())[0].id, first.id)
         self.assertEqual(await self.backend.release_many([]), 0)
 
-    async def test_a_claim_for_some_tasks_takes_them_in_order_past_the_others(self):
-        skipped = [make_job(task="tests.sync", run_at=START - 300 + i) for i in range(150)]
-        await self.backend.enqueue_many(skipped)
-        wanted = await self.enqueue(task="tests.async", run_at=START - 2)
-        later = await self.enqueue(task="tests.async", run_at=START - 1)
-        claimed = await self.backend.claim(
-            worker_id="worker-a",
-            queues=("default",),
-            limit=1,
-            lease_seconds=60.0,
-            tasks=["tests.async"],
-        )
-        self.assertEqual([job.id for job in claimed], [wanted.id])
-        nothing = await self.backend.claim(
-            worker_id="worker-a", queues=("default",), limit=5, lease_seconds=60.0, tasks=[]
-        )
-        self.assertEqual(nothing, [])
-        rest = await self.claim(limit=200)
-        self.assertEqual(
-            [job.id for job in rest], [job.id for job in skipped] + [later.id]
-        )
-
     async def test_a_job_handed_back_in_place_keeps_its_turn(self):
+        if "in_place" not in inspect.signature(self.backend.hand_back).parameters:
+            raise unittest.SkipTest("the backend cannot hand a job back in place")
         first = await self.enqueue(run_at=START - 2)
         second = await self.enqueue(run_at=START - 1)
         [claimed] = await self.claim(limit=1)
@@ -341,6 +322,32 @@ class BackendContract:
         self.assertIs(stored.status, JobStatus.QUEUED)
         self.assertEqual((stored.run_at, stored.attempts, stored.hand_backs), (START - 2, 0, 1))
         self.assertEqual([job.id for job in await self.claim()], [first.id, second.id])
+
+    async def test_a_job_claimed_by_id_is_leased_once_and_only_when_due(self):
+        if not hasattr(self.backend, "claim_job"):
+            raise unittest.SkipTest("the backend cannot claim a job by its id")
+        first = await self.enqueue(run_at=START - 2)
+        wanted = await self.enqueue(run_at=START - 1)
+        later = await self.enqueue(run_at=START + 5)
+
+        async def by_id(job: Job) -> Job | None:
+            return await self.backend.claim_job(job.id, worker_id="worker-b", lease_seconds=60.0)
+
+        self.assertIsNone(await by_id(later))
+        claimed = await by_id(wanted)
+        self.assertEqual(
+            (claimed.id, claimed.status, claimed.worker_id, claimed.attempts, claimed.claims),
+            (wanted.id, JobStatus.RUNNING, "worker-b", 1, 1),
+        )
+        self.assertEqual(claimed.lease_expires_at, START + 60)
+        self.assertIsNone(await by_id(wanted))
+        self.assertEqual([job.id for job in await self.claim()], [first.id])
+        self.assertIsNone(await by_id(first))
+        self.assertEqual(len(await self.backend.executions(wanted.id)), 1)
+        self.assertTrue(await self.backend.complete(claimed, None))
+        self.assertIsNone(await by_id(wanted))
+        self.clock.advance(5)
+        self.assertEqual((await by_id(later)).id, later.id)
 
     async def test_hand_back_returns_a_job_as_if_it_was_never_claimed(self):
         claimed = await self.claimed_one(max_attempts=2)

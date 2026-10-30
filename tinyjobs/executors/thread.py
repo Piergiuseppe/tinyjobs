@@ -49,14 +49,14 @@ class Spares:
     def exhausted(self) -> bool:
         return self._strayed >= self.limit
 
-    async def reserve(self) -> "Spare | None":
+    async def reserve(self, *, wait: bool = True) -> "Spare | None":
         loop = asyncio.get_running_loop()
         while True:
             with self._lock:
                 if self._taken < self.limit:
                     self._taken += 1
                     return Spare(self)
-                if self._strayed >= self.limit:
+                if self._strayed >= self.limit or not wait:
                     return None
                 waiter = (loop, loop.create_future())
                 self._waiting.add(waiter)
@@ -70,14 +70,14 @@ class Spares:
         with self._lock:
             self._strayed += 1
             waiting = list(self._waiting)
-        _wake(waiting)
+        wake(waiting)
 
     def _give(self, strayed: bool) -> None:
         with self._lock:
             self._taken -= 1
             self._strayed -= strayed
             waiting = list(self._waiting)
-        _wake(waiting)
+        wake(waiting)
 
 
 class Spare:
@@ -101,7 +101,7 @@ class Spare:
         self.spares._give(True)
 
 
-def _wake(waiting: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]]) -> None:
+def wake(waiting: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]]) -> None:
     for loop, future in waiting:
         with suppress(RuntimeError):
             loop.call_soon_threadsafe(_resolve, future)
@@ -143,8 +143,9 @@ class ThreadExecutor(Executor):
         started: asyncio.Future[float] = loop.create_future()
         owner = asyncio.current_task()
         context = copy_context()
-        if owner in self._lent:
-            context.run(_spared.set, True)
+        lent = self._lent.get(owner)
+        if lent is not None:
+            context.run(_spared.set, _spared.get() | {lent.spares})
         call = partial(
             _started,
             loop,
@@ -313,15 +314,15 @@ class _Threads:
                 item[0].cancel()
 
 
-_spared: ContextVar[bool] = ContextVar("tinyjobs_spared", default=False)
+_spared: ContextVar[frozenset[Spares]] = ContextVar("tinyjobs_spared", default=frozenset())
 
 
-def holds_spare() -> bool:
+def held_spares() -> frozenset[Spares]:
     return _spared.get()
 
 
-async def spared(coroutine: Coroutine[Any, Any, T]) -> T:
-    _spared.set(True)
+async def spared(held: frozenset[Spares], coroutine: Coroutine[Any, Any, T]) -> T:
+    _spared.set(held)
     return await coroutine
 
 

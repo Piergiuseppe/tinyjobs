@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import logging
 import time
 import weakref
 from contextlib import (
@@ -26,7 +25,7 @@ from .exceptions import (
     UnsupportedCapabilityError,
 )
 from .executors import Spares
-from .executors.thread import holds_spare, spared
+from .executors.thread import held_spares, spared
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -63,7 +62,7 @@ from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
-from .worker.drain import DRAIN_SPARE_THREADS, InDrains
+from .worker.drain import DRAIN_SPARE_THREADS, InDrains, drained, in_drained_job, needs_spare
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -83,8 +82,6 @@ EMBEDDED_SIGNALS_MESSAGE = (
 WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
 
 T = TypeVar("T")
-
-logger = logging.getLogger("tinyjobs.worker")
 
 _apps: "weakref.WeakSet[TinyJobs]" = weakref.WeakSet()
 _inherited: list[ManagedBackend] = []
@@ -216,8 +213,9 @@ class TinyJobs:
             refuse = getattr(self._backend, "refuse_held_transaction", None)
             if refuse is not None:
                 refuse()
-        if holds_spare():
-            factory = partial(_spared_call, factory)
+        held, inside = held_spares(), in_drained_job()
+        if held or inside:
+            factory = partial(_carried_call, held, inside, factory)
         return self._runner.run(factory, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
@@ -227,30 +225,41 @@ class TinyJobs:
         bound = self.bind(job)
         if not self._eager:
             return bound
+        await self.adrain()
+        looked = None
         while True:
-            await Drain(self, quiet=True).run()
             bound = await bound.arefresh()
-            draining = self._in_drains.running(bound.id)
-            if bound.status is not JobStatus.RUNNING or draining is None:
-                break
-            await asyncio.wrap_future(draining)
-        if self._left_for_a_spare(bound):
-            logger.warning(
-                "job %s stays queued: %d job thread(s) still run past their timeout, so jobs "
-                "of sync tasks with a timeout wait until one returns and a later drain or "
-                "eager call runs them",
-                bound.id,
-                self._thread_spares.limit,
-            )
-        return bound
+            if self._runs_alone(bound) and await Drain(self).run_job(bound.id):
+                continue
+            if in_drained_job() or not self._may_be_taken(bound):
+                return bound
+            if await self._in_drains.finished(bound.id):
+                looked = None
+                await self.adrain()
+                continue
+            seen = (bound.status, bound.claims)
+            if seen == looked:
+                return bound
+            looked = seen
+            await self._in_drains.claimed()
+            if bound.status is JobStatus.QUEUED:
+                await self.adrain()
 
-    def _left_for_a_spare(self, job: Job) -> bool:
-        if job.status is not JobStatus.QUEUED or not self._thread_spares.exhausted:
+    def _may_be_taken(self, job: Job) -> bool:
+        if job.status is JobStatus.RUNNING:
+            return True
+        if job.status is not JobStatus.QUEUED or job.run_at > self._clock.now():
             return False
-        if job.task not in self._registry or job.run_at > self._clock.now():
+        if job.task not in self._registry:
             return False
-        task = self._registry.get(job.task)
-        return not task.is_coroutine and task.timeout is not None
+        return not (needs_spare(self._registry.get(job.task)) and self._thread_spares.exhausted)
+
+    def _runs_alone(self, job: Job) -> bool:
+        if job.status is not JobStatus.QUEUED or job.run_at > self._clock.now():
+            return False
+        if job.task not in self._registry:
+            return False
+        return not needs_spare(self._registry.get(job.task))
 
     async def ensure_connected(self) -> None:
         await settled()
@@ -820,5 +829,7 @@ def _assert_callable_without_arguments(task: Task) -> None:
         ) from None
 
 
-def _spared_call(factory: Callable[[], Coroutine[Any, Any, T]]) -> Coroutine[Any, Any, T]:
-    return spared(factory())
+def _carried_call(
+    held: frozenset[Spares], inside: bool, factory: Callable[[], Coroutine[Any, Any, T]]
+) -> Coroutine[Any, Any, T]:
+    return spared(held, drained(inside, factory()))
