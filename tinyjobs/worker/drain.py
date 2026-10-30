@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from ..exceptions import ExecutorClosedError, UnknownTaskError
 from ..executors import ExecutorResolver
+from ..executors.thread import Spare, held_spare
 from ..models import Job
 from ..runtime import inside_running_loop
 from ..services.execution import current_runner
@@ -40,8 +41,9 @@ class Drain:
         self._prepare_run()
 
     def _prepare_run(self) -> None:
-        self._executors = ExecutorResolver(concurrency=1, spares=self._app.thread_spares)
+        self._executors = ExecutorResolver(concurrency=1)
         self._stopping = asyncio.Event()
+        self._held: list[Job] = []
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -82,6 +84,13 @@ class Drain:
                 await self._app.aclose()
 
     async def _drain(self) -> int:
+        try:
+            return await self._drain_all()
+        finally:
+            held, self._held = self._held, []
+            await sheltered(asyncio.gather(*(self._app.backend.hand_back(job) for job in held)))
+
+    async def _drain_all(self) -> int:
         ran = 0
         while not self._stopping.is_set():
             queues = self._queues or await self._known_queues()
@@ -112,27 +121,28 @@ class Drain:
         except UnknownTaskError:
             await self._app.backend.hand_back(job)
             raise
-        if not task.is_coroutine and self._app.thread_spares.full:
-            await sheltered(self._app.backend.hand_back(job))
-            logger.warning(
-                "the drain stops before job %s: %d job thread(s) still run past their "
-                "timeout, so it and the jobs behind it stay queued until they return",
-                job.id,
-                self._app.thread_spares.limit,
-            )
-            self._stopping.set()
+        spare = None if task.is_coroutine else self._app.thread_spares.reserve()
+        if not task.is_coroutine and spare is None:
+            if not self._held:
+                logger.warning(
+                    "the drain leaves job %s queued: %d job thread(s) still run past their "
+                    "timeout, so jobs that need a thread stay queued until they return",
+                    job.id,
+                    self._app.thread_spares.limit,
+                )
+            self._held.append(job)
             return False
-        running = asyncio.ensure_future(self._attempt(job, task))
+        running = asyncio.ensure_future(self._attempt(job, task, spare))
         try:
-            return await self._settle(running, job)
+            return await self._settle(running, job, spare)
         except ExecutorClosedError:
             await self._app.backend.hand_back(job)
             raise
         except asyncio.CancelledError:
-            await self._abandon(running, job)
+            await self._abandon(running, job, spare)
             raise
 
-    async def _settle(self, running: asyncio.Future, job: Job) -> bool:
+    async def _settle(self, running: asyncio.Future, job: Job, spare: Spare | None) -> bool:
         stopping = asyncio.ensure_future(self._stopping.wait())
         try:
             await asyncio.wait(
@@ -152,11 +162,14 @@ class Drain:
         if running.done():
             running.result()
             return True
-        await self._abandon(running, job)
+        await self._abandon(running, job, spare)
         return False
 
-    async def _abandon(self, running: asyncio.Future, job: Job) -> None:
-        if self._executors.keeps(running) is not None:
+    async def _abandon(self, running: asyncio.Future, job: Job, spare: Spare | None) -> None:
+        kept = self._executors.keeps(running)
+        if kept is not None:
+            if spare is not None:
+                spare.keep(kept)
             logger.warning(
                 "job %s still runs in a thread that cannot be stopped; it is not released, and "
                 "its outcome is recorded if it returns while the loop runs, else its lease ends",
@@ -167,6 +180,11 @@ class Drain:
         await asyncio.gather(running, return_exceptions=True)
         await sheltered(self._app.backend.release(job))
 
-    async def _attempt(self, job: Job, task: "Task") -> None:
+    async def _attempt(self, job: Job, task: "Task", spare: Spare | None) -> None:
         current_runner.set(self)
-        await self._app.execution.execute(self._app.bind(job), task, self._executors)
+        held_spare.set(spare)
+        try:
+            await self._app.execution.execute(self._app.bind(job), task, self._executors)
+        finally:
+            if spare is not None:
+                spare.end()

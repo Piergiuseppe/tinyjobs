@@ -557,6 +557,30 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             await releasing
         self.assertGreater(time.monotonic() - started, 0.9)
 
+    async def test_a_setup_waiting_for_its_lock_outlasts_a_short_statement_timeout(self):
+        await drop(self.prefix)
+        late = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, clock=self.clock, statement_timeout=0.5
+        )
+        self.addAsyncCleanup(late.close)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
+            await holder.execute(
+                "SELECT pg_advisory_xact_lock(%(key)s)", {"key": late._tables.lock}
+            )
+
+            async def released():
+                await asyncio.sleep(1.5)
+                await holder.rollback()
+
+            releasing = asyncio.ensure_future(released())
+            started = time.monotonic()
+            with self.assertNoLogs("tinyjobs.postgres", "WARNING"):
+                await late.setup()
+            await releasing
+        self.assertGreater(time.monotonic() - started, 1.4)
+        stored = await late.enqueue(make_job())
+        self.assertEqual((await late.get(stored.id)).id, stored.id)
+
     async def test_a_setup_lock_let_go_before_its_holders_are_read_is_taken_quietly(self):
         await drop(self.prefix)
         late = await self.make_backend(self.clock)
@@ -5741,6 +5765,36 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(others, return_exceptions=True)
         self.assertFalse(connection.closed)
         self.assertIsNotNone(connection.pid)
+
+    async def test_a_queued_setup_is_cut_at_its_bound_while_the_server_answers_others(self):
+        connection = await postgres_backend._Answering.connect(
+            POSTGRES_URL, **self.backend._pooled_options()
+        )
+        self.addAsyncCleanup(connection.close)
+
+        async def hangs(connection):
+            await asyncio.Event().wait()
+
+        async def answering():
+            while True:
+                await self.backend.get("missing")
+                await asyncio.sleep(0.05)
+
+        others = asyncio.ensure_future(answering())
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(postgres_backend, "CONNECT_SECONDS", 0.3),
+                mock.patch.object(postgres_backend, "QUEUED_SETUP_SECONDS", 1.0),
+                mock.patch.object(self.backend, "_configured", hangs),
+                self.assertRaisesRegex(psycopg.OperationalError, "did not answer its setup"),
+            ):
+                await asyncio.wait_for(self.backend._configure(connection), 5)
+        finally:
+            others.cancel()
+            await asyncio.gather(others, return_exceptions=True)
+        self.assertLess(time.monotonic() - started, 1.2)
+        self.assertTrue(connection.closed)
 
     async def closing_with_an_orphan(self) -> list[int]:
         swept: list[int] = []

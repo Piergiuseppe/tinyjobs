@@ -865,13 +865,15 @@ once costs a few catalog reads and one `SELECT` each. Otherwise it takes a trans
 advisory lock and checks again under it. Any role that may connect can take an advisory lock, so
 one held by a session whose role cannot become setup's own is not waited for, a lock let go between
 the attempt and the reading of its holders is tried once more before that is concluded, and one
-held for a minute, or what is left of setup's deadline, is waited out rather than obeyed: setup
+held for a minute, or what is left of setup's deadline, whatever the `statement_timeout`, is waited
+out rather than obeyed: setup
 creates the tables without it, and a concurrent creation it then trips over sends it round again,
 up to three times. The wait blocks on the lock rather than polling a clock: four workers starting
 together on a fresh prefix over a link adding 300 ms each way started quietly, one after another,
 where three of four created the tables without the lock after five seconds and two of them blamed
-a role that could not become theirs. Between the
-`CREATE` statements and the rows the meta table is seeded with, setup checks the placement and the
+a role that could not become theirs. A lock held 45 seconds was waited for under a one second
+`statement_timeout`, where the timeout failed setup after 1 second, and after 30 by default.
+Between the `CREATE` statements and the rows the meta table is seeded with, setup checks the placement and the
 owners once more in the same transaction, so a table another role creates in the gap is caught
 before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
 newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
@@ -1081,7 +1083,8 @@ after `pool_timeout`, two seconds at least. Pooled connections give up connectin
 connection whose setup statements get no answer within five seconds is closed and another opened:
 with the server accepting connections but not answering their setup for a while, jobs started 4.9
 seconds after it answered again, where none had started 120 seconds later. While other connections
-keep getting answers, the setup keeps waiting, five seconds at a time and a minute at most, since
+keep getting answers, the setup keeps waiting, five seconds at a time and a minute at most (cut
+at 60.0 seconds, where it ran to 65), since
 it is then queued behind a pooler that opens one server at a time rather than unanswered: two
 workers of 32 behind a PgBouncer pool of 25 over a link adding 300 ms each way started with no
 warning and kept the app's wait for a server under 2.4 seconds, where 37 to 44 setups were cut,
@@ -1402,11 +1405,15 @@ warning names its task, so the worker claims only jobs it has a thread for; a dr
 call runs the next job on a thread added in its place and drops it once the old one returns: a
 drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
 0.51, where they waited 3.0 and 4.0 for the thread. The app shares eight such threads among all
-its drains and eager calls; with all eight taken, a drain hands the next job that needs a thread
-back before running it and returns, and an eager call returns it `queued`, so nothing sits
-`running` under the drain's hour-long lease: 60 jobs hanging past a 0.05 second timeout held 8
-threads whether drained or sent eagerly, and the drain returned after 0.45 seconds with 52 left
-queued, where it held 9, waited three minutes holding one claimed job, and eager calls held 60.
+its drains and eager calls, each reserved before its job starts; with all eight taken, a drain
+sets each job that needs a thread aside without running it, runs the `async def` jobs behind it
+and hands the ones set aside back as it returns, and an eager call returns such a job `queued`:
+60 jobs hanging past a 0.05 second timeout held 8 threads whether drained or sent eagerly, and the
+drain returned after 0.45 seconds with 52 left queued, where it held 9, waited three minutes holding
+one claimed job, and eager calls held 60. Eager calls at once took no more: 100 from threads or
+from one `asyncio.gather` held 8, where they held 100, and an `async def` task sent after them ran,
+where it stayed `queued` behind them. A forked child starts with all eight free, where it inherited
+the parent's count and ran no threaded job at all.
 A thread that fails to start fails its job, where the job
 was handed back as if the threads were shut down and the pool counted the dead thread, so no later
 job ran. The threads are daemon threads, so a process

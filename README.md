@@ -425,9 +425,9 @@ exceeds its timeout the job is marked failed and the worker moves on, but the th
 the function returns. That thread counts against `concurrency` until it does, so the worker claims
 one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
 an eager call runs the next job beside it instead, on one of eight extra threads the app shares
-across its drains and eager calls; once all eight are taken, a drain hands the next job in a
-thread back and returns, and an eager call returns it `queued`. The process exits without waiting
-for such threads.
+across its drains and eager calls; once all eight are taken, a drain leaves jobs that need a
+thread queued and runs the rest, and an eager call returns such a job `queued`. The process exits
+without waiting for such threads.
 The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
 timeouts to the library you are calling, or write the task as `async def` where cancellation actually
 works.
@@ -580,13 +580,15 @@ with none refused and no warning. A smaller pool makes the app queue behind the 
 busy: at 20, the app got 13 queries through in four and a half minutes, and PgBouncer refused one
 after its 120 second `query_wait_timeout`. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
-connections are named `tinyjobs` in `pg_stat_activity`. The tables and their schema must belong to
-the connecting role or a role that can become it (`SET` on Postgres 16 and later), every role that
-inherits the owner's privileges must be able to become it too, and no other role may hold `TRIGGER`
-or `REFERENCES` on them or own code that runs on them, such as a trigger, a constraint's function or
-an index's; otherwise pass `schema=` with one it owns. Behind PgBouncer use session pooling with its
-default `server_reset_query`. A transaction left open for hours anywhere on the server stops
-autovacuum from cleaning the jobs table. Postgres 14 to 18 are supported, and CI tests 14 and 18.
+connections are named `tinyjobs` in `pg_stat_activity`. With `log_statement` on, Postgres logs
+the bound parameters, job payloads included in hex, unless `log_parameter_max_length` is 0. The
+tables and their schema must belong to the connecting role or a role that can become it (`SET` on
+Postgres 16 and later), every role that inherits the owner's privileges must be able to become it
+too, and no other role may hold `TRIGGER` or `REFERENCES` on them or own code that runs on them,
+such as a trigger, a constraint's function or an index's; otherwise pass `schema=` with one it owns.
+Behind PgBouncer use session pooling with its default `server_reset_query`. A transaction left open
+for hours anywhere on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18
+are supported, and CI tests 14 and 18.
 
 ## Other backends
 
@@ -752,7 +754,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1539 tests, no test dependencies. The one that matters most is
+1545 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

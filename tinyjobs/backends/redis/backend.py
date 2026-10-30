@@ -9,7 +9,7 @@ import math
 import threading
 from contextlib import suppress
 from typing import Any, Awaitable, Callable, Sequence, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -659,7 +659,8 @@ def _storable(text: str) -> str:
 
 
 def _secret(url: str) -> bool:
-    return "@" in url or "password" in url.lower()
+    plain = unquote(url).lower()
+    return "@" in plain or "password" in plain
 
 
 def _url_reason(url: str, error: ValueError) -> str:

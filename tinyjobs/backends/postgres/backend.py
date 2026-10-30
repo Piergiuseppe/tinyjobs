@@ -830,7 +830,14 @@ class PostgresBackend(BaseBackend):
         patience = max(SETUP_LOCK_SECONDS, min(SETUP_WAIT_SECONDS, _left() - SETUP_LOCK_SECONDS))
         try:
             async with connection.transaction():
-                await connection.execute(f"SET LOCAL lock_timeout = '{int(patience * 1000)}ms'")
+                await connection.execute(
+                    "SELECT pg_catalog.set_config('lock_timeout', %(wait)s, true), "
+                    "pg_catalog.set_config('statement_timeout', %(statement)s, true)",
+                    {
+                        "wait": f"{int(patience * 1000)}ms",
+                        "statement": f"{int((patience + SETUP_LOCK_SECONDS) * 1000)}ms",
+                    },
+                )
                 await connection.execute("SELECT pg_catalog.pg_advisory_xact_lock(%(key)s)", key)
         except errors.LockNotAvailable:
             logger.warning(
@@ -839,7 +846,11 @@ class PostgresBackend(BaseBackend):
                 self._tables.prefix,
                 patience,
             )
-        await connection.execute(f"SET LOCAL lock_timeout = '{SETUP_LOCK_SECONDS}s'")
+        await connection.execute(
+            "SELECT pg_catalog.set_config('lock_timeout', %(wait)s, true), "
+            "pg_catalog.set_config('statement_timeout', %(statement)s, true)",
+            {"wait": f"{SETUP_LOCK_SECONDS}s", "statement": self._statement_setting()},
+        )
 
     async def _open(self) -> None:
         failed = self._opening
@@ -1642,9 +1653,12 @@ class PostgresBackend(BaseBackend):
             options["connect_timeout"] = seconds
         return options
 
-    def _settings(self) -> list[tuple[str, dict[str, Any]]]:
+    def _statement_setting(self) -> str:
         timeout = self._statement_timeout
-        statement = "0" if timeout is None else f"{int(timeout * 1000)}ms"
+        return "0" if timeout is None else f"{int(timeout * 1000)}ms"
+
+    def _settings(self) -> list[tuple[str, dict[str, Any]]]:
+        statement = self._statement_setting()
         return [
             (
                 "SELECT pg_catalog.set_config('search_path', %(path)s, false)",
@@ -1818,10 +1832,11 @@ class PostgresBackend(BaseBackend):
         try:
             while True:
                 mark = time.monotonic()
-                await asyncio.wait({configuring}, timeout=CONNECT_SECONDS)
+                left = QUEUED_SETUP_SECONDS - (mark - started)
+                await asyncio.wait({configuring}, timeout=min(CONNECT_SECONDS, max(0.0, left)))
                 if configuring.done():
                     break
-                if self._progressed <= mark or mark - started >= QUEUED_SETUP_SECONDS:
+                if self._progressed <= mark or time.monotonic() - started >= QUEUED_SETUP_SECONDS:
                     configuring.cancel()
                     await asyncio.wait({configuring})
                     connection.pgconn.finish()

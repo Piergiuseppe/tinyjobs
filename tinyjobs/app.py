@@ -353,6 +353,7 @@ class TinyJobs:
         self._closes = 0
 
     def forget_inherited_connection(self) -> None:
+        self._thread_spares = Spares(DRAIN_SPARE_THREADS)
         self._workers = set()
         self._closing_after = set()
         if self._backend is not None:

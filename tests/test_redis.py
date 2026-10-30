@@ -1320,6 +1320,8 @@ class RedisUrlTests(unittest.TestCase):
         for url in (
             "redis://127.0.0.1:6379/0?password=s3cr&Zq9=wXy",
             "unix:///tmp/redis.sock?db=0&password=s3cr&Zq9=wXy",
+            "redis://127.0.0.1:6379/0?%70assword=s3cr&Zq9=wXy",
+            "redis://127.0.0.1:6379/0?pass%77ORD=s3cr&Zq9=wXy",
         ):
             with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
                 RedisBackend.from_url(url)

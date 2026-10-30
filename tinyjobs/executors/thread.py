@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import Future
 from contextlib import suppress
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from functools import partial
 from typing import Any, Callable, TYPE_CHECKING
 
@@ -34,17 +34,42 @@ class Spares:
         self._lock = threading.Lock()
 
     @property
-    def full(self) -> bool:
-        return self._taken >= self.limit
+    def taken(self) -> int:
+        return self._taken
 
-    def take(self) -> int:
+    def reserve(self) -> "Spare | None":
         with self._lock:
+            if self._taken >= self.limit:
+                return None
             self._taken += 1
-            return self._taken
+        return Spare(self)
 
-    def give(self, _: object = None) -> None:
+    def give(self) -> None:
         with self._lock:
             self._taken -= 1
+
+
+class Spare:
+    def __init__(self, spares: Spares) -> None:
+        self.spares = spares
+        self._kept = False
+        self._ended = False
+
+    def keep(self, running: Future) -> None:
+        if not self._kept and not self._ended:
+            self._kept = True
+            running.add_done_callback(self._give)
+
+    def end(self) -> None:
+        if not self._kept and not self._ended:
+            self._ended = True
+            self.spares.give()
+
+    def _give(self, _: object) -> None:
+        self.spares.give()
+
+
+held_spare: ContextVar[Spare | None] = ContextVar("tinyjobs_held_spare", default=None)
 
 
 class ThreadExecutor(Executor):
@@ -52,15 +77,12 @@ class ThreadExecutor(Executor):
         self,
         concurrency: int,
         freed: Callable[[], None] | None = None,
-        *,
-        spares: Spares | None = None,
     ) -> None:
         self._pool = _Threads(concurrency)
         self._threaded: dict[asyncio.Task | None, Future] = {}
         self._strays: dict[Future, str] = {}
         self._replaced: set[Future] = set()
         self._freed = freed
-        self._spares = spares
 
     @property
     def strays(self) -> int:
@@ -108,17 +130,17 @@ class ThreadExecutor(Executor):
 
     def _stray(self, loop: asyncio.AbstractEventLoop, running: Future, task: "Task") -> None:
         self._strays[running] = task.name
-        if self._spares is not None:
+        spare = held_spare.get()
+        if spare is not None:
             self._replaced.add(running)
             self._pool.widen(1)
-            taken = self._spares.take()
-            running.add_done_callback(self._spares.give)
+            spare.keep(running)
             logger.warning(
                 "%s ended while its thread still runs; a new thread takes its place, "
                 "%d of the %d such thread(s) allowed are in use until the old ones return",
                 task.name,
-                taken,
-                self._spares.limit,
+                spare.spares.taken,
+                spare.spares.limit,
             )
         else:
             logger.warning(
