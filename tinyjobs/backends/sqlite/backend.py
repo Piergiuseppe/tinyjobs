@@ -214,9 +214,15 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
         return await self._call(
-            self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
+            self._claim_sync,
+            worker_id,
+            tuple(queues),
+            limit,
+            lease_seconds,
+            None if tasks is None else tuple(tasks),
         )
 
     async def heartbeat(
@@ -251,8 +257,8 @@ class SQLiteBackend(BaseBackend):
             return 0
         return await self._call(self._release_many_sync, tuple(jobs))
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
-        return await self._call(self._hand_back_sync, job, delay)
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
+        return await self._call(self._hand_back_sync, job, delay, in_place)
 
     async def cancel(self, job_id: str) -> bool:
         return await self._call(self._cancel_sync, job_id)
@@ -411,8 +417,9 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None,
     ) -> list[Job]:
-        if limit <= 0 or not queues:
+        if limit <= 0 or not queues or tasks == ():
             return []
         now = self._clock.now()
         with self._connections.write() as connection:
@@ -423,6 +430,7 @@ class SQLiteBackend(BaseBackend):
                 limit=limit,
                 lease_expires_at=now + lease_seconds,
                 now=now,
+                tasks=tasks,
             )
             for job in jobs:
                 connection.execute(
@@ -512,11 +520,12 @@ class SQLiteBackend(BaseBackend):
                     released += 1
         return released
 
-    def _hand_back_sync(self, job: Job, delay: float) -> bool:
+    def _hand_back_sync(self, job: Job, delay: float, in_place: bool) -> bool:
+        now = self._clock.now()
+        run_at = min(job.run_at, now) if in_place else now + delay
         with self._connections.write() as connection:
             cursor = connection.execute(
-                HAND_BACK_JOB,
-                (self._clock.now() + delay, job.id, job.worker_id, job.claims),
+                HAND_BACK_JOB, (run_at, job.id, job.worker_id, job.claims)
             )
             if cursor.rowcount != 1:
                 return False

@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from contextlib import suppress
 from contextvars import ContextVar, copy_context
 from functools import partial
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, Coroutine, TYPE_CHECKING, TypeVar
 
 from ..exceptions import ExecutorClosedError
 from ..models import JobPayload
@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("tinyjobs.worker")
 
+T = TypeVar("T")
+
 EXECUTOR_CLOSED_MESSAGE = (
     "the job threads were shut down, so this job was handed back without running"
 )
@@ -31,22 +33,51 @@ class Spares:
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self._taken = 0
+        self._strayed = 0
         self._lock = threading.Lock()
+        self._waiting: set[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = set()
 
     @property
     def taken(self) -> int:
         return self._taken
 
-    def reserve(self) -> "Spare | None":
-        with self._lock:
-            if self._taken >= self.limit:
-                return None
-            self._taken += 1
-        return Spare(self)
+    @property
+    def strayed(self) -> int:
+        return self._strayed
 
-    def give(self) -> None:
+    @property
+    def exhausted(self) -> bool:
+        return self._strayed >= self.limit
+
+    async def reserve(self) -> "Spare | None":
+        loop = asyncio.get_running_loop()
+        while True:
+            with self._lock:
+                if self._taken < self.limit:
+                    self._taken += 1
+                    return Spare(self)
+                if self._strayed >= self.limit:
+                    return None
+                waiter = (loop, loop.create_future())
+                self._waiting.add(waiter)
+            try:
+                await waiter[1]
+            finally:
+                with self._lock:
+                    self._waiting.discard(waiter)
+
+    def _stray(self) -> None:
+        with self._lock:
+            self._strayed += 1
+            waiting = list(self._waiting)
+        _wake(waiting)
+
+    def _give(self, strayed: bool) -> None:
         with self._lock:
             self._taken -= 1
+            self._strayed -= strayed
+            waiting = list(self._waiting)
+        _wake(waiting)
 
 
 class Spare:
@@ -58,18 +89,27 @@ class Spare:
     def keep(self, running: Future) -> None:
         if not self._kept and not self._ended:
             self._kept = True
-            running.add_done_callback(self._give)
+            self.spares._stray()
+            running.add_done_callback(self._returned)
 
     def end(self) -> None:
         if not self._kept and not self._ended:
             self._ended = True
-            self.spares.give()
+            self.spares._give(False)
 
-    def _give(self, _: object) -> None:
-        self.spares.give()
+    def _returned(self, _: object) -> None:
+        self.spares._give(True)
 
 
-held_spare: ContextVar[Spare | None] = ContextVar("tinyjobs_held_spare", default=None)
+def _wake(waiting: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]]) -> None:
+    for loop, future in waiting:
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(_resolve, future)
+
+
+def _resolve(future: asyncio.Future) -> None:
+    if not future.done():
+        future.set_result(None)
 
 
 class ThreadExecutor(Executor):
@@ -83,6 +123,7 @@ class ThreadExecutor(Executor):
         self._strays: dict[Future, str] = {}
         self._replaced: set[Future] = set()
         self._freed = freed
+        self._lent: dict[asyncio.Task, Spare] = {}
 
     @property
     def strays(self) -> int:
@@ -91,14 +132,24 @@ class ThreadExecutor(Executor):
     def stray_names(self) -> list[str]:
         return sorted(self._strays.values())
 
+    def lend(self, owner: asyncio.Task, spare: Spare | None) -> None:
+        if spare is None:
+            self._lent.pop(owner, None)
+        else:
+            self._lent[owner] = spare
+
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
         loop = asyncio.get_running_loop()
         started: asyncio.Future[float] = loop.create_future()
+        owner = asyncio.current_task()
+        context = copy_context()
+        if owner in self._lent:
+            context.run(_spared.set, True)
         call = partial(
             _started,
             loop,
             started,
-            partial(copy_context().run, task.function, *payload.args, **payload.kwargs),
+            partial(context.run, task.function, *payload.args, **payload.kwargs),
         )
         try:
             running = self._pool.submit(call)
@@ -106,7 +157,6 @@ class ThreadExecutor(Executor):
             if not self._pool.closed:
                 raise
             raise ExecutorClosedError(EXECUTOR_CLOSED_MESSAGE) from error
-        owner = asyncio.current_task()
         self._threaded[owner] = running
         try:
             future = asyncio.wrap_future(running)
@@ -126,11 +176,16 @@ class ThreadExecutor(Executor):
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
             if not running.cancel() and not running.done():
-                self._stray(loop, running, task)
+                self._stray(loop, running, task, self._lent.get(owner))
 
-    def _stray(self, loop: asyncio.AbstractEventLoop, running: Future, task: "Task") -> None:
+    def _stray(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        running: Future,
+        task: "Task",
+        spare: Spare | None,
+    ) -> None:
         self._strays[running] = task.name
-        spare = held_spare.get()
         if spare is not None:
             self._replaced.add(running)
             self._pool.widen(1)
@@ -139,7 +194,7 @@ class ThreadExecutor(Executor):
                 "%s ended while its thread still runs; a new thread takes its place, "
                 "%d of the %d such thread(s) allowed are in use until the old ones return",
                 task.name,
-                spare.spares.taken,
+                spare.spares.strayed,
                 spare.spares.limit,
             )
         else:
@@ -256,6 +311,18 @@ class _Threads:
         for item in pending:
             if item is not None:
                 item[0].cancel()
+
+
+_spared: ContextVar[bool] = ContextVar("tinyjobs_spared", default=False)
+
+
+def holds_spare() -> bool:
+    return _spared.get()
+
+
+async def spared(coroutine: Coroutine[Any, Any, T]) -> T:
+    _spared.set(True)
+    return await coroutine
 
 
 def _started(loop: asyncio.AbstractEventLoop, started: asyncio.Future, call: Any) -> Any:

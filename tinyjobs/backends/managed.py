@@ -44,6 +44,8 @@ class ManagedBackend:
         self._gate = tracked_lock()
         self.capabilities = backend.capabilities
         self._knows_holders = _accepts(getattr(backend, "heartbeat", None), "worker_id")
+        self.claims_by_task = _accepts(getattr(backend, "claim", None), "tasks")
+        self._hands_back_in_place = _accepts(getattr(backend, "hand_back", None), "in_place")
 
     @property
     def alive(self) -> bool:
@@ -84,6 +86,7 @@ class ManagedBackend:
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
         outcome = self._track()
         if outcome is None:
@@ -97,6 +100,7 @@ class ManagedBackend:
                 queues=queues,
                 limit=limit,
                 lease_seconds=lease_seconds,
+                **({} if tasks is None else {"tasks": tasks}),
             )
         except BaseException:
             outcome.cancel()
@@ -212,7 +216,9 @@ class ManagedBackend:
         released = await asyncio.gather(*(self.release(job) for job in jobs))
         return sum(map(bool, released))
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
+        if in_place and self._hands_back_in_place:
+            return await self._forward(self._inner.hand_back, job, delay, in_place=True)
         method = getattr(self._inner, "hand_back", self._inner.release)
         return await self._forward(method, job, delay)
 

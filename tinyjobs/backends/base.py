@@ -46,6 +46,7 @@ class Backend(Protocol):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> list[Job]: ...
 
     async def heartbeat(
@@ -69,7 +70,7 @@ class Backend(Protocol):
 
     async def release_many(self, jobs: Sequence[Job]) -> int: ...
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool: ...
 
     async def cancel(self, job_id: str) -> bool: ...
 
@@ -130,7 +131,7 @@ class BaseBackend(ABC):
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         return [await self.enqueue(job) for job in jobs]
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
         return await self.release(job, delay)
 
     async def release_many(self, jobs: Sequence[Job]) -> int:

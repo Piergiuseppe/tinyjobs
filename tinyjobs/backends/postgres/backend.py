@@ -1013,8 +1013,9 @@ class PostgresBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        if limit <= 0 or not queues:
+        if limit <= 0 or not queues or (tasks is not None and not tasks):
             return []
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
@@ -1023,7 +1024,9 @@ class PostgresBackend(BaseBackend):
             if self._ghosts or self._orphans:
                 await self._swept_within()
             now = await self._now()
-            query, parameters = self._claiming(now, wanted, worker_id, limit, lease_seconds)
+            query, parameters = self._claiming(
+                now, wanted, worker_id, limit, lease_seconds, tasks
+            )
             _LEFT.set(None)
             try:
                 rows = await self._retrying(query, parameters)
@@ -1184,17 +1187,20 @@ class PostgresBackend(BaseBackend):
         worker_id: str,
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        query = (
-            self._queries.claim_one_queue
-            if len(wanted) == 1
-            else self._queries.claim_many_queues
-        )
+        if tasks is not None:
+            query = self._queries.claim_tasks
+        elif len(wanted) == 1:
+            query = self._queries.claim_one_queue
+        else:
+            query = self._queries.claim_many_queues
         token = secrets.token_hex(16)
         return query, self._at(
             now,
             queues=wanted,
             queue=wanted[0],
+            tasks=list(tasks or ()),
             limit=limit,
             worker=worker_id,
             lease=now + lease_seconds,
@@ -1305,10 +1311,11 @@ class PostgresBackend(BaseBackend):
         await self._wake({row["queue"] for row in rows})
         return len(rows)
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
         now = await self._now()
+        run_at = min(job.run_at, now) if in_place else now + delay
         return await self._requeued(
-            job, self._queries.hand_back, self._held(job, now, run_at=now + delay)
+            job, self._queries.hand_back, self._held(job, now, run_at=run_at)
         )
 
     async def _requeued(self, job: Job, query: str, parameters: dict[str, Any]) -> bool:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import time
 import weakref
 from contextlib import (
@@ -25,6 +26,7 @@ from .exceptions import (
     UnsupportedCapabilityError,
 )
 from .executors import Spares
+from .executors.thread import holds_spare, spared
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -61,7 +63,7 @@ from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
-from .worker.drain import DRAIN_SPARE_THREADS
+from .worker.drain import DRAIN_SPARE_THREADS, InDrains
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -81,6 +83,8 @@ EMBEDDED_SIGNALS_MESSAGE = (
 WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
 
 T = TypeVar("T")
+
+logger = logging.getLogger("tinyjobs.worker")
 
 _apps: "weakref.WeakSet[TinyJobs]" = weakref.WeakSet()
 _inherited: list[ManagedBackend] = []
@@ -128,6 +132,7 @@ class TinyJobs:
         self._sessions = 0
         self._workers: set[Worker | Drain] = set()
         self._thread_spares = Spares(DRAIN_SPARE_THREADS)
+        self._in_drains = InDrains()
         self._closing_after: set[Worker | Drain] = set()
         _apps.add(self)
 
@@ -138,6 +143,10 @@ class TinyJobs:
     @property
     def thread_spares(self) -> Spares:
         return self._thread_spares
+
+    @property
+    def in_drains(self) -> InDrains:
+        return self._in_drains
 
     @property
     def clock(self) -> Clock:
@@ -207,6 +216,8 @@ class TinyJobs:
             refuse = getattr(self._backend, "refuse_held_transaction", None)
             if refuse is not None:
                 refuse()
+        if holds_spare():
+            factory = partial(_spared_call, factory)
         return self._runner.run(factory, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
@@ -216,8 +227,30 @@ class TinyJobs:
         bound = self.bind(job)
         if not self._eager:
             return bound
-        await self.adrain()
-        return await bound.arefresh()
+        while True:
+            await Drain(self, quiet=True).run()
+            bound = await bound.arefresh()
+            draining = self._in_drains.running(bound.id)
+            if bound.status is not JobStatus.RUNNING or draining is None:
+                break
+            await asyncio.wrap_future(draining)
+        if self._left_for_a_spare(bound):
+            logger.warning(
+                "job %s stays queued: %d job thread(s) still run past their timeout, so jobs "
+                "of sync tasks with a timeout wait until one returns and a later drain or "
+                "eager call runs them",
+                bound.id,
+                self._thread_spares.limit,
+            )
+        return bound
+
+    def _left_for_a_spare(self, job: Job) -> bool:
+        if job.status is not JobStatus.QUEUED or not self._thread_spares.exhausted:
+            return False
+        if job.task not in self._registry or job.run_at > self._clock.now():
+            return False
+        task = self._registry.get(job.task)
+        return not task.is_coroutine and task.timeout is not None
 
     async def ensure_connected(self) -> None:
         await settled()
@@ -354,6 +387,7 @@ class TinyJobs:
 
     def forget_inherited_connection(self) -> None:
         self._thread_spares = Spares(DRAIN_SPARE_THREADS)
+        self._in_drains = InDrains()
         self._workers = set()
         self._closing_after = set()
         if self._backend is not None:
@@ -784,3 +818,7 @@ def _assert_callable_without_arguments(task: Task) -> None:
             f"{task.name} runs on a cron schedule, which calls it with no "
             f"arguments, but its signature requires some"
         ) from None
+
+
+def _spared_call(factory: Callable[[], Coroutine[Any, Any, T]]) -> Coroutine[Any, Any, T]:
+    return spared(factory())

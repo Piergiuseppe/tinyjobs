@@ -186,12 +186,21 @@ class RedisBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        tasks: Sequence[str] | None = None,
     ) -> list[Job]:
-        if limit <= 0 or not queues:
+        if limit <= 0 or not queues or (tasks is not None and not tasks):
             return []
         now = await self._now()
+        named = [] if tasks is None else list(tasks)
         claimed = await self._script(
-            "claim", now, worker_id, number(now + lease_seconds), limit, *queues
+            "claim",
+            now,
+            worker_id,
+            number(now + lease_seconds),
+            limit,
+            -1 if tasks is None else len(named),
+            *named,
+            *queues,
         )
         return [job_from_flat(flat) for flat in claimed]
 
@@ -272,8 +281,9 @@ class RedisBackend(BaseBackend):
             )
         )
 
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
-        run_at = number(await self._now() + delay)
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
+        now = await self._now()
+        run_at = number(min(job.run_at, now) if in_place else now + delay)
         return bool(
             await self._run(
                 "hand_back", job.id, job.worker_id or "", job.claims, run_at

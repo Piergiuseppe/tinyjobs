@@ -29,6 +29,46 @@ class EagerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.app.close()
 
+    def test_an_eager_call_waits_for_the_drain_that_took_its_job(self):
+        import threading
+        import time
+
+        @self.app.task
+        def slow():
+            time.sleep(0.1)
+
+        stop = threading.Event()
+
+        def draining():
+            while not stop.is_set():
+                self.app.drain()
+
+        beside = threading.Thread(target=draining)
+        beside.start()
+        try:
+            statuses = {slow.enqueue().status for _ in range(20)}
+        finally:
+            stop.set()
+            beside.join(10)
+        self.assertEqual(statuses, {JobStatus.SUCCESS})
+
+    def test_nested_eager_calls_deeper_than_the_spares_run_quietly(self):
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        for timeout in (None, 30):
+            with self.subTest(timeout=timeout):
+                app = TinyJobs("memory://", eager=True)
+                self.addCleanup(app.close)
+
+                @app.task(store_result=True, timeout=timeout)
+                def chain(n):
+                    return [n, chain.enqueue(n - 1).result()] if n else [n]
+
+                with self.assertNoLogs("tinyjobs", "WARNING"):
+                    job = chain.enqueue(DRAIN_SPARE_THREADS + 4)
+                self.assertIs(job.status, JobStatus.SUCCESS)
+                self.assertEqual(job.result()[0], DRAIN_SPARE_THREADS + 4)
+
     def test_enqueue_returns_a_finished_job(self):
         @self.app.task(store_result=True)
         def double(value):
@@ -110,6 +150,32 @@ class AsyncEagerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await app.aclose()
 
+
+    async def test_concurrent_eager_calls_of_ordinary_sync_jobs_all_run(self):
+        import time
+
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        app = TinyJobs("memory://", eager=True)
+
+        @app.task
+        def plain(i):
+            time.sleep(0.2)
+
+        @app.task(timeout=5)
+        def timed(i):
+            time.sleep(0.2)
+
+        try:
+            for task in (plain, timed):
+                with self.subTest(task=task.name):
+                    calls = [
+                        asyncio.to_thread(task.enqueue, i) for i in range(DRAIN_SPARE_THREADS + 4)
+                    ]
+                    jobs = await asyncio.gather(*calls)
+                    self.assertEqual({job.status for job in jobs}, {JobStatus.SUCCESS})
+        finally:
+            await app.aclose()
 
     async def test_concurrent_eager_calls_run_no_more_stuck_threads_than_the_spares(self):
         import threading
@@ -347,6 +413,145 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(
             self.app.counts(), {"failed": DRAIN_SPARE_THREADS, "queued": DRAIN_SPARE_THREADS * 2}
         )
+
+    def spend_the_spares(self):
+        import threading
+
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+
+        @self.app.task(timeout=0.05, max_attempts=1)
+        def runaway():
+            held.wait(10)
+
+        for _ in range(DRAIN_SPARE_THREADS):
+            runaway.enqueue()
+        self.assertEqual(self.app.drain(), DRAIN_SPARE_THREADS)
+        return held
+
+    def test_a_drain_with_its_spares_spent_leases_no_job_it_cannot_run(self):
+        self.spend_the_spares()
+        leased: list[int] = []
+
+        @self.app.task(timeout=5)
+        def timed(i):
+            return i
+
+        @self.app.task
+        async def watch():
+            stored = (await self.app.ajobs(status=JobStatus.RUNNING, limit=100)).items
+            leased.append(sum(job.task == timed.name for job in stored))
+
+        jobs = [timed.enqueue(i) for i in range(50)]
+        watch.enqueue()
+        self.assertEqual(self.app.drain(), 1)
+        self.assertEqual(leased, [0])
+        fresh = [job.refresh() for job in jobs]
+        self.assertEqual({job.status for job in fresh}, {JobStatus.QUEUED})
+        self.assertEqual({job.run_at for job in fresh}, {START})
+
+    def test_a_drain_with_its_spares_spent_runs_sync_jobs_without_a_timeout(self):
+        self.spend_the_spares()
+        jobs = [self.record.enqueue(str(i)) for i in range(3)]
+        self.assertEqual(self.app.drain(), 3)
+        self.assertEqual({job.refresh().status for job in jobs}, {JobStatus.SUCCESS})
+
+    def test_a_job_left_queued_runs_before_newer_ones_once_a_spare_returns(self):
+        held = self.spend_the_spares()
+
+        @self.app.task(timeout=5)
+        def step(name):
+            self.calls.append(name)
+
+        @self.app.task
+        async def pause():
+            held.set()
+            while self.app.thread_spares.taken:
+                await asyncio.sleep(0.01)
+
+        step.enqueue("first")
+        pause.enqueue()
+        step.enqueue("second")
+        self.assertEqual(self.app.drain(), 3)
+        self.assertEqual(self.calls, ["first", "second"])
+
+    def test_a_job_refused_a_spare_while_it_waited_keeps_its_turn(self):
+        import threading
+        import time
+
+        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+        entered: list[int] = []
+
+        @self.app.task(timeout=0.5, max_attempts=1)
+        def runaway():
+            entered.append(1)
+            held.wait(10)
+
+        @self.app.task(timeout=5)
+        def step(name):
+            self.calls.append(name)
+
+        for _ in range(DRAIN_SPARE_THREADS):
+            runaway.enqueue()
+        drains = [threading.Thread(target=self.app.drain) for _ in range(DRAIN_SPARE_THREADS)]
+        for draining in drains:
+            draining.start()
+        started = time.monotonic()
+        while len(entered) < DRAIN_SPARE_THREADS and time.monotonic() - started < 5:
+            time.sleep(0.01)
+        first = step.enqueue("first")
+        second = step.enqueue("second")
+        self.clock.advance(5)
+        self.assertEqual(self.app.drain(), 0)
+        for draining in drains:
+            draining.join(5)
+        self.assertEqual([job.refresh().run_at for job in (first, second)], [START, START])
+        held.set()
+        while self.app.thread_spares.taken:
+            time.sleep(0.01)
+        self.assertEqual(self.app.drain(), 2)
+        self.assertEqual(self.calls, ["first", "second"])
+
+    def test_a_drain_without_task_claims_stops_once_its_spares_are_spent(self):
+        self.spend_the_spares()
+
+        @self.app.task
+        async def quick():
+            self.calls.append("quick")
+
+        job = quick.enqueue()
+        self.app.backend.claims_by_task = False
+        self.assertEqual(self.app.drain(), 0)
+        self.assertIs(job.refresh().status, JobStatus.QUEUED)
+
+    def test_a_job_run_inside_a_drained_job_never_uses_the_outer_spare(self):
+        import threading
+
+        held = threading.Event()
+        self.addCleanup(held.set)
+        inner = TinyJobs("memory://", eager=True)
+        self.addCleanup(inner.close)
+        seen: list[tuple[int, int]] = []
+
+        @inner.task(timeout=0.05, max_attempts=1)
+        def stuck():
+            held.wait(10)
+
+        @self.app.task(timeout=5)
+        def outer():
+            stuck.enqueue()
+            spares = self.app.thread_spares
+            seen.append((spares.taken, spares.strayed))
+
+        outer.enqueue()
+        self.assertEqual(self.app.drain(), 1)
+        self.assertEqual(seen, [(1, 0)])
+        self.assertEqual(self.app.thread_spares.taken, 0)
 
     def test_a_drain_warns_that_a_new_thread_takes_the_place_of_a_timed_out_one(self):
         import threading

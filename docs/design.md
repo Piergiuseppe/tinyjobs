@@ -427,7 +427,8 @@ class Backend(Protocol):
 
     # --- consumer side ---------------------------------------------------
     async def claim(self, *, worker_id: str, queues: Sequence[str],
-                    limit: int, lease_seconds: float) -> list[Job]: ...
+                    limit: int, lease_seconds: float,
+                    tasks: Sequence[str] | None = None) -> list[Job]: ...
     async def heartbeat(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None = None
     ) -> None: ...
@@ -435,7 +436,7 @@ class Backend(Protocol):
     async def fail(self, job: Job, error: ExecutionError, retry_at: float | None,
                    execution_status: ExecutionStatus = ExecutionStatus.FAILED) -> bool: ...
     async def release(self, job: Job, delay: float = 0.0) -> bool: ...
-    async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
+    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool: ...
 
     # --- control ---------------------------------------------------------
     async def cancel(self, job_id: str) -> bool: ...
@@ -465,6 +466,13 @@ Redis backends will want pipelining, Postgres a multi-row `INSERT`. None of that
 core does the looping. And since the protocol freezes at v1.0, a seam that is not there at v1.0 cannot
 be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
 `enqueue()`) so that simple backends get the correct behaviour for free.
+
+`claim(tasks=...)` takes only jobs of those tasks, in the same order, and `hand_back(in_place=True)`
+returns a job at its old `run_at`; a drain needs both once its spare threads are taken (see
+[Timeouts](#timeouts-are-not-uniform-and-pretending-otherwise-would-be-a-lie)), and on a backend
+without them it stops there instead. Past 100,000 queued
+jobs of other tasks such a claim took 6.7 ms on SQLite, 10.6 ms on Postgres and 99 ms on Redis,
+which walks its ready set inside one script, against 0.4 to 1.2 ms for a plain claim.
 
 A backend may also declare `transient_errors`, the exception types that mean the store could not be
 reached. When `complete` or `fail` raises one, the worker writes again after 0.25 s, doubling up to
@@ -1405,9 +1413,24 @@ warning names its task, so the worker claims only jobs it has a thread for; a dr
 call runs the next job on a thread added in its place and drops it once the old one returns: a
 drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
 0.51, where they waited 3.0 and 4.0 for the thread. The app shares eight such threads among all
-its drains and eager calls, each reserved before its job starts; with all eight taken, a drain
-sets each job that needs a thread aside without running it, runs the `async def` jobs behind it
-and hands the ones set aside back as it returns, and an eager call returns such a job `queued`:
+its drains and eager calls. Only a sync job with a timeout can leave its thread behind, so only
+such a job reserves one of the eight before it starts, and keeps it if it outlives its timeout;
+when running ones hold all eight, the next waits for one to finish or time out, and only once all
+eight are taken by threads past their timeout is it refused. 20 eager calls at once of a task
+sleeping 0.3 seconds all returned `success` whether it had a timeout or not, in 0.94 seconds with
+one, where 12 returned `queued`. With all eight taken, a drain claims only the jobs that need no
+spare thread (`async def` tasks, or sync ones without a timeout), so the others keep their place
+and are never leased to it: behind 500 queued sync jobs with a timeout and one `async def` job, the
+drain ran the async one and leased none of them, where it held all 500 under its hour-long lease
+while the async job ran, and a sync job queued before an `async def` one that ran until a thread
+returned still ran before the sync job queued after it, where it was left `queued` and the later
+one ran. A job refused after it was claimed, while it waited for a thread that then outlived its
+timeout, goes back at once at its old `run_at`, and the drain holds nothing it does not run. A
+job a sync job with a timeout sends eagerly from its own thread needs no spare thread, since the
+thread that sent it waits for it: a chain of 12 nested eager calls ran with no warning, with or
+without a timeout, where 3 of them warned. An eager call whose job another drain in the process
+took waits for that drain to finish it: 20 eager calls beside a thread draining in a loop all
+returned `success`, where 4 returned `running`.
 60 jobs hanging past a 0.05 second timeout held 8 threads whether drained or sent eagerly, and the
 drain returned after 0.45 seconds with 52 left queued, where it held 9, waited three minutes holding
 one claimed job, and eager calls held 60. Eager calls at once took no more: 100 from threads or

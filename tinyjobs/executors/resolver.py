@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable
 
 from .base import Executor
 from .coroutine import CoroutineExecutor
-from .thread import ThreadExecutor
+from .thread import Spare, ThreadExecutor
 
 if TYPE_CHECKING:
     from ..task import Task
@@ -32,6 +32,9 @@ class ExecutorResolver:
 
     def resolve(self, task: "Task") -> Executor:
         return self._coroutine if task.is_coroutine else self._thread
+
+    def lend(self, owner: asyncio.Task, spare: Spare | None) -> None:
+        self._thread.lend(owner, spare)
 
     def keeps(self, owner: asyncio.Task) -> Future | None:
         return self._thread.keeps(owner)

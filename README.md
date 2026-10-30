@@ -387,7 +387,10 @@ app.drain()
 
 `memory://` is the SQLite backend on a private in-memory database, so tests run the same claim,
 dedup and retries as production. Delays and backoff are respected in eager mode too: advance the clock
-and drain. A failing task is recorded on the job, not raised, as it would be in a worker.
+and drain. A failing task is recorded on the job, not raised, as it would be in a worker. An eager
+call returns its job settled: when another drain or eager call in the process took it first, it
+waits for that one to finish it, so it comes back `queued` only while not yet due or, as below,
+while it waits for a thread.
 
 ## What you get
 
@@ -425,9 +428,10 @@ exceeds its timeout the job is marked failed and the worker moves on, but the th
 the function returns. That thread counts against `concurrency` until it does, so the worker claims
 one job fewer and never holds a job it has no thread for, and a warning names the task; a drain or
 an eager call runs the next job beside it instead, on one of eight extra threads the app shares
-across its drains and eager calls; once all eight are taken, a drain leaves jobs that need a
-thread queued and runs the rest, and an eager call returns such a job `queued`. The process exits
-without waiting for such threads.
+across its drains and eager calls. Only sync tasks with a timeout use them; once all eight are
+taken by threads past their timeout, a drain leaves such jobs queued in their place and runs the
+rest, and an eager call returns such a job `queued`. The process exits without waiting for such
+threads.
 The timeout counts from when the job's thread starts, so a job is never failed before it runs. Pass
 timeouts to the library you are calling, or write the task as `async def` where cancellation actually
 works.
@@ -580,8 +584,9 @@ with none refused and no warning. A smaller pool makes the app queue behind the 
 busy: at 20, the app got 13 queries through in four and a half minutes, and PgBouncer refused one
 after its 120 second `query_wait_timeout`. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
-connections are named `tinyjobs` in `pg_stat_activity`. With `log_statement` on, Postgres logs
-the bound parameters, job payloads included in hex, unless `log_parameter_max_length` is 0. The
+connections are named `tinyjobs` in `pg_stat_activity`. With `log_statement` or
+`log_min_duration_statement` on, Postgres logs the bound parameters (payloads and results in hex;
+error messages, tracebacks and dedup keys as text) unless `log_parameter_max_length` is 0. The
 tables and their schema must belong to the connecting role or a role that can become it (`SET` on
 Postgres 16 and later), every role that inherits the owner's privileges must be able to become it
 too, and no other role may hold `TRIGGER` or `REFERENCES` on them or own code that runs on them,
@@ -754,7 +759,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1545 tests, no test dependencies. The one that matters most is
+1564 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

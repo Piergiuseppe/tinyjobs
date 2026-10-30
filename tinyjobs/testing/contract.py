@@ -309,6 +309,39 @@ class BackendContract:
         self.assertEqual((await self.claim())[0].id, first.id)
         self.assertEqual(await self.backend.release_many([]), 0)
 
+    async def test_a_claim_for_some_tasks_takes_them_in_order_past_the_others(self):
+        skipped = [make_job(task="tests.sync", run_at=START - 300 + i) for i in range(150)]
+        await self.backend.enqueue_many(skipped)
+        wanted = await self.enqueue(task="tests.async", run_at=START - 2)
+        later = await self.enqueue(task="tests.async", run_at=START - 1)
+        claimed = await self.backend.claim(
+            worker_id="worker-a",
+            queues=("default",),
+            limit=1,
+            lease_seconds=60.0,
+            tasks=["tests.async"],
+        )
+        self.assertEqual([job.id for job in claimed], [wanted.id])
+        nothing = await self.backend.claim(
+            worker_id="worker-a", queues=("default",), limit=5, lease_seconds=60.0, tasks=[]
+        )
+        self.assertEqual(nothing, [])
+        rest = await self.claim(limit=200)
+        self.assertEqual(
+            [job.id for job in rest], [job.id for job in skipped] + [later.id]
+        )
+
+    async def test_a_job_handed_back_in_place_keeps_its_turn(self):
+        first = await self.enqueue(run_at=START - 2)
+        second = await self.enqueue(run_at=START - 1)
+        [claimed] = await self.claim(limit=1)
+        self.clock.advance(5)
+        self.assertTrue(await self.backend.hand_back(claimed, in_place=True))
+        stored = await self.stored(first)
+        self.assertIs(stored.status, JobStatus.QUEUED)
+        self.assertEqual((stored.run_at, stored.attempts, stored.hand_backs), (START - 2, 0, 1))
+        self.assertEqual([job.id for job in await self.claim()], [first.id, second.id])
+
     async def test_hand_back_returns_a_job_as_if_it_was_never_claimed(self):
         claimed = await self.claimed_one(max_attempts=2)
         self.assertTrue(await self.backend.hand_back(claimed, delay=10))

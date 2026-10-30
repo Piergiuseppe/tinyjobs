@@ -331,6 +331,17 @@ class Queries:
             )
         """)
 
+        self.claim_tasks = taking(f"""
+            picked AS (
+                SELECT id FROM {jobs}
+                 WHERE status = 'queued' AND queue = ANY(%(queues)b::text[])
+                   AND task = ANY(%(tasks)b::text[]) AND run_at <= {horizon}
+                 ORDER BY priority DESC, run_at ASC
+                 LIMIT %(limit)s
+                 FOR UPDATE SKIP LOCKED
+            )
+        """)
+
         self.heartbeat = f"""
             UPDATE {jobs} SET lease_expires_at = {lease_end}
              WHERE status = 'running'
