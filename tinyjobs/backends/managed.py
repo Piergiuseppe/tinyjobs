@@ -44,7 +44,6 @@ class ManagedBackend:
         self._gate = tracked_lock()
         self.capabilities = backend.capabilities
         self._knows_holders = _accepts(getattr(backend, "heartbeat", None), "worker_id")
-        self.hands_back_in_place = _accepts(getattr(backend, "hand_back", None), "in_place")
 
     @property
     def alive(self) -> bool:
@@ -231,9 +230,7 @@ class ManagedBackend:
         released = await asyncio.gather(*(self.release(job) for job in jobs))
         return sum(map(bool, released))
 
-    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
-        if in_place and self.hands_back_in_place:
-            return await self._forward(self._inner.hand_back, job, delay, in_place=True)
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         method = getattr(self._inner, "hand_back", self._inner.release)
         return await self._forward(method, job, delay)
 

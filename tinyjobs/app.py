@@ -24,8 +24,6 @@ from .exceptions import (
     ConfigurationError,
     UnsupportedCapabilityError,
 )
-from .executors import Spares
-from .executors.thread import held_spares, spared
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -62,7 +60,6 @@ from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
-from .worker.drain import DRAIN_SPARE_THREADS, InDrains, needs_spare
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -128,8 +125,6 @@ class TinyJobs:
         self._backend_closing: concurrent.futures.Future | None = None
         self._sessions = 0
         self._workers: set[Worker | Drain] = set()
-        self._thread_spares = Spares(DRAIN_SPARE_THREADS)
-        self._in_drains = InDrains()
         self._closing_after: set[Worker | Drain] = set()
         self._shutting = False
         _apps.add(self)
@@ -137,14 +132,6 @@ class TinyJobs:
     @property
     def url(self) -> str:
         return self._url
-
-    @property
-    def thread_spares(self) -> Spares:
-        return self._thread_spares
-
-    @property
-    def in_drains(self) -> InDrains:
-        return self._in_drains
 
     @property
     def clock(self) -> Clock:
@@ -214,9 +201,6 @@ class TinyJobs:
             refuse = getattr(self._backend, "refuse_held_transaction", None)
             if refuse is not None:
                 refuse()
-        held = held_spares()
-        if held:
-            factory = partial(_spared_call, held, factory)
         return self._runner.run(factory, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
@@ -233,46 +217,11 @@ class TinyJobs:
         bound = self.bind(job)
         if not self._eager:
             return bound
-        await self.adrain()
-        looked = None
-        while True:
-            bound = await bound.arefresh()
-            if self._runs_alone(bound):
-                if await Drain(self).run_job(bound.id):
-                    continue
-                bound = await bound.arefresh()
-            if not inserted or held_spares() or not self._may_be_taken(bound):
-                return bound
-            if await self._in_drains.finished(bound.id):
-                looked = None
-                await self.adrain()
-                continue
-            seen = (bound.status, bound.claims)
-            if seen == looked:
-                if bound.status is JobStatus.RUNNING and await Drain(self).run_job(bound.id):
-                    looked = None
-                    continue
-                return await bound.arefresh()
-            looked = seen
-            await self._in_drains.claimed()
-            if bound.status is JobStatus.QUEUED:
-                await self.adrain()
-
-    def _may_be_taken(self, job: Job) -> bool:
-        if job.status is JobStatus.RUNNING:
-            return True
-        if job.status is not JobStatus.QUEUED or job.run_at > self._clock.now():
-            return False
-        if job.task not in self._registry:
-            return False
-        return not (needs_spare(self._registry.get(job.task)) and self._thread_spares.exhausted)
-
-    def _runs_alone(self, job: Job) -> bool:
-        if job.status is not JobStatus.QUEUED or job.run_at > self._clock.now():
-            return False
-        if job.task not in self._registry:
-            return False
-        return not needs_spare(self._registry.get(job.task))
+        if await Drain(self).run_job(bound.id) or not inserted:
+            return await bound.arefresh()
+        while (bound := await bound.arefresh()).status is JobStatus.RUNNING:
+            await asyncio.sleep(LOOP_POLL_SECONDS / 10)
+        return bound
 
     async def ensure_connected(self) -> None:
         await settled()
@@ -409,8 +358,6 @@ class TinyJobs:
         self._closes = 0
 
     def forget_inherited_connection(self) -> None:
-        self._thread_spares = Spares(DRAIN_SPARE_THREADS)
-        self._in_drains = InDrains()
         self._workers = set()
         self._closing_after = set()
         self._shutting = False
@@ -845,8 +792,3 @@ def _assert_callable_without_arguments(task: Task) -> None:
             f"arguments, but its signature requires some"
         ) from None
 
-
-def _spared_call(
-    held: frozenset[Spares], factory: Callable[[], Coroutine[Any, Any, T]]
-) -> Coroutine[Any, Any, T]:
-    return spared(held, factory())

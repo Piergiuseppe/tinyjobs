@@ -1342,11 +1342,10 @@ class PostgresBackend(BaseBackend):
         await self._wake({row["queue"] for row in rows})
         return len(rows)
 
-    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         now = await self._now()
-        run_at = min(job.run_at, now) if in_place else now + delay
         return await self._requeued(
-            job, self._queries.hand_back, self._held(job, now, run_at=run_at)
+            job, self._queries.hand_back, self._held(job, now, run_at=now + delay)
         )
 
     async def _requeued(self, job: Job, query: str, parameters: dict[str, Any]) -> bool:

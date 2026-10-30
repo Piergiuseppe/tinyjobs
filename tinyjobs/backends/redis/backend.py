@@ -336,9 +336,8 @@ class RedisBackend(BaseBackend):
             )
         )
 
-    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
-        now = await self._now()
-        run_at = number(min(job.run_at, now) if in_place else now + delay)
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+        run_at = number(await self._now() + delay)
         return bool(
             await self._run(
                 "hand_back", job.id, job.worker_id or "", job.claims, run_at

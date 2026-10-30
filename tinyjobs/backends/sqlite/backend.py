@@ -257,8 +257,8 @@ class SQLiteBackend(BaseBackend):
             return 0
         return await self._call(self._release_many_sync, tuple(jobs))
 
-    async def hand_back(self, job: Job, delay: float = 0.0, *, in_place: bool = False) -> bool:
-        return await self._call(self._hand_back_sync, job, delay, in_place)
+    async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+        return await self._call(self._hand_back_sync, job, delay)
 
     async def cancel(self, job_id: str) -> bool:
         return await self._call(self._cancel_sync, job_id)
@@ -534,12 +534,11 @@ class SQLiteBackend(BaseBackend):
                     released += 1
         return released
 
-    def _hand_back_sync(self, job: Job, delay: float, in_place: bool) -> bool:
-        now = self._clock.now()
-        run_at = min(job.run_at, now) if in_place else now + delay
+    def _hand_back_sync(self, job: Job, delay: float) -> bool:
         with self._connections.write() as connection:
             cursor = connection.execute(
-                HAND_BACK_JOB, (run_at, job.id, job.worker_id, job.claims)
+                HAND_BACK_JOB,
+                (self._clock.now() + delay, job.id, job.worker_id, job.claims),
             )
             if cursor.rowcount != 1:
                 return False

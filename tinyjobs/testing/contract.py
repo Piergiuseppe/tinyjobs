@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import unittest
 from dataclasses import replace
 
@@ -309,19 +308,6 @@ class BackendContract:
         )
         self.assertEqual((await self.claim())[0].id, first.id)
         self.assertEqual(await self.backend.release_many([]), 0)
-
-    async def test_a_job_handed_back_in_place_keeps_its_turn(self):
-        if "in_place" not in inspect.signature(self.backend.hand_back).parameters:
-            raise unittest.SkipTest("the backend cannot hand a job back in place")
-        first = await self.enqueue(run_at=START - 2)
-        second = await self.enqueue(run_at=START - 1)
-        [claimed] = await self.claim(limit=1)
-        self.clock.advance(5)
-        self.assertTrue(await self.backend.hand_back(claimed, in_place=True))
-        stored = await self.stored(first)
-        self.assertIs(stored.status, JobStatus.QUEUED)
-        self.assertEqual((stored.run_at, stored.attempts, stored.hand_backs), (START - 2, 0, 1))
-        self.assertEqual([job.id for job in await self.claim()], [first.id, second.id])
 
     async def test_a_job_claimed_by_id_is_leased_once_and_only_when_due(self):
         if not hasattr(self.backend, "claim_job"):
