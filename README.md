@@ -575,8 +575,8 @@ for `LISTEN`, and one more, short-lived and shared, to ask about statements sile
 seconds when none is idle, so size the server's `max_connections` or the PgBouncer pool at 12 per
 process plus what the app itself uses. Connections beyond the minimum go back after ten idle
 seconds. Two workers of 32 busy without pause behind a PgBouncer session pool of 25, over a link
-adding 300 ms each way, left the app waiting 1.9 seconds for a server as a rule and 9.2 at most,
-with none refused. A smaller pool makes the app queue behind the workers for as long as they stay
+adding 300 ms each way, left the app waiting 1.9 seconds for a server as a rule and 2.4 at most,
+with none refused and no warning. A smaller pool makes the app queue behind the workers for as long as they stay
 busy: at 20, the app got 13 queries through in four and a half minutes, and PgBouncer refused one
 after its 120 second `query_wait_timeout`. Every statement times out after 30 seconds
 (`statement_timeout=`), a server that stops answering fails the call instead of hanging it, and
@@ -752,7 +752,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1538 tests, no test dependencies. The one that matters most is
+1539 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

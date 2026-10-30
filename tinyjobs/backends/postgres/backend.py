@@ -207,6 +207,7 @@ TAGGED_COMMANDS_VERSION = 160000
 ENDING_CLAIM_MILLISECONDS = 1000
 CUT_SECONDS = 0.5
 CONNECT_SECONDS = 5
+QUEUED_SETUP_SECONDS = 60.0
 CLOCK_SECONDS = 5.0
 ENDABLE = (
     "SELECT pg_catalog.has_function_privilege("
@@ -375,6 +376,7 @@ class PostgresBackend(BaseBackend):
         self._swept = -math.inf
         self._silenced = -math.inf
         self._answered = -math.inf
+        self._progressed = -math.inf
         self._sweeping = asyncio.Lock()
         self._waiters: dict[asyncio.Event, frozenset[str]] = {}
         self._listening: asyncio.Task | None = None
@@ -1789,6 +1791,7 @@ class PostgresBackend(BaseBackend):
                     self._silenced = time.monotonic()
                 elif _alive(connection):
                     self._answered = max(self._answered, getattr(connection, "heard", -math.inf))
+                    self._progressed = max(self._progressed, self._answered)
                 await self._pool.putconn(connection)
         except (psycopg.OperationalError, PoolTimeout):
             self._forget()
@@ -1810,15 +1813,29 @@ class PostgresBackend(BaseBackend):
             yield connection
 
     async def _configure(self, connection: psycopg.AsyncConnection) -> None:
+        started = time.monotonic()
+        configuring = asyncio.ensure_future(self._configured(connection))
         try:
-            async with asyncio.timeout(CONNECT_SECONDS):
-                await self._configured(connection)
-        except TimeoutError:
-            connection.pgconn.finish()
-            raise psycopg.OperationalError(
-                f"a new postgres connection did not answer its setup within {CONNECT_SECONDS} "
-                "seconds; it was closed and another is opened"
-            ) from None
+            while True:
+                mark = time.monotonic()
+                await asyncio.wait({configuring}, timeout=CONNECT_SECONDS)
+                if configuring.done():
+                    break
+                if self._progressed <= mark or mark - started >= QUEUED_SETUP_SECONDS:
+                    configuring.cancel()
+                    await asyncio.wait({configuring})
+                    connection.pgconn.finish()
+                    raise psycopg.OperationalError(
+                        "a new postgres connection did not answer its setup within "
+                        f"{time.monotonic() - started:.0f} seconds; it was closed and another "
+                        "is opened"
+                    ) from None
+        except asyncio.CancelledError:
+            configuring.cancel()
+            await asyncio.wait({configuring})
+            raise
+        configuring.result()
+        self._progressed = time.monotonic()
 
     async def _configured(self, connection: psycopg.AsyncConnection) -> None:
         if self._schemas is None:
@@ -2550,6 +2567,10 @@ class _Answering(psycopg.AsyncConnection):
         super().__init__(*args, **kwargs)
         self.cursor_factory = _Marked
 
+    def _drop(self) -> None:
+        self.dropped = True
+        self.pgconn.finish()
+
     def _exec_command(self, command: Any, *args: Any, **kwargs: Any) -> Any:
         mark = self.mark
         if (
@@ -2573,7 +2594,7 @@ class _Answering(psycopg.AsyncConnection):
             try:
                 answer = await waiting.wait_async(gen, self.pgconn.socket, interval=WAIT_INTERVAL)
             except (asyncio.CancelledError, KeyboardInterrupt):
-                self.pgconn.finish()
+                self._drop()
                 raise
             self.heard = time.monotonic()
             return answer
@@ -2581,8 +2602,7 @@ class _Answering(psycopg.AsyncConnection):
             return await self._heard(gen)
         except (asyncio.CancelledError, KeyboardInterrupt):
             if _DROPPED.get():
-                self.dropped = True
-                self.pgconn.finish()
+                self._drop()
             elif self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 await self._stopped(gen)
             raise
@@ -2613,7 +2633,7 @@ class _Answering(psycopg.AsyncConnection):
                 if ready:
                     return ready
                 self.silent = True
-                self.pgconn.finish()
+                self._drop()
                 raise psycopg.OperationalError(
                     "the postgres server did not answer: it finished or stopped the statement "
                     "but its answer never arrived, or it cannot be reached; the connection was "
@@ -2636,7 +2656,7 @@ class _Answering(psycopg.AsyncConnection):
         finally:
             if self.pgconn.transaction_status == pq.TransactionStatus.ACTIVE:
                 self.silent = True
-                self.pgconn.finish()
+                self._drop()
                 if self.orphaned is not None and self.pid is not None and self.mark is not None:
                     self.orphaned(self.pid, self.born, self.mark)
 
@@ -2863,6 +2883,8 @@ async def _pipelined(
             results = await connection.wait(_pipeline(pgconn, [text for _, text in texts]))
         except BaseException:
             if pgconn.pipeline_status != pq.PipelineStatus.OFF:
+                if isinstance(connection, _Answering):
+                    connection.dropped = True
                 pgconn.finish()
             raise
         for (index, _), result in zip(texts, results):

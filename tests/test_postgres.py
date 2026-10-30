@@ -5713,6 +5713,35 @@ class PostgresCutTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 1)
         self.assertTrue(connection.closed)
 
+    async def test_a_setup_queued_behind_a_pooler_waits_while_the_server_answers_others(self):
+        connection = await postgres_backend._Answering.connect(
+            POSTGRES_URL, **self.backend._pooled_options()
+        )
+        self.addAsyncCleanup(connection.close)
+        real = self.backend._configured
+
+        async def queued(connection):
+            await asyncio.sleep(0.8)
+            await real(connection)
+
+        async def answering():
+            while True:
+                await self.backend.get("missing")
+                await asyncio.sleep(0.05)
+
+        others = asyncio.ensure_future(answering())
+        try:
+            with (
+                mock.patch.object(postgres_backend, "CONNECT_SECONDS", 0.3),
+                mock.patch.object(self.backend, "_configured", queued),
+            ):
+                await asyncio.wait_for(self.backend._configure(connection), 5)
+        finally:
+            others.cancel()
+            await asyncio.gather(others, return_exceptions=True)
+        self.assertFalse(connection.closed)
+        self.assertIsNotNone(connection.pid)
+
     async def closing_with_an_orphan(self) -> list[int]:
         swept: list[int] = []
 

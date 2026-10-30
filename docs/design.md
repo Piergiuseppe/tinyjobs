@@ -1080,7 +1080,13 @@ after `pool_timeout`, two seconds at least. Pooled connections give up connectin
 `pool_timeout` too, between two and five seconds, unless the url sets `connect_timeout`, and a new
 connection whose setup statements get no answer within five seconds is closed and another opened:
 with the server accepting connections but not answering their setup for a while, jobs started 4.9
-seconds after it answered again, where none had started 120 seconds later. A pooled statement is never cut short while bytes move
+seconds after it answered again, where none had started 120 seconds later. While other connections
+keep getting answers, the setup keeps waiting, five seconds at a time and a minute at most, since
+it is then queued behind a pooler that opens one server at a time rather than unanswered: two
+workers of 32 behind a PgBouncer pool of 25 over a link adding 300 ms each way started with no
+warning and kept the app's wait for a server under 2.4 seconds, where 37 to 44 setups were cut,
+each warned, and the connections opened again queued behind the rest, the app waiting up to 9.2.
+A pooled statement is never cut short while bytes move
 in either direction or while the server is still working on it, waiting on a lock, a synchronous
 standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
 waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
