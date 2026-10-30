@@ -2801,6 +2801,51 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.heard(listener), [])
 
 
+@unittest.skipIf(PostgresBackend is None, "pip install 'tinyjobs[postgres]' to run this test")
+class PsycopgInternalsTests(unittest.TestCase):
+    def test_the_private_psycopg_names_tinyjobs_relies_on_are_still_there(self):
+        import inspect
+
+        from psycopg import pq
+        from psycopg._queries import PostgresQuery
+        from psycopg.adapt import Transformer
+        from psycopg_pool import AsyncConnectionPool
+        from psycopg_pool.pool_async import AddConnection, AttemptWithBackoff, MaintenanceTask
+
+        def parameters(function):
+            return list(inspect.signature(function).parameters)
+
+        converted = PostgresQuery(Transformer())
+        converted.convert("SELECT %(a)s", {"a": 1})
+        self.assertEqual(bytes(converted.query), b"SELECT $1")
+        self.assertEqual(
+            (len(converted.params), len(converted.types), len(converted.formats)), (1, 1, 1)
+        )
+        self.assertTrue(inspect.isclass(AttemptWithBackoff))
+        self.assertEqual(
+            parameters(AddConnection.__init__)[:4], ["self", "pool", "attempt", "growing"]
+        )
+        self.assertEqual(parameters(MaintenanceTask._run), ["self", "pool"])
+        self.assertEqual(
+            parameters(AsyncConnectionPool._add_connection), ["self", "attempt", "growing"]
+        )
+        for name in ("_maybe_grow_pool", "_shrink_pool", "_close_connection", "_check_size"):
+            self.assertTrue(callable(getattr(AsyncConnectionPool, name)), name)
+        source = inspect.getsource(AsyncConnectionPool)
+        for name in ("_waiting", "_nconns", "_nconns_min", "_lock", "_min_size", "_max_size"):
+            self.assertIn(f"self.{name}", source)
+        for name in ("_pool", "_growing", "_closed"):
+            self.assertIn(f"self.{name}", source)
+        for name in ("_exec_command", "_pipeline_nolock"):
+            self.assertTrue(hasattr(psycopg.AsyncConnection, name), name)
+        self.assertTrue(hasattr(psycopg.Connection, "_pipeline_nolock"))
+        self.assertIn("self._pipeline", inspect.getsource(psycopg.BaseConnection.__init__))
+        for cursor in (psycopg.Cursor, psycopg.AsyncCursor):
+            self.assertIn("prepare", parameters(cursor._execute_gen))
+        self.assertTrue(hasattr(psycopg.AsyncCursor, "_convert_query"))
+        self.assertIn("_encoding", dir(pq.PGconn))
+
+
 @requires_postgres
 class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
     def test_a_statement_timeout_that_would_switch_the_guard_off_is_refused(self):

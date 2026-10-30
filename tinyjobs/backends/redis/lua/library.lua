@@ -144,12 +144,19 @@ local function leave(job)
     redis.call('ZREM', key('ready', job.queue), ready_member(job))
   elseif status == 'running' then
     redis.call('ZREM', key('leases'), job.id)
+    if job.claim_token then
+      redis.call('ZREM', key('claim_tokens'), job.claim_token .. '|' .. job.id)
+    end
   elseif TERMINAL[status] then
     redis.call('ZREM', key('finished', status), job.id)
   end
 end
 
 local function transition(job, status, changes, removals)
+  if job.status == 'running' and job.claim_token then
+    removals = removals or {}
+    removals[#removals + 1] = 'claim_token'
+  end
   leave(job)
   changes.status = status
   for field, value in pairs(changes) do
@@ -247,9 +254,7 @@ local function take(job, worker, lease_expires_at, token)
     claim_token = token,
   })
   start_execution(job)
-  local held = key('claim', token)
-  redis.call('SADD', held, job.id)
-  redis.call('EXPIRE', held, math.max(1, math.ceil(tonumber(lease_expires_at) - tonumber(NOW))) + 1)
+  redis.call('ZADD', key('claim_tokens'), 0, token .. '|' .. job.id)
 end
 
 local function close_running_execution(job, status)

@@ -77,6 +77,58 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([e.claim for e in await self.backend.executions(job.id)], [2])
                 self.assertTrue(await self.backend.complete(again, None))
 
+    async def test_a_claim_given_up_by_its_caller_hands_its_jobs_back_as_never_claimed(self):
+        real = self.backend._scripts.run
+
+        async def unanswered(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name in ("claim", "claim_job"):
+                await asyncio.sleep(10)
+            return answer
+
+        for claiming in (self.claim_any, self.claim_by_id):
+            with self.subTest(claiming=claiming.__name__):
+                job = await self.enqueue(run_at=START - 1)
+                with mock.patch.object(self.backend._scripts, "run", unanswered):
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(claiming(job), 0.2)
+                self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+                self.backend._swept = -math.inf
+                [again] = await self.claim()
+                self.assertEqual((again.id, again.attempts, again.hand_backs), (job.id, 1, 0))
+                self.assertTrue(await self.backend.complete(again, None))
+
+    async def test_a_call_on_a_connection_the_server_reset_fails_as_a_connection_error(self):
+        job = await self.enqueue()
+        pool = self.backend._client.connection_pool
+        connections = list(pool._available_connections)
+        self.assertTrue(connections)
+        for connection in connections:
+            connection._writer.transport.abort()
+        await asyncio.sleep(0.05)
+        with self.assertRaises(RedisConnectionError):
+            await self.backend.get(job.id)
+        self.assertEqual((await self.backend.get(job.id)).id, job.id)
+
+    async def test_jobs_that_leave_running_leave_no_claim_behind(self):
+        jobs = [await self.enqueue(run_at=START - 1, max_attempts=3) for _ in range(5)]
+        claimed = {job.id: job for job in await self.claim(limit=5)}
+        first, second, third, fourth, fifth = (claimed[job.id] for job in jobs)
+        client = self.backend._client
+        tokens = self.backend._keys("claim_tokens")
+        self.assertEqual(await client.zcard(tokens), 5)
+        self.assertTrue(await self.backend.complete(first, None))
+        self.assertTrue(await self.backend.fail(second, ERROR, None))
+        self.assertTrue(await self.backend.release(third))
+        self.assertTrue(await self.backend.hand_back(fourth))
+        self.assertTrue(await self.backend.fail(fifth, ERROR, START + 5))
+        left = [key async for key in client.scan_iter(match=self.backend._keys("claim", "*"))]
+        self.assertEqual(left, [])
+        self.assertEqual(await client.zcard(tokens), 0)
+        for job in jobs:
+            stored = await client.hgetall(self.backend._keys("job", job.id))
+            self.assertNotIn(b"claim_token", stored)
+
     async def claim_any(self, job):
         return await self.claim()
 
@@ -1166,6 +1218,32 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
 
+    async def test_an_eager_call_whose_job_a_lost_claim_left_running_runs_it(self):
+        @self.app.task(store_result=True)
+        async def quick():
+            return "quick"
+
+        job = await quick.aenqueue()
+        inner = self.app.backend._inner
+        real = inner._scripts.run
+
+        async def lost(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name == "claim":
+                raise RedisConnectionError("the answer was lost")
+            return answer
+
+        inner._swept = time.monotonic()
+        with mock.patch.object(inner._scripts, "run", lost):
+            with self.assertRaises(RedisConnectionError):
+                await self.app.backend.claim(
+                    worker_id="drain", queues=["default"], limit=1, lease_seconds=60.0
+                )
+        self.assertIs((await job.arefresh()).status, JobStatus.RUNNING)
+        self.app._eager = True
+        settled = await self.app.settle(job, inserted=True)
+        self.assertEqual((settled.status, settled.result()), (JobStatus.SUCCESS, "quick"))
+
     async def test_threads_kept_at_a_stop_record_their_outcomes_where_connections_open_slowly(self):
         from redis.asyncio.connection import Connection
 
@@ -1374,7 +1452,6 @@ class RedisUrlTests(unittest.TestCase):
         self.assertEqual(backend._client.connection_pool.timeout, 3.0)
 
     def test_options_that_would_send_a_call_twice_are_refused(self):
-        from redis.asyncio import ConnectionPool, Redis
         from redis.asyncio.retry import Retry
         from redis.backoff import NoBackoff
 
@@ -1387,14 +1464,50 @@ class RedisUrlTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError) as caught:
                     RedisBackend.from_url(url, **options)
                 self.assertIn("retry_on_timeout", str(caught.exception))
-        pool = ConnectionPool.from_url("redis://127.0.0.1:6379/0", retry=Retry(NoBackoff(), 2))
-        with self.assertRaises(ConfigurationError):
-            RedisBackend(Redis(connection_pool=pool))
         backend = RedisBackend.from_url(
             "redis://127.0.0.1:6379/0?retry_on_timeout=false", retry=Retry(NoBackoff(), 0)
         )
         connection = backend._client.connection_pool.make_connection()
         self.assertEqual(connection.retry._retries, 0)
+
+    def test_a_client_handed_in_lends_its_settings_and_is_left_as_it_was(self):
+        from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
+        from redis.asyncio.retry import Retry
+        from redis.asyncio.sentinel import Sentinel
+        from redis.backoff import NoBackoff
+
+        blocking = BlockingConnectionPool.from_url(
+            "redis://127.0.0.1:6379/3", max_connections=7, timeout=4, retry_on_timeout=True
+        )
+        for client in (
+            Redis(host="127.0.0.1", port=6379),
+            Redis(connection_pool=ConnectionPool.from_url(
+                "redis://127.0.0.1:6379/0", retry=Retry(NoBackoff(), 2), retry_on_timeout=True
+            )),
+            Redis(connection_pool=blocking),
+            Sentinel([("127.0.0.1", 26379)]).master_for("primary"),
+        ):
+            with self.subTest(client=client):
+                pool = client.connection_pool
+                kind, settings = type(pool), dict(pool.connection_kwargs)
+                existing = pool.make_connection()
+                retries = existing.retry._retries
+                pool._available_connections.append(existing)
+                own = RedisBackend(client)._client.connection_pool
+                self.assertIsNot(own, pool)
+                self.assertIs(type(pool), kind)
+                self.assertEqual(pool.connection_kwargs, settings)
+                self.assertEqual(existing.retry._retries, retries)
+                self.assertEqual(own.make_connection().retry._retries, 0)
+                self.assertEqual(own.max_connections, pool.max_connections)
+                for name in ("host", "port", "db"):
+                    self.assertEqual(own.connection_kwargs.get(name), settings.get(name))
+        copied = RedisBackend(Redis(connection_pool=blocking))._client.connection_pool
+        self.assertEqual(copied.timeout, 4)
+        sentinel = Sentinel([("127.0.0.1", 26379)]).master_for("primary")
+        own = RedisBackend(sentinel)._client.connection_pool
+        self.assertEqual(own.service_name, "primary")
+        self.assertIs(own.sentinel_manager, sentinel.connection_pool.sentinel_manager)
 
     def test_a_url_without_a_password_keeps_its_reason(self):
         with self.assertRaises(ConfigurationError) as caught:

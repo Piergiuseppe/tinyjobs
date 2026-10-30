@@ -66,8 +66,15 @@ class Spares:
                 with self._lock:
                     self._waiting.discard(waiter)
 
-    def _stray(self) -> None:
+    def borrow(self) -> "Spare | None":
         with self._lock:
+            if self._strayed >= self.limit:
+                return None
+        return Spare(self, borrowed=True)
+
+    def _stray(self, taking: bool) -> None:
+        with self._lock:
+            self._taken += taking
             self._strayed += 1
             waiting = list(self._waiting)
         wake(waiting)
@@ -81,21 +88,23 @@ class Spares:
 
 
 class Spare:
-    def __init__(self, spares: Spares) -> None:
+    def __init__(self, spares: Spares, *, borrowed: bool = False) -> None:
         self.spares = spares
+        self._borrowed = borrowed
         self._kept = False
         self._ended = False
 
     def keep(self, running: Future) -> None:
         if not self._kept and not self._ended:
             self._kept = True
-            self.spares._stray()
+            self.spares._stray(self._borrowed)
             running.add_done_callback(self._returned)
 
     def end(self) -> None:
         if not self._kept and not self._ended:
             self._ended = True
-            self.spares._give(False)
+            if not self._borrowed:
+                self.spares._give(False)
 
     def _returned(self, _: object) -> None:
         self.spares._give(True)

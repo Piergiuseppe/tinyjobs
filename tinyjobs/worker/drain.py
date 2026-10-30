@@ -5,9 +5,8 @@ import logging
 import threading
 import time
 from contextlib import suppress
-from contextvars import ContextVar
 from functools import partial
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Sequence, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar
 
 from ..exceptions import ExecutorClosedError, UnknownTaskError
 from ..executors import ExecutorResolver
@@ -30,8 +29,6 @@ DRAIN_SPARE_THREADS = 8
 logger = logging.getLogger("tinyjobs.worker")
 
 T = TypeVar("T")
-
-_drained: ContextVar[bool] = ContextVar("tinyjobs_drained", default=False)
 
 Waiter = tuple[asyncio.AbstractEventLoop, asyncio.Future]
 Waiters = list[Waiter]
@@ -87,9 +84,9 @@ class Drain:
 
     async def _attached(self, running: Callable[[], Awaitable[T]]) -> T:
         await self._app.ensure_connected()
+        self._app.attach(self)
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
-        self._app.attach(self)
         try:
             return await running()
         finally:
@@ -128,8 +125,7 @@ class Drain:
         claimed = await self._claimed(partial(self._claimed_by_id, job_id))
         if claimed is None:
             return False
-        await self._execute(*claimed)
-        return True
+        return await self._execute(*claimed)
 
     async def _claimed_by_id(self, job_id: str) -> list[Job]:
         job = await self._app.backend.claim_job(
@@ -172,6 +168,8 @@ class Drain:
         elif spare is None:
             spares = self._app.thread_spares
             spare = await spares.reserve(wait=False)
+            if spare is None and spares in held_spares():
+                spare = spares.borrow()
             if spare is None:
                 await sheltered(self._app.backend.hand_back(job, in_place=True))
                 if spares not in held_spares() and not self._stopping.is_set():
@@ -200,8 +198,11 @@ class Drain:
             await self._abandon(running, job, spare)
             raise
         finally:
-            renewing.cancel()
-            await asyncio.gather(renewing, return_exceptions=True)
+            if running.done():
+                renewing.cancel()
+                await asyncio.gather(renewing, return_exceptions=True)
+            else:
+                running.add_done_callback(partial(_stop_renewing, renewing))
 
     async def _renewing(self, job: Job) -> None:
         while True:
@@ -283,7 +284,6 @@ class Drain:
 
     async def _attempt(self, job: Job, task: "Task", spare: Spare | None) -> None:
         current_runner.set(self)
-        _drained.set(True)
         owner = asyncio.current_task()
         self._executors.lend(owner, spare)
         try:
@@ -359,13 +359,8 @@ class InDrains:
                     self._after_claims.remove(entry)
 
 
-def in_drained_job() -> bool:
-    return _drained.get()
-
-
-async def drained(inside: bool, coroutine: Coroutine[Any, Any, T]) -> T:
-    _drained.set(inside)
-    return await coroutine
+def _stop_renewing(renewing: asyncio.Future, _: object) -> None:
+    renewing.cancel()
 
 
 def _lease_end() -> float:

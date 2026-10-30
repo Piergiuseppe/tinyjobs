@@ -7,6 +7,7 @@ import inspect
 import logging
 import math
 import secrets
+import sys
 import threading
 import time
 from contextlib import suppress
@@ -15,9 +16,11 @@ from urllib.parse import unquote, urlsplit
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
 from redis.asyncio.retry import Retry
+from redis.asyncio.sentinel import SentinelConnectionPool
 from redis.backoff import NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import NoScriptError
+from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
@@ -88,10 +91,12 @@ class RedisBackend(BaseBackend):
         prefix: str = DEFAULT_PREFIX,
         clock: Clock | None = None,
     ) -> None:
-        if _replays(client.connection_pool.connection_kwargs):
-            raise ConfigurationError(REPLAY_MESSAGE)
-        client.connection_pool.connection_kwargs["retry"] = Retry(NoBackoff(), 0)
+        self._bind(_own_client(client), prefix, clock)
+
+    def _bind(self, client: Redis, prefix: str, clock: Clock | None) -> None:
+        _sent_once(client.connection_pool)
         _mend(client.connection_pool)
+        _guard_writes(client)
         self._client = client
         self._clock = FollowingClock() if clock is None else clock
         self._reading = asyncio.Lock()
@@ -134,7 +139,9 @@ class RedisBackend(BaseBackend):
             connection_pool=pool, single_connection_client=single_connection_client
         )
         client.auto_close_connection_pool = True
-        return cls(client, prefix=prefix, clock=clock)
+        backend = cls.__new__(cls)
+        backend._bind(client, prefix, clock)
+        return backend
 
     async def setup(self) -> None:
         stored = int(await self._run("schema", SCHEMA_VERSION))
@@ -229,8 +236,10 @@ class RedisBackend(BaseBackend):
     async def _haunting(self, token: str, lease_seconds: float, claiming: Awaitable[T]) -> T:
         try:
             return await claiming
-        except (RedisConnectionError, RedisTimeoutError):
-            self._ghosts[token] = time.monotonic() + lease_seconds
+        except BaseException as error:
+            if not isinstance(error, ResponseError):
+                self._ghosts[token] = time.monotonic() + lease_seconds
+                self._swept = -math.inf
             raise
 
     async def _laid(self) -> None:
@@ -701,6 +710,50 @@ def _unwedged(kind: type) -> type:
     return type(kind.__name__, (_Unwedged, kind), {})
 
 
+class _GuardedWrites:
+    async def send_packed_command(self, command: Any, check_health: bool = True) -> None:
+        try:
+            await super().send_packed_command(command, check_health)
+        except TypeError as error:
+            if not _lost_transport(error):
+                raise
+            await self.disconnect(nowait=True)
+            raise RedisConnectionError("the connection was closed by the server") from error
+
+
+def _lost_transport(error: TypeError) -> bool:
+    if str(error) != "'NoneType' object is not callable":
+        return False
+    trace = error.__traceback__
+    while trace is not None and trace.tb_next is not None:
+        trace = trace.tb_next
+    if trace is None:
+        return False
+    code = trace.tb_frame.f_code
+    return code.co_name == "writelines" and code.co_filename.endswith("selector_events.py")
+
+
+@functools.cache
+def _guarded(kind: type) -> type:
+    return type(kind.__name__, (_GuardedWrites, kind), {})
+
+
+def _guard_writes(client: Redis) -> None:
+    if sys.version_info >= (3, 13):
+        return
+    pool = client.connection_pool
+    if not issubclass(pool.connection_class, _GuardedWrites):
+        pool.connection_class = _guarded(pool.connection_class)
+    connections = [
+        *getattr(pool, "_available_connections", ()),
+        *getattr(pool, "_in_use_connections", ()),
+        *([client.connection] if client.connection is not None else []),
+    ]
+    for connection in connections:
+        if not isinstance(connection, _GuardedWrites):
+            connection.__class__ = _guarded(type(connection))
+
+
 def _mend(pool: Any) -> None:
     if "get_available_connection" in vars(ConnectionPool):
         return
@@ -755,6 +808,38 @@ def _refused(url: str, pool: Any) -> str | None:
         except ValueError:
             return "its timeout is not a number of seconds"
     return None
+
+
+def _own_client(client: Redis) -> Redis:
+    pool = client.connection_pool
+    settings = {
+        name: value
+        for name, value in pool.connection_kwargs.items()
+        if name not in ("connection_pool", "retry", "retry_on_error", "retry_on_timeout")
+    }
+    options = {"connection_class": pool.connection_class, "max_connections": pool.max_connections}
+    if isinstance(pool, SentinelConnectionPool):
+        copied = SentinelConnectionPool(
+            pool.service_name,
+            pool.sentinel_manager,
+            is_master=pool.is_master,
+            check_connection=pool.check_connection,
+            **options,
+            **settings,
+        )
+    else:
+        if isinstance(pool, BlockingConnectionPool):
+            options["timeout"] = pool.timeout
+        copied = type(pool)(**options, **settings)
+    own = Redis(connection_pool=copied, single_connection_client=client.single_connection_client)
+    own.auto_close_connection_pool = True
+    return own
+
+
+def _sent_once(pool: Any) -> None:
+    once = Retry(NoBackoff(), 0)
+    pool.connection_kwargs.update(retry=once, retry_on_error=[], retry_on_timeout=False)
+    pool.set_retry(once)
 
 
 def _replays(options: dict[str, Any]) -> bool:

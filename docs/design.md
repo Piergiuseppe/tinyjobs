@@ -754,13 +754,23 @@ A `unix://` url whose socket path holds an `@` behind a password is refused too,
 took the rest of the password for the path and quoted it when the connection failed. So are
 `decode_responses`, which broke every call, and a `timeout=` that is not a number, which redis-py
 5.0 kept as text and failed every call with; one that is a number is read as one. So are the
-client's own retries (`retry` with any retries, `retry_on_timeout`, `retry_on_error`), on the url,
-as keywords or on a client handed in, and the pool is pinned to none: a call sent again after its
-answer was lost runs its script twice, so one enqueue counted two `queued` jobs and the `complete`
+client's own retries (`retry` with any retries, `retry_on_timeout`, `retry_on_error`), on the url
+or as keywords. A client handed in, redis-py 8's default included, gives tinyjobs its settings,
+not its connections: tinyjobs opens its own pool from them with no retries and leaves the client as
+it was, since redis-py keeps the retry on each connection and pinning a shared pool would take the
+retries from other code using it. A call sent again after its answer was lost runs its script twice,
+so one enqueue counted two `queued` jobs and the `complete`
 sent again found the job no longer running, returned false and left the counts at one `queued` and
 one `success`. Refusing them is simpler than making every script safe to run twice, and tinyjobs
 already recovers a lost answer itself: outcomes are written again only after checking the claim,
 and a lost claim is handed back by its token.
+
+On Python 3.12 a command written to a connection the server had reset raised asyncio's
+`TypeError: 'NoneType' object is not callable`, a bug fixed in 3.13, so a job whose outcome met it
+was failed as if the error were its own: 11 of 2,000 jobs through a 20 second outage ended `failed`.
+That exact error, raised by asyncio's write, now fails the call as a lost connection, which is
+retried, and all 2,000 ended `success`. psycopg does not write through asyncio transports, so
+Postgres never meets it.
 
 ### Atomicity
 
@@ -1179,7 +1189,11 @@ is then handed back by the sweep of unanswered claims.
 The next statement waits for a pass already running rather than going ahead of it, and a backend
 not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
 the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
-cancellation even when the server answers the cancel with another error, so it is never retried. Pooled connections ask for `UTF8` unless the URL names a client encoding, so a `SQL_ASCII`
+cancellation even when the server answers the cancel with another error, so it is never retried.
+These paths rely on private psycopg and psycopg-pool names, the pool's connection bookkeeping, the
+query pipeline and the cursor's execution internals, so both are required below 3.4 and a test
+checks every one of those names is still there. Pooled connections ask for `UTF8` unless the URL
+names a client encoding, so a `SQL_ASCII`
 database works too. Every connection unused for ten seconds beyond the minimum closes together,
 not one per interval, and a connection that failed to open is not retried once no caller waits
 for it: four workers of 16 on a 40-slot server peaked at 29 sessions of theirs instead of 36, and
@@ -1441,22 +1455,29 @@ call and the drain holds nothing it does not run: behind 500 queued sync jobs wi
 `async def` job it returned in 2.1 ms with one hand-back and nothing leased, and the async job waits
 its turn rather than costing every claim the scan above. An eager call whose own job needs no spare
 thread claims that job by its id once the drain stops, so with all eight taken an `async def` or
-untimed sync job sent eagerly still returns `success`. A job run by a job holding one of the app's
+untimed sync job sent eagerly still returns `success`. One whose claim by id loses to another
+claim returns the job as it now is, where it returned the `queued` copy read before the claim, 19
+times in a run of FastAPI requests. A job run by a job holding one of the app's
 spare threads, whether sent eagerly or drained from inside it, never waits for one: it takes a free
-one or is refused at once, so no job waits on a thread its own caller holds. A job with a timeout
-that sent 40 hanging jobs eagerly held 8 threads, where they held 43; a drain inside such a job
-finished in 0.17 seconds, where it waited 4.08; and a chain of 13 nested eager calls with a timeout
-finished in 0.02 seconds, the 5 past the eight coming back `queued` to their callers and run by the
-drains around them once a thread freed. An eager call whose job another drain in the process is
-running waits for that drain to finish it, but only when the call is not made from inside a job a
-drain runs: such a waiter holds no spare thread and no job anyone could wait on, so no wait can
-close a cycle, where a call made from inside a job could wait on its own job, through a dedup key,
-on a job waiting on it, or on a spare thread its waiter holds. A drain counts its claims in flight,
+one or, with none free, runs on its caller's, whose thread is blocked on it, and takes one of the
+eight only if it strays past its timeout; it is refused only once all eight have strayed, so no job
+waits on a thread its own caller holds. Eight requests at once, each a job with a timeout sending
+another eagerly, all ran both, where every child came back `queued` with a warning that no thread
+had strayed; a chain of 13 nested eager calls with a timeout ran all 13 in 0.04 seconds, where 5
+came back `queued`. A job with a timeout that sent 40 hanging jobs eagerly held its own thread and
+the 8 strayed ones, where they held 43, and a drain inside such a job returned in 0.42 seconds. An
+eager call whose job another drain in the process is
+running waits for that drain to finish it, but only for a job its own send inserted, and never from a
+job holding a spare thread: an inserted job is newer than any job its caller could be running, and
+such a waiter holds no spare thread, so no wait can close a cycle through a dedup key, a job waiting
+on it or a thread its waiter holds. The wait used to be skipped by a mark on the drained job that a
+thread the job starts does not carry, so a job sending its own dedup key from `run_in_executor` or
+from a thread of its own waited for itself forever; it now gets itself back `running` within 0.4
+seconds, as it does when it sends the key directly. A drain counts its claims in flight,
 so a call that finds its job `running` but not yet entered, or still `queued` under a claim not yet
 committed, waits for those claims first: 4,000 eager calls beside a thread draining in a loop all
 returned `success` on SQLite, Postgres and Redis, sync, async or with a timeout, where Redis
-returned 5 `running` and Postgres 1 `running` and 2 `queued`. A job that sends its own dedup key
-eagerly gets itself back `running` at once, where it waited for itself forever. 60 jobs hanging past
+returned 5 `running` and Postgres 1 `running` and 2 `queued`. 60 jobs hanging past
 a 0.05 second timeout held 8 threads whether drained or sent eagerly, and the drain returned after
 0.45 seconds with 52 left queued, where it held 9, waited three minutes holding one claimed job, and
 eager calls held 60. Eager calls at once took no more: 100 from threads or from one `asyncio.gather`
@@ -1591,10 +1612,19 @@ the job of a drain killed mid-run comes back within a minute, where its one-hour
 for an hour; and it writes a job's outcome again after an error that means the store could not be
 reached, as a worker does, where it raised and left the job `running`: 3,000 jobs drained through
 six half-second Redis cuts all ended `success`, each run once, where up to 6 stayed `running`. A
-Redis claim carries a token; when its answer is lost, the next claim, once a second at most until
-that lease would end, hands back the jobs still `running` under it as if never claimed, as the sweep
-of unanswered claims does on Postgres, where they stayed `running` until their lease ended and then
-counted as a failed attempt.
+Redis claim carries a token; when its answer is lost, the next claim, at once and then once a second
+at most until that lease would end, hands back the jobs still `running` under it as if never
+claimed, as the sweep of unanswered claims does on Postgres, where they stayed `running` until their
+lease ended and then counted as a failed attempt. A claim its caller gives up, cancelled or timed
+out, is handed back the same way, where it left the job `running` until its lease ended. An eager
+call whose job such a claim holds takes it back and runs it: of 2,000 eager calls with every
+twentieth claim answer lost, 68 returned their job `running`, now none. The tokens are kept in one
+sorted set, one entry per running job, removed with its outcome: 10,000 running jobs cost about 2 MB
+more and nothing once done, and claims are within 5% of their speed without tokens, where a set per
+claim, kept for its whole lease, doubled the keys and slowed claims by up to 25%. A drain given up
+by its caller while a sync job's thread runs renews that
+lease until the thread returns, where it stopped at once, so with the lease scaled down twentyfold
+the lease lapsed and the next drain ran the job again beside the first thread; it ran once.
 
 A worker or scheduler installs SIGINT and SIGTERM handlers only on the main thread; elsewhere it
 runs without them, since Python delivers signals to the main thread only. Workers on one loop share
@@ -1755,7 +1785,10 @@ the calls already running, closes the backend and stops the facade's loop. A cal
 close gets `AppClosedError` too, never a `RuntimeError` from a shut-down executor or a closed pool:
 four threads calling `enqueue`, `start` and `close` and three event loops calling `aenqueue`, `ready`
 and `aclose` at random for 9 s saw nothing else, on SQLite and on Redis, and asyncio logged no
-unretrieved exception. A loop being shut down refuses new work instead of running it beside the
+unretrieved exception. Once a close begins, a drain or eager call that would start is refused with
+`AppClosedError`: an eager call caught by a close that cut its `async def` job started it again in a
+new drain, so it ran twice and stayed `running` under a lease; it now runs once and is left `queued`.
+A loop being shut down refuses new work instead of running it beside the
 closing connection. A
 sync call on a closed app raises without starting the loop thread, and an app dropped without
 `close()` stops that thread and closes its connections when it is collected, so `python -X dev` stays

@@ -62,7 +62,7 @@ from .services.hooks import FAILURE, START, SUCCESS
 from .status import JobStatus
 from .task import Task
 from .worker import Drain, EmbeddedWorker, Worker
-from .worker.drain import DRAIN_SPARE_THREADS, InDrains, drained, in_drained_job, needs_spare
+from .worker.drain import DRAIN_SPARE_THREADS, InDrains, needs_spare
 
 DEFAULT_URL = "sqlite:///tinyjobs.db"
 
@@ -131,6 +131,7 @@ class TinyJobs:
         self._thread_spares = Spares(DRAIN_SPARE_THREADS)
         self._in_drains = InDrains()
         self._closing_after: set[Worker | Drain] = set()
+        self._shutting = False
         _apps.add(self)
 
     @property
@@ -213,15 +214,22 @@ class TinyJobs:
             refuse = getattr(self._backend, "refuse_held_transaction", None)
             if refuse is not None:
                 refuse()
-        held, inside = held_spares(), in_drained_job()
-        if held or inside:
-            factory = partial(_carried_call, held, inside, factory)
+        held = held_spares()
+        if held:
+            factory = partial(_spared_call, held, factory)
         return self._runner.run(factory, name=name, async_name=async_name)
 
     def bind(self, job: Job | None) -> Job | None:
         return job.bound_to(self) if job is not None else None
 
-    async def settle(self, job: Job) -> Job:
+    async def send_settled(
+        self, name: str, payload: JobPayload, options: EnqueueOptions
+    ) -> Job:
+        sent = self.dispatch.prepare(name, payload, options)
+        stored = await self.backend.enqueue(sent)
+        return await self.settle(stored, inserted=stored.id == sent.id)
+
+    async def settle(self, job: Job, *, inserted: bool = False) -> Job:
         bound = self.bind(job)
         if not self._eager:
             return bound
@@ -229,9 +237,11 @@ class TinyJobs:
         looked = None
         while True:
             bound = await bound.arefresh()
-            if self._runs_alone(bound) and await Drain(self).run_job(bound.id):
-                continue
-            if in_drained_job() or not self._may_be_taken(bound):
+            if self._runs_alone(bound):
+                if await Drain(self).run_job(bound.id):
+                    continue
+                bound = await bound.arefresh()
+            if not inserted or held_spares() or not self._may_be_taken(bound):
                 return bound
             if await self._in_drains.finished(bound.id):
                 looked = None
@@ -239,7 +249,10 @@ class TinyJobs:
                 continue
             seen = (bound.status, bound.claims)
             if seen == looked:
-                return bound
+                if bound.status is JobStatus.RUNNING and await Drain(self).run_job(bound.id):
+                    looked = None
+                    continue
+                return await bound.arefresh()
             looked = seen
             await self._in_drains.claimed()
             if bound.status is JobStatus.QUEUED:
@@ -273,6 +286,7 @@ class TinyJobs:
     async def ready(self) -> None:
         await settled()
         self._closed = False
+        self._shutting = False
         await self._connect()
 
     async def _connect(self) -> None:
@@ -399,6 +413,7 @@ class TinyJobs:
         self._in_drains = InDrains()
         self._workers = set()
         self._closing_after = set()
+        self._shutting = False
         if self._backend is not None:
             _inherited.append(self._backend)
         self._backend = None
@@ -491,9 +506,7 @@ class TinyJobs:
         if tx is not None:
             return await self.aenqueue_in(tx, name, payload, chosen)
         await self.ensure_connected()
-        return await self.settle(
-            await self.dispatch.dispatch_by_name(name, payload, chosen)
-        )
+        return await self.send_settled(name, payload, chosen)
 
     def send(
         self,
@@ -678,6 +691,8 @@ class TinyJobs:
 
     def attach(self, worker: Worker | Drain) -> None:
         with self._lock_guard:
+            if self._shutting:
+                raise AppClosedError(CLOSED_MESSAGE)
             self._workers.add(worker)
 
     def detach(self, worker: Worker | Drain) -> bool:
@@ -722,6 +737,8 @@ class TinyJobs:
         return workers
 
     async def _stop_workers(self) -> None:
+        with self._lock_guard:
+            self._shutting = True
         waiting = self._signal_workers()
         if not waiting:
             return
@@ -829,7 +846,7 @@ def _assert_callable_without_arguments(task: Task) -> None:
         ) from None
 
 
-def _carried_call(
-    held: frozenset[Spares], inside: bool, factory: Callable[[], Coroutine[Any, Any, T]]
+def _spared_call(
+    held: frozenset[Spares], factory: Callable[[], Coroutine[Any, Any, T]]
 ) -> Coroutine[Any, Any, T]:
-    return spared(held, drained(inside, factory()))
+    return spared(held, factory())

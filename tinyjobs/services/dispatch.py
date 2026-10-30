@@ -31,11 +31,6 @@ class DispatchService:
         self._registry = registry
         self._ids = JobIdGenerator()
 
-    async def dispatch_by_name(
-        self, name: str, payload: JobPayload, options: EnqueueOptions
-    ) -> Job:
-        return await self._backend.enqueue(self.prepare(name, payload, options))
-
     def prepare(
         self,
         name: str,

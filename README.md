@@ -389,8 +389,9 @@ app.drain()
 dedup and retries as production. Delays and backoff are respected in eager mode too: advance the clock
 and drain. A failing task is recorded on the job, not raised, as it would be in a worker. An eager
 call returns its job settled: when another drain or eager call in the process runs it, the call
-waits for that one to finish it, except from inside a job a drain runs, where waiting could mean
-waiting on itself and it returns the job `running` at once. It comes back `queued` only while not
+waits for that one to finish it, except when its dedup key found the job already sent or the call
+comes from a job holding a thread for timed sync tasks, where waiting could mean waiting on itself
+and it returns the job `running` at once. It comes back `queued` only while not
 yet due or, for a sync task with a timeout, as below, while it waits for a thread.
 
 ## What you get
@@ -764,7 +765,7 @@ Importing the package on anything older than 3.12 raises with the version it fou
 python -m unittest discover -s tests -t .
 ```
 
-1576 tests, no test dependencies. The one that matters most is
+1587 tests, no test dependencies. The one that matters most is
 `tests/test_claim_concurrency.py`, which runs six processes and eight threads against one database and
 asserts every job was claimed exactly once.
 

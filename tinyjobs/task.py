@@ -85,9 +85,7 @@ class Task:
     ) -> Job:
         payload = self.bind(args, kwargs)
         await self._app.ensure_connected()
-        return await self._app.settle(
-            await self._app.dispatch.dispatch_by_name(self._name, payload, options)
-        )
+        return await self._app.send_settled(self._name, payload, options)
 
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:
         return await self.aenqueue_with(self._options, args, kwargs)
