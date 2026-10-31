@@ -14,11 +14,16 @@ from functools import partial
 from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
-from .backends.loader import load_backend
+from .backends.loader import check_options, load_backend
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .codecs import CodecRegistry
-from .exceptions import AppClosedError, BackendNotReadyError, ConfigurationError
+from .exceptions import (
+    AppClosedError,
+    BackendNotReadyError,
+    ConfigurationError,
+    UnsupportedCapabilityError,
+)
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -94,6 +99,7 @@ class TinyJobs:
         eager: bool = False,
         **backend_options: Any,
     ) -> None:
+        check_options(url, backend_options)
         self._url = url
         self._backend_options = backend_options
         self._default_queue = default_queue
@@ -120,6 +126,7 @@ class TinyJobs:
         self._sessions = 0
         self._workers: set[Worker | Drain] = set()
         self._closing_after: set[Worker | Drain] = set()
+        self._shutting = False
         _apps.add(self)
 
     @property
@@ -199,12 +206,22 @@ class TinyJobs:
     def bind(self, job: Job | None) -> Job | None:
         return job.bound_to(self) if job is not None else None
 
-    async def settle(self, job: Job) -> Job:
+    async def send_settled(
+        self, name: str, payload: JobPayload, options: EnqueueOptions
+    ) -> Job:
+        sent = self.dispatch.prepare(name, payload, options)
+        stored = await self.backend.enqueue(sent)
+        return await self.settle(stored, inserted=stored.id == sent.id)
+
+    async def settle(self, job: Job, *, inserted: bool = False) -> Job:
         bound = self.bind(job)
         if not self._eager:
             return bound
-        await self.adrain()
-        return await bound.arefresh()
+        if await Drain(self).run_job(bound.id) or not inserted:
+            return await bound.arefresh()
+        while (bound := await bound.arefresh()).status is JobStatus.RUNNING:
+            await asyncio.sleep(LOOP_POLL_SECONDS / 10)
+        return bound
 
     async def ensure_connected(self) -> None:
         await settled()
@@ -218,6 +235,7 @@ class TinyJobs:
     async def ready(self) -> None:
         await settled()
         self._closed = False
+        self._shutting = False
         await self._connect()
 
     async def _connect(self) -> None:
@@ -229,10 +247,14 @@ class TinyJobs:
         except Exception as error:
             self._settle(attempt, error)
             raise
-        if raw.capabilities.loop_bound:
-            await self._connect_on_own_loop(raw, attempt)
-        else:
-            await self._attempt(raw, attempt)
+        try:
+            if raw.capabilities.loop_bound:
+                await self._connect_on_own_loop(raw, attempt)
+            else:
+                await self._attempt(raw, attempt)
+        except BaseException:
+            self._settle(attempt, None)
+            raise
 
     async def _elect(self) -> concurrent.futures.Future | None:
         while True:
@@ -338,6 +360,7 @@ class TinyJobs:
     def forget_inherited_connection(self) -> None:
         self._workers = set()
         self._closing_after = set()
+        self._shutting = False
         if self._backend is not None:
             _inherited.append(self._backend)
         self._backend = None
@@ -421,18 +444,66 @@ class TinyJobs:
         name: str,
         args: Sequence[Any] = (),
         kwargs: dict[str, Any] | None = None,
+        *,
+        tx: Any = None,
         **options: Any,
     ) -> Job:
-        await self.ensure_connected()
         payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
-        return await self.settle(
-            await self.dispatch.dispatch_by_name(
-                name, payload, EnqueueOptions().merged_with(**options)
+        chosen = EnqueueOptions().merged_with(**options)
+        if tx is not None:
+            return await self.aenqueue_in(tx, name, payload, chosen)
+        await self.ensure_connected()
+        return await self.send_settled(name, payload, chosen)
+
+    def send(
+        self,
+        name: str,
+        args: Sequence[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+        *,
+        tx: Any = None,
+        **options: Any,
+    ) -> Job:
+        if tx is None:
+            return self.run_sync(
+                partial(self.asend, name, args, kwargs, **options), name="send"
             )
+        payload = JobPayload(args=tuple(args), kwargs=dict(kwargs or {}))
+        return self.enqueue_in(
+            tx, name, payload, EnqueueOptions().merged_with(**options), call="send"
         )
 
-    def send(self, name: str, *args: Any, **kwargs: Any) -> Job:
-        return self.run_sync(partial(self.asend, name, *args, **kwargs), name="send")
+    async def aenqueue_in(
+        self, tx: Any, name: str, payload: JobPayload, options: EnqueueOptions
+    ) -> Job:
+        await self.ensure_connected()
+        job = self._joining(name, payload, options)
+        return self.bind((await self.backend.aenqueue_in(tx, [job]))[0])
+
+    def enqueue_in(
+        self,
+        tx: Any,
+        name: str,
+        payload: JobPayload,
+        options: EnqueueOptions,
+        *,
+        call: str = "enqueue",
+    ) -> Job:
+        self.run_sync(self.ensure_connected, name=call)
+        job = self._joining(name, payload, options)
+        return self.bind(self.backend.enqueue_in(tx, [job])[0])
+
+    def _joining(self, name: str, payload: JobPayload, options: EnqueueOptions) -> Job:
+        if self._eager:
+            raise UnsupportedCapabilityError(
+                "eager mode runs each job as it is sent, before any transaction "
+                "could commit; tx is not available with eager=True"
+            )
+        if not self.backend.capabilities.transactional_enqueue:
+            raise UnsupportedCapabilityError(
+                "this backend does not support enqueueing inside a transaction"
+            )
+        return self.dispatch.prepare(name, payload, options)
 
     async def aget(self, job_id: str) -> Job | None:
         await self.ensure_connected()
@@ -567,6 +638,8 @@ class TinyJobs:
 
     def attach(self, worker: Worker | Drain) -> None:
         with self._lock_guard:
+            if self._shutting:
+                raise AppClosedError(CLOSED_MESSAGE)
             self._workers.add(worker)
 
     def detach(self, worker: Worker | Drain) -> bool:
@@ -611,6 +684,8 @@ class TinyJobs:
         return workers
 
     async def _stop_workers(self) -> None:
+        with self._lock_guard:
+            self._shutting = True
         waiting = self._signal_workers()
         if not waiting:
             return
@@ -716,3 +791,4 @@ def _assert_callable_without_arguments(task: Task) -> None:
             f"{task.name} runs on a cron schedule, which calls it with no "
             f"arguments, but its signature requires some"
         ) from None
+

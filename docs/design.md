@@ -51,11 +51,11 @@ Where we *can* help:
   submitting the same job three times.
 - **Attempt visibility.** Every attempt is recorded as an `Execution` row, so a duplicate run is
   visible after the fact rather than silent.
-- **Transactional enqueue, planned.** With the SQLite backend, `enqueue` will be able to join your
-  application's own transaction: if the transaction rolls back, the job is never created. This removes the classic
-  dual-write bug where a job starts running against a row that was never committed. It is a genuine
-  advantage of a database-backed queue over a broker-backed one; see
-  [Transactional enqueue](#transactional-enqueue) for the API and its one hard constraint.
+- **Transactional enqueue.** On Postgres, `enqueue` joins your application's own transaction: if
+  the transaction rolls back, the job is never created. This removes the classic dual-write bug where
+  a job starts running against a row that was never committed. It is a genuine advantage of a
+  database-backed queue over a broker-backed one; see [Transactional enqueue](#transactional-enqueue)
+  for the API, and for why SQLite does not have it yet.
 
 ---
 
@@ -428,6 +428,8 @@ class Backend(Protocol):
     # --- consumer side ---------------------------------------------------
     async def claim(self, *, worker_id: str, queues: Sequence[str],
                     limit: int, lease_seconds: float) -> list[Job]: ...
+    async def claim_job(self, job_id: str, *, worker_id: str,
+                        lease_seconds: float) -> Job | None: ...
     async def heartbeat(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None = None
     ) -> None: ...
@@ -465,6 +467,23 @@ Redis backends will want pipelining, Postgres a multi-row `INSERT`. None of that
 core does the looping. And since the protocol freezes at v1.0, a seam that is not there at v1.0 cannot
 be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
 `enqueue()`) so that simple backends get the correct behaviour for free.
+
+`claim_job` claims one job by its id, only while it is queued and due, which is how an eager call
+runs the job it sent and no other (see [Testing](#testing)). It is optional: without it an eager
+call returns its job `queued`. It is a lookup by
+primary key, under `FOR UPDATE SKIP LOCKED` on Postgres: 200 rounds of three apps each racing it
+against a plain claim for the same job gave the job to exactly one of them on SQLite, Postgres and
+Redis, and one that finds nothing to claim takes 0.2 to 0.3 ms.
+
+A backend may also declare `transient_errors`, the exception types that mean the store could not be
+reached. When `complete` or `fail` raises one, the worker writes again after 0.25 s, doubling up to
+4 s, until a second before its lease would run out, where the last try lands. Every outcome write
+checks that the worker still holds that claim, so a write repeated after its reply was lost changes
+nothing, and the worker then reads the execution of its own claim to learn whether the first one
+landed; that read is retried the same way. A job whose task returned but whose outcome is still
+being written when the worker shuts down is not handed back to the queue: its lease runs out and the
+reaper decides, so `max_attempts` still holds. Redis and Postgres declare theirs; SQLite does not,
+and is never retried.
 
 ### The contract a backend must honour
 
@@ -548,8 +567,8 @@ app = TinyJobs("redis://localhost/0")   # after
 
 The URL scheme selects the backend. The core package never imports, references or knows the names of
 optional backends; it looks up the scheme in the entry point group and raises a helpful error
-(`pip install tinyjobs-postgres`) if nothing is registered for it. Bundled: `sqlite://`, `memory://`,
-and `redis://` behind the `redis` extra, imported only when a `redis://` URL is used.
+if nothing is registered for it. Bundled: `sqlite://`, `memory://`, `redis://` behind the `redis`
+extra and `postgres://` behind the `postgres` extra, each client imported only when its URL is used.
 
 ---
 
@@ -573,6 +592,12 @@ contention into a bounded wait instead of a mid-transaction `SQLITE_BUSY` and a 
 classic source of "database is locked" in multi-process SQLite.
 
 One connection per thread (`check_same_thread=True`), never shared across threads.
+
+A cancelled call still queued behind another is taken off the backend's thread at once; one
+already running gets half a second, then the cancel goes on while it finishes in that thread. A
+release at shutdown is one write transaction for every job. With another process holding the write
+lock, four jobs released at shutdown let the app close 6.5 seconds after the signal, where each
+release waited out `busy_timeout` behind the others and the close took 22.6.
 
 Switching a fresh file to WAL needs an exclusive lock, and SQLite answers "database is locked" at
 once instead of honouring `busy_timeout`. Two workers starting together on a new file lost that race
@@ -620,7 +645,22 @@ latency to sub-millisecond without changing the polling fallback that covers cro
 A claimed job holds a lease. The worker refreshes it (`heartbeat`) at one third of the lease duration
 while the job runs, naming itself, so a worker that lost the job cannot extend the lease of the one
 that holds it now. A plugin gets `worker_id` only when its `heartbeat` names that parameter; an
-older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it. If
+older two-argument one, or one hidden behind a `*args, **kwargs` wrapper, is called without it.
+`heartbeat` returns the ids whose lease it renewed; a job missing from that answer, and not already
+recording its outcome, is logged once as no longer held, by id, and left out of later heartbeats. A
+heartbeat or a claim that runs out of time or hits a transient error is a one-line warning, not a
+traceback.
+An answer that is not a collection of ids, such as a plugin's count, is logged once and the worker
+keeps beating without tracking lost leases; a count used to end the heartbeats silently. A heartbeat
+unanswered after a quarter of the lease is joined by a second one, without cutting the first, and
+the two get until the lease they renew would lapse: with the first call of every heartbeat never
+answering, the second renewed the lease with no warning. A cut call costs Redis its connection, and a
+fresh one three round trips more, so on a slow link one late heartbeat used to make every later one
+late too.
+On Redis over a link adding 300 ms each way, with a 6 second lease and eight jobs at a time, 218
+jobs ran once each with no heartbeat error, where 27 heartbeats used to fail and a job whose outcome
+got a second and a half ran twice. Over 70 seconds on that link, eight jobs ran once with no
+heartbeat warning, where from the first clock reading due all 20 heartbeats failed. If
 the worker is killed by SIGKILL, by the OOM killer or by a yanked power cable, the lease
 simply expires.
 
@@ -699,7 +739,33 @@ the reason the backend seam exists.
 Bundled rather than a separate `tinyjobs-redis` package: until the protocol freezes at v1.0, a change
 to it would otherwise need two releases in lockstep. It depends on nothing but the public protocol, so
 it can move out later without touching a line. The client library is an extra, `tinyjobs[redis]`, and
-is imported only when a `redis://` URL is used, so the core stays dependency-free.
+is imported only when a `redis://` URL is used, so the core stays dependency-free. A url redis-py
+cannot read raises `ConfigurationError`, without its reason once the url holds a password, since
+that reason may quote part of it. So does a connection option the client does not take, named
+unless the url holds a password, before the host or as a `password=` option: a raw `?` in the
+password made the rest of the url such an option, which redis-py raised at the first command as a
+`TypeError` quoting the password, and a raw `&` in a `password=` value made the part after it one.
+A `unix://` url whose socket path holds an `@` behind a password is refused too, since redis-py
+took the rest of the password for the path and quoted it when the connection failed. So are
+`decode_responses`, which broke every call, and a `timeout=` that is not a number, which redis-py
+5.0 kept as text and failed every call with; one that is a number is read as one. So are the
+client's own retries (`retry` with any retries, `retry_on_timeout`, `retry_on_error`), on the url
+or as keywords. A client handed in, redis-py 8's default included, gives tinyjobs its settings,
+not its connections: tinyjobs opens its own pool from them with no retries and leaves the client as
+it was, since redis-py keeps the retry on each connection and pinning a shared pool would take the
+retries from other code using it. A call sent again after its answer was lost runs its script twice,
+so one enqueue counted two `queued` jobs and the `complete`
+sent again found the job no longer running, returned false and left the counts at one `queued` and
+one `success`. Refusing them is simpler than making every script safe to run twice, and tinyjobs
+already recovers a lost answer itself: outcomes are written again only after checking the claim,
+and a lost claim is handed back by its token.
+
+On Python 3.12 a command written to a connection the server had reset raised asyncio's
+`TypeError: 'NoneType' object is not callable`, a bug fixed in 3.13, so a job whose outcome met it
+was failed as if the error were its own: 11 of 2,000 jobs through a 20 second outage ended `failed`.
+That exact error, raised by asyncio's write, now fails the call as a lost connection, which is
+retried, and all 2,000 ended `success`. psycopg does not write through asyncio transports, so
+Postgres never meets it.
 
 ### Atomicity
 
@@ -732,8 +798,10 @@ Every machine keeps Redis's time. The app's default clock is a `FollowingClock`:
 has read Redis's `TIME`, `now()` is that reading plus the time elapsed since, counted on a clock that
 never steps and keeps counting through a suspend (`CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on
 macOS). A step of the wall clock therefore changes nothing, whether it lands between two calls or
-during a reading. The backend reads `TIME` again on its first call after thirty seconds, after a
-connection error, and when the wall clock and the elapsed clock disagree by half a second. Only the
+during a reading. The backend reads `TIME` again before a call goes on after a connection error or
+when the wall clock and the elapsed clock disagree by half a second. A reading thirty seconds old,
+or one whose round trip was slow, is read again beside the call that finds it due, which goes on
+with the reading it has, and one a minute old before the call. Only the
 `TIME` command itself is timed, on a connection already taken from the pool and opened. A reading
 whose round trip took more than half a second only renews the reading held when the two agree
 within half that round trip plus a quarter of a second; when they do not, it is taken, and either
@@ -745,8 +813,8 @@ it. A following host marks its `now` with a `~`, and for it the scripts read `TI
 reaper takes the earlier of the two, so it never reaps by a time ahead of Redis's, and a claim or a
 heartbeat stamps the later of the two lease ends, so no lease is written to end before Redis says it
 should. Everything else written in that moment, a delayed `run_at` or a cron slot, is off by the
-stale reading until the next one, at most thirty seconds later; the app also reads again before it
-builds a job whenever a reading is due. The one thing a following host cannot survive is Redis's own
+stale reading until the next one, at most a minute later; the app also reads again before it
+builds a job whenever the reading is not to be trusted. The one thing a following host cannot survive is Redis's own
 time jumping ahead, as after a failover to a node whose clock is ahead: every lease stamped before
 the jump by more than its length looks expired and is reaped, so its job runs again, or fails when it
 has no attempts left. Redis's nodes therefore stay on NTP.
@@ -772,11 +840,398 @@ apps on two servers whose times differ by more than a second raises instead of m
 - **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
   pop would save the idle round trips but cannot express priorities across queues.
 - **No transactional enqueue, ever.** Redis shares no transaction with your database, so the
-  planned SQLite feature has no Redis counterpart.
+  Postgres feature has no Redis counterpart.
 - **A bounded pool that waits.** redis-py 8 caps its pool at 100 and raises `MaxConnectionsError` the
   moment a caller finds it full, which turned half of 200 concurrent `aenqueue()` calls into errors.
   The backend uses a blocking pool of the same size instead, so 400 concurrent requests to a FastAPI
-  endpoint all succeeded, and a caller only fails after `pool_timeout`.
+  endpoint all succeeded, and a caller only fails after `pool_timeout`. redis-py 5.0.1 connects while
+  holding that pool's lock, so a call cancelled mid-connect held it until `pool_timeout` (2.00 s in
+  the test, 20 s by default), stalled every other call, and kept its connection counted as in use.
+  On 5.0.1 the backend swaps in the 5.0.2 acquire, which connects outside the lock: the cancel
+  returns at once and the connection goes back.
+
+---
+
+## The Postgres backend
+
+Bundled like Redis, behind the `postgres` extra (`psycopg` and `psycopg-pool`), and imported only
+when a `postgres://` or `postgresql://` URL is used. It runs on psycopg 3's async API with an
+`AsyncConnectionPool`, so it is `loop_bound` and the app routes every call onto its own loop.
+
+### Tables
+
+Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
+`<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
+Before `setup` reads any of them it finds them in the catalog, along the schemas the connection's
+`search_path` named when the pool opened, passing over a table of a tinyjobs name that a role it
+does not trust owns, or sits in a schema such a role owns, when a trusted one of that name comes later
+on the path, with a warning naming the schema, so a role allowed to create schemas cannot stop new
+processes by planting one earlier. It checks that all four sit in one schema and that the
+tables and the schema belong to the connecting role or to a role that can become it (`SET` on
+Postgres 16 and later, membership before), and that no role inherits the privileges of without
+being able to become it too; a schema owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
+role reading or writing the row, so a table owned by anyone else would let that role act as
+tinyjobs. For the same reason a table is refused too when it grants `TRIGGER`, or `REFERENCES` on
+the table or any of its columns, to such a role or to `PUBLIC`, since a foreign key from that role's own table would make a purge fire
+its triggers, or when code that runs on it belongs to one: a function behind a trigger, constraint,
+default, generated column, index or policy, an operator, a domain or type, or an index's operator
+class. Setup and every `tx=` call find that code by following, in `pg_depend`, the objects attached
+to the tables down through every object a user created, and the same goes for each table that
+references them by a foreign key, whose triggers a cascade fires, and each table that inherits from
+them, whose rows tinyjobs' statements reach. A table they reference, such as a lookup, runs nothing
+of its owner's on tinyjobs' statements and is not counted, and neither is a view, a function or a stored
+`regclass` that merely names the tables runs nothing during tinyjobs' statements and is not counted,
+so no role can block the tables by creating one. The guard stays near a tenth of a millisecond. Such tables are refused before a row is read, even
+when tinyjobs connects as a superuser, was made a member of their owner, or the database belongs to
+someone else. With no tables yet, the schema they would be created in is checked the same way, and
+created only when it does not exist, so a role that owns its schema needs no `CREATE` on the
+database. Setup
+then reads the stored schema version and creates nothing when it matches, so a fleet starting at
+once costs a few catalog reads and one `SELECT` each. Otherwise it takes a transaction-scoped
+advisory lock and checks again under it. Any role that may connect can take an advisory lock, so
+one held by a session whose role cannot become setup's own is not waited for, a lock let go between
+the attempt and the reading of its holders is tried once more before that is concluded, and one
+held for a minute, or what is left of setup's deadline, whatever the `statement_timeout`, is waited
+out rather than obeyed: setup
+creates the tables without it, and a concurrent creation it then trips over sends it round again,
+up to three times. The wait blocks on the lock rather than polling a clock: four workers starting
+together on a fresh prefix over a link adding 300 ms each way started quietly, one after another,
+where three of four created the tables without the lock after five seconds and two of them blamed
+a role that could not become theirs. A lock held 45 seconds was waited for under a one second
+`statement_timeout`, where the timeout failed setup after 1 second, and after 30 by default.
+Between the `CREATE` statements and the rows the meta table is seeded with, setup checks the placement and the
+owners once more in the same transaction, so a table another role creates in the gap is caught
+before tinyjobs writes a row into it, and the whole creation rolls back. A store written by a
+newer release is refused and left alone. Every setup then checks that each tinyjobs index exists as
+a valid index of the right table, unique where it must be, and that the statistics below exist on
+the jobs table, so an object of that name another role made first stops setup instead. One that is
+missing, invalid or of the wrong kind is rebuilt with `CREATE INDEX CONCURRENTLY`, on a connection
+of its own while a second one holds the meta table's instance row `FOR UPDATE`, so workers keep
+claiming and enqueueing while it builds. Only a role that may write the meta table can take that row
+lock, though one allowed to `LOCK` it, as `MAINTAIN` allows, can hold the table; each attempt waits
+half a second for the table, and neither connection is ended by `transaction_timeout` or
+`idle_in_transaction_session_timeout`. Other setups starting meanwhile wait up to 30 seconds for
+that rebuild instead of racing it, and do not wait on the table again for what it left: a plain
+index is kept for the next setup with a warning and a unique one stops setup with the reason, naming
+the pid, role and application of each session still holding the meta table. The executions
+index claims insert against is the exception: claims cannot run without it, so it is built in one
+plain step, during which they wait instead of failing. Unique indexes go first. A build waits up to
+30 seconds for every transaction open in the database when it started, since that is what
+`CONCURRENTLY` waits for, whether or not they touch the table; past that a unique index stops setup
+with the reason and the oldest sessions it waited for, and the plain ones left are kept for the next setup with a warning, without waiting
+again, since jobs run without them, only more slowly. If active jobs with the same dedup key got in
+while that index was missing, setup names those jobs and asks to cancel all but one of each group.
+`CREATE INDEX IF NOT EXISTS` skips a name another relation already holds, which would leave claims
+failing and dedup keys ignored, so then setup names the index and stops, and the next setup after
+that relation is dropped creates it. From then on every statement names the tables with the
+schema setup found them in, so a table of the same name created later earlier on a `search_path`
+cannot take the jobs, and tinyjobs' own connections run with `search_path` set to `pg_catalog,
+pg_temp`, so no function or operator someone created elsewhere is ever called. The statements that
+run on a caller's connection for `tx=` name every function, type and operator with `pg_catalog`, so
+the caller's `search_path` cannot change them either. The caller may connect as another role, or
+switch with `SET ROLE` between two calls, so every `tx=` call runs the ownership check through the
+caller's connection, against the role current at that moment, before anything touches the tables;
+a role the tables' owner does not answer to never writes through them, and none of the owner's
+triggers, defaults or index expressions runs with its privileges. A `tx=` call holds the
+connection's lock from the check to its last statement, as psycopg's own `executemany` does, so no
+other statement on that connection, such as a `RESET ROLE` from another task or thread, lands
+anywhere inside it. The check and the first insert share one pipeline sync, so the check costs no
+round trip (a libpq older than 14 has no pipeline mode and spends one); a failing check makes
+Postgres skip the insert unparsed. Inside a caller's own pipeline they join it without a sync, so an
+autocommit pipeline still commits as one; there the check is read before the insert is sent, so a
+refusal sends nothing more and leaves the pipeline as any failed statement does, for the caller to
+sync. The insert sent behind the check is never prepared: psycopg counts a statement Postgres skipped
+as prepared, and on an autocommit connection no rollback would clear that, so every later call
+would fail. A `tx=` call that needs more than one batch on an idle autocommit connection runs in a
+transaction of its own, so it stores all its jobs or none, as an enqueue through the pool does. Values are bound by the server, arrays in binary, so neither the caller's `search_path`
+nor its `standard_conforming_strings` or client encoding changes what runs or what is stored. This
+uses psycopg internals present in 3.2 and 3.3; on a psycopg without them `tx=` raises
+`UnsupportedCapabilityError` rather than run unguarded. A connection whose client encoding is
+`SQL_ASCII` is refused, since psycopg reads its text as bytes. A guard inside the insert
+statement would not do: a statement-level `BEFORE` trigger fires before any row reaches the guard,
+and the planner may evaluate an immutable column default before the statement starts. A refused
+call leaves the caller's transaction aborted. Setup also reads the store's identity: a
+random instance id written into the meta table when the tables are created, the database's oid and,
+when the role may read it, the cluster's system identifier. A copy made with `CREATE DATABASE ...
+TEMPLATE` or a restored dump keeps the instance id but not the other two. A `tx=` connection whose
+identity differs makes tinyjobs read its own again on a fresh connection of its own, with the same
+settings and timeouts as the pool's and a connect timeout, before refusing, so an app that rides
+through a move of the same store, such as a switchover to a replica, follows it.
+
+`id`, `queue`, `status` and `dedup_key` use the `C` collation, so ids sort as bytes, the way UUIDv7
+ids are ordered on SQLite and Redis, whatever the database's locale. A btree entry holds about
+2.7 kB, so the unique index covers a dedup key's SHA-256 digest, stored beside it, and the queue
+indexes cover a queue's first 500 characters, with the full name compared on top; neither has a
+length limit. Queues longer than that which share their first 500 characters share index entries,
+so each is claimed by reading its siblings' rows too. Extended statistics tell the planner that the
+prefix and the name go together; without them it multiplies the two conditions' selectivities, and
+after a few prepared listings by queue and status Postgres picked a generic plan that read the whole
+primary key, 14 ms instead of 0.12 at 300,000 jobs. Many jobs go in batches of at most 1,000 jobs and 64 MiB of payloads, keys and errors,
+in one transaction, so no array parameter nears Postgres' 1 GB limit on a value. The jobs table has a fillfactor
+of 85 and an autovacuum tuned to run often: a job row is updated several times in its life, and the
+free space lets most of those updates stay on the same page. There is no index on the lease, so a
+heartbeat touches no indexed column and is a HOT update; the reaper scans the running jobs instead,
+which are few.
+
+### The claim
+
+A claim is one statement. A recursive query walks the priorities present in the wanted queues from
+the highest down, using the partial index on `(left(queue, 500), priority DESC, run_at)` over queued
+jobs, and
+for each level that holds a due job takes the due jobs with `FOR UPDATE SKIP LOCKED`, oldest first,
+until it has enough. Each step reads a span of index entries per queue below the last level, in index
+order, and either finds the highest level with a due job or skips every level the spans covered,
+since they hold each such level's oldest job; over several queues it skips only down to the highest
+of the spans' last entries. The span starts at one entry, doubles up to 128 while steps cross several
+levels, and drops back to one when it finds a due level, or when a span of at least 16 entries stays
+inside one level. So the common
+claim reads one entry per queue, delayed jobs spread one per priority are skipped up to 128 per step,
+and a large delayed level costs one index descent instead of a scan.
+Over several queues, each level visits the queues in the order of their oldest due job, so a batch
+can take a queue's newer jobs before another queue's next one, and the next claim starts from that
+other queue. Rows are locked only as the claim takes them, so a concurrent claim never skips a due
+job that nobody is taking. The same statement marks them running, stamps the lease and opens their
+executions, and it stamps a random token of its own and takes a transaction advisory lock derived
+from it, which only that claim's transaction can hold. A claim that ends without its answer, from a
+lost connection, a server that stopped answering or a cancelled call, even one cancelled again
+while it gives up, may still commit later, so tinyjobs keeps its token, its lease, its worker and
+the backend it was sent on, named by process id and start time, in memory. Passes over them run
+one at a time. Each, as the login role, first ends the backend if it holds the claim's lock, so a
+claim still running takes nothing, unless the role may not run `pg_terminate_backend`, which is
+logged once and leaves the claim to commit, then reads `pg_stat_activity` and runs one `UPDATE` that hands back the running jobs
+carrying those tokens, without counting the attempt and with their executions removed. A token is
+forgotten once that `UPDATE` hands back its jobs, or when its backend, as read before the `UPDATE`,
+is gone, belongs to another role, or has gone idle since the first pass saw it, since a backend
+only goes idle once the claim, if it arrived, has ended. A backend that sat idle since the first
+pass may still receive a claim delayed on the way, or be idle in PgBouncer's pool; its token is kept
+until the backend changes state or goes. Passes run before a claim and on a heartbeat, at most once
+a second while some backend is busy or unseen, when a wait for jobs is also cut to a second, and
+once every third of the lease while all sit idle. Closing runs passes for up to five seconds while
+some backend is busy, so a claim still running there is ended too. A pass that fails is logged and
+tried again later, and never fails the claim it runs before. No timing is guessed, and no
+backend that might serve someone else is ended: only the holder of the claim's own lock. A process
+without such tokens runs no extra statement; the lock costs a claim about 3 µs. A process that dies
+loses its tokens, like any jobs it held: their leases expire. Workers never wait on each other's rows. Walking levels rather than sorting matters when
+a backlog is not due: with 50,000 delayed jobs at one priority ahead of a due one, the plain `ORDER
+BY priority DESC, run_at` read 205 buffers per claim and the level walk 50. Spans matter when the
+delayed work spreads over many priorities: with 20,000 delayed jobs each at its own priority above a
+due one, a walk of one level per step read 100,000 buffers and took 57 ms per claim, the spans 1,200
+buffers and 4 ms.
+
+### Time
+
+As on Redis, every machine follows the server's clock: the backend reads `clock_timestamp()` on
+setup and after a connection error, and again every thirty seconds beside a call while the pool has
+a second idle connection and no worker on it is stopping, so the reading never takes the connection
+a release needs, or before the call once the reading is a minute old; the statements that decide by time
+compare against the earlier of the caller's `now` and `statement_timestamp()`. A claim or a heartbeat
+stamps the later of the two lease ends. So a host on a stale reading never reaps a live lease and
+never writes one that ends too soon.
+
+### Waking workers
+
+Idle workers do not wait for their next poll. After an enqueue that left a job due, the backend sends
+`pg_notify` with the queue as payload, cut to its first 1,000 characters so it stays under
+Postgres's limit, at most once per queue every 50 ms; a burst sends one notification and a trailing
+one. A queue with a trailing notification pending waits for it rather than sending its own: 30
+enqueues 4.4 ms apart sent 5 notifications, two of them 3 ms apart, and now send 4, 50 ms apart.
+A caller with a deadline does not wait for the notification, which is sent on its own: at a
+600 ms round trip a release of eight jobs under a one second deadline returned after 0.61 seconds,
+where waiting for the notification took it past the deadline and the worker logged them unreleased
+though they were queued. The channel is `tinyjobs_` and a hash of the instance id, which always fits in a channel name.
+So every spelling of one store, by `schema=` or by `search_path`, shares one channel, and two stores
+never do. Each worker process holds one extra
+connection that `LISTEN`s, and a notification for one of its queues ends its idle wait at once,
+unless it claimed since. A lost listening connection is reopened within a second, and every reopen
+wakes the workers once, since notifications sent meanwhile are gone. Closing while its `LISTEN` is still on
+the way closes that connection instead of sending a cancel, which psycopg waits five seconds for:
+over a link adding 300 ms each way, workers stopped right after going idle used to log a failed
+cancel five seconds after they stopped. A server
+`idle_session_timeout` closes an idle listener too, and it reopens the same way; idle pooled
+connections it closes are replaced, and `psycopg_pool` logs a warning for each. Polling stays as the fallback, so
+`notify=False` or a dropped notification costs latency, never a job.
+
+### Joining the caller's transaction
+
+`tx=` takes the caller's psycopg connection or cursor, sync or async, and writes the job on it:
+
+```python
+with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+    connection.execute("INSERT INTO orders (id) VALUES (%s)", (42,))
+    send_receipt.with_options(tx=connection).enqueue(42)
+```
+
+The insert is written once as a generator of `(statement, parameters)` steps, driven by the pool's
+async connections, by the caller's async connection on the caller's loop, and by the caller's sync
+connection in the caller's thread. A sync enqueue therefore never crosses to the backend's loop with
+a connection that belongs to another thread. The notification goes inside the same transaction, and
+Postgres delivers it only at commit, so a worker never wakes for a job it cannot see yet; a rollback
+takes both. The tables are named with their schema here too, so the caller's `search_path` or a
+temporary table of the same name cannot divert the job. The first use of a connection reads the
+store's identity through it and raises `ConfigurationError` when it differs, which catches a
+connection to another database, even one holding tinyjobs tables of its own or a copy of this one.
+
+Dedup keys work inside the transaction as outside: a second enqueue with a held key returns the
+holder, including one written earlier in the same transaction. Jobs sharing a key inside one call
+become one job before anything is written, and the first one given is the one stored. Every call
+inserts its jobs in key order, so two bulk enqueues racing on the same keys wait for each other
+instead of deadlocking. A holder written by another transaction that has not committed makes the
+insert wait for it, as any unique index does. Eager mode refuses `tx=`, because it would run the job
+before the transaction could commit, and so does every backend that cannot join one.
+
+In Django, `OPTIONS = {"url": ..., "database": "default"}` enqueues through that database's own
+connection, so a task enqueued inside `transaction.atomic()` is written in its transaction, and a
+rolled-back savepoint takes its tasks with it. `aenqueue` runs in the thread that holds the
+transaction, through `sync_to_async(thread_sensitive=True)`.
+
+### Connections
+
+Each process keeps a pool of 1 to 10 connections (`min_connections=`, `max_connections=`), plus the
+listening one, whatever its workers run. Growing it with their concurrency bought nothing: with three
+workers of 16 jobs on a 40 connection server, over a link adding 300 ms each way, 1200 jobs took 67.3
+seconds with at most 32 connections, no warning and none of 270 other connections refused; grown,
+they took 66.2 seconds with 36, 15 warnings and 107 of 267 refused. Claims did not starve behind the
+outcome writes either: no worker logged a failed claim. Resizing the pool opens only the connections
+it lacks, never past `max_connections=`: psycopg's own resize opens one per step of the minimum,
+which with both connections of a two connection pool busy opened a third. Every pooled connection
+is set to read committed, a 30 second `statement_timeout` and a one minute
+`idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
+trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
+call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
+instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements
+without a round trip of its own: on an idle autocommit connection the setting travels in the same
+pipeline as the statement and ends with it, and inside the caller's transaction the caller's value
+is kept on the server and put back with the last statement, or after a failure; every connection,
+the listening one too, is named `tinyjobs` in `pg_stat_activity` unless the URL names it and keeps
+TCP keepalives and a one minute `tcp_user_timeout` on, and the listening one gives up connecting
+after `pool_timeout`, two seconds at least. Pooled connections give up connecting after
+`pool_timeout` too, between two and five seconds, unless the url sets `connect_timeout`, and a new
+connection whose setup statements get no answer within five seconds is closed and another opened:
+with the server accepting connections but not answering their setup for a while, jobs started 4.9
+seconds after it answered again, where none had started 120 seconds later. While other connections
+keep getting answers, the setup keeps waiting, five seconds at a time and a minute at most (cut
+at 60.0 seconds, where it ran to 65), since
+it is then queued behind a pooler that opens one server at a time rather than unanswered: two
+workers of 32 behind a PgBouncer pool of 25 over a link adding 300 ms each way started with no
+warning and kept the app's wait for a server under 2.4 seconds, where 37 to 44 setups were cut,
+each warned, and the connections opened again queued behind the rest, the app waiting up to 9.2.
+A pooled statement is never cut short while bytes move
+in either direction or while the server is still working on it, waiting on a lock, a synchronous
+standby or its disk; a deadline would fail a large claim over a slow link, or report a commit
+waiting on a standby as failed while it then applies. After ten silent seconds tinyjobs asks the
+server what the statement's backend is doing, on an idle pooled connection when the pool has one,
+which gets a second to take the question and answer it, and otherwise, or when it does not, on a
+fresh connection, one per backend shared by every statement asking at the time, which closes once
+none is: twenty statements silent together behind a held row lock over that slow link kept a
+process at 11 sessions, where each opened a connection of its own and it reached 18. The question
+names the
+backend by its process id and start time, so a reused id is never taken for it, runs as the login
+role, which sees its own sessions even when the url or `ALTER ROLE ... SET role` switches to
+another, and uses only `pg_catalog` operators whatever the url's `search_path`. If the backend is
+gone, the call raises `OperationalError`, which the worker treats like a lost connection. If the
+backend has been blocked sending to us for those ten seconds, or has waited five minutes for bytes
+from us with nothing moving on our side, an answer lost on its way or a request stuck in a proxy,
+tinyjobs ends that backend first, so nothing it was doing takes effect afterwards, then raises;
+a login role that may not run `pg_terminate_backend` raises without ending it. A
+server that cannot be asked within ten seconds is not taken for gone, since a PgBouncer whose
+server slots this pool already holds looks the same: the call waits for those five minutes of
+silence, then raises. A claim waits half its lease instead, asking after silences of a third of
+that, between one and ten seconds, and no question nor wait between them runs past that half: with
+the server cut off, a claim leased for 6, 30 and 60 seconds gave up after 3.0, 15.0 and 30.0. That
+half covers the whole claim: the sweep of earlier unanswered claims, which gets a quarter of the
+lease so one that hears nothing leaves the claim the rest, the clock reading or the wait for another
+call's, every wait for a pooled connection, and the cancel request and the wait after it when the
+claim is cancelled. With a 6 second lease and the server cut off, the claim after a lost answer gave
+up after 3.0 seconds rather than 40, and one due to read the clock after 3.0 rather than 321. With
+no connection to ask on, a slow claim and a lost answer look the same, so a claim still running
+when the server has taken no new connection for half its lease is given up too, and settled like
+any claim without its answer: it is ended if still running, and its jobs come back without the
+attempt counted. A heartbeat gets a quarter of its lease the same way, its sweep half of that, and
+the next one starts a third of the lease after the last one started, so a heartbeat that hears nothing
+leaves the next one time to renew the lease: with the connections already open frozen and new ones
+answering, a heartbeat on a 12 second lease gave up within 4.0 seconds with at least 8.0 left on
+the lease, where it used to wait past 40 with the lease lapsed. The worker gives an outcome or a
+hand-back one full lease from when it starts, and during shutdown no more than the shutdown
+deadline. An outcome whose call ran out of time is checked against the job's execution history on a
+fresh call within a second, bounded by the worker's own end rather than by the job's deadline that
+just ran out; if it landed, it counts as recorded and its hooks run. Once a statement goes unanswered, the
+pooled connections idle since before it are closed and replaced rather than used, since a frozen
+network path or a hung proxy silences them all alike. A call cut by its
+deadline or cancelled sends the server a cancel request and waits for the statement to stop, both
+within half a second once the deadline has passed. A backend whose stop is not confirmed in that
+time has its connection closed and is ended with `pg_terminate_backend`, matched by process id and
+start time, before the next statement this backend sends, so a statement left waiting on a lock
+never applies afterwards. Every statement tinyjobs sends on a pooled connection starts with a
+comment carrying a secret random token of that connection, `/* tinyjobs <token> */`, first so
+`track_activity_query_size` never cuts it, and the same for every statement so prepared statements
+still work, including the `BEGIN`, `COMMIT` and `ROLLBACK` psycopg sends itself on Postgres 16
+and later; each pooled connection also holds a session advisory lock on a secret random key. A
+backend is ended, as the login role and in the same statement that looks, only while its current or
+last statement carries the token, whatever its state and whenever it arrived: running, idle with the
+statement still on its way, or a statement that reached the server after the cut. Where the role
+sees no statement text, with `track_activities` off, the lock stands in for the token, and the same
+for a bare transaction command: before 16, `pg_stat_statements` keys those by their text, so a token
+on them added two entries per connection, 40 after 20 short runs where there are now 2. Nothing else
+runs our token or holds our lock, and PgBouncer's reset (`DISCARD ALL`) drops the lock before it
+hands the backend to another client, whose statements carry no token, so another client is never
+ended; neither clock takes part. Through a proxy that delivered the statement three seconds late,
+past the cut, onto a row lock, the statement was ended and the job stayed `running`, where it used to
+land as `success` once the lock was let go; through a session pooler that handed our backend to
+another process, that process's three second statement ran to its end. A `COMMIT` that reached the
+server late, after the cut, is ended too, by its token or, before 16, by the lock: it used to be
+left to apply all 100 jobs of a cut batch enqueue; none apply. A claim delayed on its way
+is then handed back by the sweep of unanswered claims.
+The next statement waits for a pass already running rather than going ahead of it, and a backend
+not gone within a second of being asked stays queued for the next pass. Cancelling a call bounds
+the cancel request at five seconds on psycopg 3.2 and 3.3 alike, and the call ends in its
+cancellation even when the server answers the cancel with another error, so it is never retried.
+These paths rely on private psycopg and psycopg-pool names, the pool's connection bookkeeping, the
+query pipeline and the cursor's execution internals, so both are required below 3.4 and a test
+checks every one of those names is still there. Pooled connections ask for `UTF8` unless the URL
+names a client encoding, so a `SQL_ASCII`
+database works too. Every connection unused for ten seconds beyond the minimum closes together,
+not one per interval, and a connection that failed to open is not retried once no caller waits
+for it: four workers of 16 on a 40-slot server peaked at 29 sessions of theirs instead of 36, and
+refused none of the app's own instead of 8 in 265. Callers kept waiting a quarter of a second get
+connections opened for all of them at once, up to the maximum, rather than one after another: four
+callers behind connects of 0.6 seconds were all served within 0.94 seconds instead of 1.83, and over
+a link adding 300 ms each way bursts of 150 jobs after 13 idle seconds took 9.6 seconds instead of
+10.1, 9.55 before the pool gave idle connections back, with the same peak of 20 to 21 sessions.
+Every connection is replaced after half an hour. Deadlocks, serialization
+failures and a session the server closed under `idle_session_timeout`, which it only does while
+waiting for a command, so before the statement ran, are retried three times with a warning, except inside the caller's transaction, which only
+the caller can retry. Before using a pooled connection, tinyjobs reads what the server already sent on
+it without a round trip, under a microsecond, and hands a closed one back to be replaced and takes
+the next at once. So the connections a restart or `pg_terminate_backend` closed while idle cost
+neither an error nor a wait: with eight of them dead, the next three statements took under a
+second together. A read that still loses its connection mid-flight, such as `get`, a listing or the
+clock, runs once more on a fresh one; writes do not, since the server may have applied them, and
+nothing is retried after waiting `pool_timeout` for a connection. Options the backend does not know
+and libpq does not either, such as a misspelled `max_conections=`, whether passed as arguments or
+in the url's query string, are refused by `TinyJobs(...)`
+itself rather than surfacing as a pool that never opens; so is a url whose host or port came out
+malformed, which is what a raw `@`, `/`, `?` or `#` in the password does, and an error about the url
+never quotes it once it holds a password; `cursor_factory` is not taken either, since
+tinyjobs picks its own cursors. On a caller's connection whose cursors bind raw, `tx=` uses a plain
+cursor of its own. A fork leaves the parent's connections alone: the
+child opens its own.
+
+### Where the limits are
+
+- **Behind PgBouncer, session pooling only, with its default `server_reset_query`.** Each connection
+  is configured once when opened, and the listener needs a session of its own. Transaction pooling
+  would lose both, and without the reset a backend could reach another client still holding our
+  lock and our last statement, which is what marks it as ours.
+- **A held snapshot stops the cleanup.** A transaction left open anywhere on the server, or a
+  replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
+  jobs table bloats until it ends.
+- **`statement_timeout` is the server's limit, and so is what it counts.** A purge or a claim that
+  needs longer than 30 seconds fails, and Postgres counts sending a result, and receiving the
+  parameters of a statement not yet prepared, as part of the statement, so a payload slower than
+  that to move fails at once with nothing applied. Raise it with `statement_timeout=` or turn it off
+  with `None`; the watch on silent connections stays on either way.
+- **Supported versions are the ones the community supports**, 14 to 18 today. CI runs the suite
+  on 14 and 18.
 
 ---
 
@@ -946,7 +1401,7 @@ the interesting decisions are in the dispatch.
 | Task kind                    | Executor                | Timeout        | Notes                          |
 | ---------------------------- | ----------------------- | -------------- | ------------------------------ |
 | `async def`                  | worker event loop       | hard           | `asyncio.timeout`, real cancel |
-| `def`                        | `ThreadPoolExecutor`    | **soft**       | see below                      |
+| `def`                        | daemon thread pool      | **soft**       | see below                      |
 
 A single worker process runs an event loop plus a thread pool. Async and sync tasks share the process
 without either starving the other. A process executor for tasks declared `isolated=True` is planned,
@@ -972,11 +1427,32 @@ async tasks, overridable with `--async-concurrency` when the default does not fi
 **A running Python thread cannot be killed.** There is no safe interrupt for arbitrary code; the
 CPython APIs that come close corrupt interpreter state. So for a sync task in a thread pool, a timeout
 can only mark the job `TIMEOUT` and move on. The thread keeps running until the function returns, and
-it keeps occupying a pool slot.
+it keeps occupying a pool slot. The timeout counts from when the thread starts, so a job waiting
+for a free thread behind one that timed out is never recorded as timed out before it ran: it used to
+be failed with `TIMEOUT` while queued and then run anyway, and with retries left it ran again.
+A thread still running after its job ended counts against `concurrency` until it returns, and a
+warning names its task, so the worker claims only jobs it has a thread for; a drain or an eager
+call runs the next job on a thread added in its place and drops it once the old one returns: a
+drain behind such a thread finished in 0.5 seconds and an eager call past its timeout returned in
+0.51, where they waited 3.0 and 4.0 for the thread. Nothing caps those added threads, so a
+process that keeps sending jobs that hang holds one thread per hung job, as it would calling the
+functions directly: 40 eager calls of a task with a 0.05 second timeout that sleeps for three
+seconds held 41 threads and about 40 MB at most, all 40 ended `failed`, and they returned in 2.2
+seconds. An earlier cap of eight such threads per app kept that bounded, but it
+made drains hand jobs back and eager calls wait for or borrow threads, and every rule it needed
+broke another case. A thread that fails to start fails its job, where the job was handed
+back as if the threads were shut down and the pool counted the dead thread, so no later job ran. The
+threads are daemon threads, so a process whose worker stopped with one still running exits, with a
+warning naming them, where it used to hang at interpreter exit until killed. A job with a 0.3 second
+timeout claimed behind such a thread used to stay `running` for as long as the thread ran, its lease
+renewed so no other worker could take it; it now stays `queued` for any other worker, and ran here
+once the thread returned. With two workers of concurrency 2, one holding two runaway threads, all
+six quick jobs ran on the other, where two were held `running` after 24 seconds.
 
 This catches people out, so, plainly:
 
-- A sync task stuck in an infinite loop leaks a thread for the life of the process.
+- A sync task stuck in an infinite loop leaks a thread, and the job slot with it, for the life of
+  the process.
 - A blocking socket read with no timeout of its own blocks past your `timeout=`.
 
 Mitigations, in order of preference: pass timeouts to the library you are calling (every HTTP client
@@ -987,18 +1463,99 @@ point where `timeout=` is introduced, not in a footnote.
 ### Graceful shutdown
 
 On `SIGTERM` (or the first `SIGINT`), the worker stops claiming, keeps heartbeating in-flight jobs,
-and waits up to `--shutdown-timeout` for them to finish. Anything still running is released back to
-`QUEUED` so another worker picks it up immediately rather than waiting for the lease to expire. A
-second `SIGINT` exits at once and lets the leases lapse.
+and returns within `--shutdown-timeout`. The last quarter of it, one second at least, is kept for
+releases; jobs get the rest to finish. A claim still waiting on the backend shares that wait: jobs it
+brings back in time run like the others, and one that has not answered by then is given up and its
+statement stopped on the server. Anything still running is then released back to `QUEUED` in one
+call for all of them, a single round trip on Redis, so another worker picks it up immediately rather than waiting for the lease to
+expire; a release that has not landed when the timeout ends is left to its lease. With the server
+cut off and `--shutdown-timeout 3`, the worker returned 3.0 seconds after the signal and the process
+exited after 3.1; it took 9.6 before, and under uvicorn with `shutdown_timeout=5` 6.2 rather than
+12.2. Closing ends a connection still being opened at once rather than waiting for it: over a link
+adding 300 ms each way, closing while one was being opened took under 0.01 seconds with nothing
+logged, where it took 1.0 and `psycopg_pool` logged that it could not stop its task. A
+backend that went silent is not asked to end what it left behind at close; one that still answers
+gets half a second a pass for it. Once the stop is
+asked the backend keeps a connection open for each running job plus two for the releases and the
+heartbeat, within the pool size, and opens those it lacks, so outcomes written as threads return
+need not connect first; on Redis the idle connections stay free for other calls meanwhile, where a
+call waited a second behind them, and a stop asked outside a run reserves nothing;
+the heartbeat stops renewing the jobs
+about to be released, and a clock reading that falls due is taken beside a call rather than before
+it. Over a link that adds 300 ms each way, eight jobs on a 2 second timeout were all released, on
+Postgres and on Redis, with the worker back after 1.61 seconds, where every run used to log all
+eight unreleased and Redis left them `running` until their lease ran out. A second `SIGINT`
+ends the wait at once: a release already sent gets a second, and the process exited 2.6 seconds after
+the second signal with the server cut off, where it took 6.6. The process itself exits within the
+timeout: a wake-up still on its way at exit drops its connection, without the pool's warning about
+it, instead of asking the server to stop it, which over that link cost another second, so with a 3
+second timeout it exited 2.65 seconds after the signal rather than 3.6, and with 5 seconds and 16 jobs
+after 4.4 rather than 5.3.
+
+A job whose outcome is being written when the jobs' share ends is not cancelled: the write keeps
+its deadline, which ends a second before the timeout, or half the release share when that is
+shorter, and the check of a write whose answer is lost gets the rest. With a 2 second timeout and the
+outcome held on a row lock for 1.3 seconds, it was recorded and its hooks ran, where it used to be
+cut and left `running` for its lease. Outcomes that would wait for a connection go out together, in
+one pipelined round trip of their own statements on both backends: over a link adding 300 ms each
+way, four jobs ending just before a 3 second stop were all recorded with their hooks run, where
+Postgres lost 6 of 16 and Redis left every one `running` with no hook. Each outcome keeps its own
+answer, so of two claims of one job in a batch only the live one lands, where both read as written
+and the stale one's failure was stored; an outcome its text cannot encode, or that the server
+refuses, fails alone and the rest of its batch lands: 29 of 29 beside such a poison outcome, where
+26 or, on Redis, 5 landed and the others stayed `running`. Texts holding a lone surrogate are
+stored escaped. The statements carry their values as bound parameters, as alone, so a result or a
+traceback never shows in `pg_stat_activity` or in the statement the server logs on an error, where
+the batch wrote them into its text. An outcome is cut at its own deadline: outcomes with five
+seconds or more left share a batch, and those with less share one with others whose time left is
+within a factor of two, each batch cut at the earliest deadline among its outcomes, so a cut job
+stays `running` as when written alone, where a batch without a deadline wrote it `success`. With
+leases of four seconds, eight outcomes waiting for one connection over a 0.7 second round trip
+went out in one batch, where each went alone, two timed out waiting and their jobs ran again. A retry
+due in a batch wakes its listeners as when written alone, which took 0.10 seconds where it timed out
+after 1.5. Closing the backend settles outcomes still waiting for a batch with the close error,
+where two calls never returned; on Redis that error is not one a write is retried after, and a
+script is refused once the backend is closed, where the retry reopened a connection on the closed
+client and wrote the outcome after `close()` returned. A Redis batch waits for a connection only
+when the pool is full, and takes the first one any call gives back: beside an outcome written
+alone that held its connection 2.5 seconds, another under a one second deadline was written at
+once, where it waited for that one, timed out after 1.55 seconds and left its job `running`.
+On Redis a script missing from the server is loaded once per batch
+and the batch sent again, one load where twenty of them took 6.1 seconds over that link.
+A cancelled job still awaiting in its cleanup when the timeout
+ends is cancelled once more and left behind, logged, for the reaper: with `--shutdown-timeout 4` and a
+cleanup awaiting 15 seconds the worker stopped after 4.0 seconds, where it took 18.0.
+
+A job running in a thread cannot be stopped, and releasing it would let another worker run it while
+the thread still does. So at shutdown the worker leaves such a job running instead: it keeps its
+lease renewed, records its outcome when the thread returns, within the release share of the timeout
+from that moment, once more for each further pool's worth of running jobs, and returns after that.
+Over a link adding 300 ms each way, six such jobs with `--shutdown-timeout 3` or `5` were all
+recorded on Redis and on Postgres, and twelve on Postgres's ten connections, where two to four of
+six used to lose their outcome and run again, or be marked failed with `max_attempts=1`. It keeps the job as soon as the jobs' share ends, so a
+thread that returns while another job's cleanup still holds the wait is recorded too: beside such a
+job it ended `success`, where it used to stay `running`. A drain does the same: stopped while its
+job runs in a thread, it waits for the thread and records the outcome, where it used to release the
+job, which another worker then claimed while the thread still ran it. A second signal does not change this: it ends the wait at
+once and keeps such a job the same way, where its thread used to be waited for under the cut
+deadline, so its outcome was given up and the job ran again; with `SIGTERM` then `SIGINT` the job now
+ran once and was recorded. A `def` job is not claimed while no thread is free for it; one still
+queued in the thread pool at shutdown is taken out of the pool before it is released, so it never
+runs here afterwards, and one whose call has started is kept like a running one. With a 20 second
+`def` job and the server cut off, the worker exited 17.4 seconds after the signal, once the thread was
+done and its outcome had been given up; before, the job was released while its thread kept running.
 
 A claim whose caller is cancelled while it is in flight still lands in the backend, so tinyjobs lets
 it finish and hands its jobs back, as if they were never claimed; otherwise a cancelled drain would
-leave its job `running` for the hour its lease lasts. The claim runs on tinyjobs' own loop, not the
+leave its job `running` until its lease ends. The claim runs on tinyjobs' own loop, not the
 caller's, so this holds when the caller's loop ends with the claim in flight (`asyncio.run`
 returning, Ctrl-C under it) and when the process exits: that loop finishes such claims before it
-stops, including a hand-back sent while that loop is being closed. Closing it cancels every other task
-at once and waits five seconds at most: a task that keeps ignoring cancellation is logged and left
-behind, so the close never hangs. At exit SQLite runs only the calls
+stops, including a hand-back sent while that loop is being closed, unless the caller's deadline has
+passed: a claim the worker gave up at shutdown neither holds the app's close nor the loop's, and
+its jobs come back through the sweep of unanswered claims or their lease. Closing it cancels every other task
+at once and waits five seconds at most, and half a second more for a task that swallowed the cancel,
+which is cancelled once again: a task that keeps ignoring cancellation is logged and left behind, so
+the close never hangs. At exit SQLite runs only the calls
 that return jobs (complete, fail, release, hand back) on the loop thread once the interpreter refuses
 new work to its executor; a claim is refused, so a worker still running stops instead of claiming
 jobs it cannot start. A job whose job threads were already shut down is handed back without using an
@@ -1006,6 +1563,33 @@ attempt, never recorded as failed. Once the interpreter is exiting, tinyjobs sta
 thread, and the exit closes only the connections no live thread is using, so a worker left running
 in a daemon thread cannot crash the process. A job task cancelled before it starts is released the
 same way as one cancelled while it runs.
+
+These guards cost little per job. A drain keeps one renewal timer for all the jobs it holds, a SQLite
+call waits on a future its thread fills rather than on a shielded task, a job without a timeout
+starts without a message back to the loop, and a claim runs inside the worker's loop task with a
+timer that gives it up at shutdown. Draining 10,000 jobs took 3.03 seconds in memory, 3.84 on
+SQLite and 5.65 on Redis, against 3.01, 3.82 and 5.37 before these guards existed; three CLI workers
+of concurrency 8 ran 4,408 jobs a second on SQLite and 5,928 on Redis, against 4,547 and 6,338.
+
+A drain leases each job for a minute and renews the lease every 20 seconds while the job runs, so
+the job of a drain killed mid-run comes back within a minute, where its one-hour lease stranded it
+for an hour; and it writes a job's outcome again after an error that means the store could not be
+reached, as a worker does, where it raised and left the job `running`: 3,000 jobs drained through
+six half-second Redis cuts all ended `success`, each run once, where up to 6 stayed `running`. A
+Redis claim carries a token; when its answer is lost, the next claim, at once and then once a second
+at most until that lease would end, hands back the jobs still `running` under it as if never
+claimed, as the sweep of unanswered claims does on Postgres, where they stayed `running` until their
+lease ended and then counted as a failed attempt. A claim its caller gives up, cancelled or timed
+out, is handed back the same way, where it left the job `running` until its lease ended. A worker
+meets this whenever a reply is lost: with every twentieth claim answer lost, a worker
+of concurrency 8 ran 2,000 jobs to `success` in 1.1 seconds, where without tokens 79 ended `failed`,
+each once its 10 second lease ran out. The tokens are kept in one
+sorted set, one entry per running job, removed with its outcome: 10,000 running jobs cost about 2 MB
+more and nothing once done, and claims are within 5% of their speed without tokens, where a set per
+claim, kept for its whole lease, doubled the keys and slowed claims by up to 25%. A drain given up
+by its caller while a sync job's thread runs renews that
+lease until the thread returns, where it stopped at once, so with the lease scaled down twentyfold
+the lease lapsed and the next drain ran the job again beside the first thread; it ran once.
 
 A worker or scheduler installs SIGINT and SIGTERM handlers only on the main thread; elsewhere it
 runs without them, since Python delivers signals to the main thread only. Workers on one loop share
@@ -1166,7 +1750,10 @@ the calls already running, closes the backend and stops the facade's loop. A cal
 close gets `AppClosedError` too, never a `RuntimeError` from a shut-down executor or a closed pool:
 four threads calling `enqueue`, `start` and `close` and three event loops calling `aenqueue`, `ready`
 and `aclose` at random for 9 s saw nothing else, on SQLite and on Redis, and asyncio logged no
-unretrieved exception. A loop being shut down refuses new work instead of running it beside the
+unretrieved exception. Once a close begins, a drain or eager call that would start is refused with
+`AppClosedError`, and an eager call whose `async def` job the close cuts raises it too: the job ran
+once and is left `queued`, where it was started again in a new drain and ran twice.
+A loop being shut down refuses new work instead of running it beside the
 closing connection. A
 sync call on a closed app raises without starting the loop thread, and an app dropped without
 `close()` stops that thread and closes its connections when it is collected, so `python -X dev` stays
@@ -1308,7 +1895,11 @@ waiter takes over; a Redis connection is made on the facade's loop and finishes 
 backend made in that race is closed, as is one whose `setup()` fails. An `asyncio.Lock` did this
 before, and it belongs to one loop: two loops connecting at once deadlocked in every trial, and four
 loops racing four threads hung all of them. With the election, 0 of 100 such trials fail on SQLite
-and 0 of 50 on Redis.
+and 0 of 50 on Redis. A connection that never reaches the app's loop, because a close retired that
+loop or cancelled the caller first, ends its election too, so the next caller connects. A 3 s race
+of seven callers hit that 16 to 59 times; the election used to stay open, and when the loop kept
+running every later caller waited on it: on Python 3.14 against a disk-synced Postgres, 1 race in
+69 left all seven stuck until the app was closed, and 0 in 80 do now.
 
 Calling a synchronous method from inside a running loop raises `SynchronousCallInsideEventLoopError`
 and names the awaitable to use instead, rather than deadlocking or silently blocking the caller's
@@ -1366,7 +1957,8 @@ parameter called `queue`, `priority` or `key`, none of which are exotic names, t
 be swallowed as an option, or the option would land in their function. The bug would surface as a job
 running in the wrong queue, or a `TypeError` far from its cause. Separating them costs seven
 characters and removes the failure mode entirely. `with_options` returns a lightweight view and never
-mutates the task, so it is safe to build per call site.
+mutates the task, so it is safe to build per call site. A priority must fit in 32 bits, from -2³¹ to
+2³¹ - 1, which every backend stores exactly; anything else raises `ValueError` at enqueue.
 
 `enqueue` performs no work: it serializes the arguments, writes one row, returns. `job.id` and
 `job.status` are available immediately.
@@ -1407,23 +1999,29 @@ reaching for it.
 The dual-write bug is old and common: you commit a row, enqueue a job about it, and the enqueue
 succeeds while the commit rolls back, or the worker claims the job a millisecond before the commit
 lands and finds nothing there. A broker-backed queue cannot fix this, because the broker and your
-database have no transaction in common. A database-backed queue can. This is planned, not in 0.7
-yet; the shape it will take:
+database have no transaction in common. A database-backed queue can, and on Postgres tinyjobs does:
 
 ```python
-with app.transaction() as tx:
-    tx.execute("INSERT INTO documents (id, name) VALUES (?, ?)", (123, "contract.pdf"))
-    generate_pdf.enqueue(123, tx=tx)
+with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+    connection.execute("INSERT INTO documents (id, name) VALUES (%s, %s)", (123, "contract.pdf"))
+    generate_pdf.with_options(tx=connection).enqueue(123)
 # both committed, or neither
 ```
 
-tinyjobs owns the connection and hands it to you, rather than borrowing one of yours. That is what
-lets it guarantee the settings this whole design rests on (WAL, `busy_timeout`, `BEGIN IMMEDIATE`)
-instead of inheriting whatever an ORM happened to configure. Passing `tx=` to a backend whose
-`Capabilities.transactional_enqueue` is `False` will raise at enqueue time, not silently degrade;
-until the feature lands every backend reports `False`.
+`tx=` goes on `with_options`, `app.send` and `app.asend`, and takes the connection or a cursor the
+caller already has, sync or async, which is the one an ORM or a request handler holds. Borrowing it
+rather than handing one out is what makes the job part of a transaction tinyjobs did not start; the
+settings the claim relies on live on tinyjobs's own pool, and an insert needs none of them. How the
+Postgres backend joins it is in
+[Joining the caller's transaction](#joining-the-callers-transaction). `tx=` on a backend whose
+`Capabilities.transactional_enqueue` is `False` raises `UnsupportedCapabilityError` at enqueue time,
+and so does eager mode.
 
-Until then, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
+SQLite does not have it yet. The jobs table would have to live in the same file as your data:
+SQLite documents that transactions spanning `ATTACH`ed databases are not atomic when `journal_mode`
+is WAL, and WAL is not negotiable here, since it is what lets readers work while a worker writes.
+
+Until it does, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
 made while the same context holds an open `backend.transaction()` on the same database file is
 refused at once: it would run on another connection and wait for the write lock that transaction
 holds. Make the call after the block, or from `transaction.on_commit` in Django. An asyncio task
@@ -1435,20 +2033,6 @@ there the enqueue waits for the lock and fails after `busy_timeout`. Inside the 
 are refused because they would end the transaction early, and a
 transaction SQLite ends by itself, as `INSERT OR ROLLBACK` does, makes the block raise when it exits,
 since every statement after that point committed on its own.
-
-**The constraint, stated plainly: the `jobs` table must live in the same SQLite file as your data.**
-There is no way around it. SQLite documents that transactions spanning `ATTACH`ed databases are not
-atomic when `journal_mode` is WAL, and WAL is not negotiable here. It is what lets readers work while
-a worker writes. So transactional enqueue means pointing tinyjobs at your application database
-(`TinyJobs("sqlite:///app.db")`) and letting its tables sit alongside yours. If you would rather keep
-the queue in a file of its own, you keep that separation and give up this one feature; everything else
-is unaffected.
-
-Joining a connection your ORM already owns, via something like `app.using(django_connection)`, is the
-natural next step and is deliberately **not** in v1. Designing an ORM integration before there is a
-real ORM to test it against produces an API shaped by imagination, and v1.0 freezes it. The hook it
-would attach to is `transaction()`, which the SQLite backend already has and the protocol will gain
-with transactional enqueue.
 
 ### Task discovery
 
@@ -1583,7 +2167,7 @@ becomes a no-op, and a refused 0.6 start cannot stop a running 0.7 worker from r
 Testing background jobs is normally miserable, so it is a design constraint rather than an afterthought.
 
 ```python
-# 1. Eager mode: every enqueue runs the job before it returns
+# 1. Eager mode: every enqueue runs its own job before it returns
 app = TinyJobs("memory://", eager=True)
 
 # 2. Manual draining: real queue semantics, deterministic ordering
@@ -1602,8 +2186,17 @@ app.drain()
 
 `memory://` is not a second implementation. It is the SQLite backend on a private in-memory database,
 so a test exercises the same claim, the same dedup index and the same retry bookkeeping as
-production, with nothing to keep in sync. Eager mode is a drain after every enqueue, so a delayed job
-or a retry with backoff stays queued until the clock reaches it, exactly as it would under a worker.
+production, with nothing to keep in sync. Eager mode claims the job an enqueue sent by its id and
+runs it, so a delayed job or a retry with backoff stays queued until the clock reaches it and a drain
+runs it, exactly as it would under a worker. It runs no other job: Celery, RQ, Huey and Django's own
+test backends run only the job sent, and running every due job made the sent one wait behind older
+ones and, with nested sends and threads, led to waits on jobs other calls held. A call whose job
+another drain or worker claimed first waits until it is no longer `running`; that wait has no
+cycle, since the job it waits on was inserted by the call itself and is run by a drain or worker
+that runs one job at a time without waiting on the caller. A dedup hit comes back as it is, since
+the job it found may be the caller's own. An eager send takes 0.6 to 0.8 ms on SQLite and in memory,
+0.9 on
+Postgres and 1.3 on Redis at the median, where running every due job took 1.5 to 2.8.
 `drain()` runs jobs one at a time, fires hooks, and raises `UnknownTaskError` on a job no task in the
 app can run, leaving it queued. It does not fire cron schedules; enqueue the task to test it.
 
@@ -1658,16 +2251,16 @@ Result storage, `memory://` backend and the conformance suite, eager and drain t
 `tinyjobs stats` / `check`.
 
 **Next**
-Transactional enqueue (`app.transaction()`, `enqueue(tx=)`), the process executor and
-`isolated=True`, a result size cap and TTL, structured log fields.
+Transactional enqueue on SQLite, the process executor and `isolated=True`, a result size cap and
+TTL, structured log fields.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
 protocol is a compatibility promise.
 
 **Beyond**
-`app.using(conn)` to join an ORM's own transaction, designed against a real Django or SQLAlchemy
-application rather than against a guess. A Postgres backend. `--processes N`, if running one worker per core under a supervisor turns out to be the
+Joining a SQLAlchemy session's transaction, designed against a real application rather than against a
+guess. `--processes N`, if running one worker per core under a supervisor turns out to be the
 friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
 file). Chains and groups only if usage demands them. They are where task queues usually go to become
 frameworks.

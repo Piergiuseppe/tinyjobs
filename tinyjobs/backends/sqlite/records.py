@@ -90,6 +90,7 @@ def execution_from_row(row: sqlite3.Row) -> Execution:
         finished_at=row["finished_at"],
         error_type=row["error_type"],
         traceback=row["traceback"],
+        claim=row["claim"],
     )
 
 

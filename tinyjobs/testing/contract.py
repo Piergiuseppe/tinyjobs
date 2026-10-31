@@ -233,6 +233,22 @@ class BackendContract:
         await self.backend.heartbeat([claimed.id, new_job_id()], 600.0)
         self.assertIsNone((await self.stored(claimed)).lease_expires_at)
 
+    async def test_heartbeat_names_the_leases_it_renewed(self):
+        held, done = await self.claim_two()
+        await self.backend.complete(done, None)
+        renewed = await self.backend.heartbeat(
+            [held.id, done.id, new_job_id()], 600.0, worker_id=held.worker_id
+        )
+        self.assertEqual(list(renewed), [held.id])
+        self.assertEqual(
+            list(await self.backend.heartbeat([held.id], 600.0, worker_id="someone-else")), []
+        )
+
+    async def claim_two(self) -> list[Job]:
+        await self.enqueue()
+        await self.enqueue()
+        return await self.claim(limit=2)
+
     async def test_a_heartbeat_from_another_worker_leaves_the_lease_alone(self):
         claimed = await self.claimed_one()
         self.clock.advance(50)
@@ -276,6 +292,48 @@ class BackendContract:
         self.assertIs(
             (await self.backend.executions(claimed.id))[0].status, ExecutionStatus.LOST
         )
+
+    async def test_release_many_returns_the_jobs_still_held_in_one_call(self):
+        for _ in range(3):
+            await self.enqueue()
+        first, second, third = await self.claim(limit=3)
+        await self.backend.complete(third, None)
+        impostor = replace(second, worker_id="worker-b")
+        self.assertEqual(await self.backend.release_many([first, impostor, third]), 1)
+        self.assertIs((await self.stored(first)).status, JobStatus.QUEUED)
+        self.assertIs((await self.stored(second)).status, JobStatus.RUNNING)
+        self.assertIs((await self.stored(third)).status, JobStatus.SUCCESS)
+        self.assertIs(
+            (await self.backend.executions(first.id))[0].status, ExecutionStatus.LOST
+        )
+        self.assertEqual((await self.claim())[0].id, first.id)
+        self.assertEqual(await self.backend.release_many([]), 0)
+
+    async def test_a_job_claimed_by_id_is_leased_once_and_only_when_due(self):
+        if not hasattr(self.backend, "claim_job"):
+            raise unittest.SkipTest("the backend cannot claim a job by its id")
+        first = await self.enqueue(run_at=START - 2)
+        wanted = await self.enqueue(run_at=START - 1)
+        later = await self.enqueue(run_at=START + 5)
+
+        async def by_id(job: Job) -> Job | None:
+            return await self.backend.claim_job(job.id, worker_id="worker-b", lease_seconds=60.0)
+
+        self.assertIsNone(await by_id(later))
+        claimed = await by_id(wanted)
+        self.assertEqual(
+            (claimed.id, claimed.status, claimed.worker_id, claimed.attempts, claimed.claims),
+            (wanted.id, JobStatus.RUNNING, "worker-b", 1, 1),
+        )
+        self.assertEqual(claimed.lease_expires_at, START + 60)
+        self.assertIsNone(await by_id(wanted))
+        self.assertEqual([job.id for job in await self.claim()], [first.id])
+        self.assertIsNone(await by_id(first))
+        self.assertEqual(len(await self.backend.executions(wanted.id)), 1)
+        self.assertTrue(await self.backend.complete(claimed, None))
+        self.assertIsNone(await by_id(wanted))
+        self.clock.advance(5)
+        self.assertEqual((await by_id(later)).id, later.id)
 
     async def test_hand_back_returns_a_job_as_if_it_was_never_claimed(self):
         claimed = await self.claimed_one(max_attempts=2)

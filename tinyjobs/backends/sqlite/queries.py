@@ -44,9 +44,25 @@ CLAIM_ONE = """
      WHERE id = ? AND status = 'queued'
 """
 
+CLAIM_DUE_ONE = """
+    UPDATE jobs
+       SET status = 'running',
+           worker_id = ?,
+           attempts = attempts + 1,
+           claims = claims + 1,
+           lease_expires_at = ?
+     WHERE id = ? AND status = 'queued' AND run_at <= ?
+"""
+
 HEARTBEAT = """
     UPDATE jobs SET lease_expires_at = ?
      WHERE status = 'running' AND (? IS NULL OR worker_id = ?) AND id IN ({ids})
+"""
+
+RENEWED = """
+    SELECT id FROM jobs
+     WHERE lease_expires_at = ? AND status = 'running' AND (? IS NULL OR worker_id = ?)
+       AND id IN ({ids})
 """
 
 COMPLETE_JOB = """
@@ -155,7 +171,7 @@ MARK_EXECUTIONS_LOST = """
 """
 
 SELECT_EXECUTIONS = """
-    SELECT id, job_id, attempt, status, worker_id, started_at,
+    SELECT id, job_id, attempt, claim, status, worker_id, started_at,
            finished_at, error_type, traceback
       FROM executions WHERE job_id = ? ORDER BY claim ASC
 """

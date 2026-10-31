@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import importlib.util
 import os
@@ -14,7 +15,7 @@ import weakref
 from contextlib import ExitStack, contextmanager, suppress
 from unittest import mock
 
-from tinyjobs import RetryPolicy, Task, TinyJobs, runtime
+from tinyjobs import RetryPolicy, Task, TinyJobs, deadlines, runtime
 from tinyjobs.backends import managed
 from tinyjobs.backends.sqlite import SQLiteBackend
 from tinyjobs.exceptions import (
@@ -179,6 +180,16 @@ class EnqueueTests(BackendTestCase):
         payload = self.app.decode(self.app.get(job.id))
         self.assertEqual(payload.args, (7,))
         self.assertEqual(payload.kwargs, {"reason": "test"})
+
+    def test_a_priority_every_backend_can_store_is_required(self):
+        for priority in (2**31, -(2**31) - 1):
+            with self.subTest(priority=priority):
+                with self.assertRaisesRegex(ValueError, "priority must be between"):
+                    self.handler.with_options(priority=priority).enqueue(7)
+        for priority in (2**31 - 1, -(2**31)):
+            with self.subTest(priority=priority):
+                job = self.handler.with_options(priority=priority).enqueue(7)
+                self.assertEqual(self.app.get(job.id).priority, priority)
 
     def test_wrong_arguments_fail_at_enqueue_time(self):
         with self.assertRaises(TypeError):
@@ -942,6 +953,20 @@ class ClosedAppTests(BackendTestCase):
             self.assertTrue(closed.wait(5))
         self.assertLess(stall, 0.5)
 
+    def test_a_claim_left_behind_past_its_deadline_does_not_hold_the_close(self):
+        async def scenario():
+            await self.app.ready()
+            backend = self.app.backend
+            behind = concurrent.futures.Future()
+            backend._returning[behind] = deadlines.Deadline(time.monotonic() - 1)
+            started = time.monotonic()
+            with mock.patch.object(managed, "CLOSE_GRACE_SECONDS", 3.0):
+                await self.app.aclose()
+            behind.cancel()
+            return time.monotonic() - started
+
+        self.assertLess(asyncio.run(scenario()), 1.0)
+
     def test_a_worker_stops_once_its_app_is_closed(self):
         async def scenario():
             worker = self.app.worker(poll_maximum=0.02, handle_signals=False)
@@ -1156,6 +1181,25 @@ class ClosedAppTests(BackendTestCase):
         drain.stop()
         self.assertEqual(self.app.run_sync(drain.run, name="drain"), 0)
         self.assertEqual(job.refresh().status, JobStatus.QUEUED)
+
+    def test_a_drain_stopped_while_a_thread_runs_its_job_records_the_outcome(self):
+        from tinyjobs.worker.drain import Drain
+
+        running = threading.Event()
+
+        @self.app.task(name="transfer")
+        def transfer():
+            running.set()
+            time.sleep(0.8)
+            return "sent"
+
+        job = transfer.enqueue()
+        drain = Drain(self.app, shutdown_timeout=0.1)
+        threading.Thread(target=lambda: (running.wait(5), drain.stop())).start()
+        with self.assertLogs("tinyjobs.worker", "WARNING") as logs:
+            self.app.run_sync(drain.run, name="drain")
+        self.assertEqual(job.refresh().status, JobStatus.SUCCESS)
+        self.assertTrue(any("cannot be stopped" in line for line in logs.output))
 
     def test_a_drain_runs_again_after_it_finished(self):
         from tinyjobs.worker.drain import Drain

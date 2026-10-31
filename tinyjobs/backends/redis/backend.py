@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import inspect
-from typing import Any, Awaitable, Sequence, TypeVar
+import logging
+import math
+import secrets
+import sys
+import threading
+import time
+from contextlib import suppress
+from typing import Any, Awaitable, Callable, Sequence, TypeVar
+from urllib.parse import unquote, urlsplit
 
-from redis.asyncio import BlockingConnectionPool, Redis
+from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
+from redis.asyncio.retry import Retry
+from redis.asyncio.sentinel import SentinelConnectionPool
+from redis.backoff import NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import NoScriptError
+from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
+from ...exceptions import AppClosedError, ConfigurationError
 from ...models import (
     Execution,
     ExecutionError,
@@ -21,6 +37,7 @@ from ...models import (
 from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
+from ..batching import AGAIN, Batches, Entry
 from .keys import Keys
 from .records import (
     execution_from,
@@ -38,11 +55,24 @@ DEFAULT_POOL_TIMEOUT = 20.0
 SCHEMA_VERSION = 2
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
+CLOCK_SECONDS = 5.0
+SPARE_CONNECTIONS = 2
+SETTLE_BATCH = 100
+CLOSED_MESSAGE = "the redis backend was closed"
+CLOSE_SECONDS = 0.5
+GHOST_SWEEP_SECONDS = 1.0
+REPLAY_MESSAGE = (
+    "tinyjobs sends each redis call once and recovers a lost answer itself, since a call sent "
+    "again could apply twice, so retry, retry_on_timeout and retry_on_error cannot be set"
+)
+
+logger = logging.getLogger("tinyjobs.redis")
 
 T = TypeVar("T")
 
 
 class RedisBackend(BaseBackend):
+    transient_errors = (RedisConnectionError, RedisTimeoutError)
     capabilities = Capabilities(
         priority=True,
         delayed=True,
@@ -61,10 +91,24 @@ class RedisBackend(BaseBackend):
         prefix: str = DEFAULT_PREFIX,
         clock: Clock | None = None,
     ) -> None:
+        self._bind(_own_client(client), prefix, clock)
+
+    def _bind(self, client: Redis, prefix: str, clock: Clock | None) -> None:
+        _sent_once(client.connection_pool)
+        _mend(client.connection_pool)
+        _guard_writes(client)
         self._client = client
         self._clock = FollowingClock() if clock is None else clock
         self._reading = asyncio.Lock()
         self._read = False
+        self._refreshing: asyncio.Task | None = None
+        self._reserving = threading.Lock()
+        self._reserved: dict[object, int] = {}
+        self._batches = Batches(self._settled_batch, SETTLE_BATCH)
+        self._closed = False
+        self._alone = 0
+        self._ghosts: dict[str, float] = {}
+        self._swept = -math.inf
         self._keys = Keys(prefix)
         self._scripts = Scripts(client, self._keys.root)
 
@@ -80,14 +124,24 @@ class RedisBackend(BaseBackend):
         **options: Any,
     ) -> "RedisBackend":
         single_connection_client = options.pop("single_connection_client", False)
-        pool = BlockingConnectionPool.from_url(
-            url, max_connections=max_connections, timeout=pool_timeout, **options
-        )
+        reason = None
+        try:
+            pool = BlockingConnectionPool.from_url(
+                url, max_connections=max_connections, timeout=pool_timeout, **options
+            )
+        except ValueError as error:
+            reason = _url_reason(url, error)
+        else:
+            reason = _refused(url, pool)
+        if reason is not None:
+            raise ConfigurationError(f"the redis url is not valid: {reason}")
         client = Redis(
             connection_pool=pool, single_connection_client=single_connection_client
         )
         client.auto_close_connection_pool = True
-        return cls(client, prefix=prefix, clock=clock)
+        backend = cls.__new__(cls)
+        backend._bind(client, prefix, clock)
+        return backend
 
     async def setup(self) -> None:
         stored = int(await self._run("schema", SCHEMA_VERSION))
@@ -98,7 +152,42 @@ class RedisBackend(BaseBackend):
             )
 
     async def close(self) -> None:
+        self._closed = True
+        await self._batches.close(AppClosedError(CLOSED_MESSAGE), CLOSE_SECONDS)
+        refreshing, self._refreshing = self._refreshing, None
+        if refreshing is not None and not refreshing.done():
+            refreshing.cancel()
+            await asyncio.wait({refreshing})
         await self._client.aclose()
+
+    def reserve(self, owner: object, jobs: int) -> int:
+        with self._reserving:
+            if jobs < 0:
+                self._reserved.pop(owner, None)
+            else:
+                self._reserved[owner] = jobs + SPARE_CONNECTIONS
+            reserved = sum(self._reserved.values())
+        return max(1, math.ceil(reserved / self._client.connection_pool.max_connections))
+
+    async def spare(self) -> None:
+        client = self._client
+        await client.initialize()
+        if client.connection is not None:
+            return
+        pool = client.connection_pool
+        with self._reserving:
+            wanted = sum(self._reserved.values()) or SPARE_CONNECTIONS
+        opening = {
+            asyncio.ensure_future(connection.connect()): connection
+            for connection in _unopened(pool, wanted)
+        }
+        try:
+            if opening:
+                await asyncio.gather(*opening)
+        finally:
+            for task in opening:
+                task.cancel()
+            await asyncio.shield(_opened(pool, opening))
 
     async def enqueue(self, job: Job) -> Job:
         return (await self.enqueue_many([job]))[0]
@@ -121,31 +210,76 @@ class RedisBackend(BaseBackend):
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
+        await self._laid()
         now = await self._now()
-        claimed = await self._script(
-            "claim", now, worker_id, number(now + lease_seconds), limit, *queues
+        token = secrets.token_hex(16)
+        claimed = await self._haunting(
+            token,
+            lease_seconds,
+            self._script("claim", now, worker_id, number(now + lease_seconds), limit, token, *queues),
         )
         return [job_from_flat(flat) for flat in claimed]
+
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        await self._laid()
+        now = await self._now()
+        token = secrets.token_hex(16)
+        claimed = await self._haunting(
+            token,
+            lease_seconds,
+            self._script("claim_job", now, worker_id, number(now + lease_seconds), job_id, token),
+        )
+        return job_from_flat(claimed[0]) if claimed else None
+
+    async def _haunting(self, token: str, lease_seconds: float, claiming: Awaitable[T]) -> T:
+        try:
+            return await claiming
+        except BaseException as error:
+            if not isinstance(error, ResponseError):
+                self._ghosts[token] = time.monotonic() + lease_seconds
+                self._swept = -math.inf
+            raise
+
+    async def _laid(self) -> None:
+        if not self._ghosts or time.monotonic() - self._swept < GHOST_SWEEP_SECONDS:
+            return
+        self._swept = time.monotonic()
+        for token, deadline in list(self._ghosts.items()):
+            try:
+                await self._run("unclaim", token)
+            except (RedisConnectionError, RedisTimeoutError) as error:
+                logger.warning(
+                    "could not hand back the jobs of a redis claim whose answer never arrived, "
+                    "trying again later: %s",
+                    error,
+                )
+                return
+            if time.monotonic() >= deadline:
+                del self._ghosts[token]
 
     async def heartbeat(
         self,
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None:
-        if job_ids:
-            now = await self._now()
-            await self._script(
-                "heartbeat",
-                now,
-                number(now + lease_seconds),
-                worker_id or "",
-                *job_ids,
-            )
+    ) -> list[str]:
+        if not job_ids:
+            return []
+        now = await self._now()
+        renewed = await self._script(
+            "heartbeat",
+            now,
+            number(now + lease_seconds),
+            worker_id or "",
+            *job_ids,
+        )
+        return [item.decode() if isinstance(item, bytes) else str(item) for item in renewed]
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
         return bool(
-            await self._run(
+            await self._outcome(
                 "complete",
                 job.id,
                 job.worker_id or "",
@@ -163,15 +297,15 @@ class RedisBackend(BaseBackend):
         execution_status: ExecutionStatus = ExecutionStatus.FAILED,
     ) -> bool:
         return bool(
-            await self._run(
+            await self._outcome(
                 "fail",
                 job.id,
                 job.worker_id or "",
                 job.claims,
-                error.summary,
+                _storable(error.summary),
                 str(execution_status),
-                error.type,
-                error.traceback,
+                _storable(error.type),
+                _storable(error.traceback),
                 "" if retry_at is None else number(retry_at),
             )
         )
@@ -181,6 +315,24 @@ class RedisBackend(BaseBackend):
         return bool(
             await self._run(
                 "release", job.id, job.worker_id or "", job.claims, run_at
+            )
+        )
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        if not jobs:
+            return 0
+        clock = self._clock
+        now = clock.now() if self._read or not isinstance(clock, FollowingClock) else await self._now()
+        held = [
+            part
+            for job in jobs
+            for part in (job.id, job.worker_id or "", job.claims, number(now))
+        ]
+        return int(
+            await self._forgetting(
+                self._scripts.run_once(
+                    "release_many", now, *held, following=isinstance(clock, FollowingClock)
+                )
             )
         )
 
@@ -324,7 +476,76 @@ class RedisBackend(BaseBackend):
     async def _run(self, name: str, *arguments: Any) -> Any:
         return await self._script(name, await self._now(), *arguments)
 
+    async def _outcome(self, name: str, *arguments: Any) -> Any:
+        now = await self._now()
+        alone = self._client.connection is not None or self._closed
+        if alone or (not self._batches.waiting and self._spare_connections() > self._alone):
+            self._alone += 1
+            try:
+                return await self._script(name, now, *arguments)
+            finally:
+                self._alone -= 1
+        return await self._batches.submit((name, now, arguments))
+
+    def _spare_connections(self) -> int:
+        pool = self._client.connection_pool
+        return sum(1 for connection in pool._available_connections if connection.is_connected)
+
+    async def _borrowed(self) -> Any:
+        pool = self._client.connection_pool
+        for connection in reversed(pool._available_connections):
+            if connection.is_connected:
+                pool._available_connections.remove(connection)
+                pool._in_use_connections.add(connection)
+                return connection
+        return await _acquire(pool)
+
+    async def _settled_batch(self, take: Callable[[], list[Entry]]) -> list[Any]:
+        following = isinstance(self._clock, FollowingClock)
+        encoder = self._client.connection_pool.get_encoder()
+        pipeline = self._client.pipeline(transaction=False)
+        try:
+            pipeline.connection = await self._borrowed()
+            batch = take()
+            answers: list[Any] = [None] * len(batch)
+            queued: list[int] = []
+            for index, entry in enumerate(batch):
+                name, now, arguments = entry.payload
+                try:
+                    for argument in arguments:
+                        encoder.encode(argument)
+                except Exception as error:
+                    answers[index] = error
+                    continue
+                self._scripts.queue(pipeline, name, now, *arguments, following=following)
+                queued.append(index)
+            if not queued:
+                return answers
+            results = await self._forgetting(pipeline.execute(raise_on_error=False))
+        finally:
+            await pipeline.reset()
+        missing: dict[str, list[int]] = {}
+        for index, result in zip(queued, results):
+            entry = batch[index]
+            if isinstance(result, NoScriptError) and entry.attempts == 1:
+                missing.setdefault(entry.payload[0], []).append(index)
+            else:
+                answers[index] = result
+                entry.settle(result)
+        for name, indexes in missing.items():
+            try:
+                await self._scripts.load(name)
+            except Exception as error:
+                for index in indexes:
+                    answers[index] = error
+            else:
+                for index in indexes:
+                    answers[index] = AGAIN
+        return answers
+
     async def _script(self, name: str, now: float, *arguments: Any) -> Any:
+        if self._closed:
+            raise AppClosedError(CLOSED_MESSAGE)
         following = isinstance(self._clock, FollowingClock)
         return await self._forgetting(
             self._scripts.run(name, now, *arguments, following=following)
@@ -332,12 +553,40 @@ class RedisBackend(BaseBackend):
 
     async def _now(self) -> float:
         clock = self._clock
-        if isinstance(clock, FollowingClock) and (not self._read or clock.due()):
+        if not isinstance(clock, FollowingClock):
+            return clock.now()
+        if self._read and clock.trusted and not clock.overdue():
+            if clock.due() and not self._reading.locked():
+                self._refresh()
+            return clock.now()
+        if not self._read or not clock.trusted or clock.due():
             async with self._reading:
-                if not self._read or clock.due():
-                    clock.follow(*await self._forgetting(self._timed()), self._server())
-                    self._read = True
+                if not self._read or not clock.trusted or clock.due():
+                    await self._follow(clock)
         return clock.now()
+
+    async def _follow(self, clock: FollowingClock) -> None:
+        clock.follow(*await self._forgetting(self._timed()), self._server())
+        self._read = True
+
+    def _refresh(self) -> None:
+        if self._refreshing is None or self._refreshing.done():
+            self._refreshing = asyncio.create_task(
+                self._refreshed(), name="tinyjobs-redis-clock", context=contextvars.Context()
+            )
+
+    async def _refreshed(self) -> None:
+        clock = self._clock
+        if not isinstance(clock, FollowingClock):
+            return
+        async with self._reading:
+            if not clock.due():
+                return
+            try:
+                async with asyncio.timeout(CLOCK_SECONDS):
+                    await self._follow(clock)
+            except (RedisConnectionError, RedisTimeoutError, TimeoutError) as error:
+                logger.debug("could not read the server clock: %s", error)
 
     async def _timed(self) -> tuple[float, float, float]:
         client = self._client
@@ -426,6 +675,218 @@ class RedisBackend(BaseBackend):
         if queue is not None:
             return self._keys("index", "queue", queue)
         return self._keys("index", "all")
+
+
+class _Unwedged:
+    async def get_connection(self, command_name: Any = None, *keys: Any, **options: Any) -> Any:
+        pool: Any = self
+        try:
+            async with asyncio.timeout(pool.timeout):
+                async with pool._condition:
+                    await pool._condition.wait_for(pool.can_get_connection)
+                    connection = _take(pool)
+        except TimeoutError as error:
+            raise RedisConnectionError("No connection available.") from error
+        try:
+            await pool.ensure_connection(connection)
+        except BaseException:
+            await pool.release(connection)
+            raise
+        return connection
+
+
+def _take(pool: Any) -> Any:
+    try:
+        connection = pool._available_connections.pop()
+    except IndexError:
+        connection = pool.make_connection()
+    pool._in_use_connections.add(connection)
+    return connection
+
+
+@functools.cache
+def _unwedged(kind: type) -> type:
+    return type(kind.__name__, (_Unwedged, kind), {})
+
+
+class _GuardedWrites:
+    async def send_packed_command(self, command: Any, check_health: bool = True) -> None:
+        try:
+            await super().send_packed_command(command, check_health)
+        except TypeError as error:
+            if not _lost_transport(error):
+                raise
+            await self.disconnect(nowait=True)
+            raise RedisConnectionError("the connection was closed by the server") from error
+
+
+def _lost_transport(error: TypeError) -> bool:
+    if str(error) != "'NoneType' object is not callable":
+        return False
+    trace = error.__traceback__
+    while trace is not None and trace.tb_next is not None:
+        trace = trace.tb_next
+    if trace is None:
+        return False
+    code = trace.tb_frame.f_code
+    return code.co_name == "writelines" and code.co_filename.endswith("selector_events.py")
+
+
+@functools.cache
+def _guarded(kind: type) -> type:
+    return type(kind.__name__, (_GuardedWrites, kind), {})
+
+
+def _guard_writes(client: Redis) -> None:
+    if sys.version_info >= (3, 13):
+        return
+    pool = client.connection_pool
+    if not issubclass(pool.connection_class, _GuardedWrites):
+        pool.connection_class = _guarded(pool.connection_class)
+    connections = [
+        *getattr(pool, "_available_connections", ()),
+        *getattr(pool, "_in_use_connections", ()),
+        *([client.connection] if client.connection is not None else []),
+    ]
+    for connection in connections:
+        if not isinstance(connection, _GuardedWrites):
+            connection.__class__ = _guarded(type(connection))
+
+
+def _mend(pool: Any) -> None:
+    if "get_available_connection" in vars(ConnectionPool):
+        return
+    if not isinstance(pool, BlockingConnectionPool):
+        return
+    if type(pool).get_connection is BlockingConnectionPool.get_connection:
+        pool.__class__ = _unwedged(type(pool))
+
+
+def _storable(text: str) -> str:
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _secret(url: str) -> bool:
+    plain = unquote(url).lower()
+    return "@" in plain or "password" in plain
+
+
+def _url_reason(url: str, error: ValueError) -> str:
+    if _secret(url):
+        return (
+            "its error is hidden, since the url holds a password; check the port and "
+            "percent-encode the password's reserved characters"
+        )
+    return str(error)
+
+
+def _refused(url: str, pool: Any) -> str | None:
+    options = pool.connection_kwargs
+    split = urlsplit(url)
+    if split.scheme == "unix" and split.netloc and "@" in split.path:
+        return (
+            "its socket path is hidden, since the url holds a password; percent-encode the "
+            "password's reserved characters"
+        )
+    unknown = _unknown_options(pool)
+    if unknown:
+        if _secret(url):
+            return (
+                "it holds a connection option the redis client does not take, its name "
+                "hidden since the url holds a password; percent-encode the password's "
+                "reserved characters"
+            )
+        return f"the redis client takes no connection option named {', '.join(unknown)}"
+    if options.get("decode_responses"):
+        return "tinyjobs reads raw bytes from redis, so decode_responses cannot be set"
+    if _replays(options):
+        return REPLAY_MESSAGE
+    if isinstance(pool.timeout, str):
+        try:
+            pool.timeout = float(pool.timeout)
+        except ValueError:
+            return "its timeout is not a number of seconds"
+    return None
+
+
+def _own_client(client: Redis) -> Redis:
+    pool = client.connection_pool
+    settings = {
+        name: value
+        for name, value in pool.connection_kwargs.items()
+        if name not in ("connection_pool", "retry", "retry_on_error", "retry_on_timeout")
+    }
+    options = {"connection_class": pool.connection_class, "max_connections": pool.max_connections}
+    if isinstance(pool, SentinelConnectionPool):
+        copied = SentinelConnectionPool(
+            pool.service_name,
+            pool.sentinel_manager,
+            is_master=pool.is_master,
+            check_connection=pool.check_connection,
+            **options,
+            **settings,
+        )
+    else:
+        if isinstance(pool, BlockingConnectionPool):
+            options["timeout"] = pool.timeout
+        copied = type(pool)(**options, **settings)
+    own = Redis(connection_pool=copied, single_connection_client=client.single_connection_client)
+    own.auto_close_connection_pool = True
+    return own
+
+
+def _sent_once(pool: Any) -> None:
+    once = Retry(NoBackoff(), 0)
+    pool.connection_kwargs.update(retry=once, retry_on_error=[], retry_on_timeout=False)
+    pool.set_retry(once)
+
+
+def _replays(options: dict[str, Any]) -> bool:
+    retry = options.get("retry")
+    retries = 0 if retry is None else getattr(retry, "_retries", 0)
+    return bool(retries or options.get("retry_on_timeout") or options.get("retry_on_error"))
+
+
+def _unknown_options(pool: Any) -> list[str]:
+    accepted: set[str] = set()
+    for kind in pool.connection_class.__mro__:
+        if kind is object:
+            return []
+        if "__init__" not in vars(kind):
+            continue
+        parameters = inspect.signature(kind.__init__).parameters.values()
+        accepted.update(parameter.name for parameter in parameters)
+        if not any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters):
+            break
+    return sorted(set(pool.connection_kwargs) - accepted)
+
+
+def _unopened(pool: Any, wanted: int) -> list[Any]:
+    available = pool._available_connections
+    ready = len(pool._in_use_connections) + sum(1 for c in available if c.is_connected)
+    taken: list[Any] = []
+    for _ in range(max(0, min(wanted, pool.max_connections) - ready)):
+        closed = next((c for c in available if not c.is_connected), None)
+        if closed is not None:
+            available.remove(closed)
+        elif len(available) + len(pool._in_use_connections) < pool.max_connections:
+            closed = pool.make_connection()
+        else:
+            break
+        pool._in_use_connections.add(closed)
+        taken.append(closed)
+    return taken
+
+
+async def _opened(pool: Any, opening: dict[asyncio.Future, Any]) -> None:
+    if not opening:
+        return
+    await asyncio.wait(opening)
+    for task, connection in opening.items():
+        if task.cancelled() or task.exception() is not None:
+            with suppress(Exception):
+                await connection.disconnect()
+        await pool.release(connection)
 
 
 async def _acquire(pool: Any) -> Any:

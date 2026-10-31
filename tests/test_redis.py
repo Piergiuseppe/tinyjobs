@@ -2,25 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import sys
 import time
-import types
 import unittest
 import uuid
-from functools import partial
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from unittest import mock
 
 import tinyjobs.clock
 from tinyjobs import JobStatus, TinyJobs
-from tinyjobs.exceptions import ConfigurationError
+from tinyjobs.exceptions import AppClosedError, ConfigurationError
 from tinyjobs.runtime import run_on
 from tinyjobs.status import ExecutionStatus
 from tinyjobs.testing import BackendContract
 from tinyjobs.testing.contract import ERROR, START, make_job
-from tests.support import fork_without_warning, race_open_and_close
+from tests.support import (
+    LoopBoundAppCases,
+    Untouched,
+    fork_without_warning,
+    later_by,
+    revealed,
+    skewed,
+)
 
 REDIS_URL = os.environ.get("TINYJOBS_REDIS_URL")
 
@@ -47,6 +53,87 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         if keys:
             await client.delete(*keys)
         await super().asyncTearDown()
+
+    async def test_a_claim_whose_answer_was_lost_hands_its_jobs_back_as_never_claimed(self):
+        real = self.backend._scripts.run
+
+        async def lost(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name in ("claim", "claim_job"):
+                raise RedisConnectionError("the answer was lost")
+            return answer
+
+        for claiming in (self.claim_any, self.claim_by_id):
+            with self.subTest(claiming=claiming.__name__):
+                job = await self.enqueue(run_at=START - 1)
+                with mock.patch.object(self.backend._scripts, "run", lost):
+                    with self.assertRaises(RedisConnectionError):
+                        await claiming(job)
+                self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+                self.backend._swept = -math.inf
+                [again] = await self.claim()
+                self.assertEqual(again.id, job.id)
+                self.assertEqual((again.attempts, again.hand_backs, again.claims), (1, 0, 2))
+                self.assertEqual([e.claim for e in await self.backend.executions(job.id)], [2])
+                self.assertTrue(await self.backend.complete(again, None))
+
+    async def test_a_claim_given_up_by_its_caller_hands_its_jobs_back_as_never_claimed(self):
+        real = self.backend._scripts.run
+
+        async def unanswered(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name in ("claim", "claim_job"):
+                await asyncio.sleep(10)
+            return answer
+
+        for claiming in (self.claim_any, self.claim_by_id):
+            with self.subTest(claiming=claiming.__name__):
+                job = await self.enqueue(run_at=START - 1)
+                with mock.patch.object(self.backend._scripts, "run", unanswered):
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.wait_for(claiming(job), 0.2)
+                self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+                self.backend._swept = -math.inf
+                [again] = await self.claim()
+                self.assertEqual((again.id, again.attempts, again.hand_backs), (job.id, 1, 0))
+                self.assertTrue(await self.backend.complete(again, None))
+
+    async def test_a_call_on_a_connection_the_server_reset_fails_as_a_connection_error(self):
+        job = await self.enqueue()
+        pool = self.backend._client.connection_pool
+        connections = list(pool._available_connections)
+        self.assertTrue(connections)
+        for connection in connections:
+            connection._writer.transport.abort()
+        await asyncio.sleep(0.05)
+        with self.assertRaises(RedisConnectionError):
+            await self.backend.get(job.id)
+        self.assertEqual((await self.backend.get(job.id)).id, job.id)
+
+    async def test_jobs_that_leave_running_leave_no_claim_behind(self):
+        jobs = [await self.enqueue(run_at=START - 1, max_attempts=3) for _ in range(5)]
+        claimed = {job.id: job for job in await self.claim(limit=5)}
+        first, second, third, fourth, fifth = (claimed[job.id] for job in jobs)
+        client = self.backend._client
+        tokens = self.backend._keys("claim_tokens")
+        self.assertEqual(await client.zcard(tokens), 5)
+        self.assertTrue(await self.backend.complete(first, None))
+        self.assertTrue(await self.backend.fail(second, ERROR, None))
+        self.assertTrue(await self.backend.release(third))
+        self.assertTrue(await self.backend.hand_back(fourth))
+        self.assertTrue(await self.backend.fail(fifth, ERROR, START + 5))
+        left = [key async for key in client.scan_iter(match=self.backend._keys("claim", "*"))]
+        self.assertEqual(left, [])
+        self.assertEqual(await client.zcard(tokens), 0)
+        for job in jobs:
+            stored = await client.hgetall(self.backend._keys("job", job.id))
+            self.assertNotIn(b"claim_token", stored)
+
+    async def claim_any(self, job):
+        return await self.claim()
+
+    async def claim_by_id(self, job):
+        return await self.backend.claim_job(job.id, worker_id="worker-a", lease_seconds=60.0)
 
     async def test_a_retried_job_takes_its_dedup_key_over_from_a_vanished_holder(self):
         failed = await self.claimed_one(dedup_key="invoice:1")
@@ -187,42 +274,6 @@ app.close()
 """
 
 
-@contextmanager
-def skewed(seconds: float):
-    import tinyjobs.clock
-
-    real = time.time
-    fake = types.SimpleNamespace(time=lambda: real() + seconds, monotonic=time.monotonic)
-    with mock.patch.object(tinyjobs.clock, "time", fake):
-        yield
-
-
-@contextmanager
-def later_by(seconds: float):
-    import tinyjobs.clock
-    from tinyjobs.backends.redis import backend as module
-
-    real = tinyjobs.clock.elapsed
-
-    def shifted() -> float:
-        return real() + seconds
-
-    with (
-        mock.patch.object(tinyjobs.clock, "elapsed", shifted),
-        mock.patch.object(module, "elapsed", shifted),
-        skewed(seconds),
-    ):
-        yield
-
-
-class Untouched:
-    def now(self) -> float:
-        return time.time() + 900.0
-
-    def monotonic(self) -> float:
-        return time.monotonic()
-
-
 @unittest.skipUnless(REDIS_URL, "set TINYJOBS_REDIS_URL to run the redis tests")
 @unittest.skipIf(RedisBackend is None, "pip install 'tinyjobs[redis]' to run the redis tests")
 class RedisClockTests(unittest.IsolatedAsyncioTestCase):
@@ -262,7 +313,8 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_host_whose_clock_runs_an_hour_ahead_leaves_live_leases_alone(self):
         here = await self.open()
-        job = await here.enqueue(make_job(run_at=time.time(), created_at=time.time()))
+        now = await self.server_time(here)
+        job = await here.enqueue(make_job(run_at=now, created_at=now))
         [claimed] = await here.claim(
             worker_id="here", queues=["default"], limit=1, lease_seconds=30.0
         )
@@ -371,16 +423,320 @@ class RedisClockTests(unittest.IsolatedAsyncioTestCase):
         await backend.reap_expired()
         self.assertEqual(reads, [])
 
-    async def test_the_clock_is_read_again_once_it_is_old(self):
+    async def slow_reads(self, backend) -> list:
+        reads: list = []
+        original = backend._time
+
+        async def slow(connection):
+            reads.append(1)
+            await asyncio.sleep(1.0)
+            return await original(connection)
+
+        backend._time = slow
+        return reads
+
+    async def test_an_old_clock_is_read_again_beside_the_call_that_found_it_old(self):
+        from tinyjobs.backends.redis import backend as module
         from tinyjobs.clock import FOLLOW_SECONDS
 
         backend = await self.open()
-        reads = await self.counted_reads(backend)
+        reads = await self.slow_reads(backend)
         await backend.reap_expired()
         self.assertEqual(reads, [])
-        with later_by(FOLLOW_SECONDS + 1):
+        with later_by(FOLLOW_SECONDS + 1, module):
+            started = time.monotonic()
             await backend.reap_expired()
+            self.assertLess(time.monotonic() - started, 0.5)
+            await backend._refreshing
+            self.assertFalse(backend._clock.due())
         self.assertEqual(reads, [1])
+
+    async def test_a_clock_left_unread_for_too_long_is_read_before_the_call_goes_on(self):
+        from tinyjobs.backends.redis import backend as module
+        from tinyjobs.clock import FOLLOW_SECONDS
+
+        backend = await self.open()
+        reads = await self.slow_reads(backend)
+        with later_by(2 * FOLLOW_SECONDS + 1, module):
+            started = time.monotonic()
+            await backend.reap_expired()
+            self.assertGreater(time.monotonic() - started, 1.0)
+        self.assertEqual(reads, [1])
+
+    async def test_a_stop_leaves_spare_connections_open_for_the_releases(self):
+        from tinyjobs.backends.redis.backend import SPARE_CONNECTIONS
+
+        backend = await self.open()
+        pool = backend._client.connection_pool
+        await backend.spare()
+        idle = [
+            connection for connection in pool._available_connections if connection.is_connected
+        ]
+        self.assertGreaterEqual(len(idle), SPARE_CONNECTIONS)
+
+    async def test_a_stop_opens_a_connection_for_each_running_job_within_the_pool(self):
+        from tinyjobs.backends.redis.backend import SPARE_CONNECTIONS
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=8)
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        owner = object()
+        backend.reserve(owner, 4)
+        await backend.spare()
+        connected = [c for c in pool._available_connections if c.is_connected]
+        self.assertEqual(len(connected), 4 + SPARE_CONNECTIONS)
+        backend.reserve(object(), 4)
+        await backend.spare()
+        connected = [c for c in pool._available_connections if c.is_connected]
+        self.assertEqual(len(connected), 8)
+        self.assertEqual(len(pool._in_use_connections), 0)
+
+    async def test_a_spare_cancelled_while_it_connects_leaves_the_pool_usable(self):
+        from redis.asyncio.connection import Connection
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, pool_timeout=2.0)
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        original = Connection.connect
+        entered = asyncio.Event()
+
+        async def slow(connection):
+            entered.set()
+            await asyncio.sleep(0.5)
+            await original(connection)
+
+        with mock.patch.object(Connection, "connect", slow):
+            spare = asyncio.ensure_future(backend.spare())
+            await entered.wait()
+            started = time.monotonic()
+            spare.cancel()
+            await asyncio.gather(spare, return_exceptions=True)
+            stopped = time.monotonic() - started
+        self.assertLess(stopped, 0.5)
+        self.assertEqual(len(pool._in_use_connections), 0)
+        async with asyncio.timeout(1.0):
+            await backend.setup()
+
+    async def test_a_spare_cut_after_one_connection_returns_it_to_the_pool(self):
+        from redis.asyncio.connection import Connection
+
+        from tinyjobs.backends.redis.backend import _acquire
+
+        backend = RedisBackend.from_url(
+            REDIS_URL, prefix=self.prefix, max_connections=2, pool_timeout=20.0
+        )
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        original = Connection.connect
+        opened: list[object] = []
+
+        async def one_then_none(connection):
+            if opened:
+                await asyncio.sleep(30)
+            opened.append(connection)
+            await original(connection)
+
+        with mock.patch.object(Connection, "connect", one_then_none):
+            with self.assertRaises(TimeoutError):
+                async with asyncio.timeout(0.5):
+                    await backend.spare()
+        self.assertEqual(len(pool._in_use_connections), 0)
+        self.assertEqual(sum(1 for c in pool._available_connections if c.is_connected), 1)
+        async with asyncio.timeout(1.0):
+            taken = [await _acquire(pool), await _acquire(pool)]
+        for connection in taken:
+            await pool.release(connection)
+
+    async def test_a_spare_leaves_open_connections_free_while_it_opens_the_rest(self):
+        from redis.asyncio.connection import Connection
+
+        from tinyjobs.backends.redis.backend import _acquire
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=10)
+        self.opened.append(backend)
+        pool = backend._client.connection_pool
+        warm = [await _acquire(pool), await _acquire(pool)]
+        for connection in warm:
+            await pool.release(connection)
+        original = Connection.connect
+
+        async def slowly(connection):
+            if not connection.is_connected:
+                await asyncio.sleep(1.0)
+            await original(connection)
+
+        backend.reserve(self, 4)
+        with mock.patch.object(Connection, "connect", slowly):
+            sparing = asyncio.ensure_future(backend.spare())
+            await asyncio.sleep(0.1)
+            started = time.monotonic()
+            connection = await _acquire(pool)
+            took = time.monotonic() - started
+            await pool.release(connection)
+            await sparing
+        self.assertLess(took, 0.3)
+        self.assertEqual(sum(1 for c in pool._available_connections if c.is_connected), 6)
+
+    async def test_outcomes_waiting_for_a_connection_are_sent_in_one_round_trip(self):
+        from tinyjobs.backends.redis.backend import _acquire
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=1)
+        self.opened.append(backend)
+        await backend.setup()
+        for _ in range(3):
+            await backend.enqueue(make_job())
+        jobs = await backend.claim(worker_id="w", queues=["default"], limit=3, lease_seconds=60)
+        pool = backend._client.connection_pool
+        alone: list[str] = []
+        real = backend._scripts.run
+
+        async def counted(name, *args, **kwargs):
+            alone.append(name)
+            return await real(name, *args, **kwargs)
+
+        with mock.patch.object(backend._scripts, "run", counted):
+            held = await _acquire(pool)
+            writes = asyncio.gather(*(backend.complete(job, None) for job in jobs))
+            await asyncio.sleep(0.2)
+            await pool.release(held)
+            self.assertEqual(await writes, [True, True, True])
+        self.assertNotIn("complete", alone)
+        self.assertEqual(
+            [(await backend.get(job.id)).status for job in jobs], [JobStatus.SUCCESS] * 3
+        )
+        self.assertFalse(await backend.complete(jobs[0], None))
+
+    async def single(self) -> RedisBackend:
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=1)
+        self.opened.append(backend)
+        await backend.setup()
+        return backend
+
+    async def claimed(self, backend: RedisBackend, count: int) -> list:
+        for _ in range(count):
+            await backend.enqueue(make_job())
+        return await backend.claim(
+            worker_id="w", queues=["default"], limit=count, lease_seconds=60
+        )
+
+    async def test_an_outcome_its_text_cannot_encode_leaves_the_rest_of_its_batch(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.models import ExecutionError
+
+        backend = await self.single()
+        good, bad = await self.claimed(backend, 2)
+        hostile = b"no such file: report-\xff.csv".decode("utf-8", "surrogateescape")
+        error = ExecutionError("FileNotFoundError", hostile, f"Traceback: {hostile}")
+        pool = backend._client.connection_pool
+        held = await _acquire(pool)
+        writes = asyncio.gather(backend.complete(good, None), backend.fail(bad, error, None))
+        await asyncio.sleep(0.2)
+        await pool.release(held)
+        self.assertEqual(await writes, [True, True])
+        stored = await backend.get(bad.id)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertIn("report-\\udcff.csv", stored.last_error)
+        self.assertEqual((await backend.get(good.id)).status, JobStatus.SUCCESS)
+
+    async def test_a_batched_outcome_opens_a_free_slot_rather_than_wait_for_one_alone(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.deadlines import bounded
+
+        backend = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, max_connections=10)
+        self.opened.append(backend)
+        await backend.setup()
+        first, second = await self.claimed(backend, 2)
+        pool = backend._client.connection_pool
+        real = backend._script
+
+        async def slow(name, now, *arguments):
+            if name == "complete":
+                held = await _acquire(pool)
+                await asyncio.sleep(2.5)
+                await pool.release(held)
+            return await real(name, now, *arguments)
+
+        with mock.patch.object(backend, "_script", slow):
+            alone = asyncio.ensure_future(backend.complete(first, None))
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            async with bounded(time.monotonic() + 1.0):
+                self.assertTrue(await backend.complete(second, None))
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(await alone)
+
+    async def test_a_batched_outcome_on_a_full_pool_takes_the_next_connection_freed(self):
+        from tinyjobs.backends.redis.backend import _acquire
+        from tinyjobs.deadlines import bounded
+
+        backend = await self.single()
+        [job] = await self.claimed(backend, 1)
+        pool = backend._client.connection_pool
+        held = await _acquire(pool)
+        writing = asyncio.ensure_future(self.bounded_complete(backend, job, bounded))
+        await asyncio.sleep(0.3)
+        await pool.release(held)
+        self.assertTrue(await asyncio.wait_for(writing, 2))
+
+    async def bounded_complete(self, backend, job, bounded):
+        async with bounded(time.monotonic() + 1.5):
+            return await backend.complete(job, None)
+
+    async def test_closing_settles_outcomes_still_waiting_for_their_batch(self):
+        backend = await self.open()
+        first, second = await self.claimed(backend, 2)
+        borrowed = backend._borrowed
+
+        async def slow():
+            await asyncio.sleep(1.0)
+            return await borrowed()
+
+        with mock.patch.object(backend, "_spare_connections", lambda: 0), mock.patch.object(
+            backend, "_borrowed", slow
+        ):
+            sending = asyncio.ensure_future(backend.complete(first, None))
+            await asyncio.sleep(0.2)
+            waiting = asyncio.ensure_future(backend.complete(second, None))
+            await asyncio.sleep(0.2)
+            await asyncio.wait_for(backend.close(), 10)
+        done, pending = await asyncio.wait((sending, waiting), timeout=5)
+        for write in pending:
+            write.cancel()
+        self.assertEqual(len(done), 2)
+        for write in done:
+            self.assertFalse(write.cancelled())
+            self.assertIsInstance(write.exception(), AppClosedError)
+
+    async def test_an_outcome_after_close_is_refused_and_never_written(self):
+        backend = await self.single()
+        [job] = await self.claimed(backend, 1)
+        await backend.close()
+        with self.assertRaises(AppClosedError):
+            await backend.complete(job, None)
+        pool = backend._client.connection_pool
+        self.assertEqual([c for c in pool._available_connections if c.is_connected], [])
+        reader = await self.single()
+        self.assertEqual((await reader.get(job.id)).status, JobStatus.RUNNING)
+
+    async def test_a_script_missing_from_the_server_is_loaded_once_for_its_batch(self):
+        backend = await self.open()
+        jobs = await self.claimed(backend, 10)
+        script = backend._scripts._scripts["complete"]
+        known, script.sha = script.sha, "0" * 40
+        loads: list[str] = []
+        load = backend._scripts.load
+
+        async def counted(name):
+            loads.append(name)
+            await load(name)
+            script.sha = known
+
+        with mock.patch.object(backend, "_spare_connections", lambda: 0), mock.patch.object(
+            backend._scripts, "load", counted
+        ):
+            results = await asyncio.gather(*(backend.complete(job, None) for job in jobs))
+        self.assertEqual(results, [True] * 10)
+        self.assertEqual(loads, ["complete"])
 
     async def test_a_lost_connection_reads_the_clock_again(self):
         backend = await self.open()
@@ -862,6 +1218,60 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
 
+    async def test_an_eager_call_whose_job_a_lost_claim_left_running_runs_it(self):
+        @self.app.task(store_result=True)
+        async def quick():
+            return "quick"
+
+        job = await quick.aenqueue()
+        inner = self.app.backend._inner
+        real = inner._scripts.run
+
+        async def lost(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name == "claim":
+                raise RedisConnectionError("the answer was lost")
+            return answer
+
+        inner._swept = time.monotonic()
+        with mock.patch.object(inner._scripts, "run", lost):
+            with self.assertRaises(RedisConnectionError):
+                await self.app.backend.claim(
+                    worker_id="drain", queues=["default"], limit=1, lease_seconds=60.0
+                )
+        self.assertIs((await job.arefresh()).status, JobStatus.RUNNING)
+        self.app._eager = True
+        settled = await self.app.settle(job, inserted=True)
+        self.assertEqual((settled.status, settled.result()), (JobStatus.SUCCESS, "quick"))
+
+    async def test_threads_kept_at_a_stop_record_their_outcomes_where_connections_open_slowly(self):
+        from redis.asyncio.connection import Connection
+
+        @self.app.task(max_attempts=1)
+        def steady(i):
+            time.sleep(3.0)
+
+        jobs = [await steady.aenqueue(i) for i in range(6)]
+        original = Connection._connect
+
+        async def slowly(connection):
+            await asyncio.sleep(1.5)
+            await original(connection)
+
+        worker = self.app.worker(
+            concurrency=6, poll_maximum=0.05, shutdown_timeout=3.0, handle_signals=False
+        )
+        with mock.patch.object(Connection, "_connect", slowly):
+            runner = asyncio.create_task(worker.start())
+            while JobStatus.QUEUED in [(await job.arefresh()).status for job in jobs]:
+                await asyncio.sleep(0.05)
+            pool = self.app.backend._inner._client.connection_pool
+            await on_backend_loop(self.app, pool.disconnect(inuse_connections=False))
+            worker.stop()
+            await asyncio.wait_for(runner, 15)
+        statuses = [(await job.arefresh()).status for job in jobs]
+        self.assertEqual(statuses, [JobStatus.SUCCESS] * 6)
+
     async def test_a_worker_runs_jobs_and_retries_against_redis(self):
         attempts = []
 
@@ -977,422 +1387,132 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(REDIS_URL, "set TINYJOBS_REDIS_URL to run the redis tests")
 @unittest.skipIf(RedisBackend is None, "pip install 'tinyjobs[redis]' to run the redis tests")
-class RedisEventLoopTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.prefix = f"tinyjobs-test-{uuid.uuid4().hex}"
-        self.app = TinyJobs(REDIS_URL, prefix=self.prefix)
-
-        @self.app.task
-        def handler(value):
-            return value
-
-        self.handler = handler
-
-    def tearDown(self) -> None:
-        self.app.start()
-        self.app.run_sync(partial(forget, self.app, self.prefix), name="forget")
-        self.app.close()
-
-    def test_one_app_serves_one_event_loop_after_another(self):
-        asyncio.run(self.handler.aenqueue(1))
-        asyncio.run(self.handler.aenqueue(2))
-        self.handler.enqueue(3)
-        self.assertEqual(self.app.counts()["queued"], 3)
-
-    def test_a_loop_reaches_an_app_hosted_on_another_running_loop(self):
-        import threading
-
-        hosted = threading.Event()
-        release = threading.Event()
-
-        async def host() -> None:
-            await self.app.ready()
-            hosted.set()
-            while not release.is_set():
-                await asyncio.sleep(0.01)
-
-        thread = threading.Thread(target=asyncio.run, args=(host(),))
-        thread.start()
-        try:
-            hosted.wait(5)
-            job = asyncio.run(self.handler.aenqueue(4))
-            stored = asyncio.run(self.app.aget(job.id))
-            self.assertEqual(self.app.decode(stored).args, (4,))
-        finally:
-            release.set()
-            thread.join(5)
-
-    def test_a_worker_on_a_second_loop_shares_an_app_hosted_elsewhere(self):
-        import threading
-
-        hosted = threading.Event()
-        release = threading.Event()
-        jobs = []
-
-        async def host() -> None:
-            await self.app.ready()
-            hosted.set()
-            while not release.is_set():
-                await asyncio.sleep(0.01)
-            jobs.append(await self.handler.aenqueue(8))
-
-        async def work() -> None:
-            job = await self.handler.aenqueue(7)
-            worker = self.app.worker(handle_signals=False, scheduler=False)
-            running = asyncio.create_task(worker.start())
-            deadline = time.monotonic() + 10
-            while (await job.arefresh()).status is not JobStatus.SUCCESS:
-                self.assertLess(time.monotonic(), deadline)
-                await asyncio.sleep(0.02)
-            worker.stop()
-            await running
-
-        thread = threading.Thread(target=asyncio.run, args=(host(),))
-        thread.start()
-        try:
-            hosted.wait(5)
-            asyncio.run(work())
-        finally:
-            release.set()
-            thread.join(5)
-        self.assertEqual(len(jobs), 1)
-        self.assertEqual(self.app.counts(), {"success": 1, "queued": 1})
-
-    def test_an_app_dropped_without_closing_stops_its_loop_thread(self):
-        import gc
-        import threading
-
-        def loop_threads() -> int:
-            return sum(t.name == "tinyjobs-loop" for t in threading.enumerate())
-
-        before = loop_threads()
-        dropped = TinyJobs(REDIS_URL, prefix=self.prefix)
-        handler = dropped.task(name="handler")(lambda value: value)
-        asyncio.run(handler.aenqueue(9))
-        self.assertEqual(loop_threads(), before + 1)
-        del dropped, handler
-        gc.collect()
-        deadline = time.monotonic() + 5
-        while loop_threads() > before and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(loop_threads(), before)
-
-    def test_an_app_readied_on_a_stopped_loop_keeps_working(self):
-        stopped = asyncio.new_event_loop()
-        try:
-            stopped.run_until_complete(self.app.ready())
-            self.handler.enqueue(10)
-
-            async def host() -> None:
-                await self.app.ready()
-                await self.handler.aenqueue(11)
-
-            asyncio.run(host())
-            self.assertEqual(self.app.counts()["queued"], 2)
-        finally:
-            stopped.close()
-
-    def test_an_app_readied_on_a_finished_loop_keeps_working(self):
-        async def host() -> None:
-            await self.app.ready()
-            await self.handler.aenqueue(5)
-
-        asyncio.run(host())
-        asyncio.run(self.handler.aenqueue(6))
-        self.assertEqual(self.app.counts()["queued"], 2)
-
-    def test_event_loops_and_threads_connecting_at_once_share_one_connection(self):
-        import threading
-
-        errors: list[BaseException] = []
-        start = threading.Barrier(8)
-
-        def from_a_loop() -> None:
-            async def enqueue() -> None:
-                start.wait()
-                await self.handler.aenqueue(1)
-
-            try:
-                asyncio.run(enqueue())
-            except BaseException as error:
-                errors.append(error)
-
-        def from_a_thread() -> None:
-            start.wait()
-            try:
-                self.handler.enqueue(2)
-            except BaseException as error:
-                errors.append(error)
-
-        threads = [threading.Thread(target=from_a_loop) for _ in range(4)]
-        threads += [threading.Thread(target=from_a_thread) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-
-        self.assertFalse(any(thread.is_alive() for thread in threads))
-        self.assertEqual(errors, [])
-        self.assertEqual(self.app.counts()["queued"], 8)
-
-
-    def slow_setup(self, seconds: float):
-        from unittest import mock
-
-        setup = RedisBackend.setup
-
-        async def slowly(backend):
-            await asyncio.sleep(seconds)
-            await setup(backend)
-
-        patcher = mock.patch.object(RedisBackend, "setup", slowly)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def finish(self, loop: asyncio.AbstractEventLoop) -> None:
-        abandoned = asyncio.all_tasks(loop)
-        for task in abandoned:
-            task.cancel()
-        if abandoned:
-            loop.run_until_complete(
-                asyncio.gather(*abandoned, return_exceptions=True)
-            )
-        loop.close()
-
-    def test_a_worker_uses_the_connection_a_sync_call_made(self):
-        ran: list[int] = []
-
-        @self.app.task
-        def record(value):
-            ran.append(value)
-
-        record.enqueue(1)
-
-        async def work() -> None:
-            running = asyncio.create_task(
-                self.app.worker(handle_signals=False).start()
-            )
-            for _ in range(50):
-                if ran:
-                    break
-                await asyncio.sleep(0.05)
-            running.cancel()
-            with suppress(asyncio.CancelledError):
-                await running
-
-        asyncio.run(work())
-        self.assertEqual(ran, [1])
-
-    def test_cancelling_the_first_connection_closes_the_half_made_backend(self):
-        closed = self.track_closes()
-        self.slow_setup(0.5)
-
-        with self.assertRaises(TimeoutError):
-            asyncio.run(asyncio.wait_for(self.handler.aenqueue(1), 0.2))
-        deadline = time.monotonic() + 5
-        while not closed and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(len(closed), 1)
-        self.assertIsNone(self.app._backend)
-        self.handler.enqueue(2)
-        self.assertEqual(self.app.counts()["queued"], 1)
-
-    def test_a_host_loop_that_ends_leaves_the_connection_in_place(self):
-        async def host() -> None:
-            await self.app.ready()
-            await self.handler.aenqueue(1)
-
-        asyncio.run(host())
-        connected = self.app.backend
-        self.handler.enqueue(2)
-        asyncio.run(self.handler.aenqueue(3))
-        self.assertIs(self.app.backend, connected)
-        self.assertEqual(self.app.counts()["queued"], 3)
-
-    def test_a_sync_drain_survives_another_loop_connecting(self):
-        import threading
-
-        ran: list[int] = []
-
-        @self.app.task
-        async def step(value):
-            await asyncio.sleep(0.2)
-            ran.append(value)
-
-        for value in range(3):
-            step.enqueue(value)
-        errors: list[BaseException] = []
-
-        def drain() -> None:
-            try:
-                self.app.drain()
-            except BaseException as error:
-                errors.append(error)
-
-        thread = threading.Thread(target=drain)
-        thread.start()
-        time.sleep(0.1)
-
-        async def host() -> None:
-            await self.app.ready()
-            await self.handler.aenqueue(9)
-
-        asyncio.run(host())
-        thread.join(10)
-        self.assertEqual(errors, [])
-        self.assertEqual(sorted(ran), [0, 1, 2])
-
-    def test_a_caller_takes_over_a_connection_whose_loop_stopped(self):
-        import threading
-
-        self.slow_setup(0.5)
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever)
-        thread.start()
-        asyncio.run_coroutine_threadsafe(self.handler.aenqueue(1), loop)
-        time.sleep(0.2)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(5)
-        self.addCleanup(self.finish, loop)
-
-        asyncio.run(asyncio.wait_for(self.handler.aenqueue(2), 5))
-        self.assertGreaterEqual(self.app.counts()["queued"], 1)
-
-    def track_closes(self) -> list:
-        from unittest import mock
-
-        closed: list = []
-        close = RedisBackend.close
-
-        async def record(backend):
-            closed.append(backend)
-            await close(backend)
-
-        patcher = mock.patch.object(RedisBackend, "close", record)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return closed
-
-    def test_an_owner_whose_loop_stops_mid_connection_still_connects_once(self):
-        import threading
-
-        closed = self.track_closes()
-        self.slow_setup(0.5)
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(target=loop.run_forever)
-        thread.start()
-        asyncio.run_coroutine_threadsafe(self.app.ready(), loop)
-        time.sleep(0.2)
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(5)
-        asyncio.run(self.handler.aenqueue(1))
-        winner = self.app.backend
-
-        resumed = threading.Thread(target=loop.run_forever)
-        resumed.start()
-        time.sleep(1)
-        loop.call_soon_threadsafe(loop.stop)
-        resumed.join(5)
-        self.addCleanup(self.finish, loop)
-
-        self.assertIs(self.app.backend, winner)
-        self.assertEqual(closed, [])
-
-    def test_an_explicit_host_reuses_the_connection_a_sync_call_made(self):
-        closed = self.track_closes()
-        self.handler.enqueue(1)
-        implicit = self.app.backend
-
-        async def host() -> None:
-            await self.app.ready()
-            await self.handler.aenqueue(2)
-
-        asyncio.run(host())
-        self.assertIs(self.app.backend, implicit)
-        self.assertEqual(closed, [])
-
-    def test_a_dropped_app_closes_its_connection(self):
-        import gc
-
-        closed = self.track_closes()
-        dropped = TinyJobs(REDIS_URL, prefix=self.prefix)
-        handler = dropped.task(name="handler")(lambda value: value)
-        handler.enqueue(1)
-        del dropped, handler
-        gc.collect()
-        deadline = time.monotonic() + 5
-        while not closed and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertEqual(len(closed), 1)
-
-    def test_sync_and_async_callers_racing_start_and_close_leave_nothing_behind(self):
-        race_open_and_close(self, TinyJobs(REDIS_URL, prefix=self.prefix))
-
-    def test_enqueues_racing_open_and_close_cycles_see_only_closed_errors(self):
-        import threading
-
-        from tinyjobs.exceptions import AppClosedError
-
-        unexpected: list[BaseException] = []
-        stop = threading.Event()
-
-        def hammer() -> None:
-            while not stop.is_set():
-                try:
-                    self.handler.enqueue(1)
-                except AppClosedError:
-                    time.sleep(0.001)
-                except BaseException as error:
-                    unexpected.append(error)
-
-        threads = [threading.Thread(target=hammer) for _ in range(4)]
-        for thread in threads:
-            thread.start()
-
-        async def cycle() -> None:
-            for _ in range(15):
-                await self.app.ready()
-                await asyncio.sleep(0.02)
-                await self.app.aclose()
-
-        try:
-            for _ in range(2):
-                asyncio.run(cycle())
-        finally:
-            stop.set()
-            for thread in threads:
-                thread.join(10)
-        self.assertEqual(unexpected, [])
-
-    def test_closing_during_the_first_connection_does_not_hang_a_caller(self):
-        import threading
-
-        from tinyjobs.exceptions import AppClosedError
-
-        self.slow_setup(0.5)
-        outcome: list[BaseException] = []
-
-        def enqueue() -> None:
-            try:
-                self.handler.enqueue(1)
-            except BaseException as error:
-                outcome.append(error)
-
-        thread = threading.Thread(target=enqueue)
-        thread.start()
-        time.sleep(0.2)
-        self.app.close()
-        thread.join(5)
-
-        self.assertFalse(thread.is_alive())
-        self.assertIsInstance(outcome[0], AppClosedError)
-
-    def test_aclose_stops_the_loop_an_implicit_connection_started(self):
-        asyncio.run(self.handler.aenqueue(1))
-        own = self.app._runner._thread
-        asyncio.run(self.app.aclose())
-        own.join(5)
-        self.assertFalse(own.is_alive())
+class RedisEventLoopTests(LoopBoundAppCases, unittest.TestCase):
+    backend_class = RedisBackend
+
+    def new_prefix(self) -> str:
+        return f"tinyjobs-test-{uuid.uuid4().hex}"
+
+    def make_app(self) -> TinyJobs:
+        return TinyJobs(REDIS_URL, prefix=self.prefix)
+
+    async def forget(self, app: TinyJobs) -> None:
+        await forget(app, self.prefix)
+
+
+@unittest.skipIf(RedisBackend is None, "pip install 'tinyjobs[redis]' to run the redis tests")
+class RedisUrlTests(unittest.TestCase):
+    def test_a_url_redis_cannot_read_is_refused_without_its_password(self):
+        for url, secret in (
+            ("redis://:q7x/zz9k@cache.internal:6379/0", "q7x/zz9k"),
+            ("redis://user:hun#ter2@cache.internal/0", "hun#ter2"),
+            ("redis://:hunter2@cache.internal/0?socket_timeout=abc", "hunter2"),
+        ):
+            with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
+                RedisBackend.from_url(url)
+            text = revealed(caught.exception)
+            for piece in {secret, *secret.replace("#", "/").split("/")}:
+                self.assertNotIn(piece, text)
+
+    def test_a_password_holding_a_question_mark_is_refused_without_the_password(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://app:123?TopSecretPw@127.0.0.1:6379/0?db=0")
+        self.assertNotIn("TopSecretPw", revealed(caught.exception))
+
+    def test_an_option_the_redis_client_does_not_take_is_named(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?sockettimeout=2")
+        self.assertIn("sockettimeout", str(caught.exception))
+
+    def test_an_unknown_option_is_not_named_when_a_password_is_in_the_query(self):
+        for url in (
+            "redis://127.0.0.1:6379/0?password=s3cr&Zq9=wXy",
+            "unix:///tmp/redis.sock?db=0&password=s3cr&Zq9=wXy",
+            "redis://127.0.0.1:6379/0?%70assword=s3cr&Zq9=wXy",
+            "redis://127.0.0.1:6379/0?pass%77ORD=s3cr&Zq9=wXy",
+        ):
+            with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
+                RedisBackend.from_url(url)
+            self.assertNotIn("Zq9", revealed(caught.exception))
+
+    def test_a_socket_path_holding_part_of_a_password_is_refused(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("unix://:s3cr/Zq9@/tmp/redis.sock")
+        self.assertNotIn("Zq9", revealed(caught.exception))
+        self.assertIn("percent-encode", str(caught.exception))
+        RedisBackend.from_url("unix:///tmp/a@b.sock")
+
+    def test_options_that_would_break_every_call_are_refused(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?decode_responses=true")
+        self.assertIn("decode_responses", str(caught.exception))
+        with self.assertRaises(ConfigurationError):
+            RedisBackend.from_url("redis://127.0.0.1:6379/0?decode_responses=1&timeout=abc")
+        backend = RedisBackend.from_url("redis://127.0.0.1:6379/0?timeout=3")
+        self.assertEqual(backend._client.connection_pool.timeout, 3.0)
+
+    def test_options_that_would_send_a_call_twice_are_refused(self):
+        from redis.asyncio.retry import Retry
+        from redis.backoff import NoBackoff
+
+        for url, options in (
+            ("redis://127.0.0.1:6379/0?retry_on_timeout=true", {}),
+            ("redis://127.0.0.1:6379/0", {"retry": Retry(NoBackoff(), 3)}),
+            ("redis://127.0.0.1:6379/0", {"retry_on_error": [RedisConnectionError]}),
+        ):
+            with self.subTest(url=url, options=options):
+                with self.assertRaises(ConfigurationError) as caught:
+                    RedisBackend.from_url(url, **options)
+                self.assertIn("retry_on_timeout", str(caught.exception))
+        backend = RedisBackend.from_url(
+            "redis://127.0.0.1:6379/0?retry_on_timeout=false", retry=Retry(NoBackoff(), 0)
+        )
+        connection = backend._client.connection_pool.make_connection()
+        self.assertEqual(connection.retry._retries, 0)
+
+    def test_a_client_handed_in_lends_its_settings_and_is_left_as_it_was(self):
+        from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
+        from redis.asyncio.retry import Retry
+        from redis.asyncio.sentinel import Sentinel
+        from redis.backoff import NoBackoff
+
+        blocking = BlockingConnectionPool.from_url(
+            "redis://127.0.0.1:6379/3", max_connections=7, timeout=4, retry_on_timeout=True
+        )
+        for client in (
+            Redis(host="127.0.0.1", port=6379),
+            Redis(connection_pool=ConnectionPool.from_url(
+                "redis://127.0.0.1:6379/0", retry=Retry(NoBackoff(), 2), retry_on_timeout=True
+            )),
+            Redis(connection_pool=blocking),
+            Sentinel([("127.0.0.1", 26379)]).master_for("primary"),
+        ):
+            with self.subTest(client=client):
+                pool = client.connection_pool
+                kind, settings = type(pool), dict(pool.connection_kwargs)
+                existing = pool.make_connection()
+                retries = existing.retry._retries
+                pool._available_connections.append(existing)
+                own = RedisBackend(client)._client.connection_pool
+                self.assertIsNot(own, pool)
+                self.assertIs(type(pool), kind)
+                self.assertEqual(pool.connection_kwargs, settings)
+                self.assertEqual(existing.retry._retries, retries)
+                self.assertEqual(own.make_connection().retry._retries, 0)
+                self.assertEqual(own.max_connections, pool.max_connections)
+                for name in ("host", "port", "db"):
+                    self.assertEqual(own.connection_kwargs.get(name), settings.get(name))
+        copied = RedisBackend(Redis(connection_pool=blocking))._client.connection_pool
+        self.assertEqual(copied.timeout, 4)
+        sentinel = Sentinel([("127.0.0.1", 26379)]).master_for("primary")
+        own = RedisBackend(sentinel)._client.connection_pool
+        self.assertEqual(own.service_name, "primary")
+        self.assertIs(own.sentinel_manager, sentinel.connection_pool.sentinel_manager)
+
+    def test_a_url_without_a_password_keeps_its_reason(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            RedisBackend.from_url("redis://cache.internal:port/0")
+        self.assertIn("Port could not be cast", str(caught.exception))
 
 
 class RedisInstallTests(unittest.TestCase):

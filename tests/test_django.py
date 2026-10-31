@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import uuid
 import tempfile
 import threading
 import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from tinyjobs.exceptions import UnknownTaskError
+from tinyjobs.exceptions import ConfigurationError, UnknownTaskError
+
+POSTGRES_URL = os.environ.get("TINYJOBS_POSTGRES_URL")
+
+try:
+    import psycopg
+    from psycopg.conninfo import conninfo_to_dict
+except ImportError:
+    psycopg = None
 
 try:
     import django
@@ -24,11 +34,22 @@ def setUpModule() -> None:
 
     if settings.configured:
         return
+    databases = {
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
+    }
+    if POSTGRES_URL and psycopg is not None:
+        settings_of = conninfo_to_dict(POSTGRES_URL)
+        databases["pg"] = {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": settings_of.get("dbname", ""),
+            "USER": settings_of.get("user", ""),
+            "PASSWORD": settings_of.get("password", ""),
+            "HOST": settings_of.get("host", ""),
+            "PORT": settings_of.get("port", ""),
+        }
     settings.configure(
         INSTALLED_APPS=["tinyjobs.contrib.django", "tests.djangoapp"],
-        DATABASES={
-            "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
-        },
+        DATABASES=databases,
         USE_TZ=True,
         TASKS={},
     )
@@ -429,6 +450,14 @@ class EagerTests(DjangoTestCase):
         self.assertEqual(result.return_value, 10)
 
 
+class EagerDatabaseTests(DjangoTestCase):
+    options = {"eager": True, "database": "default"}
+
+    def test_eager_mode_ignores_the_database_and_still_runs_the_task(self):
+        result = self.tasks.double.enqueue(6)
+        self.assertEqual((result.status, result.return_value), ("SUCCESSFUL", 12))
+
+
 class CommandTests(DjangoTestCase):
     def call(self, *arguments: str) -> str:
         from django.core.management import call_command
@@ -473,6 +502,156 @@ class CommandTests(DjangoTestCase):
         ):
             with self.assertRaises(CommandError):
                 self.call("stats")
+
+
+@unittest.skipIf(django is None, "pip install django to run the django tests")
+@unittest.skipUnless(
+    POSTGRES_URL and psycopg is not None,
+    "set TINYJOBS_POSTGRES_URL and install psycopg to run the django postgres tests",
+)
+class TransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with psycopg.connect(POSTGRES_URL) as connection:
+            version = connection.info.server_version
+        if version < 150000:
+            self.skipTest("django 6 needs postgres 15 or newer")
+        self.prefix = f"tinyjobs_test_{uuid.uuid4().hex[:16]}"
+        self.backend = self.configured({"database": "pg"})
+        from django.db import connections
+
+        from tests.djangoapp import tasks
+
+        self.tasks = tasks
+        self.addCleanup(connections["pg"].close)
+        self.addCleanup(self.dropped)
+
+    def configured(self, extra: dict):
+        overrides = override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+                    "QUEUES": ["default", "emails"],
+                    "OPTIONS": {"url": POSTGRES_URL, "prefix": self.prefix, **extra},
+                }
+            }
+        )
+        overrides.enable()
+        self.addCleanup(overrides.disable)
+        from django.tasks import default_task_backend
+
+        self.addCleanup(default_task_backend.app.close)
+        return default_task_backend
+
+    def dropped(self) -> None:
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as connection:
+            for table in ("executions", "jobs", "schedules", "meta"):
+                connection.execute(f'DROP TABLE IF EXISTS "{self.prefix}_{table}" CASCADE')
+
+    def stored(self, result):
+        return self.backend.app.get(result.id)
+
+    def test_a_task_enqueued_inside_atomic_appears_when_it_commits(self):
+        from django.db import transaction
+
+        with transaction.atomic(using="pg"):
+            result = self.tasks.double.enqueue(2)
+            self.assertIsNone(self.stored(result))
+        self.assertEqual(self.stored(result).task, "tests.djangoapp.tasks.double")
+        self.assertEqual(self.backend.app.drain(), 1)
+        self.assertEqual(self.backend.get_result(result.id).return_value, 4)
+
+    def test_a_task_enqueued_inside_a_rolled_back_atomic_is_never_stored(self):
+        from django.db import transaction
+
+        with self.assertRaises(ZeroDivisionError):
+            with transaction.atomic(using="pg"):
+                result = self.tasks.double.enqueue(2)
+                1 / 0
+        self.assertIsNone(self.stored(result))
+
+    def test_a_rolled_back_savepoint_takes_only_its_own_tasks(self):
+        from django.db import transaction
+
+        with transaction.atomic(using="pg"):
+            kept = self.tasks.double.enqueue(1)
+            with contextlib.suppress(ZeroDivisionError):
+                with transaction.atomic(using="pg"):
+                    dropped = self.tasks.double.enqueue(2)
+                    1 / 0
+        self.assertIsNotNone(self.stored(kept))
+        self.assertIsNone(self.stored(dropped))
+
+    def test_a_task_enqueued_outside_atomic_is_stored_at_once(self):
+        result = self.tasks.greet.enqueue("ada")
+        self.assertEqual(self.stored(result).queue, "emails")
+
+    def test_aenqueue_joins_the_transaction_of_the_calling_thread(self):
+        from asgiref.sync import async_to_sync
+        from django.db import transaction
+
+        with self.assertRaises(ZeroDivisionError):
+            with transaction.atomic(using="pg"):
+                result = async_to_sync(self.tasks.double.aenqueue)(5)
+                self.assertIsNone(self.stored(result))
+                1 / 0
+        self.assertIsNone(self.stored(result))
+
+    def dropped_by_the_server(self):
+        from django.db import connections
+
+        self.tasks.double.enqueue(1)
+        wrapper = connections["pg"]
+        wrapper.close_at = None
+        with psycopg.connect(POSTGRES_URL, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(%s)", [wrapper.connection.info.backend_pid]
+            )
+        return wrapper
+
+    def test_a_connection_the_server_dropped_is_replaced_after_the_request(self):
+        from django.db import OperationalError, close_old_connections
+
+        wrapper = self.dropped_by_the_server()
+        with self.assertRaises(OperationalError) as caught:
+            self.tasks.double.enqueue(2)
+        self.assertIsInstance(caught.exception.__cause__, psycopg.OperationalError)
+        self.assertTrue(wrapper.errors_occurred)
+        close_old_connections()
+        result = self.tasks.double.enqueue(3)
+        self.assertIsNotNone(self.stored(result))
+
+    def test_a_health_check_replaces_a_dropped_connection_before_enqueueing(self):
+        wrapper = self.dropped_by_the_server()
+        wrapper.health_check_enabled = True
+        wrapper.health_check_done = False
+        result = self.tasks.double.enqueue(2)
+        self.assertIsNotNone(self.stored(result))
+
+    def test_a_connection_from_another_thread_is_refused_as_django_refuses_it(self):
+        from django.db import DatabaseError, connections
+
+        self.tasks.double.enqueue(1)
+        wrapper = connections["pg"]
+        raised = []
+
+        def enqueue_elsewhere() -> None:
+            connections["pg"] = wrapper
+            try:
+                self.tasks.double.enqueue(2)
+            except DatabaseError as error:
+                raised.append(error)
+
+        other = threading.Thread(target=enqueue_elsewhere)
+        other.start()
+        other.join(10)
+        self.assertEqual(len(raised), 1)
+        self.assertIn("same thread", str(raised[0]))
+        self.assertEqual(len(self.backend.app.jobs().items), 1)
+
+    def test_a_database_that_is_not_postgres_is_refused(self):
+        backend = self.configured({"database": "default"})
+        with self.assertRaisesRegex(ConfigurationError, "not PostgreSQL"):
+            self.tasks.double.using(backend=backend.alias).enqueue(1)
 
 
 class ExceptionPathTests(unittest.TestCase):

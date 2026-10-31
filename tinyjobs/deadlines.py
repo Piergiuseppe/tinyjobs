@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import math
+import time
+from contextlib import asynccontextmanager, contextmanager
+from typing import Any, AsyncIterator, Iterator
+
+GRACE_SECONDS = 0.5
+
+
+class Deadline:
+    __slots__ = ("at", "outer")
+
+    def __init__(self, at: float = math.inf, outer: Deadline | None = None) -> None:
+        self.at = at
+        self.outer = outer
+
+    def left(self) -> float:
+        at, outer = self.at, self.outer
+        while outer is not None:
+            at, outer = min(at, outer.at), outer.outer
+        return at - time.monotonic()
+
+    def end(self, at: float) -> None:
+        self.at = min(self.at, at)
+
+
+current: contextvars.ContextVar[Deadline | None] = contextvars.ContextVar(
+    "tinyjobs_deadline", default=None
+)
+final: contextvars.ContextVar[Deadline | None] = contextvars.ContextVar(
+    "tinyjobs_final_deadline", default=None
+)
+
+
+def left() -> float:
+    deadline = current.get()
+    return math.inf if deadline is None else deadline.left()
+
+
+@contextmanager
+def until(at: float) -> Iterator[Deadline]:
+    deadline = Deadline(at, current.get())
+    token = current.set(deadline)
+    try:
+        yield deadline
+    finally:
+        current.reset(token)
+
+
+@contextmanager
+def under(deadline: Deadline) -> Iterator[Deadline]:
+    token = current.set(deadline)
+    try:
+        yield deadline
+    finally:
+        current.reset(token)
+
+
+class bounded:
+    __slots__ = ("_at", "_token", "_timeout")
+
+    def __init__(self, at: float) -> None:
+        self._at = at
+
+    async def __aenter__(self) -> Deadline:
+        deadline = Deadline(self._at, current.get())
+        self._token = current.set(deadline)
+        remaining = deadline.left()
+        self._timeout = asyncio.timeout(
+            None if remaining == math.inf else max(0.0, remaining) + GRACE_SECONDS
+        )
+        try:
+            await self._timeout.__aenter__()
+        except BaseException:
+            current.reset(self._token)
+            raise
+        return deadline
+
+    async def __aexit__(self, kind: Any, error: Any, trace: Any) -> bool | None:
+        try:
+            return await self._timeout.__aexit__(kind, error, trace)
+        finally:
+            current.reset(self._token)
+
+
+@asynccontextmanager
+async def lastly(seconds: float) -> AsyncIterator[Deadline]:
+    hard = final.get()
+    deadline = Deadline(time.monotonic() + seconds, current.get() if hard is None else hard)
+    with under(deadline):
+        async with asyncio.timeout(max(0.0, deadline.left()) + GRACE_SECONDS):
+            yield deadline

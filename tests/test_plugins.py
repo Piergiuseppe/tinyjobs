@@ -14,7 +14,7 @@ from tinyjobs.backends import (
     load_backend,
     register_builtin,
 )
-from tinyjobs.backends.loader import ENTRY_POINT_GROUP
+from tinyjobs.backends.loader import ENTRY_POINT_GROUP, scheme_of
 from tinyjobs.exceptions import UnknownBackendError, UnsupportedCapabilityError
 
 
@@ -63,15 +63,27 @@ class BackendResolutionTests(unittest.TestCase):
 
     def test_unknown_scheme_names_the_missing_package(self):
         with self.assertRaises(UnknownBackendError) as caught:
-            load_backend("postgres://localhost/jobs")
+            load_backend("mysql://localhost/jobs")
         message = str(caught.exception)
-        self.assertIn("postgres", message)
-        self.assertIn("pip install tinyjobs-postgres", message)
+        self.assertIn("mysql", message)
+        self.assertIn("pip install tinyjobs-mysql", message)
         self.assertIn("sqlite", message)
 
     def test_a_url_without_a_scheme_is_rejected(self):
         with self.assertRaises(UnknownBackendError):
             load_backend("jobs.db")
+
+    def test_a_url_without_a_scheme_is_never_repeated_back(self):
+        with self.assertRaises(UnknownBackendError) as caught:
+            load_backend("host=db password=Zq9secret")
+        self.assertNotIn("Zq9secret", str(caught.exception))
+
+    def test_leading_whitespace_before_the_scheme_is_ignored(self):
+        self.assertEqual(scheme_of(" \tsqlite:///jobs.db"), "sqlite")
+
+    def test_a_nul_before_the_scheme_is_not_taken_for_whitespace(self):
+        with self.assertRaises(UnknownBackendError):
+            scheme_of("\x00sqlite:///jobs.db")
 
     def test_the_entry_point_group_is_stable(self):
         self.assertEqual(ENTRY_POINT_GROUP, "tinyjobs.backends")
@@ -148,6 +160,12 @@ class CapabilityTests(unittest.TestCase):
     def test_requesting_a_delay_on_a_backend_without_it_fails_at_enqueue(self):
         with self.assertRaises(UnsupportedCapabilityError):
             self.handler.with_options(delay=60).enqueue()
+
+    def test_enqueueing_inside_a_transaction_on_a_backend_without_it_fails(self):
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "inside a transaction"):
+            self.handler.with_options(tx=object()).enqueue()
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "inside a transaction"):
+            asyncio.run(self.app.asend("handler", tx=object()))
 
     def test_a_plain_enqueue_still_works(self):
         self.assertIsNotNone(self.handler.enqueue())

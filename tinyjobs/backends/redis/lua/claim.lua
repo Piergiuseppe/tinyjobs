@@ -1,7 +1,8 @@
 local worker, lease_expires_at, limit = ARGV[2], lease_until(ARGV[3]), tonumber(ARGV[4])
+local token = ARGV[5]
 local PROMOTE_BATCH = 100
 local candidates = {}
-for index = 5, #ARGV do
+for index = 6, #ARGV do
   local queue = ARGV[index]
   local due = redis.call('ZRANGEBYSCORE', key('waiting', queue), '-inf', HORIZON, 'LIMIT', 0, PROMOTE_BATCH)
   for _, id in ipairs(due) do
@@ -24,13 +25,7 @@ local claimed = {}
 for index = 1, math.min(limit, #candidates) do
   local id = string.match(candidates[index].member, '|(.+)$')
   local job = load(id)
-  transition(job, 'running', {
-    worker_id = worker,
-    attempts = tostring(tonumber(job.attempts) + 1),
-    claims = tostring(tonumber(claim_of(job)) + 1),
-    lease_expires_at = lease_expires_at,
-  })
-  start_execution(job)
+  take(job, worker, lease_expires_at, token)
   claimed[#claimed + 1] = flatten(job)
 end
 return claimed

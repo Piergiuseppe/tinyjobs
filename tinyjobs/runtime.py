@@ -13,11 +13,13 @@ import os
 import threading
 import time
 import weakref
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from functools import partial
 from queue import SimpleQueue
-from typing import Any, Callable, Coroutine, TypeVar
+from typing import Any, Callable, Coroutine, Iterator, TypeVar
 
+from .deadlines import current as current_deadline
 from .exceptions import (
     AppClosedError,
     EventLoopStoppedError,
@@ -57,6 +59,8 @@ EXITING_MESSAGE = (
 )
 
 STOP_SECONDS = 5.0
+INSIST_SECONDS = 0.5
+RECHECK_SECONDS = 0.05
 FORK_PAUSE_SECONDS = 0.1
 FORK_ACK_SECONDS = 1.0
 LOOP_THREAD_PREFIX = "tinyjobs-loop"
@@ -89,6 +93,7 @@ _watched: dict[weakref.ref, list[Any]] = {}
 _closing: set[threading.Thread] = set()
 _kept: "weakref.WeakSet[asyncio.Task]" = weakref.WeakSet()
 _keeping: contextvars.ContextVar[bool] = contextvars.ContextVar("tinyjobs_keeping", default=False)
+_sparing: contextvars.ContextVar[bool] = contextvars.ContextVar("tinyjobs_sparing", default=False)
 _inbox: SimpleQueue = SimpleQueue()
 _fork_marks: dict[int, int] = {}
 _after_fork_actions: dict[int, Any] = {}
@@ -565,7 +570,12 @@ def _cancel(request: _Request) -> bool:
 
 def _cancel_task(request: _Request) -> None:
     if request.task is not None:
-        request.task.cancel()
+        _cancel_once(request.task)
+
+
+def _cancel_once(task: asyncio.Task) -> None:
+    if not task.cancelling():
+        task.cancel()
 
 
 def _settle_request(
@@ -661,7 +671,7 @@ class LoopRunner:
     def close_here(self) -> None:
         loop, thread = self._take_own()
         if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=STOP_SECONDS)
+            thread.join(timeout=STOP_SECONDS + INSIST_SECONDS)
 
     def _take_own(self) -> tuple[asyncio.AbstractEventLoop | None, Any]:
         with self._guard:
@@ -789,11 +799,13 @@ class LoopRunner:
         _ending.add(loop)
         _resting.discard(loop)
         deadline = time.monotonic() + STOP_SECONDS
-        _finish_tasks(loop, deadline)
+        finishing = _Finishing()
+        _finish_tasks(loop, deadline, spare=True, finishing=finishing)
         for resident in residents:
             with suppress(Exception):
                 loop.run_until_complete(resident.close())
-            _finish_tasks(loop, deadline)
+            _finish_tasks(loop, deadline, spare=True, finishing=finishing)
+        _finish_tasks(loop, deadline, finishing=finishing)
         loop.close()
         self._settle_left(loop)
 
@@ -821,16 +833,49 @@ class LoopRunner:
         self._paused, self._keep_serving = None, False
 
 
-def _finish_tasks(loop: asyncio.AbstractEventLoop, deadline: float) -> None:
-    asked: set[asyncio.Task] = set()
+@contextmanager
+def spared_until_close() -> Iterator[None]:
+    token = _sparing.set(True)
+    try:
+        yield
+    finally:
+        _sparing.reset(token)
+
+
+@dataclass
+class _Finishing:
+    asked: set[asyncio.Task] = field(default_factory=set)
+    insisted: set[asyncio.Task] = field(default_factory=set)
+
+
+def _finish_tasks(
+    loop: asyncio.AbstractEventLoop,
+    deadline: float,
+    *,
+    spare: bool = False,
+    finishing: _Finishing | None = None,
+) -> None:
+    state = _Finishing() if finishing is None else finishing
+    asked = state.asked
     loop.run_until_complete(asyncio.sleep(0))
-    while pending := asyncio.all_tasks(loop):
+    while pending := {
+        task
+        for task in asyncio.all_tasks(loop)
+        if not (spare and task.get_context().get(_sparing, False))
+    }:
         left = deadline - time.monotonic()
         fresh = [
             task
             for task in pending
             if task not in asked and (left <= 0 or not _is_kept(task))
         ]
+        stubborn = pending - state.insisted
+        if not fresh and left <= 0 and stubborn:
+            state.insisted |= stubborn
+            for task in stubborn:
+                task.cancel()
+            loop.run_until_complete(asyncio.wait(stubborn, timeout=INSIST_SECONDS))
+            continue
         if not fresh and left <= 0:
             logger.warning(
                 "%d task(s) ignored cancellation; closing the loop without them: %s",
@@ -839,15 +884,24 @@ def _finish_tasks(loop: asyncio.AbstractEventLoop, deadline: float) -> None:
             )
             return
         for task in fresh:
-            task.cancel()
+            _cancel_once(task)
             asked.add(task)
-        loop.run_until_complete(asyncio.wait(pending, timeout=max(left, 0)))
+        for task in pending & asked:
+            if not task.done() and not task.cancelling():
+                task.cancel()
+        loop.run_until_complete(
+            asyncio.wait(pending, timeout=min(max(left, 0), RECHECK_SECONDS))
+        )
         loop.run_until_complete(asyncio.sleep(0))
     loop.run_until_complete(asyncio.sleep(0))
 
 
 def _is_kept(task: asyncio.Task) -> bool:
-    return task in _kept or task.get_context().get(_keeping, False)
+    context = task.get_context()
+    if not (task in _kept or context.get(_keeping, False)):
+        return False
+    deadline = context.get(current_deadline)
+    return deadline is None or deadline.left() > 0
 
 
 def _gone(loop: asyncio.AbstractEventLoop) -> bool:
@@ -897,7 +951,7 @@ def _abandon(
 ) -> None:
     if outcome.cancelled():
         with suppress(RuntimeError):
-            loop.call_soon_threadsafe(task.cancel)
+            loop.call_soon_threadsafe(_cancel_once, task)
 
 
 def _stop(loop: asyncio.AbstractEventLoop) -> None:

@@ -13,10 +13,10 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Piergiuseppe D'Abbraccio", email = "piergiuseppedabbraccio@gmail.com" },
 ]
-keywords = ["jobs", "queue", "cron", "background", "sqlite", "worker", "tasks", "django", "fastapi"]
+keywords = ["jobs", "queue", "cron", "background", "sqlite", "postgres", "redis", "worker", "tasks", "django", "fastapi"]
 dependencies = []
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Framework :: Django",
     "Framework :: Django :: 6.0",
     "Framework :: FastAPI",
@@ -32,6 +32,7 @@ classifiers = [
 
 [project.optional-dependencies]
 redis = ["redis>=5.0.1"]
+postgres = ["psycopg[binary]>=3.2,<3.4", "psycopg-pool>=3.2,<3.4"]
 
 [project.urls]
 Homepage = "https://github.com/Piergiuseppe/tinyjobs"
