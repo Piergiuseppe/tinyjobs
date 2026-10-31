@@ -24,6 +24,7 @@ from ..runtime import inside_running_loop
 from ..deadlines import GRACE_SECONDS, Deadline, bounded, current, final, under
 from ..duration import format_seconds
 from ..executors import ExecutorResolver
+from ..flag import Flag
 from ..polling import AdaptiveInterval
 from ..services.execution import current_runner
 from ..services.lifecycle import VERIFY_SECONDS
@@ -97,9 +98,9 @@ class Worker:
             async_concurrency=self._async_concurrency,
             freed=self._freed,
         )
-        self._stopping = asyncio.Event()
-        self._forced = asyncio.Event()
-        self._capacity = asyncio.Event()
+        self._stopping = Flag()
+        self._forced = Flag()
+        self._capacity = Flag()
         self._capacity.set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown_timeout = self._configured_shutdown_timeout
@@ -108,6 +109,9 @@ class Worker:
         self._admitting = Deadline()
         self._beating = Deadline()
         self._sparing: asyncio.Task | None = None
+        self._claiming: asyncio.Task | None = None
+        self._giving_up: asyncio.TimerHandle | None = None
+        self._gave_up = False
         self._reserved: Any = None
         self._waves = 1
         self._transient: tuple[type[BaseException], ...] = ()
@@ -231,6 +235,7 @@ class Worker:
         return background
 
     async def _claim_loop(self) -> None:
+        await asyncio.sleep(0)
         while not self._stopping.is_set():
             capacity = self._concurrency - len(self._inflight) - self._executors.strays
             if capacity <= 0:
@@ -264,35 +269,42 @@ class Worker:
             return []
 
     async def _claimed(self, capacity: int) -> list[Job]:
-        with under(Deadline(math.inf, self._admitting)):
-            claiming = asyncio.ensure_future(
-                self._app.backend.claim(
+        claiming = asyncio.current_task()
+        self._claiming = claiming
+        try:
+            with under(Deadline(math.inf, self._admitting)):
+                return await self._app.backend.claim(
                     worker_id=self._id,
                     queues=self._queues,
                     limit=capacity,
                     lease_seconds=self._lease_seconds,
                 )
-            )
-        stopping = asyncio.ensure_future(self._stopping.wait())
-        forced = asyncio.ensure_future(self._forced.wait())
-        try:
-            await asyncio.wait({claiming, stopping}, return_when=asyncio.FIRST_COMPLETED)
-            if not claiming.done():
-                await asyncio.wait(
-                    {claiming, forced},
-                    timeout=max(0.0, self._admitting.left()),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            if not claiming.done():
-                logger.warning(
-                    "a claim was still waiting on the backend at shutdown; giving it up"
-                )
-                return []
-            return claiming.result()
+        except asyncio.CancelledError:
+            if not self._gave_up or claiming is None or claiming.uncancel() > 0:
+                raise
+            logger.warning("a claim was still waiting on the backend at shutdown; giving it up")
+            return []
         finally:
-            for task in (claiming, stopping, forced):
-                task.cancel()
-            await asyncio.gather(claiming, stopping, forced, return_exceptions=True)
+            self._claiming = None
+            self._gave_up = False
+            if self._giving_up is not None:
+                self._giving_up.cancel()
+                self._giving_up = None
+
+    def _give_up_claim(self) -> None:
+        self._giving_up = None
+        if self._claiming is not None and not self._gave_up:
+            self._gave_up = True
+            self._claiming.cancel()
+
+    def _bound_claim(self) -> None:
+        if self._claiming is None or self._giving_up is not None:
+            return
+        left = self._admitting.left()
+        if left <= 0:
+            self._give_up_claim()
+            return
+        self._giving_up = asyncio.get_running_loop().call_later(left, self._give_up_claim)
 
     def _launch(self, job: Job) -> None:
         key = (job.id, job.claims)
@@ -634,20 +646,16 @@ class Worker:
     async def _until(
         self, tasks: Collection[asyncio.Task], deadline: Deadline, grace: float = 0.0
     ) -> None:
-        forced = asyncio.ensure_future(self._forced.wait())
-        try:
-            while pending := {task for task in tuple(tasks) if not task.done()}:
-                left = deadline.left() + grace
-                if left <= 0:
-                    return
-                await asyncio.wait(
-                    pending if forced.done() else {*pending, forced},
-                    timeout=None if left == math.inf else left,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-        finally:
-            forced.cancel()
-            await asyncio.gather(forced, return_exceptions=True)
+        while pending := {task for task in tuple(tasks) if not task.done()}:
+            left = deadline.left() + grace
+            if left <= 0:
+                return
+            forced = self._forced.raised()
+            await asyncio.wait(
+                pending if forced.done() else {*pending, forced},
+                timeout=None if left == math.inf else left,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
     def _leave_behind(self, tasks: set[asyncio.Task]) -> None:
         behind = [task for task in tasks if not task.done()]
@@ -685,16 +693,10 @@ class Worker:
         window = _release_window(self._configured_shutdown_timeout) * self._waves
         thread.add_done_callback(partial(_ended_by, asyncio.get_running_loop(), run, window))
 
-    async def _wait_for(self, event: asyncio.Event) -> None:
-        waiters = [
-            asyncio.create_task(event.wait()),
-            asyncio.create_task(self._stopping.wait()),
-        ]
-        done, pending = await asyncio.wait(
-            waiters, return_when=asyncio.FIRST_COMPLETED
+    async def _wait_for(self, flag: Flag) -> None:
+        await asyncio.wait(
+            {flag.raised(), self._stopping.raised()}, return_when=asyncio.FIRST_COMPLETED
         )
-        for task in pending:
-            task.cancel()
 
     async def _idle(self, seconds: float) -> None:
         try:
@@ -707,26 +709,23 @@ class Worker:
         waiting = asyncio.create_task(
             backend.wait_for_jobs(worker_id=self._id, queues=self._queues, timeout=seconds)
         )
-        stopping = asyncio.create_task(self._stopping.wait())
         try:
-            await asyncio.wait({waiting, stopping}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(
+                {waiting, self._stopping.raised()}, return_when=asyncio.FIRST_COMPLETED
+            )
         finally:
-            for task in (waiting, stopping):
-                task.cancel()
-            await asyncio.gather(waiting, stopping, return_exceptions=True)
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
         failure = None if waiting.cancelled() else waiting.exception()
         if failure is not None and not isinstance(failure, AppClosedError):
             logger.warning("waiting for new jobs failed: %s", failure)
             await self._pause(seconds)
 
     async def _pause(self, seconds: float) -> None:
-        try:
-            await asyncio.wait_for(self._stopping.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            return
+        await asyncio.wait({self._stopping.raised()}, timeout=seconds)
 
     def _request_stop(
-        self, stopping: asyncio.Event | None = None, ending: Deadline | None = None
+        self, stopping: Flag | None = None, ending: Deadline | None = None
     ) -> None:
         logger.info("shutdown requested; finishing in-flight jobs")
         now, timeout = time.monotonic(), self._shutdown_timeout
@@ -736,8 +735,10 @@ class Worker:
             self._writing.end(now + timeout - min(VERIFY_SECONDS, window / 2))
         (self._ending if ending is None else ending).end(now + timeout)
         (self._stopping if stopping is None else stopping).set()
-        if (ending is None or ending is self._ending) and self._sparing is None:
-            self._spare()
+        if ending is None or ending is self._ending:
+            self._bound_claim()
+            if self._sparing is None:
+                self._spare()
 
     def _spare(self) -> None:
         if not self._serving:
@@ -775,6 +776,7 @@ class Worker:
         self._admitting.end(now)
         self._writing.end(now + RELEASE_SECONDS / 2)
         self._ending.end(now + RELEASE_SECONDS)
+        self._give_up_claim()
         for task, run in tuple(self._running.items()):
             if self._settling.get(run.key) is False:
                 continue

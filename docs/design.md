@@ -1564,6 +1564,13 @@ thread, and the exit closes only the connections no live thread is using, so a w
 in a daemon thread cannot crash the process. A job task cancelled before it starts is released the
 same way as one cancelled while it runs.
 
+These guards cost little per job. A drain keeps one renewal timer for all the jobs it holds, a SQLite
+call waits on a future its thread fills rather than on a shielded task, a job without a timeout
+starts without a message back to the loop, and a claim runs inside the worker's loop task with a
+timer that gives it up at shutdown. Draining 10,000 jobs took 3.03 seconds in memory, 3.84 on
+SQLite and 5.65 on Redis, against 3.01, 3.82 and 5.37 before these guards existed; three CLI workers
+of concurrency 8 ran 4,408 jobs a second on SQLite and 5,928 on Redis, against 4,547 and 6,338.
+
 A drain leases each job for a minute and renews the lease every 20 seconds while the job runs, so
 the job of a drain killed mid-run comes back within a minute, where its one-hour lease stranded it
 for an hour; and it writes a job's outcome again after an error that means the store could not be

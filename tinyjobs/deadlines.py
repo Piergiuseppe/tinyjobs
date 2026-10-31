@@ -5,7 +5,7 @@ import contextvars
 import math
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 GRACE_SECONDS = 0.5
 
@@ -59,14 +59,31 @@ def under(deadline: Deadline) -> Iterator[Deadline]:
         current.reset(token)
 
 
-@asynccontextmanager
-async def bounded(at: float) -> AsyncIterator[Deadline]:
-    with until(at) as deadline:
+class bounded:
+    __slots__ = ("_at", "_token", "_timeout")
+
+    def __init__(self, at: float) -> None:
+        self._at = at
+
+    async def __aenter__(self) -> Deadline:
+        deadline = Deadline(self._at, current.get())
+        self._token = current.set(deadline)
         remaining = deadline.left()
-        async with asyncio.timeout(
+        self._timeout = asyncio.timeout(
             None if remaining == math.inf else max(0.0, remaining) + GRACE_SECONDS
-        ):
-            yield deadline
+        )
+        try:
+            await self._timeout.__aenter__()
+        except BaseException:
+            current.reset(self._token)
+            raise
+        return deadline
+
+    async def __aexit__(self, kind: Any, error: Any, trace: Any) -> bool | None:
+        try:
+            return await self._timeout.__aexit__(kind, error, trace)
+        finally:
+            current.reset(self._token)
 
 
 @asynccontextmanager

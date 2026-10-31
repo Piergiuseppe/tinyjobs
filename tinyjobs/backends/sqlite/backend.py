@@ -22,7 +22,7 @@ from ...models import (
 from ...retention import RetentionPolicy
 from ...exceptions import AppClosedError
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
-from ...sheltered import sheltered
+from ...sheltered import landing
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
@@ -163,12 +163,12 @@ class SQLiteBackend(BaseBackend):
                 if self._closed or function.__name__ not in RETURNING_CALLS:
                     raise AppClosedError(EXECUTOR_GONE_MESSAGE) from error
                 return _gated(None, function, *args)
-            pending = asyncio.wrap_future(running)
             try:
-                result = await sheltered(pending)
+                result = await landing(running)
             except asyncio.CancelledError:
-                pending.add_done_callback(_retrieved)
                 if not running.cancel():
+                    pending = asyncio.wrap_future(running)
+                    pending.add_done_callback(_retrieved)
                     await asyncio.wait({pending}, timeout=CANCELLED_CALL_SECONDS)
                 raise
             if result is not STEPPED_ASIDE:

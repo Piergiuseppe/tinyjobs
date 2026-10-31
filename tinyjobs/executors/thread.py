@@ -51,15 +51,12 @@ class ThreadExecutor(Executor):
 
     async def execute(self, task: "Task", payload: JobPayload) -> Any:
         loop = asyncio.get_running_loop()
-        started: asyncio.Future[float] = loop.create_future()
         owner = asyncio.current_task()
-        context = copy_context()
-        call = partial(
-            _started,
-            loop,
-            started,
-            partial(context.run, task.function, *payload.args, **payload.kwargs),
-        )
+        call = partial(copy_context().run, task.function, *payload.args, **payload.kwargs)
+        started: asyncio.Future[float] | None = None
+        if task.timeout is not None:
+            started = loop.create_future()
+            call = partial(_started, loop, started, call)
         try:
             running = self._pool.submit(call)
         except RuntimeError as error:
@@ -69,7 +66,7 @@ class ThreadExecutor(Executor):
         self._threaded[owner] = running
         try:
             future = asyncio.wrap_future(running)
-            if task.timeout is None:
+            if started is None:
                 return await future
             try:
                 await asyncio.wait({future, started}, return_when=asyncio.FIRST_COMPLETED)
@@ -81,7 +78,8 @@ class ThreadExecutor(Executor):
             left = started.result() + task.timeout - time.monotonic()
             return await asyncio.wait_for(sheltered(future), max(0.0, left))
         finally:
-            started.cancel()
+            if started is not None:
+                started.cancel()
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
             if not running.cancel() and not running.done():

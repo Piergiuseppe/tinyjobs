@@ -503,23 +503,6 @@ class DrainTests(unittest.TestCase):
         self.assertIs(job.refresh().status, JobStatus.SUCCESS)
         self.assertEqual((self.calls, returned), (["charged"], []))
 
-    def spend_the_spares(self):
-        import threading
-
-        from tinyjobs.worker.drain import DRAIN_SPARE_THREADS
-
-        held = threading.Event()
-        self.addCleanup(held.set)
-
-        @self.app.task(timeout=0.05, max_attempts=1)
-        def runaway():
-            held.wait(10)
-
-        for _ in range(DRAIN_SPARE_THREADS):
-            runaway.enqueue()
-        self.assertEqual(self.app.drain(), DRAIN_SPARE_THREADS)
-        return held
-
     def test_a_drain_renews_the_lease_of_a_job_while_it_runs(self):
         import time
         from unittest import mock
