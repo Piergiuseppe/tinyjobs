@@ -152,6 +152,10 @@ class RedisBackend(BaseBackend):
             )
 
     async def close(self) -> None:
+        if self._ghosts and not self._closed:
+            self._swept = -math.inf
+            with suppress(Exception):
+                await asyncio.wait_for(self._laid(), CLOSE_SECONDS)
         self._closed = True
         await self._batches.close(AppClosedError(CLOSED_MESSAGE), CLOSE_SECONDS)
         refreshing, self._refreshing = self._refreshing, None
