@@ -40,6 +40,14 @@ FILE_PRAGMAS = ("PRAGMA synchronous = NORMAL",)
 
 WAL_RETRY_SECONDS = 0.05
 
+BUSY_SLICE_SECONDS = 0.1
+
+class _Calling(threading.local):
+    end: Any = None
+
+
+CALLING = _Calling()
+
 SHARED_PRAGMAS = ("PRAGMA foreign_keys = ON",)
 
 FORK_WAIT_SECONDS = 10.0
@@ -405,7 +413,9 @@ FORK_GATE = ForkGate()
 hold_at_fork(FORK_GATE)
 
 
-def _gated(method: Callable[..., Any], on_cursor: bool) -> Callable[..., Any]:
+def _gated(
+    method: Callable[..., Any], on_cursor: bool, waits: bool = False
+) -> Callable[..., Any]:
     get_ident, getpid = _thread.get_ident, os.getpid
 
     def call(*args: Any, **options: Any) -> Any:
@@ -423,7 +433,12 @@ def _gated(method: Callable[..., Any], on_cursor: bool) -> Callable[..., Any]:
             if retired is not None and retired[0] != key:
                 raise sqlite3.ProgrammingError(retired[1])
             opened = connection.in_transaction
-            return method(*args, **options)
+            try:
+                return method(*args, **options)
+            except sqlite3.OperationalError as error:
+                if opened or not waits or not connection.sliced:
+                    raise
+                return _waited(connection, method, args, options, error)
         except sqlite3.Error as error:
             if opened:
                 _note_ending(connection, error)
@@ -435,6 +450,28 @@ def _gated(method: Callable[..., Any], on_cursor: bool) -> Callable[..., Any]:
                 flights.pop(key, None)
 
     return call
+
+
+def _waited(
+    connection: sqlite3.Connection,
+    method: Callable[..., Any],
+    args: tuple[Any, ...],
+    options: dict[str, Any],
+    error: sqlite3.OperationalError,
+) -> Any:
+    until = time.monotonic() + connection.patience - BUSY_SLICE_SECONDS
+    end = CALLING.end
+    while (
+        error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+        and not connection.in_transaction
+        and time.monotonic() < until
+        and (end is None or end.left() > 0)
+    ):
+        try:
+            return method(*args, **options)
+        except sqlite3.OperationalError as again:
+            error = again
+    raise error
 
 
 def _note_ending(connection: sqlite3.Connection, error: sqlite3.Error) -> None:
@@ -564,7 +601,7 @@ def _shut(
 
 
 class GatedCursor(sqlite3.Cursor):
-    execute = _gated(sqlite3.Cursor.execute, True)
+    execute = _gated(sqlite3.Cursor.execute, True, True)
     executemany = _gated(sqlite3.Cursor.executemany, True)
     executescript = _sparing_writes(_gated(sqlite3.Cursor.executescript, True), True)
     fetchone = _gated(sqlite3.Cursor.fetchone, True)
@@ -580,6 +617,9 @@ class GatedConnection(sqlite3.Connection):
         self.retired: tuple[tuple[int, int], str] | None = None
         self.visitors: set[tuple[int, int]] = set()
         self.ending: tuple[weakref.ref, int] | None = None
+        self.patience = 0.0
+        self.wal = False
+        self.sliced = False
         FORK_GATE._register(self)
 
     def cursor(self, factory: Any = GatedCursor) -> sqlite3.Cursor:
@@ -636,6 +676,8 @@ class ConnectionPool:
         self._uri = uri
         self._file = _file_of(database, uri, self)
         self._busy_timeout = busy_timeout
+        self._patient = f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}"
+        self._sliced = f"PRAGMA busy_timeout = {int(min(busy_timeout, BUSY_SLICE_SECONDS) * 1000)}"
         self._local = threading.local()
         self._all: set[sqlite3.Connection] = set()
         self._spare: list[sqlite3.Connection] = []
@@ -768,7 +810,7 @@ class ConnectionPool:
                 scope.handed,
             )
             self._writers[connection] = _WriterRef(scope, settle)
-            connection.execute("BEGIN IMMEDIATE")
+            self._immediate(connection)
             connection.ending = None
             connection.visitors = {(_thread.get_ident(), os.getpid()), *list(connection.flights)}
             scope.state = OPEN
@@ -777,6 +819,21 @@ class ConnectionPool:
             self._finish(scope)
             raise
         return connection
+
+    def _immediate(self, connection: sqlite3.Connection) -> None:
+        sliced = CALLING.end is not None
+        if sliced != connection.sliced:
+            connection.execute(self._sliced if sliced else self._patient)
+            connection.sliced = sliced
+        if not sliced or connection.wal:
+            connection.execute("BEGIN IMMEDIATE")
+            return
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        finally:
+            with suppress(sqlite3.Error):
+                connection.execute(self._patient)
+                connection.sliced = False
 
     def _nest(self, scope: _WriteScope, outer: _WriteScope) -> sqlite3.Connection:
         scope.outer = outer
@@ -1241,11 +1298,13 @@ class ConnectionPool:
 
     def _configure(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout * 1000)}")
+        connection.patience = self._busy_timeout
+        connection.execute(self._patient)
         if not self._uri:
             self._enable_wal(connection)
             for pragma in FILE_PRAGMAS:
                 connection.execute(pragma)
+        connection.wal = connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         for pragma in SHARED_PRAGMAS:
             connection.execute(pragma)
 

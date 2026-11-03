@@ -77,6 +77,7 @@ class FollowingClock(Clock):
     def __init__(self) -> None:
         self._sample: tuple[float, float, float, float] | None = None
         self._stale = False
+        self._jumped = False
         self._source: str | None = None
         self._next_try = 0.0
         self._checked = 0.0
@@ -89,7 +90,7 @@ class FollowingClock(Clock):
         reference, at, wall, _ = sample
         passed = elapsed() - at
         if abs(time.time() - wall - passed) >= JUMP_SECONDS:
-            self._stale = True
+            self._stale = self._jumped = True
         return reference + passed
 
     def from_wall(self, instant: float) -> float:
@@ -104,6 +105,17 @@ class FollowingClock(Clock):
     @property
     def following(self) -> bool:
         return self._sample is not None
+
+    @property
+    def trusted(self) -> bool:
+        sample = self._sample
+        if sample is None or sample[3] <= self._forgotten:
+            return False
+        self.now()
+        return not self._jumped
+
+    def overdue(self) -> bool:
+        return self._sample is None or elapsed() - self._checked >= 2 * FOLLOW_SECONDS
 
     def due(self) -> bool:
         sample = self._sample
@@ -137,11 +149,12 @@ class FollowingClock(Clock):
             kept, at, _, began = current
             self._sample = (kept, at, time.time() - (elapsed() - at), max(began, started))
             self._checked = middle
-            self._stale = False
+            self._stale = self._jumped = False
             return
         self._sample = (reference, middle, time.time() - (elapsed() - middle), started)
         self._checked = middle
         self._stale = slow
+        self._jumped = False
 
     def _compare(
         self, source: str, reference: float, middle: float, spread: float

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -221,6 +222,22 @@ class NativeAsyncBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(done), [0, 1, 2, 3, 4])
         self.assertEqual(self.app.backend.thread_hops, 0)
 
+    async def test_eager_mode_runs_jobs_on_a_backend_that_cannot_claim_one_by_id(self):
+        self.assertFalse(hasattr(RamBackend, "claim_job"))
+        app = TinyJobs("ram://", eager=True)
+        await app.ready()
+        self.addAsyncCleanup(app.aclose)
+
+        ran: list[int] = []
+
+        @app.task
+        async def handler(value):
+            ran.append(value)
+
+        job = await handler.aenqueue(21)
+        self.assertIs(job.status, JobStatus.SUCCESS)
+        self.assertEqual(ran, [21])
+
     async def test_retries_work_against_a_third_party_backend(self):
         tries = []
 
@@ -355,6 +372,125 @@ class HandBackFallbackTests(unittest.IsolatedAsyncioTestCase):
         finally:
             runner.close()
         self.assertEqual(plugin.released, [(job, 5.0)])
+
+
+class ClaimHandBackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_given_up_claim_hands_back_until_its_callers_end_and_names_what_failed(self):
+        from tinyjobs import deadlines
+
+        class Timed(Releasing):
+            def __init__(self) -> None:
+                super().__init__()
+                self.left: list[float] = []
+
+            async def release(self, job: Job, delay: float = 0.0) -> bool:
+                self.left.append(deadlines.left())
+                if job.id == "broken":
+                    raise OSError("gone")
+                return await super().release(job, delay)
+
+        plugin = Timed()
+        runner = LoopRunner()
+        jobs = [
+            Job(name, "task", b"", "json", "default", JobStatus.RUNNING)
+            for name in ("kept", "broken")
+        ]
+        try:
+            wrapper = ManagedBackend(plugin, runner)
+            with deadlines.until(time.monotonic() - 1):
+                with self.assertLogs("tinyjobs.backend", "WARNING") as logs:
+                    end = deadlines.Deadline(time.monotonic() + 30)
+                    await wrapper._hand_back_all(jobs, end)
+        finally:
+            runner.close()
+        self.assertEqual(plugin.released, [(jobs[0], 0.0)])
+        self.assertTrue(all(20 < left <= 30 for left in plugin.left))
+        self.assertIn("broken", logs.output[0])
+        self.assertIn("gone", logs.output[0])
+
+    async def test_a_cancelled_hand_back_still_names_the_jobs_that_failed(self):
+        handing = asyncio.Event()
+
+        class Stuck(Releasing):
+            async def release(self, job: Job, delay: float = 0.0) -> bool:
+                if job.id == "broken":
+                    raise OSError("gone")
+                handing.set()
+                await asyncio.sleep(60)
+                return True
+
+        runner = LoopRunner()
+        jobs = [
+            Job(name, "task", b"", "json", "default", JobStatus.RUNNING)
+            for name in ("broken", "stuck")
+        ]
+        try:
+            wrapper = ManagedBackend(Stuck(), runner)
+            with self.assertLogs("tinyjobs.backend", "WARNING") as logs:
+                task = asyncio.ensure_future(wrapper._hand_back_all(jobs, None))
+                await asyncio.wait_for(handing.wait(), 5)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+        finally:
+            runner.close()
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("stuck", logs.output[0])
+        self.assertIn("cancelled", logs.output[0])
+        self.assertIn("broken", logs.output[1])
+        self.assertIn("gone", logs.output[1])
+
+
+class GivenUpClaimCloseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_slow_hand_back_holds_neither_close_nor_the_loop(self):
+        for loop_bound in (True, False):
+            with self.subTest(loop_bound=loop_bound):
+                await self.closes_at_once(loop_bound)
+
+    async def closes_at_once(self, loop_bound: bool) -> None:
+        from tinyjobs import deadlines
+
+        caller = asyncio.current_task()
+        loop = asyncio.get_running_loop()
+        job = Job("id", "task", b"", "json", "default", JobStatus.RUNNING)
+        handing = threading.Event()
+
+        class Sleepy(Releasing):
+            capabilities = Capabilities(loop_bound=loop_bound)
+
+            async def claim(self, **_) -> list[Job]:
+                await asyncio.sleep(0.3)
+                loop.call_soon_threadsafe(caller.cancel)
+                return [job]
+
+            async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
+                handing.set()
+                await asyncio.sleep(60)
+                return True
+
+            async def close(self) -> None:
+                return None
+
+        runner = LoopRunner()
+        wrapper = ManagedBackend(Sleepy(), runner)
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                with deadlines.until(time.monotonic() + 0.2):
+                    await wrapper.claim(
+                        worker_id="w", queues=["default"], limit=1, lease_seconds=60
+                    )
+            caller.uncancel()
+            self.assertTrue(await asyncio.to_thread(handing.wait, 5))
+            started = time.monotonic()
+            await asyncio.wait_for(wrapper.close(), 15)
+            self.assertLess(time.monotonic() - started, 1.0)
+        finally:
+            started = time.monotonic()
+            with self.assertLogs("tinyjobs.backend", "WARNING") as logs:
+                await asyncio.to_thread(runner.close)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("id", logs.output[0])
+        self.assertIn("cancelled", logs.output[0])
 
 
 class ManagedBackendTests(unittest.TestCase):

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import contextlib
+import os
 import logging
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -394,6 +396,616 @@ class ScheduleCommandTests(FixtureApp, unittest.TestCase):
             sys.modules.pop("plain_app", None)
         self.assertEqual(code, 1)
         self.assertIn("no cron tasks", output)
+
+    def test_a_ctrl_c_after_the_worker_finished_keeps_the_clean_exit(self):
+        import signal
+        from unittest import mock
+
+        import threading
+
+        from tinyjobs.cli import run
+        from tinyjobs.worker.worker import Worker
+
+        running = Worker.run
+
+        def briefly(worker: Worker) -> None:
+            threading.Timer(0.5, worker.stop).start()
+            running(worker)
+
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
+        with mock.patch.object(Worker, "run", briefly), mock.patch(
+            "sys.argv", ["tinyjobs", "worker", "--app", "fixture_app:app", "--no-scheduler"]
+        ):
+            self.assertEqual(run(), 0)
+        from tinyjobs.worker.signals import _exit_cleanly
+
+        self.assertIs(signal.getsignal(signal.SIGINT), _exit_cleanly)
+        self.assertIs(signal.getsignal(signal.SIGTERM), _exit_cleanly)
+
+    def test_main_called_in_process_leaves_the_signal_handlers_it_found(self):
+        import signal
+        from unittest import mock
+
+        from tinyjobs.cli.main import main as entry
+        from tinyjobs.worker.worker import Worker
+
+        def finished(worker: Worker) -> None:
+            worker._finished.set()
+
+        found = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM)}
+        for number, handler in found.items():
+            self.addCleanup(signal.signal, number, handler)
+        with mock.patch.object(Worker, "run", finished), mock.patch(
+            "sys.argv", ["tinyjobs", "worker", "--app", "fixture_app:app"]
+        ):
+            self.assertEqual(entry(), 0)
+        for number, handler in found.items():
+            self.assertIs(signal.getsignal(number), handler)
+
+    def test_a_stop_signal_ends_a_worker_whose_exit_waits_on_a_job_thread(self):
+        import signal
+        import subprocess
+        import sys
+
+        (self.root / "lingering_app.py").write_text(
+            "import threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "lingering.db"}'!r})\n"
+            "@app.task(name='lingering')\n"
+            "def lingering():\n"
+            "    threading.Thread(target=time.sleep, args=(60,), daemon=False).start()\n"
+        )
+        import os
+
+        import tinyjobs
+
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join(
+                [str(Path(tinyjobs.__file__).parents[1]), str(self.root)]
+            ),
+        )
+        enqueue = "from lingering_app import app; app.send('lingering')"
+        subprocess.run([sys.executable, "-c", enqueue], cwd=self.root, env=env, check=True)
+        worker = subprocess.Popen(
+            [sys.executable, "-m", "tinyjobs", "worker", "--app", "lingering_app:app",
+             "--shutdown-timeout", "1", "--no-scheduler"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(2.0)
+            worker.send_signal(signal.SIGTERM)
+            time.sleep(2.5)
+            self.assertIsNone(worker.poll())
+            worker.send_signal(signal.SIGTERM)
+            self.assertEqual(worker.wait(10), 0)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(10)
+
+    def test_a_stop_signal_keeps_the_failure_status_of_a_worker_that_crashed(self):
+        import os
+        import signal
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / "occupied").write_text("")
+        (self.root / "crashing_app.py").write_text(
+            "import threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            "threading.Thread(target=time.sleep, args=(8,), daemon=False).start()\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "occupied" / "jobs.db"}'!r})\n"
+        )
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join(
+                [str(Path(tinyjobs.__file__).parents[1]), str(self.root)]
+            ),
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-m", "tinyjobs", "worker", "--app", "crashing_app:app"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(2.0)
+            worker.send_signal(signal.SIGTERM)
+            self.assertNotEqual(worker.wait(15), 0)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(10)
+
+    def owned_worker(self, module: str, source: str):
+        import os
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / f"{module}.py").write_text(source)
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join(
+                [str(Path(tinyjobs.__file__).parents[1]), str(self.root)]
+            ),
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-m", "tinyjobs", "worker", "--app", f"{module}:app",
+             "--shutdown-timeout", "1", "--no-scheduler"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        worker.args_env = env
+        return worker
+
+    def ended(self, worker) -> tuple[int, str]:
+        try:
+            _, errors = worker.communicate(timeout=20)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.communicate(timeout=10)
+        return worker.returncode, errors
+
+    def test_a_stop_signal_while_the_run_tears_down_keeps_the_clean_exit(self):
+        worker = self.owned_worker(
+            "teardown_app",
+            "import logging, os, signal, threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "teardown.db"}'!r})\n"
+            "class Late(logging.Handler):\n"
+            "    def emit(self, record):\n"
+            "        if record.getMessage().endswith(' stopped'):\n"
+            "            os.kill(os.getpid(), signal.SIGTERM)\n"
+            "            time.sleep(0.3)\n"
+            "logging.getLogger('tinyjobs.worker').addHandler(Late())\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n",
+        )
+        status, errors = self.ended(worker)
+        self.assertEqual(status, 0, errors[-2000:])
+
+    def test_a_stop_signal_ends_a_process_that_waits_on_a_child_process_at_exit(self):
+        import signal
+        import subprocess
+        import sys
+
+        worker = self.owned_worker(
+            "child_app",
+            "import multiprocessing, signal, time\n"
+            "from tinyjobs import TinyJobs\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "child.db"}'!r})\n"
+            "def child():\n"
+            "    signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+            "    time.sleep(12)\n"
+            "@app.task(name='spawning')\n"
+            "def spawning():\n"
+            "    multiprocessing.get_context('fork').Process(target=child).start()\n",
+        )
+        try:
+            subprocess.run(
+                [sys.executable, "-c", "from child_app import app; app.send('spawning')"],
+                cwd=self.root,
+                env=worker.args_env,
+                check=True,
+            )
+            time.sleep(3.0)
+            worker.send_signal(signal.SIGTERM)
+            time.sleep(2.5)
+            self.assertIsNone(worker.poll())
+            worker.send_signal(signal.SIGTERM)
+            self.assertEqual(worker.wait(5), 0)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(10)
+
+    def stalled(self, script: str, pipe: str):
+        import os
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / "entry.py").write_text(
+            "import tinyjobs.cli\n"
+            "def ran(run=tinyjobs.cli.run):\n"
+            "    code = run()\n"
+            "    open('ran', 'w').close()\n"
+            "    return code\n"
+            "tinyjobs.cli.run = ran\n" + script
+        )
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join([str(Path(tinyjobs.__file__).parents[1]), str(self.root)]),
+        )
+        streams = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, pipe: subprocess.PIPE}
+        return subprocess.Popen([sys.executable, "entry.py"], cwd=self.root, env=env, **streams)
+
+    def wait_for_the_run(self, worker) -> None:
+        deadline = time.monotonic() + 30
+        while not (self.root / "ran").exists():
+            self.assertLess(time.monotonic(), deadline)
+            self.assertIsNone(worker.poll())
+            time.sleep(0.05)
+        time.sleep(3.0)
+        self.assertIsNone(worker.poll())
+
+    def assert_one_signal_ends(self, worker, pipe) -> None:
+        import signal
+
+        try:
+            self.wait_for_the_run(worker)
+            worker.send_signal(signal.SIGTERM)
+            self.assertEqual(worker.wait(10), 0)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(10)
+            pipe.close()
+
+    def test_a_stop_signal_ends_a_final_flush_stuck_on_a_stalled_stderr(self):
+        worker = self.stalled(
+            "import atexit, os, sys\n"
+            "def fill():\n"
+            "    sys.stderr.write('x' * 4000)\n"
+            "    os.set_blocking(2, False)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            os.write(2, b'x' * 512)\n"
+            "    except BlockingIOError:\n"
+            "        pass\n"
+            "    os.set_blocking(2, True)\n"
+            "atexit.register(fill)\n"
+            "import signal, threading\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "stderr.db"}'!r})\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    sys.exit(run())\n",
+            "stderr",
+        )
+        self.assert_one_signal_ends(worker, worker.stderr)
+
+    def test_one_stop_signal_ends_an_exit_hook_that_holds_a_stalled_stdout(self):
+        worker = self.stalled(
+            "import atexit, os, signal, sys, threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "held.db"}'!r})\n"
+            "def hold():\n"
+            "    os.set_blocking(1, False)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            os.write(1, b'x' * 512)\n"
+            "    except BlockingIOError:\n"
+            "        pass\n"
+            "    os.set_blocking(1, True)\n"
+            "    sys.stdout.write('pending line\\n')\n"
+            "    time.sleep(60)\n"
+            "atexit.register(hold)\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    sys.exit(run())\n",
+            "stdout",
+        )
+        self.assert_one_signal_ends(worker, worker.stdout)
+
+    def test_one_stop_signal_ends_a_process_whose_thread_writes_to_a_stalled_stdout(self):
+        worker = self.stalled(
+            "import os, signal, sys, threading\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "spam.db"}'!r})\n"
+            "def spam():\n"
+            "    while True:\n"
+            "        print('log ' + 'x' * 200, flush=True)\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    code = run()\n"
+            "    threading.Thread(target=spam).start()\n"
+            "    sys.exit(code)\n",
+            "stdout",
+        )
+        self.assert_one_signal_ends(worker, worker.stdout)
+
+    def test_one_stop_signal_ends_a_stalled_flush_after_the_wakeup_descriptor_was_reset(self):
+        worker = self.stalled(
+            "import asyncio, os, signal, sys, threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "reset.db"}'!r})\n"
+            "async def after():\n"
+            "    loop = asyncio.get_running_loop()\n"
+            "    loop.add_signal_handler(signal.SIGUSR1, lambda: None)\n"
+            "    await asyncio.sleep(0)\n"
+            "    loop.remove_signal_handler(signal.SIGUSR1)\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    code = run()\n"
+            "    asyncio.run(after())\n"
+            "    sys.stdout.write('y' * 4000)\n"
+            "    os.set_blocking(1, False)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            os.write(1, b'x' * 512)\n"
+            "    except BlockingIOError:\n"
+            "        pass\n"
+            "    os.set_blocking(1, True)\n"
+            "    time.sleep(60)\n"
+            "    sys.exit(code)\n",
+            "stdout",
+        )
+        self.assert_one_signal_ends(worker, worker.stdout)
+
+    def test_one_stop_signal_ends_a_forked_child_stalled_on_its_stdout(self):
+        worker = self.stalled(
+            "import os, signal, sys, threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "child.db"}'!r})\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    code = run()\n"
+            "    if os.fork():\n"
+            "        os._exit(code)\n"
+            "    sys.stdout.write('y' * 4000)\n"
+            "    os.set_blocking(1, False)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            os.write(1, b'x' * 512)\n"
+            "    except BlockingIOError:\n"
+            "        pass\n"
+            "    os.set_blocking(1, True)\n"
+            f"    open({str(self.root / 'child.pid')!r}, 'w').write(str(os.getpid()))\n"
+            "    time.sleep(60)\n"
+            "    os._exit(3)\n",
+            "stdout",
+        )
+        import signal
+
+        try:
+            self.assertEqual(worker.wait(10), 0)
+            marker = self.root / "child.pid"
+            deadline = time.monotonic() + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            child = int(marker.read_text())
+            os.kill(child, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(child, signal.SIGKILL)
+                self.fail("the forked child ignored its stop signal")
+        finally:
+            worker.stdout.close()
+
+    def test_a_second_stop_signal_inside_the_clean_exit_leaves_the_shared_stream_blocking(self):
+        import os
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        reading, writing = os.pipe()
+        self.addCleanup(os.close, reading)
+        try:
+            done = subprocess.run(
+                [sys.executable, "-c",
+                 "import os, signal, sys, threading, time\n"
+                 "from tinyjobs.exiting import exit_cleanly\n"
+                 "class Slow:\n"
+                 "    def __init__(self, stream):\n"
+                 "        self.stream = stream\n"
+                 "    def fileno(self):\n"
+                 "        return self.stream.fileno()\n"
+                 "    def flush(self):\n"
+                 "        time.sleep(0.2)\n"
+                 "        self.stream.flush()\n"
+                 "sys.stdout = Slow(sys.stdout)\n"
+                 "signal.signal(signal.SIGINT, exit_cleanly)\n"
+                 "signal.signal(signal.SIGTERM, exit_cleanly)\n"
+                 "threading.Timer(0.1, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+                 "os.kill(os.getpid(), signal.SIGINT)\n"
+                 "time.sleep(5)\n"],
+                env=dict(os.environ, PYTHONPATH=str(Path(tinyjobs.__file__).parents[1])),
+                stdout=writing,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue(os.get_blocking(writing))
+        finally:
+            os.close(writing)
+
+    def test_a_clean_exit_leaves_a_shared_stdout_pipe_blocking(self):
+        import os
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / "entry.py").write_text(
+            "import os, signal, sys, threading\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "shared.db"}'!r})\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            "    sys.exit(run())\n"
+        )
+        reading, writing = os.pipe()
+        try:
+            done = subprocess.run(
+                [sys.executable, "entry.py"],
+                cwd=self.root,
+                env=dict(
+                    os.environ,
+                    PYTHONPATH=os.pathsep.join(
+                        [str(Path(tinyjobs.__file__).parents[1]), str(self.root)]
+                    ),
+                ),
+                stdout=writing,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            self.assertEqual(done.returncode, 0)
+            self.assertTrue(os.get_blocking(writing))
+        finally:
+            os.close(reading)
+            os.close(writing)
+
+    def run_entry(self, body: str, stdout=None) -> int:
+        import os
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / "entry.py").write_text(
+            "import os, signal, sys, threading, time\n"
+            "from tinyjobs import TinyJobs\n"
+            "from tinyjobs.cli import run\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "entry.db"}'!r})\n"
+            "sys.argv = ['tinyjobs', 'worker', '--app', 'entry:app', '--shutdown-timeout', '1', '--no-scheduler']\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+            "if __name__ == '__main__':\n"
+            "    sys.modules['entry'] = sys.modules['__main__']\n"
+            + body
+        )
+        done = subprocess.run(
+            [sys.executable, "entry.py"],
+            cwd=self.root,
+            env=dict(
+                os.environ,
+                PYTHONPATH=os.pathsep.join([str(Path(tinyjobs.__file__).parents[1]), str(self.root)]),
+            ),
+            stdout=stdout or subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        return done.returncode
+
+    def test_a_stop_signal_during_a_slow_call_after_the_run_keeps_the_buffered_output(self):
+        with open(self.root / "summary.txt", "w") as summary:
+            self.run_entry(
+                "    code = run()\n"
+                "    print('summary line')\n"
+                "    threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+                "    import sqlite3\n"
+                "    sqlite3.connect(':memory:').execute(\n"
+                "        'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30000000)'\n"
+                "        ' SELECT count(*) FROM n').fetchall()\n"
+                "    sys.exit(code)\n",
+                stdout=summary,
+            )
+        self.assertEqual((self.root / "summary.txt").read_text(), "summary line\n")
+
+    def test_a_stop_signal_while_the_main_thread_holds_the_thread_registry_keeps_the_buffered_output(self):
+        with open(self.root / "limbo.txt", "w") as summary:
+            self.run_entry(
+                "    code = run()\n"
+                "    sys.stdout.write('pending line\\n')\n"
+                "    with threading._active_limbo_lock:\n"
+                "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                "        time.sleep(0.01)\n"
+                "    time.sleep(20)\n"
+                "    sys.exit(code)\n",
+                stdout=summary,
+            )
+        self.assertEqual((self.root / "limbo.txt").read_text(), "pending line\n")
+
+    def test_a_stop_signal_ends_a_final_flush_stuck_on_a_stalled_pipe(self):
+        import os
+        import signal
+        import subprocess
+        import sys
+
+        import tinyjobs
+
+        (self.root / "stalled_app.py").write_text(
+            "import atexit, os, sys, threading, signal\n"
+            "from tinyjobs import TinyJobs\n"
+            f"app = TinyJobs({f'sqlite:///{self.root / "stalled.db"}'!r})\n"
+            "def fill():\n"
+            "    open('ran', 'w').close()\n"
+            "    os.set_blocking(1, False)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            os.write(1, b'x' * 512)\n"
+            "    except BlockingIOError:\n"
+            "        pass\n"
+            "    os.set_blocking(1, True)\n"
+            "    sys.stdout.write('pending line\\n')\n"
+            "atexit.register(fill)\n"
+            "threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM)).start()\n"
+        )
+        env = dict(
+            os.environ,
+            PYTHONPATH=os.pathsep.join([str(Path(tinyjobs.__file__).parents[1]), str(self.root)]),
+        )
+        worker = subprocess.Popen(
+            [sys.executable, "-m", "tinyjobs", "worker", "--app", "stalled_app:app",
+             "--shutdown-timeout", "1", "--no-scheduler"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.wait_for_the_run(worker)
+            worker.send_signal(signal.SIGTERM)
+            self.assertEqual(worker.wait(10), 0)
+        finally:
+            if worker.poll() is None:
+                worker.kill()
+                worker.wait(10)
+            worker.stdout.close()
+
+    def test_a_ctrl_c_before_the_worker_finished_still_exits_130(self):
+        from unittest import mock
+
+        from tinyjobs.worker.worker import Worker
+
+        def interrupted(worker: Worker) -> None:
+            raise KeyboardInterrupt
+
+        with mock.patch.object(Worker, "run", interrupted):
+            code, _ = self.invoke("worker", "--app", "fixture_app:app")
+        self.assertEqual(code, 130)
 
     def test_the_worker_accepts_the_scheduler_flags(self):
         args = build_parser().parse_args(
