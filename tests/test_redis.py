@@ -77,6 +77,26 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([e.claim for e in await self.backend.executions(job.id)], [2])
                 self.assertTrue(await self.backend.complete(again, None))
 
+    async def test_closing_hands_back_the_jobs_of_a_claim_whose_answer_was_lost(self):
+        job = await self.enqueue(run_at=START - 1)
+        other = RedisBackend.from_url(REDIS_URL, prefix=self.prefix, clock=self.backend._clock)
+        real = other._scripts.run
+
+        async def lost(name, *arguments, **options):
+            answer = await real(name, *arguments, **options)
+            if name == "claim":
+                raise RedisConnectionError("the answer was lost")
+            return answer
+
+        with mock.patch.object(other._scripts, "run", lost):
+            with self.assertRaises(RedisConnectionError):
+                await other.claim(
+                    worker_id="w", queues=["default"], limit=1, lease_seconds=60
+                )
+        self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+        await other.close()
+        self.assertIs((await self.stored(job)).status, JobStatus.QUEUED)
+
     async def test_a_claim_answers_without_its_token(self):
         await self.enqueue(run_at=START - 1)
         now = await self.backend._now()
