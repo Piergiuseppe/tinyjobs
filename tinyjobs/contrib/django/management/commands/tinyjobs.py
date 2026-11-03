@@ -17,6 +17,12 @@ class Command(BaseCommand):
         "'tinyjobs worker' or 'tinyjobs stats'."
     )
 
+    _process_argv = False
+
+    def run_from_argv(self, argv: list[str]) -> None:
+        self._process_argv = list(argv) == sys.argv
+        super().run_from_argv(argv)
+
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--backend",
@@ -36,6 +42,6 @@ class Command(BaseCommand):
                 f"not tinyjobs.contrib.django.TinyJobsBackend"
             )
         configured.discover()
-        code = main(arguments, app=configured.app)
+        code = main(arguments, app=configured.app, owns_process=self._process_argv)
         if code:
             sys.exit(code)
