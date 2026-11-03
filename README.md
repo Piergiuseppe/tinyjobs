@@ -315,8 +315,8 @@ Starlette takes the same `lifespan`. Leave out `worker=True` and the server only
 `tinyjobs worker --app tasks:app` running the jobs elsewhere.
 
 The worker shares the process with your API: an async task that blocks the loop stalls requests too,
-and CPU-heavy `def` tasks compete for the GIL. That is the point where a separate worker pays off.
-Numbers in [Measured](#measured).
+and CPU-heavy `def` tasks compete for the GIL unless the build is free-threaded. That is the point
+where a separate worker pays off. Numbers in [Measured](#measured).
 
 ## Django
 
@@ -427,6 +427,7 @@ ones. To run the rest of the queue, call `app.drain()`.
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 | FastAPI | `lifespan()`, with an optional worker inside the server process |
 | Django | a `django.tasks` backend and `manage.py tinyjobs` |
+| Free-threaded Python | the GIL stays off on 3.14t, and `--loops N` runs several event loops in one process |
 
 Delivery is **at-least-once**. A worker can finish a job and die before recording it, in which case
 the job runs again. Write your tasks so that running twice is the same as running once. There's no
@@ -550,9 +551,10 @@ Worth knowing: a job costs about 1 KB of Redis memory, retention prunes it like 
 cannot join your database's transaction. All keys share one hash slot (`{prefix}`), so it runs on a
 single Redis or a primary with replicas, not spread across a cluster.
 
-Each process holds at most 100 connections (`max_connections=`). A burst beyond that waits for a free
+Each pool holds at most 100 connections (`max_connections=`). A burst beyond that waits for a free
 one rather than failing, and gives up with redis-py's `ConnectionError` after `pool_timeout=` seconds
-(20).
+(20). The app has one pool, opened on first use; `worker.run()` and `tinyjobs worker` open one of
+their own for claims, outcomes and cron, plus one for each extra loop.
 
 ## Postgres
 
@@ -586,10 +588,12 @@ can become it, the same rule as below, or the enqueue raises `ConfigurationError
 with `client_encoding` `SQL_ASCII` is refused too. In Django, add
 `"database": "default"` to `OPTIONS` and every enqueue joins `transaction.atomic()`.
 
-Each process holds at most 10 connections (`max_connections=`), whatever its workers run, plus one
+Each pool holds at most 10 connections (`max_connections=`), whatever its worker runs, plus one
 for `LISTEN`, and one more, short-lived and shared, to ask about statements silent for ten
-seconds when none is idle, so size the server's `max_connections` or the PgBouncer pool at 12 per
-process plus what the app itself uses. Connections beyond the minimum go back after ten idle
+seconds when none is idle. `worker.run()` and `tinyjobs worker` open a pool of their own for
+claims, outcomes and cron, and one more for each extra loop; the app's pool opens only when your
+code calls it, a task enqueuing another for instance. An embedded worker uses the app's. Size the server's `max_connections` or the PgBouncer pool at 12 per
+pool. Connections beyond the minimum go back after ten idle
 seconds. Two workers of 32 busy without pause behind a PgBouncer session pool of 25, over a link
 adding 300 ms each way, left the app waiting 1.9 seconds for a server as a rule and 2.4 at most,
 with none refused and no warning. A smaller pool makes the app queue behind the workers for as long as they stay
@@ -606,6 +610,29 @@ such as a trigger, a constraint's function or an index's; otherwise pass `schema
 Behind PgBouncer use session pooling with its default `server_reset_query`. A transaction left open
 for hours anywhere on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18
 are supported, and CI tests 14 and 18.
+
+## Free-threaded Python
+
+On a free-threaded build such as 3.14t the GIL stays off: no tinyjobs module turns it back on, so
+`def` tasks run in parallel in the worker's thread pool. A worker is still one event loop, and one
+loop is one thread; `loops=` gives a worker several, each in its own thread with its own Redis or
+Postgres connection, sharing `concurrency` between them:
+
+```bash
+tinyjobs worker --app tasks:app --concurrency 64 --loops 3
+```
+
+From Python, `app.worker(concurrency=64, loops=3).run()` does the same.
+
+Only the first loop fires cron and prunes. `loops` is for `tinyjobs worker` and `worker.run()`: an
+embedded worker lives on the server's loop and refuses it. SQLite refuses `loops` above 1, since its
+one writer would make them wait on each other, and with the GIL on extra loops take turns on it, so
+run more processes there instead.
+
+Two installs differ. psycopg-binary has no free-threaded wheels: install `psycopg psycopg-pool` and
+the system libpq rather than the `postgres` extra. hiredis turns the GIL back on as soon as redis-py
+imports it, so leave it out; a worker that finds the GIL on in a free-threaded build says so in its
+log.
 
 ## Other backends
 
@@ -730,6 +757,29 @@ Enqueueing through `django.tasks` costs about what a direct `send` does, 6,000 a
 6,600. A worker `SIGKILL`ed mid-task leaves that task `FAILED` once its lease expires, since Django
 tasks are not retried.
 
+Throughput was measured on the same four-core ARM VPS against one Redis 7.4 capped at one CPU, the
+workers capped at three, 128 slots per loop or process, draining 80,000 no-op jobs; jobs a second
+over the middle 80% of the drain:
+
+| | GIL on | free-threaded 3.14t |
+| --- | --- | --- |
+| 1 process, `async def` | 3,626 | 3,491 |
+| 1 process, 3 loops, `async def` | 5,473 | 7,190 |
+| 3 processes, `async def` | 7,300 | 7,476 |
+| 1 process, `def` | 4,269 | 3,951 |
+| 1 process, 3 loops, `def` | 4,882 | 7,109 |
+| 3 processes, `def` | 7,356 | 7,263 |
+
+Without the GIL one process with three loops does what three processes do, in a third of the
+memory; with it, the loops take turns and gain less than half as much. One loop runs a few percent
+slower on 3.14t, the price of its per-object locks. Redis ran at 94 to 98% of its core at the top,
+so that is its ceiling on this machine: its Lua scripts run on one thread, and `io-threads` on
+Redis 8 or Valkey 8.1 changed nothing measurable. Past that ceiling the loops keep scaling: on a
+ten-core laptop with two Redis instances and two apps, one process running eight loops reached
+42,000 `async def` and 36,000 `def` jobs a second on 3.14t, 97% and 94% of what eight processes
+did, while with the GIL the same threads flattened at 27,000 and 17,000. CPU-bound `def` tasks gain
+the most: on that laptop, a worker of eight slots got through them 3.7 times faster on 3.14t.
+
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
@@ -755,6 +805,8 @@ v0.8.0. Working and measured, but young. What's in:
 - the backend plugin seam and its contract suite
 - `app.lifespan()` and `app.serve()` for FastAPI and Starlette, with an embedded worker
 - a `django.tasks` backend and `manage.py tinyjobs`
+- a worker that keeps the GIL off on free-threaded builds, with `--loops` for several event loops in
+  one process
 
 What's not in yet:
 
