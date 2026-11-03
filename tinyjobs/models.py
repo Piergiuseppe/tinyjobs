@@ -136,6 +136,7 @@ class Execution:
     finished_at: float | None = None
     error_type: str | None = None
     traceback: str | None = None
+    claim: int | None = None
 
     @property
     def duration(self) -> float | None:

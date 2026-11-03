@@ -51,6 +51,10 @@ class InterruptedCallError(TinyJobsError):
     pass
 
 
+class ForcedInterrupt(KeyboardInterrupt):
+    pass
+
+
 class WaitTimeout(TinyJobsError, TimeoutError):
     pass
 

@@ -61,9 +61,14 @@ def configure_own_logger(level: str) -> None:
     logger.propagate = False
 
 
-def main(argv: Sequence[str] | None = None, *, app: TinyJobs | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    app: TinyJobs | None = None,
+    owns_process: bool = False,
+) -> int:
     parser = build_parser()
-    parser.set_defaults(instance=app)
+    parser.set_defaults(instance=app, owns_process=owns_process)
     args = parser.parse_args(argv)
     level = getattr(args, "log_level", DEFAULT_LOG_LEVEL)
     if app is None:
@@ -77,3 +82,7 @@ def main(argv: Sequence[str] | None = None, *, app: TinyJobs | None = None) -> i
         return 2
     except KeyboardInterrupt:
         return 130
+
+
+def run() -> int:
+    return main(owns_process=True)

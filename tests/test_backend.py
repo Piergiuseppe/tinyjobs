@@ -19,6 +19,7 @@ import weakref
 from contextlib import ExitStack, contextmanager, suppress
 from functools import partial
 from pathlib import Path
+from typing import Iterator
 from unittest import mock
 
 from tinyjobs import runtime
@@ -275,6 +276,94 @@ class ClosedSQLiteBackendTests(unittest.IsolatedAsyncioTestCase):
         backend.pause_for_fork()
         with self.assertRaises(AppClosedError):
             await backend.get("anything")
+
+
+class SQLiteCancelledCallTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.backend = SQLiteBackend(str(Path(directory.name) / "jobs.db"))
+        await self.backend.setup()
+        self.addAsyncCleanup(self.backend.close)
+        self.gate = threading.Event()
+        self.addCleanup(self.gate.set)
+
+    async def cancelled(self, call: asyncio.Future, times: int = 1) -> float:
+        started = time.monotonic()
+        for _ in range(times):
+            call.cancel()
+            await asyncio.sleep(0.05)
+        with self.assertRaises(asyncio.CancelledError):
+            await call
+        return time.monotonic() - started
+
+    async def test_a_call_cancelled_while_queued_ends_at_once_and_never_runs(self):
+        ran: list[str] = []
+        real = self.backend._get_sync
+
+        def counted(job_id):
+            ran.append(job_id)
+            return real(job_id)
+
+        counted.__name__ = "_get_sync"
+        self.backend._executor.submit(self.gate.wait, 5)
+        with mock.patch.object(self.backend, "_get_sync", counted):
+            call = asyncio.ensure_future(self.backend.get("cancelled"))
+            await asyncio.sleep(0.05)
+            took = await self.cancelled(call)
+            self.gate.set()
+            await self.backend.get("after")
+        self.assertLess(took, 0.3)
+        self.assertEqual(ran, ["after"])
+
+    async def test_a_running_call_holds_its_cancel_back_half_a_second_at_most(self):
+        from tinyjobs.backends.sqlite import backend as sqlite_backend
+
+        failures: list[dict] = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: failures.append(context))
+        self.addCleanup(loop.set_exception_handler, None)
+
+        def locked(job_id):
+            self.gate.wait(5)
+            raise sqlite3.OperationalError("database is locked")
+
+        locked.__name__ = "_get_sync"
+        with mock.patch.object(self.backend, "_get_sync", locked):
+            call = asyncio.ensure_future(self.backend.get("held"))
+            await asyncio.sleep(0.05)
+            took = await self.cancelled(call, times=2)
+            self.gate.set()
+        await self.backend.get("after")
+        del call
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertLess(took, sqlite_backend.CANCELLED_CALL_SECONDS + 0.3)
+        self.assertEqual(failures, [])
+
+    async def test_jobs_are_released_together_in_one_call(self):
+        from tinyjobs.status import JobStatus
+        from tinyjobs.testing.contract import make_job
+
+        for _ in range(4):
+            await self.backend.enqueue(make_job())
+        jobs = await self.backend.claim(
+            worker_id="w", queues=("default",), limit=4, lease_seconds=60.0
+        )
+        calls: list[str] = []
+        real = self.backend._call
+
+        async def counted(function, *args):
+            calls.append(function.__name__)
+            return await real(function, *args)
+
+        with mock.patch.object(self.backend, "_call", counted):
+            self.assertEqual(await self.backend.release_many([*jobs, jobs[0]]), 4)
+        self.assertEqual(calls, ["_release_many_sync"])
+        for job in jobs:
+            self.assertIs((await self.backend.get(job.id)).status, JobStatus.QUEUED)
+            [execution] = await self.backend.executions(job.id)
+            self.assertIs(execution.status, ExecutionStatus.LOST)
 
 
 class FreshDatabaseTests(unittest.TestCase):
@@ -3726,6 +3815,59 @@ class FreshDatabaseTests(unittest.TestCase):
                         connection.execute("SELECT 1")
             finally:
                 pool.close()
+
+
+class SlicedBusyWaitTests(unittest.TestCase):
+    def _sliced_pool(self, path: str) -> ConnectionPool:
+        from tinyjobs.backends.sqlite.connection import CALLING
+        from tinyjobs.deadlines import Deadline
+
+        pool = ConnectionPool(path, busy_timeout=2)
+        pool.connection.execute("CREATE TABLE marks (n INTEGER)")
+        CALLING.end = Deadline()
+        try:
+            with pool.write() as connection:
+                connection.execute("INSERT INTO marks (n) VALUES (1)")
+        finally:
+            CALLING.end = None
+        self.assertTrue(pool.connection.sliced)
+        return pool
+
+    @contextmanager
+    def _locked_for(self, path: str, seconds: float) -> Iterator[None]:
+        other = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        other.execute("BEGIN IMMEDIATE")
+        release = threading.Timer(seconds, other.execute, ("ROLLBACK",))
+        release.start()
+        try:
+            yield
+        finally:
+            release.join()
+            other.close()
+
+    def test_a_statement_on_a_connection_left_sliced_still_waits_out_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "jobs.db")
+            pool = self._sliced_pool(path)
+            try:
+                with self._locked_for(path, 0.5):
+                    started = time.monotonic()
+                    pool.connection.execute("INSERT INTO marks (n) VALUES (2)")
+                    waited = time.monotonic() - started
+            finally:
+                pool.close()
+            self.assertGreater(waited, 0.4)
+
+    def test_a_write_without_a_shutdown_end_runs_under_the_full_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "jobs.db")
+            pool = self._sliced_pool(path)
+            try:
+                with self._locked_for(path, 0.5), pool.write() as connection:
+                    timeout = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            finally:
+                pool.close()
+            self.assertEqual(timeout, 2000)
 
 
 class MemoryContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):

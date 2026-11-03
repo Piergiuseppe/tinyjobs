@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..clock import Clock
-from ..exceptions import ExecutorClosedError
+from ..exceptions import ExecutorClosedError, ForcedInterrupt
 from ..executors import ExecutorResolver
 from ..models import Job
 from .hooks import Hooks
@@ -41,16 +41,29 @@ class ExecutionService:
         self._clock = clock
 
     async def execute(
-        self, job: Job, task: "Task", executors: ExecutorResolver
+        self,
+        job: Job,
+        task: "Task",
+        executors: ExecutorResolver,
+        *,
+        held_until: Callable[[], float] | None = None,
+        settling: Callable[[], None] | None = None,
+        settled: Callable[[], None] | None = None,
     ) -> Attempt:
         token = current_job.set(job)
         try:
-            return await self._attempt(job, task, executors)
+            return await self._attempt(job, task, executors, held_until, settling, settled)
         finally:
             current_job.reset(token)
 
     async def _attempt(
-        self, job: Job, task: "Task", executors: ExecutorResolver
+        self,
+        job: Job,
+        task: "Task",
+        executors: ExecutorResolver,
+        held_until: Callable[[], float] | None,
+        settling: Callable[[], None] | None,
+        settled: Callable[[], None] | None,
     ) -> Attempt:
         await self._hooks.started(job)
         started = self._clock.monotonic()
@@ -58,16 +71,27 @@ class ExecutionService:
             payload = self._serialization.decode_payload(job)
             result = await executors.resolve(task).execute(task, payload)
             encoded = self._lifecycle.encode_result(job, task, result)
-        except (asyncio.CancelledError, ExecutorClosedError):
+        except (asyncio.CancelledError, ExecutorClosedError, ForcedInterrupt):
             raise
         except BaseException as error:
-            recorded, will_retry = await self._lifecycle.fail(job, task, error)
+            if settling is not None:
+                settling()
+            recorded, will_retry = await self._lifecycle.fail(
+                job, task, error, held_until=held_until
+            )
+            if settled is not None:
+                settled()
             if not recorded:
                 return Attempt(error, will_retry, recorded=False)
             await self._hooks.failed(job, error, will_retry)
             return Attempt(error, will_retry)
         duration = self._clock.monotonic() - started
-        if not await self._lifecycle.complete(job, encoded):
+        if settling is not None:
+            settling()
+        recorded = await self._lifecycle.complete(job, encoded, held_until=held_until)
+        if settled is not None:
+            settled()
+        if not recorded:
             return Attempt(recorded=False)
         await self._hooks.succeeded(job, result, duration)
         return Attempt()

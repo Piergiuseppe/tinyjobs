@@ -77,17 +77,15 @@ class Task:
         bound = self._signature.bind(*args, **kwargs)
         return JobPayload(args=tuple(bound.args), kwargs=dict(bound.kwargs))
 
-    def with_options(self, **overrides: Any) -> "BoundTask":
-        return BoundTask(self, self._options.merged_with(**overrides))
+    def with_options(self, *, tx: Any = None, **overrides: Any) -> "BoundTask":
+        return BoundTask(self, self._options.merged_with(**overrides), tx)
 
     async def aenqueue_with(
         self, options: EnqueueOptions, args: tuple, kwargs: dict
     ) -> Job:
         payload = self.bind(args, kwargs)
         await self._app.ensure_connected()
-        return await self._app.settle(
-            await self._app.dispatch.dispatch_by_name(self._name, payload, options)
-        )
+        return await self._app.send_settled(self._name, payload, options)
 
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:
         return await self.aenqueue_with(self._options, args, kwargs)
@@ -105,17 +103,30 @@ class Task:
 
 
 class BoundTask:
-    def __init__(self, task: Task, options: EnqueueOptions) -> None:
+    def __init__(self, task: Task, options: EnqueueOptions, tx: Any = None) -> None:
         self._task = task
         self._options = options
+        self._tx = tx
 
-    def with_options(self, **overrides: Any) -> "BoundTask":
-        return BoundTask(self._task, self._options.merged_with(**overrides))
+    def with_options(self, *, tx: Any = None, **overrides: Any) -> "BoundTask":
+        return BoundTask(
+            self._task,
+            self._options.merged_with(**overrides),
+            self._tx if tx is None else tx,
+        )
 
     async def aenqueue(self, *args: Any, **kwargs: Any) -> Job:
+        if self._tx is not None:
+            return await self._task.app.aenqueue_in(
+                self._tx, self._task.name, self._task.bind(args, kwargs), self._options
+            )
         return await self._task.aenqueue_with(self._options, args, kwargs)
 
     def enqueue(self, *args: Any, **kwargs: Any) -> Job:
+        if self._tx is not None:
+            return self._task.app.enqueue_in(
+                self._tx, self._task.name, self._task.bind(args, kwargs), self._options
+            )
         return self._task.app.run_sync(
             partial(self._task.aenqueue_with, self._options, args, kwargs),
             name="enqueue",

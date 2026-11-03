@@ -10,7 +10,7 @@ import unittest
 from contextlib import suppress
 from unittest import mock
 
-from tinyjobs import runtime
+from tinyjobs import deadlines, runtime
 from tinyjobs.runtime import FORK_PAUSE_SECONDS, LoopRunner
 
 
@@ -1021,7 +1021,7 @@ class SignalStateTests(unittest.TestCase):
         package = pathlib.Path(runtime.__file__).parent
         found = []
         for path in package.rglob("*.py"):
-            if path == package / "worker" / "signals.py":
+            if path in (package / "worker" / "signals.py", package / "exiting.py"):
                 continue
             for node in ast.walk(ast.parse(path.read_text())):
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -1442,6 +1442,81 @@ class CollectedElsewhereTests(unittest.TestCase):
 
 
 class KeptTaskTests(unittest.TestCase):
+    def test_a_task_that_swallowed_a_cancel_is_cancelled_again_at_wind_down(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def stubborn() -> None:
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                seen.append("swallowed")
+            try:
+                await asyncio.sleep(30)
+            finally:
+                seen.append("ended")
+
+        task = loop.create_task(stubborn())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        started = time.monotonic()
+        runtime._finish_tasks(loop, time.monotonic() + 0.2)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["swallowed", "ended"])
+        self.assertLess(time.monotonic() - started, 0.2 + runtime.INSIST_SECONDS + 0.3)
+
+    def test_a_task_cancelled_before_the_close_keeps_its_whole_budget_to_clean_up(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def tidy() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                await asyncio.sleep(1.0)
+                seen.append("cleaned")
+                raise
+
+        task = loop.create_task(tidy())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["cleaned"])
+
+    def test_a_task_its_own_timeout_took_the_cancel_from_is_cancelled_again(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        seen: list[str] = []
+
+        async def polling() -> None:
+            recovered = False
+            try:
+                while True:
+                    try:
+                        await asyncio.sleep(30)
+                    except asyncio.CancelledError:
+                        if recovered:
+                            raise
+                        recovered = True
+                        await asyncio.sleep(0.1)
+                        asyncio.current_task().uncancel()
+            finally:
+                seen.append("ended")
+
+        task = loop.create_task(polling())
+        loop.run_until_complete(asyncio.sleep(0))
+        task.cancel()
+        started = time.monotonic()
+        runtime._finish_tasks(loop, time.monotonic() + runtime.STOP_SECONDS)
+        self.assertTrue(task.done())
+        self.assertEqual(seen, ["ended"])
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_a_hand_back_submitted_as_the_loop_closes_still_runs(self):
         runner = LoopRunner()
         loop = runner.own_loop()
@@ -1471,6 +1546,117 @@ class KeptTaskTests(unittest.TestCase):
             loop.close()
             with self.subTest(steps=steps), self.assertRaises(RuntimeError):
                 outcome.result(0)
+
+    def cleaning_up(self, loop: asyncio.AbstractEventLoop, seen: list[str]) -> asyncio.Task:
+        async def cleaning() -> None:
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                seen.append("cancelled")
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    seen.append("cancelled while cleaning up")
+                raise
+
+        task = loop.create_task(cleaning())
+        loop.run_until_complete(asyncio.sleep(0))
+        return task
+
+    def test_a_task_its_caller_cancelled_is_not_cancelled_again_as_the_loop_winds_down(self):
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        runtime._finish_tasks(loop, time.monotonic() + 1)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_a_task_the_wind_down_cancelled_is_not_cancelled_again_by_its_caller(self):
+        import types
+
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        loop.call_soon(runtime._cancel_task, types.SimpleNamespace(task=task))
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(task)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_a_task_whose_outcome_is_abandoned_while_it_winds_down_is_cancelled_once(self):
+        import concurrent.futures
+
+        loop = asyncio.new_event_loop()
+        seen: list[str] = []
+        task = self.cleaning_up(loop, seen)
+        task.cancel()
+        outcome = concurrent.futures.Future()
+        outcome.cancel()
+        runtime._abandon(loop, task, outcome)
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(task)
+        loop.close()
+        self.assertEqual(seen, ["cancelled"])
+
+    def test_tasks_a_resident_owns_are_left_to_its_close_whoever_closes_first(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        seen: list[str] = []
+
+        class Resident:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.stop = asyncio.Event()
+                self.task: asyncio.Task | None = None
+
+            async def start(self) -> None:
+                with runtime.spared_until_close():
+                    self.task = asyncio.create_task(self.serve())
+
+            async def serve(self) -> None:
+                try:
+                    await self.stop.wait()
+                    seen.append(f"{self.name} stopped by its close")
+                except asyncio.CancelledError:
+                    seen.append(f"{self.name} cancelled")
+                    raise
+
+            async def close(self) -> None:
+                self.stop.set()
+                await self.task
+
+        residents = [Resident("first"), Resident("second")]
+        for resident in residents:
+            asyncio.run_coroutine_threadsafe(resident.start(), loop).result(5)
+            runner.keep(loop, resident)
+        runner.close_here()
+        self.assertEqual(
+            seen, ["first stopped by its close", "second stopped by its close"]
+        )
+
+    def test_a_spared_task_no_resident_ends_is_still_cancelled(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        seen: list[str] = []
+
+        async def forever() -> None:
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                seen.append("cancelled")
+                raise
+
+        async def start() -> None:
+            with runtime.spared_until_close():
+                asyncio.create_task(forever())
+
+        asyncio.run_coroutine_threadsafe(start(), loop).result(5)
+        runner.close_here()
+        self.assertEqual(seen, ["cancelled"])
 
     def test_other_work_submitted_as_the_loop_closes_is_refused(self):
         runner = LoopRunner()
@@ -1579,6 +1765,36 @@ class KeptTaskTests(unittest.TestCase):
         )
 
 
+    def test_a_task_that_keeps_ignoring_cancellation_is_insisted_on_once_per_close(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        started = threading.Event()
+
+        class Resident:
+            async def close(self) -> None:
+                return None
+
+        async def stubborn() -> None:
+            started.set()
+            while True:
+                with suppress(asyncio.CancelledError):
+                    await asyncio.sleep(10)
+
+        for _ in range(3):
+            runner.keep(loop, Resident())
+        runtime.submit(loop, stubborn(), "stubborn")
+        self.assertTrue(started.wait(5))
+        with (
+            mock.patch.object(runtime, "STOP_SECONDS", 0.3),
+            self.assertLogs("tinyjobs.runtime", "WARNING"),
+        ):
+            began = time.monotonic()
+            runner.close_here()
+            while not loop.is_closed() and time.monotonic() - began < 10:
+                time.sleep(0.01)
+        self.assertLess(time.monotonic() - began, 0.3 + runtime.INSIST_SECONDS + 0.5)
+
     def test_other_tasks_are_cancelled_while_a_kept_task_outlasts_the_close(self):
         runner = LoopRunner()
         loop = runner.own_loop()
@@ -1604,6 +1820,31 @@ class KeptTaskTests(unittest.TestCase):
             runner.close_here()
         self.assertLess(time.monotonic() - began, 3.0)
         self.assertEqual(events, ["cleaned up"])
+
+    def test_a_kept_task_past_its_deadline_is_cancelled_without_waiting_out_the_close(self):
+        runner = LoopRunner()
+        loop = runner.own_loop()
+        wait_running(loop)
+        started = threading.Event()
+        events: list[str] = []
+
+        async def kept() -> None:
+            deadlines.current.set(deadlines.Deadline(time.monotonic() + 0.2))
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                events.append("cancelled")
+                raise
+
+        runtime.submit(loop, kept(), "kept", kept=True)
+        self.assertTrue(started.wait(5))
+        time.sleep(0.3)
+        with mock.patch.object(runtime, "STOP_SECONDS", 3.0):
+            began = time.monotonic()
+            runner.close_here()
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertEqual(events, ["cancelled"])
 
     def test_the_tasks_a_kept_task_waits_on_are_kept_too(self):
         runner = LoopRunner()
@@ -1757,6 +1998,23 @@ class OsThreadTests(unittest.TestCase):
         )
 
 
+class BoundedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_bounded_call_ends_with_the_final_deadline_without_its_grace(self):
+        began = time.monotonic()
+        with deadlines.finishing(deadlines.Deadline(began + 0.2)):
+            with self.assertRaises(TimeoutError):
+                async with deadlines.bounded(began + 0.2):
+                    await asyncio.sleep(3600)
+        self.assertLess(time.monotonic() - began, 0.2 + deadlines.GRACE_SECONDS / 2)
+
+    async def test_a_bounded_call_without_a_final_deadline_keeps_its_grace(self):
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            async with deadlines.bounded(began + 0.1):
+                await asyncio.sleep(3600)
+        self.assertGreaterEqual(time.monotonic() - began, 0.1 + deadlines.GRACE_SECONDS * 0.9)
+
+
 def weakref_set(*items):
     import weakref
 
@@ -1765,3 +2023,133 @@ def weakref_set(*items):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedBoundTimerTests(unittest.TestCase):
+    def test_a_bound_entered_outside_a_loop_leaves_the_deadline_it_found(self):
+        outer = deadlines.Deadline(time.monotonic() + 60)
+        with deadlines.under(outer):
+            with self.assertRaises(RuntimeError):
+                with deadlines.bounded(time.monotonic() + 1):
+                    pass
+            self.assertIs(deadlines.current.get(), outer)
+
+    def test_a_forgotten_closed_loop_is_not_kept_by_a_bound_still_open(self):
+        import gc
+        import weakref
+
+        loop = asyncio.new_event_loop()
+
+        async def held() -> None:
+            async with deadlines.bounded(time.monotonic() + 3600):
+                await asyncio.sleep(3600)
+
+        task = loop.create_task(held())
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()
+        deadlines.forget_loop(loop)
+        gone = weakref.ref(loop)
+        with self.assertLogs("asyncio", "ERROR"):
+            del loop, task
+            gc.collect()
+        self.assertIsNone(gone())
+
+    def test_many_open_bounds_share_one_timer(self):
+        async def main():
+            loop = asyncio.get_running_loop()
+            before = sum(not handle.cancelled() for handle in loop._scheduled)
+            async with deadlines.bounded(time.monotonic() + 30):
+                async with deadlines.bounded(time.monotonic() + 20):
+                    async with deadlines.bounded(time.monotonic() + 40):
+                        armed = sum(not handle.cancelled() for handle in loop._scheduled)
+                        return armed - before
+
+        self.assertEqual(asyncio.run(main()), 1)
+
+    def test_a_bound_past_its_end_raises_timeout_after_its_grace(self):
+        async def main():
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                async with deadlines.bounded(started + 0.1):
+                    await asyncio.sleep(5)
+            return time.monotonic() - started
+
+        took = asyncio.run(main())
+        self.assertGreaterEqual(took, 0.1 + deadlines.GRACE_SECONDS)
+        self.assertLess(took, 0.1 + deadlines.GRACE_SECONDS + 0.5)
+
+    def test_a_bound_that_ended_never_cancels_its_task_later(self):
+        async def main():
+            async with deadlines.bounded(time.monotonic() + 0.05):
+                pass
+            await asyncio.sleep(0.05 + deadlines.GRACE_SECONDS + 0.2)
+            return asyncio.current_task().cancelling()
+
+        self.assertEqual(asyncio.run(main()), 0)
+
+    def test_an_inner_bound_that_expires_leaves_its_outer_one_running(self):
+        async def main():
+            async with deadlines.bounded(time.monotonic() + 30):
+                with self.assertRaises(TimeoutError):
+                    async with deadlines.bounded(time.monotonic()):
+                        await asyncio.sleep(5)
+                await asyncio.sleep(0.01)
+                return "outer kept"
+
+        self.assertEqual(asyncio.run(main()), "outer kept")
+
+    def test_a_bound_entered_without_await_times_out_like_an_awaited_one(self):
+        async def main():
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                with deadlines.bounded(started + 0.05):
+                    await asyncio.sleep(5)
+            return time.monotonic() - started
+
+        took = asyncio.run(main())
+        self.assertGreaterEqual(took, 0.05 + deadlines.GRACE_SECONDS)
+        self.assertLess(took, 0.05 + deadlines.GRACE_SECONDS + 0.5)
+
+    def test_a_plain_cancel_inside_a_bound_stays_a_cancel(self):
+        async def main():
+            async def inner():
+                async with deadlines.bounded(time.monotonic() + 30):
+                    await asyncio.sleep(5)
+
+            task = asyncio.create_task(inner())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(main())
+
+    def test_loops_on_two_threads_keep_their_own_timers(self):
+        results = []
+        barrier = threading.Barrier(2)
+
+        def run():
+            async def main():
+                barrier.wait(5)
+                for _ in range(2000):
+                    async with deadlines.bounded(time.monotonic() + 30):
+                        await asyncio.sleep(0)
+                started = time.monotonic()
+                try:
+                    async with deadlines.bounded(started):
+                        await asyncio.sleep(5)
+                except TimeoutError:
+                    return time.monotonic() - started
+                return None
+
+            results.append(asyncio.run(main()))
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(len(results), 2)
+        for took in results:
+            self.assertIsNotNone(took)
+            self.assertLess(took, deadlines.GRACE_SECONDS + 0.5)

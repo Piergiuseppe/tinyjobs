@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 
 from ...retention import RetentionPolicy
+from ...worker.signals import owning_process
 from ..duration import parse_duration
 from .base import Command
 
@@ -58,7 +60,12 @@ class WorkerCommand(Command):
             scheduler=not args.no_scheduler,
             misfire_grace=args.misfire_grace,
         )
-        worker.run()
+        with owning_process() if getattr(args, "owns_process", False) else nullcontext():
+            try:
+                worker.run()
+            except KeyboardInterrupt:
+                if not worker.finished:
+                    raise
         return 0
 
     def _retention(

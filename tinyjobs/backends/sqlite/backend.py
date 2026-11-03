@@ -10,6 +10,7 @@ from typing import Any, Callable, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 from ...clock import Clock
+from ...deadlines import Deadline, final
 from ...models import (
     Execution,
     ExecutionError,
@@ -22,14 +23,16 @@ from ...models import (
 from ...retention import RetentionPolicy
 from ...exceptions import AppClosedError
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
+from ...sheltered import landing
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
-from .connection import FORK_GATE, ConnectionPool, StepAside
+from .connection import CALLING, FORK_GATE, ConnectionPool, StepAside
 from .queries import (
     ADVANCE_SCHEDULE,
     CANCEL_EXECUTIONS,
     CANCEL_JOB,
+    CLAIM_DUE_ONE,
     CLAIM_HOUSEKEEPING,
     COMPLETE_JOB,
     COUNT_BY_QUEUE,
@@ -40,6 +43,7 @@ from .queries import (
     FINISH_EXECUTION,
     HAND_BACK_JOB,
     HEARTBEAT,
+    RENEWED,
     INSERT_EXECUTION,
     INSERT_JOB,
     MARK_EXECUTIONS_LOST,
@@ -89,6 +93,7 @@ HELD_TRANSACTION_MESSAGE = (
 )
 
 RETIRE_SECONDS = 1.0
+CANCELLED_CALL_SECONDS = 0.5
 
 STEPPED_ASIDE = object()
 
@@ -97,6 +102,7 @@ RETURNING_CALLS = frozenset(
         "_complete_sync",
         "_fail_sync",
         "_release_sync",
+        "_release_many_sync",
         "_hand_back_sync",
         "_heartbeat_sync",
         "_close_sync",
@@ -116,7 +122,15 @@ LOCK_FREE_CALLS = frozenset(
 )
 
 
+class DatabaseBusyError(sqlite3.OperationalError):
+    pass
+
+
+BUSY_CODES = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
 class SQLiteBackend(BaseBackend):
+    transient_errors = (DatabaseBusyError,)
     capabilities = Capabilities(
         priority=True,
         delayed=True,
@@ -145,23 +159,32 @@ class SQLiteBackend(BaseBackend):
         pause_threads_at_fork(self)
 
     async def _call(self, function, *args):
-        loop = asyncio.get_running_loop()
         refuse_interrupted(function.__name__.strip("_"))
         if function.__name__ not in LOCK_FREE_CALLS:
             self.refuse_held_transaction()
+        end = final.get()
         while True:
             executor = self._executor
             try:
-                pending = loop.run_in_executor(
-                    executor, partial(_gated, executor, function, *args)
-                )
+                running = executor.submit(_gated, executor, end, function, *args)
             except RuntimeError as error:
                 if executor.retiring:
                     continue
                 if self._closed or function.__name__ not in RETURNING_CALLS:
                     raise AppClosedError(EXECUTOR_GONE_MESSAGE) from error
-                return _gated(None, function, *args)
-            result = await pending
+                return _busy_as_transient(_gated, None, end, function, *args)
+            try:
+                result = await landing(running)
+            except sqlite3.OperationalError as error:
+                if not _busy(error):
+                    raise
+                raise _transient(error) from error
+            except asyncio.CancelledError:
+                if not running.cancel():
+                    pending = asyncio.wrap_future(running)
+                    pending.add_done_callback(_retrieved)
+                    await asyncio.wait({pending}, timeout=CANCELLED_CALL_SECONDS)
+                raise
             if result is not STEPPED_ASIDE:
                 return result
 
@@ -174,7 +197,7 @@ class SQLiteBackend(BaseBackend):
         except BaseException:
             self._closed = True
             with suppress(RuntimeError):
-                self._executor.submit(_gated, None, self._close_sync)
+                self._executor.submit(_gated, None, None, self._close_sync)
             self._executor.shutdown(wait=False)
             raise
         self._closed = True
@@ -211,13 +234,18 @@ class SQLiteBackend(BaseBackend):
             self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
         )
 
+    async def claim_job(
+        self, job_id: str, *, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        return await self._call(self._claim_job_sync, job_id, worker_id, lease_seconds)
+
     async def heartbeat(
         self,
         job_ids: Sequence[str],
         lease_seconds: float,
         worker_id: str | None = None,
-    ) -> None:
-        await self._call(
+    ) -> list[str]:
+        return await self._call(
             self._heartbeat_sync, tuple(job_ids), lease_seconds, worker_id
         )
 
@@ -237,6 +265,11 @@ class SQLiteBackend(BaseBackend):
 
     async def release(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._release_sync, job, delay)
+
+    async def release_many(self, jobs: Sequence[Job]) -> int:
+        if not jobs:
+            return 0
+        return await self._call(self._release_many_sync, tuple(jobs))
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._hand_back_sync, job, delay)
@@ -403,7 +436,7 @@ class SQLiteBackend(BaseBackend):
             return []
         now = self._clock.now()
         with self._connections.write() as connection:
-            jobs = self._claim_strategy.claim(
+            rows = self._claim_strategy.claim(
                 connection,
                 worker_id=worker_id,
                 queues=tuple(queues),
@@ -411,17 +444,34 @@ class SQLiteBackend(BaseBackend):
                 lease_expires_at=now + lease_seconds,
                 now=now,
             )
-            for job in jobs:
-                connection.execute(
-                    INSERT_EXECUTION, (job.id, job.attempts, job.claims, worker_id, now)
+            if rows:
+                connection.executemany(
+                    INSERT_EXECUTION,
+                    [(row["id"], row["attempts"], row["claims"], worker_id, now) for row in rows],
                 )
-        return jobs
+        return [job_from_row(row) for row in rows]
+
+    def _claim_job_sync(
+        self, job_id: str, worker_id: str, lease_seconds: float
+    ) -> Job | None:
+        now = self._clock.now()
+        with self._connections.write() as connection:
+            cursor = connection.execute(
+                CLAIM_DUE_ONE, (worker_id, now + lease_seconds, job_id, now)
+            )
+            if cursor.rowcount != 1:
+                return None
+            job = job_from_row(connection.execute(SELECT_JOB, (job_id,)).fetchone())
+            connection.execute(
+                INSERT_EXECUTION, (job.id, job.attempts, job.claims, worker_id, now)
+            )
+        return job
 
     def _heartbeat_sync(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None
-    ) -> None:
+    ) -> list[str]:
         if not job_ids:
-            return
+            return []
         placeholders = ", ".join("?" for _ in job_ids)
         expiry = self._clock.now() + lease_seconds
         with self._connections.write() as connection:
@@ -429,6 +479,13 @@ class SQLiteBackend(BaseBackend):
                 HEARTBEAT.format(ids=placeholders),
                 (expiry, worker_id, worker_id, *job_ids),
             )
+            return [
+                row[0]
+                for row in connection.execute(
+                    RENEWED.format(ids=placeholders),
+                    (expiry, worker_id, worker_id, *job_ids),
+                )
+            ]
 
     def _complete_sync(self, job: Job, result: bytes | None) -> bool:
         now = self._clock.now()
@@ -478,6 +535,19 @@ class SQLiteBackend(BaseBackend):
                 MARK_EXECUTIONS_LOST.format(ids="?"), (now, job.id)
             )
         return True
+
+    def _release_many_sync(self, jobs: Sequence[Job]) -> int:
+        now = self._clock.now()
+        released = 0
+        with self._connections.write() as connection:
+            for job in jobs:
+                cursor = connection.execute(
+                    RELEASE_JOB, (now, job.id, job.worker_id, job.claims)
+                )
+                if cursor.rowcount == 1:
+                    connection.execute(MARK_EXECUTIONS_LOST.format(ids="?"), (now, job.id))
+                    released += 1
+        return released
 
     def _hand_back_sync(self, job: Job, delay: float) -> bool:
         with self._connections.write() as connection:
@@ -701,14 +771,47 @@ def _executor() -> CountingPool:
     return CountingPool(max_workers=1, thread_name_prefix="tinyjobs-sqlite")
 
 
-def _gated(pool: CountingPool | None, function: Callable[..., T], *args: Any) -> T:
-    if pool is None:
-        with FORK_GATE.using():
-            return function(*args)
-    if pool.retiring:
-        return STEPPED_ASIDE
+def _retrieved(future: asyncio.Future) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+def _gated(
+    pool: CountingPool | None, end: Deadline | None, function: Callable[..., T], *args: Any
+) -> T:
+    if end is not None:
+        CALLING.end = end
     try:
-        with FORK_GATE.using(partial(getattr, pool, "retiring")):
-            return function(*args)
-    except StepAside:
-        return STEPPED_ASIDE
+        if pool is None:
+            with FORK_GATE.using():
+                return function(*args)
+        if pool.retiring:
+            return STEPPED_ASIDE
+        try:
+            with FORK_GATE.using(partial(getattr, pool, "retiring")):
+                return function(*args)
+        except StepAside:
+            return STEPPED_ASIDE
+    finally:
+        if end is not None:
+            CALLING.end = None
+
+
+def _busy_as_transient(function: Callable[..., T], *args: Any) -> T:
+    try:
+        return function(*args)
+    except sqlite3.OperationalError as error:
+        if not _busy(error):
+            raise
+        raise _transient(error) from error
+
+
+def _busy(error: sqlite3.OperationalError) -> bool:
+    return getattr(error, "sqlite_errorcode", 0) & 0xFF in BUSY_CODES
+
+
+def _transient(error: sqlite3.OperationalError) -> DatabaseBusyError:
+    busy = DatabaseBusyError(*error.args)
+    busy.sqlite_errorcode = error.sqlite_errorcode
+    busy.sqlite_errorname = error.sqlite_errorname
+    return busy

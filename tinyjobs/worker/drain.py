@@ -1,23 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
 from contextlib import suppress
-from typing import TYPE_CHECKING, Sequence
+from functools import partial
+from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar
 
-from ..exceptions import ExecutorClosedError, UnknownTaskError
+from ..exceptions import AppClosedError, ExecutorClosedError, UnknownTaskError
 from ..executors import ExecutorResolver
+from ..flag import Flag
 from ..models import Job
-from ..runtime import inside_running_loop
+from ..runtime import CLOSED_MESSAGE, inside_running_loop
 from ..services.execution import current_runner
+from ..sheltered import sheltered
 
 if TYPE_CHECKING:
     from ..app import TinyJobs
     from ..task import Task
 
 DRAIN_WORKER_ID = "drain"
-DRAIN_LEASE_SECONDS = 3600.0
+DRAIN_LEASE_SECONDS = 60.0
+DRAIN_RENEW_SECONDS = 20.0
 DRAIN_SHUTDOWN_SECONDS = 30.0
+
+logger = logging.getLogger("tinyjobs.worker")
+
+T = TypeVar("T")
 
 
 class Drain:
@@ -32,11 +42,12 @@ class Drain:
         self._queues = tuple(queues) if queues else None
         self._shutdown_timeout = shutdown_timeout
         self._finished = threading.Event()
+        self._renewal = _Renewal(app)
         self._prepare_run()
 
     def _prepare_run(self) -> None:
-        self._executors = ExecutorResolver(concurrency=1)
-        self._stopping = asyncio.Event()
+        self._executors = ExecutorResolver(concurrency=1, widens=True)
+        self._stopping = Flag()
         self._loop: asyncio.AbstractEventLoop | None = None
 
     @property
@@ -62,13 +73,21 @@ class Drain:
             loop.call_soon_threadsafe(stopping.set)
 
     async def run(self) -> int:
+        return await self._attached(self._drain)
+
+    async def run_job(self, job_id: str) -> bool:
+        return await self._attached(partial(self._run_job, job_id))
+
+    async def _attached(self, running: Callable[[], Awaitable[T]]) -> T:
         await self._app.ensure_connected()
+        self._app.attach(self)
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
-        self._app.attach(self)
+        self._renewal.open()
         try:
-            return await self._drain()
+            return await running()
         finally:
+            self._renewal.close()
             closing = self._app.detach(self)
             self._executors.shutdown()
             self._prepare_run()
@@ -81,8 +100,8 @@ class Drain:
         while not self._stopping.is_set():
             queues = self._queues or await self._known_queues()
             drained = 0
-            while not self._stopping.is_set() and (job := await self._claim(queues)):
-                drained += await self._execute(job)
+            while not self._stopping.is_set() and (claimed := await self._claim(queues)):
+                drained += await self._run(claimed)
             ran += drained
             if not drained or self._queues:
                 return ran
@@ -97,17 +116,28 @@ class Drain:
         )
         return jobs[0] if jobs else None
 
+    async def _run_job(self, job_id: str) -> bool:
+        job = await self._app.backend.claim_job(
+            job_id, worker_id=DRAIN_WORKER_ID, lease_seconds=DRAIN_LEASE_SECONDS
+        )
+        if job is None:
+            return False
+        if await self._run(job):
+            return True
+        raise AppClosedError(CLOSED_MESSAGE)
+
     async def _known_queues(self) -> tuple[str, ...]:
         stats = await self._app.astats()
         return tuple(queue.queue for queue in stats.queues)
 
-    async def _execute(self, job: Job) -> bool:
+    async def _run(self, job: Job) -> bool:
         try:
             task = self._app.registry.get(job.task)
         except UnknownTaskError:
             await self._app.backend.hand_back(job)
             raise
         running = asyncio.ensure_future(self._attempt(job, task))
+        self._renewal.hold(job)
         try:
             return await self._settle(running, job)
         except ExecutorClosedError:
@@ -116,17 +146,25 @@ class Drain:
         except asyncio.CancelledError:
             await self._abandon(running, job)
             raise
+        finally:
+            if running.done():
+                self._renewal.free(job)
+            else:
+                running.add_done_callback(partial(self._renewal.free, job))
 
     async def _settle(self, running: asyncio.Future, job: Job) -> bool:
-        stopping = asyncio.ensure_future(self._stopping.wait())
-        try:
-            await asyncio.wait(
-                (running, stopping), return_when=asyncio.FIRST_COMPLETED
+        await asyncio.wait(
+            (running, self._stopping.raised()), return_when=asyncio.FIRST_COMPLETED
+        )
+        if not running.done():
+            await asyncio.wait((running,), timeout=self._shutdown_timeout)
+        if not running.done() and self._executors.keeps(running) is not None:
+            logger.warning(
+                "job %s runs in a thread that cannot be stopped; the drain waits for it "
+                "and records its outcome",
+                job.id,
             )
-            if not running.done():
-                await asyncio.wait((running,), timeout=self._shutdown_timeout)
-        finally:
-            stopping.cancel()
+            await asyncio.wait((running,))
         if running.done():
             running.result()
             return True
@@ -134,10 +172,92 @@ class Drain:
         return False
 
     async def _abandon(self, running: asyncio.Future, job: Job) -> None:
+        kept = self._executors.keeps(running)
+        if kept is not None:
+            logger.warning(
+                "job %s still runs in a thread that cannot be stopped; it is not released, and "
+                "its outcome is recorded if it returns while the loop runs, else its lease ends",
+                job.id,
+            )
+            return
         running.cancel()
         await asyncio.gather(running, return_exceptions=True)
-        await asyncio.shield(self._app.backend.release(job))
+        await sheltered(self._app.backend.release(job))
 
     async def _attempt(self, job: Job, task: "Task") -> None:
         current_runner.set(self)
-        await self._app.execution.execute(self._app.bind(job), task, self._executors)
+        await self._app.execution.execute(
+            self._app.bind(job), task, self._executors, held_until=_lease_end
+        )
+
+
+class _Renewal:
+    def __init__(self, app: "TinyJobs") -> None:
+        self._app = app
+        self._held: dict[str, Job] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._handle: asyncio.TimerHandle | None = None
+        self._beating: asyncio.Task | None = None
+        self._running = False
+
+    def open(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._running = True
+        self._arm()
+
+    def close(self) -> None:
+        self._running = False
+        if not self._held:
+            self._halt()
+
+    def hold(self, job: Job) -> None:
+        self._held[job.id] = job
+
+    def free(self, job: Job, _: object = None) -> None:
+        self._held.pop(job.id, None)
+        if not self._running and not self._held:
+            self._halt()
+
+    def _arm(self) -> None:
+        if self._handle is None and self._beating is None and self._loop is not None:
+            self._handle = self._loop.call_later(DRAIN_RENEW_SECONDS, self._due)
+
+    def _halt(self) -> None:
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        if self._beating is not None:
+            self._beating.cancel()
+            self._beating = None
+
+    def _due(self) -> None:
+        self._handle = None
+        if not self._held:
+            self._arm()
+            return
+        self._beating = asyncio.get_running_loop().create_task(
+            self._beat(list(self._held.values()))
+        )
+
+    async def _beat(self, jobs: list[Job]) -> None:
+        try:
+            await self._app.backend.heartbeat(
+                [job.id for job in jobs], DRAIN_LEASE_SECONDS, worker_id=DRAIN_WORKER_ID
+            )
+        except Exception as error:
+            for job in jobs:
+                logger.warning(
+                    "could not renew the lease of job %s, trying again in %.0f seconds: %s",
+                    job.id,
+                    DRAIN_RENEW_SECONDS,
+                    error,
+                )
+        finally:
+            if asyncio.current_task() is self._beating:
+                self._beating = None
+                if self._running or self._held:
+                    self._arm()
+
+
+def _lease_end() -> float:
+    return time.monotonic() + DRAIN_LEASE_SECONDS
