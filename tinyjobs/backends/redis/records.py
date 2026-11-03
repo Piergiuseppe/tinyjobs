@@ -104,6 +104,7 @@ def execution_from(job_id: str, claim: bytes, encoded: bytes) -> Execution:
         finished_at=None if finished_at is None else float(finished_at),
         error_type=data.get("error_type"),
         traceback=data.get("traceback"),
+        claim=int(claim),
     )
 
 
