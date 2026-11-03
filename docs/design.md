@@ -322,10 +322,10 @@ is what Celery originally did. It is still the wrong default, for four reasons t
 1. **It becomes a remote code execution sink the moment the store is shared.** `pickle.loads` will
    execute arbitrary code by design (`__reduce__`), so deserializing is equivalent to executing
    whatever produced the payload. In a local SQLite file that is roughly as trusted as your own
-   source tree. But the roadmap here includes Redis and RabbitMQ backends: network
-   services, frequently unauthenticated in development, occasionally exposed by accident. Anyone able
-   to write a job row would gain code execution inside every worker. Choosing pickle now is designing
-   in a vulnerability that opens by itself later, when the plugin ships.
+   source tree. But the Redis and Postgres backends are network services, frequently unauthenticated
+   in development, occasionally exposed by accident. Anyone able to write a job row would gain code
+   execution inside every worker. Choosing pickle would have designed in a vulnerability that opened
+   by itself when those backends shipped.
 
 2. **It throws away the main benefit of a database-backed queue.** With JSON, diagnosing a bad job is
    `SELECT task, args FROM jobs WHERE status = 'failed'`. With pickle it is an opaque blob that only
@@ -2388,6 +2388,19 @@ lifecycle hooks, retention and automatic purge.
 **v0.4, comfort**
 Result storage, `memory://` backend and the conformance suite, eager and drain test modes,
 `tinyjobs stats` / `check`.
+
+**v0.5 to v0.6, integrations**
+FastAPI and Starlette lifespans with an embedded worker, the `django.tasks` backend and
+`manage.py tinyjobs`, the backend plugin seam and its contract suite.
+
+**v0.7, Redis**
+A Redis backend on Lua scripts, with per-claim tokens, batched outcomes, scripts reloaded when the
+server loses them, and the server's clock followed instead of the worker's.
+
+**v0.8, Postgres and free threading**
+A Postgres backend with `LISTEN`/`NOTIFY` wake-ups, enqueue inside the caller's transaction, also
+through Django's `transaction.atomic()`; a worker that keeps the GIL off on free-threaded builds, and
+`loops=` to run several event loops in one process.
 
 **Next**
 Transactional enqueue on SQLite, the process executor and `isolated=True`, a result size cap and

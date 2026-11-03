@@ -2,7 +2,7 @@
 
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/tinyjobs?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/tinyjobs)
 
-Background jobs and cron for Python, backed by SQLite, with no dependencies.
+Background jobs and cron for Python: SQLite with no dependencies, or Postgres or Redis.
 
 ```bash
 pip install tinyjobs
@@ -448,7 +448,7 @@ as `async def` where cancellation actually works.
 **Arguments are serialized as JSON**, extended with tags for `datetime`, `date`, `Decimal`, `UUID`,
 `Path`, `set`, `tuple`, `bytes` and non-string dict keys. Pickle is available behind
 `TinyJobs(..., allow_pickle=True)` but it's off by default, because deserializing a pickle runs arbitrary
-code and the roadmap includes backends that reach over a network. Dataclasses and enums need one line
+code and the Postgres and Redis backends reach over a network. Dataclasses and enums need one line
 of registration:
 
 ```python
@@ -463,7 +463,7 @@ SQLite with no dependencies, and has cron, retries and a `django.tasks` backend.
 things. `async def` tasks run natively on the worker's loop, where Huey has no asyncio pipeline for
 running tasks, only helpers to await their results. FastAPI and Starlette can run the worker inside
 the server's lifespan. And cron fires from every worker without a leader, with timezones and misfire
-policies, on SQLite or on Redis. [LiteQ](https://github.com/ddreamboy/liteq), at 0.2, makes much
+policies, on SQLite, Postgres or Redis. [LiteQ](https://github.com/ddreamboy/liteq), at 0.2, makes much
 the same pitch on SQLite.
 
 [RQ](https://python-rq.org) and [arq](https://github.com/python-arq/arq) need Redis. RQ's cron

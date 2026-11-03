@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "tinyjobs"
 version = "0.8.0"
-description = "Background jobs and cron for Python, on SQLite, with zero dependencies"
+description = "Background jobs and cron for Python, on SQLite with zero dependencies, or on Postgres or Redis"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

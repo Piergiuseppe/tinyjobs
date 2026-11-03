@@ -1,5 +1,5 @@
 site_name: tinyjobs
-site_description: Background jobs and cron for Python, on SQLite, with zero dependencies
+site_description: Background jobs and cron for Python, on SQLite with zero dependencies, or on Postgres or Redis
 site_url: https://tinyjobs.readthedocs.io/
 repo_url: https://github.com/Piergiuseppe/tinyjobs
 repo_name: Piergiuseppe/tinyjobs
