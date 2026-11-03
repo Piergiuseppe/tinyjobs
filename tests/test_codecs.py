@@ -23,6 +23,45 @@ class Money:
     currency: str
 
 
+class TypeCacheTests(unittest.TestCase):
+    def test_registering_an_adapter_swaps_the_type_cache_in_one_step(self):
+        codec = CodecRegistry().get()
+        self.assertIsNotNone(codec._resolve(datetime))
+        seen = []
+
+        class Watching(list):
+            def __reversed__(self):
+                seen.append(codec._by_type)
+                return super().__reversed__()
+
+        codec._adapters = Watching(codec._adapters)
+        before = codec._by_type
+        codec.register_enum(Colour)
+        self.assertEqual(seen, [before])
+        self.assertIn(datetime, before)
+        self.assertIsNot(codec._by_type, before)
+        self.assertIn(Colour, codec._by_type)
+        self.assertIn(datetime, codec._by_type)
+
+    def test_resolving_reads_one_snapshot_of_the_type_cache(self):
+        codec = CodecRegistry().get()
+        swapped = {}
+
+        class Swapping(dict):
+            def __contains__(self, key):
+                codec._by_type = swapped
+                return super().__contains__(key)
+
+            def get(self, key, default=None):
+                codec._by_type = swapped
+                return super().get(key, default)
+
+        codec._by_type = Swapping(codec._by_type)
+        self.assertIsNotNone(codec._resolve(datetime))
+        self.assertIsNotNone(codec._resolve(Decimal))
+        self.assertIn(Decimal, codec._by_type)
+
+
 class JSONCodecTests(unittest.TestCase):
     def setUp(self) -> None:
         self.registry = CodecRegistry()

@@ -335,7 +335,8 @@ class Worker:
             self._prepare_run()
             self._finished.set()
             raise
-        self._app.close_by(None)
+        if self._parent is None:
+            self._app.close_by(None)
         self._serving = True
         try:
             self._open_lanes()
