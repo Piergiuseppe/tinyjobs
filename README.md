@@ -780,6 +780,24 @@ ten-core laptop with two Redis instances and two apps, one process running eight
 did, while with the GIL the same threads flattened at 27,000 and 17,000. CPU-bound `def` tasks gain
 the most: on that laptop, a worker of eight slots got through them 3.7 times faster on 3.14t.
 
+The same VPS and the same Redis also ran Celery 5.6, to put these numbers beside something known.
+Redis is the backend to do that on: it is the fastest of the three, so the libraries, not the
+store, set the pace. Both drained 80,000 jobs on Python 3.12 with three worker processes capped at
+three cores: Celery's default prefork pool, with no result backend and heartbeat, gossip and mingle
+off, against three tinyjobs workers.
+
+| jobs a second | Celery | tinyjobs |
+| --- | --- | --- |
+| no-op `def`: the library's own cost | 800 | 7,260 |
+| about 1 ms of CPU: the job's cost | 610 | 840 |
+
+Celery's other pools land nearby, 910 with `solo` and 760 with 64 threads, and `acks_late` or a
+prefetch of 32 move it by a few percent: its ceiling is its own consumer process, which takes every
+message apart and hands it to the children while Redis sits at 9%. On 3.14t one tinyjobs process
+with three loops does the work of the three processes, 7,100 and 1,010. So the gap is what each
+library adds to a job: it counts when jobs are many and small, and fades behind jobs that do real
+work. Celery still has the canvas, rate limits and RabbitMQ that tinyjobs does not.
+
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.
 
