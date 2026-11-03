@@ -17,7 +17,7 @@ GROUPS = {
         "testing-your-tasks",
     ],
     "Integrations": ["fastapi", "django"],
-    "Backends": ["postgres", "redis", "other-backends"],
+    "Backends": ["postgres", "redis", "free-threaded-python", "other-backends"],
     "About": ["what-you-get", "how-it-compares", "how-it-works", "measured", "status"],
     "Project": ["working-on-it", "tests", "license"],
 }
