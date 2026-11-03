@@ -395,6 +395,367 @@ class LoopBoundAppCases:
         self.assertEqual(len(jobs), 1)
         self.assertEqual(self.app.counts(), {"success": 1, "queued": 1})
 
+    def run_worker(self, worker, *, until, seconds: float = 20.0) -> None:
+        def stop_when_done() -> None:
+            deadline = time.monotonic() + seconds
+            while not until() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            worker.stop()
+
+        stopper = threading.Thread(target=stop_when_done, daemon=True)
+        stopper.start()
+        worker.run()
+        stopper.join(5)
+
+    def settled(self, total: int):
+        return lambda: self.app.counts().get("success", 0) >= total
+
+    def test_a_worker_run_claims_through_a_connection_on_its_own_loop(self):
+        from tinyjobs.services.execution import current_runner
+
+        seen = []
+
+        @self.app.task(name="where")
+        async def where():
+            home = current_runner.get()._home
+            seen.append((home is not self.app, home.backend._loop is asyncio.get_running_loop()))
+
+        self.app.start()
+        where.enqueue()
+        worker = self.app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        self.run_worker(worker, until=self.settled(1))
+        self.assertEqual(seen, [(True, True)])
+        self.assertIs(worker._home, self.app)
+        self.assertIsNone(self.app._runner._hosted)
+        self.handler.enqueue(1)
+        self.assertEqual(self.app.counts(), {"success": 1, "queued": 1})
+
+    def test_a_worker_keeps_running_after_another_run_on_its_app_ends(self):
+        @self.app.task(name="nap")
+        async def nap():
+            await asyncio.sleep(0.01)
+
+        first = self.app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        second = self.app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        threads = [threading.Thread(target=worker.run) for worker in (first, second)]
+        for thread in threads:
+            thread.start()
+        try:
+            time.sleep(0.5)
+            first.stop()
+            threads[0].join(10)
+            observer = self.make_app()
+            observed = observer.task(name="nap")(lambda: None)
+            try:
+                for _ in range(10):
+                    observed.enqueue()
+                deadline = time.monotonic() + 10
+                while observer.counts().get("success", 0) < 10 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(observer.counts(), {"success": 10})
+            finally:
+                observer.close()
+            self.assertFalse(second.finished)
+        finally:
+            first.stop()
+            second.stop()
+            for thread in threads:
+                thread.join(10)
+
+    def test_a_def_job_enqueues_from_a_worker_run(self):
+        @self.app.task(name="parent")
+        def parent(value):
+            self.handler.enqueue(value)
+
+        observer = self.make_app()
+        observed = observer.task(name="parent")(lambda value: None)
+        try:
+            for value in range(6):
+                observed.enqueue(value)
+        finally:
+            observer.close()
+        worker = self.app.worker(
+            concurrency=3, queues=("default",), scheduler=False, handle_signals=False
+        )
+        self.run_worker(worker, until=self.settled(12))
+        self.assertEqual(self.app.counts(), {"success": 12})
+
+    def test_worker_loops_share_one_queue_across_threads(self):
+        threads = set()
+
+        @self.app.task(name="spot")
+        async def spot():
+            threads.add(threading.current_thread().name)
+            await asyncio.sleep(0.01)
+
+        observer = self.make_app()
+        observed = observer.task(name="spot")(lambda: None)
+        try:
+            for _ in range(60):
+                observed.enqueue()
+        finally:
+            observer.close()
+        worker = self.app.worker(
+            concurrency=6, loops=3, scheduler=False, handle_signals=False
+        )
+        self.run_worker(worker, until=self.settled(60))
+        self.assertEqual(self.app.counts(), {"success": 60})
+        self.assertGreater(len(threads), 1)
+        self.assertLessEqual(
+            threads, {threading.current_thread().name, "tinyjobs-worker-1", "tinyjobs-worker-2"}
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(
+            thread.name.startswith("tinyjobs-worker") for thread in threading.enumerate()
+        ):
+            time.sleep(0.02)
+        self.assertFalse(
+            [t.name for t in threading.enumerate() if t.name.startswith("tinyjobs-worker")]
+        )
+
+    def test_closing_the_app_from_another_thread_stops_a_worker_with_loops(self):
+        napping = threading.Event()
+
+        @self.app.task(name="nap")
+        async def nap():
+            napping.set()
+            await asyncio.sleep(0.05)
+
+        observer = self.make_app()
+        observed = observer.task(name="nap")(lambda: None)
+        try:
+            for _ in range(40):
+                observed.enqueue()
+        finally:
+            observer.close()
+        worker = self.app.worker(concurrency=2, loops=2, scheduler=False, handle_signals=False)
+        errors = []
+
+        def close_soon() -> None:
+            napping.wait(10)
+            try:
+                self.app.close()
+            except BaseException as error:
+                errors.append(error)
+
+        closer = threading.Thread(target=close_soon)
+        closer.start()
+        started = time.monotonic()
+        worker.run()
+        closer.join(10)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertTrue(worker.finished)
+
+    def test_a_loop_that_cannot_connect_stops_the_worker_with_its_error(self):
+        homes = []
+        lane = self.app.lane
+
+        async def refuse() -> None:
+            raise RuntimeError("no connection for this loop")
+
+        def failing_after_the_first():
+            home = lane()
+            if homes:
+                home.ready = refuse
+            homes.append(home)
+            return home
+
+        self.app.lane = failing_after_the_first
+        worker = self.app.worker(concurrency=2, loops=2, scheduler=False, handle_signals=False)
+        with self.assertLogs("tinyjobs.worker", "ERROR"):
+            with self.assertRaisesRegex(RuntimeError, "no connection for this loop"):
+                worker.run()
+        self.assertTrue(worker.finished)
+
+    def test_closing_the_app_from_a_job_on_an_extra_loop_stops_at_once(self):
+        from tinyjobs.services.execution import current_runner
+
+        closed_from_a_lane = threading.Event()
+
+        @self.app.task(name="closer")
+        def closer():
+            if current_runner.get()._parent is None:
+                time.sleep(0.05)
+                return
+            closed_from_a_lane.set()
+            self.app.close()
+
+        observer = self.make_app()
+        observed = observer.task(name="closer")(lambda: None)
+        try:
+            for _ in range(40):
+                observed.enqueue()
+        finally:
+            observer.close()
+        worker = self.app.worker(
+            concurrency=2, loops=2, scheduler=False, handle_signals=False, shutdown_timeout=20
+        )
+        fallback = threading.Timer(15, worker.stop)
+        fallback.start()
+        started = time.monotonic()
+        try:
+            worker.run()
+        finally:
+            fallback.cancel()
+        self.assertTrue(closed_from_a_lane.is_set())
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertTrue(worker.finished)
+        self.assertFalse(
+            [t.name for t in threading.enumerate() if t.name.startswith("tinyjobs-worker")]
+        )
+
+    def test_a_stopped_worker_waits_for_a_def_job_on_an_extra_loop(self):
+        @self.app.task(name="slow")
+        def slow():
+            time.sleep(1.5)
+
+        observer = self.make_app()
+        observed = observer.task(name="slow")(lambda: None)
+        try:
+            observed.enqueue()
+            observed.enqueue()
+        finally:
+            observer.close()
+        worker = self.app.worker(
+            concurrency=2, loops=2, scheduler=False, handle_signals=False, shutdown_timeout=0.3
+        )
+        self.run_worker(worker, until=lambda: self.app.counts().get("running", 0) >= 2)
+        self.assertEqual(self.app.counts(), {"success": 2})
+
+    def test_a_stop_reaches_a_worker_still_connecting(self):
+        lane = self.app.lane
+
+        def slow_to_connect():
+            home = lane()
+            ready = home.ready
+
+            async def slowly() -> None:
+                await asyncio.sleep(30)
+                await ready()
+
+            home.ready = slowly
+            return home
+
+        self.app.lane = slow_to_connect
+        worker = self.app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        stopper = threading.Timer(0.5, worker.stop)
+        stopper.start()
+        started = time.monotonic()
+        worker.run()
+        stopper.join(5)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(worker.finished)
+
+    def test_closing_the_app_while_a_worker_connects_stops_it(self):
+        from tinyjobs.exceptions import AppClosedError
+
+        lane = self.app.lane
+        connecting = threading.Event()
+
+        def slow_to_connect():
+            home = lane()
+            ready = home.ready
+
+            async def slowly() -> None:
+                connecting.set()
+                await asyncio.sleep(0.5)
+                await ready()
+
+            home.ready = slowly
+            return home
+
+        def close_while_connecting() -> None:
+            connecting.wait(10)
+            self.app.close()
+
+        self.app.lane = slow_to_connect
+        worker = self.app.worker(concurrency=2, scheduler=False, handle_signals=False)
+        closer = threading.Thread(target=close_while_connecting, daemon=True)
+        closer.start()
+        started = time.monotonic()
+        with self.assertRaises(AppClosedError):
+            worker.run()
+        closer.join(5)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(worker.finished)
+        self.assertIsNone(worker._loop)
+        stopper = threading.Timer(0.2, worker.stop)
+        self.app.lane = slow_to_connect
+        stopper.start()
+        started = time.monotonic()
+        worker.run()
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_second_stop_forces_extra_loops_after_the_main_one_finished(self):
+        stuck_on_a_lane = threading.Event()
+
+        @self.app.task(name="stuck")
+        async def stuck():
+            if threading.current_thread().name.startswith("tinyjobs-worker"):
+                stuck_on_a_lane.set()
+                await asyncio.sleep(30)
+
+        observer = self.make_app()
+        observed = observer.task(name="stuck")(lambda: None)
+        try:
+            for _ in range(40):
+                observed.enqueue()
+        finally:
+            observer.close()
+        worker = self.app.worker(
+            concurrency=2, loops=2, scheduler=False, handle_signals=False, shutdown_timeout=30
+        )
+
+        def stop_twice() -> None:
+            stuck_on_a_lane.wait(20)
+            worker.stop()
+            time.sleep(0.3)
+            worker.force()
+
+        stopper = threading.Thread(target=stop_twice, daemon=True)
+        stopper.start()
+        started = time.monotonic()
+        worker.run()
+        stopper.join(5)
+        self.assertTrue(stuck_on_a_lane.is_set())
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_an_embedded_worker_refuses_loops(self):
+        from tinyjobs.exceptions import ConfigurationError
+
+        async def serve() -> None:
+            async with self.app.serve(worker=True, loops=2):
+                pass
+
+        with self.assertRaisesRegex(ConfigurationError, "takes no loops"):
+            asyncio.run(serve())
+
+    def test_async_concurrency_below_loops_is_refused(self):
+        from tinyjobs.exceptions import ConfigurationError
+
+        with self.assertRaisesRegex(ConfigurationError, "async_concurrency"):
+            self.app.worker(concurrency=4, async_concurrency=1, loops=2)
+
+    def test_a_signalled_cli_worker_with_loops_finishes_its_jobs(self):
+        took = seconds_to_exit(
+            self.app.url,
+            prefix=self.prefix,
+            seconds=0.5,
+            count=4,
+            timeout=5.0,
+            lock=contextlib.nullcontext,
+            task="nap",
+            options=("--loops", "2"),
+        )
+        self.assertLess(took, 3.0)
+        observer = self.make_app()
+        try:
+            self.assertEqual(observer.counts(), {"success": 4})
+        finally:
+            observer.close()
+
     def test_an_app_dropped_without_closing_stops_its_loop_thread(self):
         import gc
         import threading

@@ -10,14 +10,25 @@ SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
 
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
 _BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
+_LOOP_BOUND: set[str] = set()
 
 
 def register_builtin(
-    scheme: str, factory: Callable[..., Any], check: Callable[..., None] | None = None
+    scheme: str,
+    factory: Callable[..., Any],
+    check: Callable[..., None] | None = None,
+    *,
+    loop_bound: bool = False,
 ) -> None:
     _BUILTIN_FACTORIES[scheme] = factory
     if check is not None:
         _BUILTIN_CHECKS[scheme] = check
+    if loop_bound:
+        _LOOP_BOUND.add(scheme)
+
+
+def loop_bound(url: str) -> bool:
+    return _scheme(url) in _LOOP_BOUND
 
 
 def check_options(url: str, options: dict[str, Any]) -> None:

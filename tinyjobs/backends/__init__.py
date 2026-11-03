@@ -25,10 +25,10 @@ def _postgres_options(url: str, **options):
 
 register_builtin("sqlite", SQLiteBackend.from_url)
 register_builtin("memory", SQLiteBackend.from_url)
-register_builtin("redis", _redis)
-register_builtin("rediss", _redis)
-register_builtin("postgres", _postgres, _postgres_options)
-register_builtin("postgresql", _postgres, _postgres_options)
+register_builtin("redis", _redis, loop_bound=True)
+register_builtin("rediss", _redis, loop_bound=True)
+register_builtin("postgres", _postgres, _postgres_options, loop_bound=True)
+register_builtin("postgresql", _postgres, _postgres_options, loop_bound=True)
 
 __all__ = [
     "Backend",

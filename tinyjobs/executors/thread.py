@@ -15,6 +15,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from ..exceptions import ExecutorClosedError
 from ..models import JobPayload
+from ..runtime import fresh_thread
 from ..sheltered import landing, sheltered
 from .base import Executor
 
@@ -178,9 +179,7 @@ class _Threads:
 
     def _grow(self) -> None:
         while self._waiting > self._idle and len(self._threads) < self._size:
-            thread = threading.Thread(
-                target=self._serve, name=f"tinyjobs_{next(self._names)}", daemon=True
-            )
+            thread = fresh_thread(self._serve, name=f"tinyjobs_{next(self._names)}")
             thread.start()
             self._threads.add(thread)
             self._idle += 1

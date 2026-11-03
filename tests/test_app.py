@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import gc
 import importlib.util
 import os
@@ -1917,7 +1918,7 @@ class ForkTests(BackendTestCase):
             return None
 
         inner = self.app.backend._inner
-        waiting = threading.Thread(target=noop.enqueue)
+        waiting = threading.Thread(target=contextvars.Context().run, args=(noop.enqueue,))
         child = None
         try:
             with inner.transaction() as connection:
@@ -1950,6 +1951,27 @@ class ForkTests(BackendTestCase):
         ).fetchone()[0]
         self.assertEqual(marker, "committed")
         self.assertEqual(self.app.counts()["queued"], 1)
+
+    def test_a_thread_started_with_the_transactions_context_counts_as_inside_it(self):
+        @self.app.task
+        def noop():
+            return None
+
+        refused = []
+
+        def enqueue():
+            try:
+                noop.enqueue()
+            except RuntimeError as error:
+                refused.append(str(error))
+
+        with self.app.backend._inner.transaction():
+            inside = threading.Thread(target=contextvars.copy_context().run, args=(enqueue,))
+            inside.start()
+            inside.join(10)
+        self.assertEqual(len(refused), 1)
+        self.assertIn("transaction", refused[0])
+        self.assertEqual(self.app.counts().get("queued", 0), 0)
 
     def test_a_child_that_fails_inside_its_parents_transaction_leaves_it_alone(self):
         inner = self.app.backend._inner
