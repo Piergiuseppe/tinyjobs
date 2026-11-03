@@ -145,8 +145,8 @@ class _Threads:
         self._work: queue.SimpleQueue = queue.SimpleQueue()
         self._lock = threading.Lock()
         self._threads: set[threading.Thread] = set()
-        self._idle = 0
-        self._waiting = 0
+        self._idle = threading.Semaphore(0)
+        self._short = False
         self._closed = False
         self._names = itertools.count()
 
@@ -159,11 +159,13 @@ class _Threads:
         with self._lock:
             if self._closed:
                 raise RuntimeError("cannot schedule new futures after shutdown")
-            self._waiting += 1
             self._work.put((future, call))
+            if not self._short and self._idle.acquire(blocking=False):
+                return future
             try:
                 self._grow()
             except RuntimeError:
+                self._short = True
                 if self._threads:
                     return future
                 future.cancel()
@@ -173,27 +175,27 @@ class _Threads:
     def widen(self, change: int) -> None:
         with self._lock:
             self._size += change
-            if not self._closed:
-                with suppress(RuntimeError):
+            if change > 0 and not self._closed:
+                try:
                     self._grow()
+                except RuntimeError:
+                    self._short = True
 
     def _grow(self) -> None:
-        while self._waiting > self._idle and len(self._threads) < self._size:
+        if len(self._threads) < self._size:
             thread = fresh_thread(self._serve, name=f"tinyjobs_{next(self._names)}")
             thread.start()
             self._threads.add(thread)
-            self._idle += 1
+        if len(self._threads) >= self._size:
+            self._short = False
 
     def _serve(self) -> None:
         while True:
             item = self._work.get()
-            with self._lock:
-                if item is None:
-                    self._idle -= 1
+            if item is None:
+                with self._lock:
                     self._threads.discard(threading.current_thread())
-                    return
-                self._idle -= 1
-                self._waiting -= 1
+                return
             future, call = item
             del item
             if future.set_running_or_notify_cancel():
@@ -204,11 +206,12 @@ class _Threads:
                 else:
                     future.set_result(result)
             del future, call
-            with self._lock:
-                if self._closed or len(self._threads) > self._size:
-                    self._threads.discard(threading.current_thread())
-                    return
-                self._idle += 1
+            if self._closed or len(self._threads) > self._size:
+                with self._lock:
+                    if self._closed or len(self._threads) > self._size:
+                        self._threads.discard(threading.current_thread())
+                        return
+            self._idle.release()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -219,7 +222,6 @@ class _Threads:
             with suppress(queue.Empty):
                 while True:
                     pending.append(self._work.get_nowait())
-            self._waiting = 0
             for _ in self._threads:
                 self._work.put(None)
         for item in pending:

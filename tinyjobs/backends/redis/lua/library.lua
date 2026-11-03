@@ -70,6 +70,17 @@ local function flatten(job, hidden)
   return flat
 end
 
+local function packed(job, hidden)
+  local sizes, values = {}, {}
+  for field, value in pairs(job) do
+    if field ~= hidden then
+      sizes[#sizes + 1] = field .. '=' .. #value
+      values[#values + 1] = value
+    end
+  end
+  return table.concat(sizes, ',') .. '\n' .. table.concat(values)
+end
+
 local function read_job(arguments, start)
   local size = tonumber(arguments[start])
   local job = {}

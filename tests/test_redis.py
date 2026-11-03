@@ -100,11 +100,12 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
     async def test_a_claim_answers_without_its_token(self):
         await self.enqueue(run_at=START - 1)
         now = await self.backend._now()
-        [flat] = await self.backend._scripts.run(
+        [blob] = await self.backend._scripts.run(
             "claim", now, "worker", str(now + 60), 1, "a-token", "default"
         )
-        self.assertNotIn(b"claim_token", flat[::2])
-        self.assertIn(b"claims", flat[::2])
+        names = [item.partition(b"=")[0] for item in blob.partition(b"\n")[0].split(b",")]
+        self.assertNotIn(b"claim_token", names)
+        self.assertIn(b"claims", names)
 
     async def test_a_script_the_server_lost_is_loaded_again_and_run_once(self):
         job = await self.enqueue(run_at=START - 1)
