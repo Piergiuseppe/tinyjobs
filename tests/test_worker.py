@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import os
 import tempfile
 import time
@@ -1647,10 +1648,68 @@ class SQLiteExitTests(unittest.TestCase):
         self.assertLess(took, 1.25 + 0.5)
         self.assertEqual(printed.split()[0], "returned")
 
+    @unittest.skipUnless(importlib.util.find_spec("psycopg_pool"), "needs psycopg_pool")
+    def test_a_stop_before_the_run_ends_it_while_the_backend_never_answers(self):
+        import socket
+
+        with socket.socket() as silent:
+            silent.bind(("127.0.0.1", 0))
+            silent.listen(8)
+            app = TinyJobs(f"postgresql://postgres@127.0.0.1:{silent.getsockname()[1]}/silent")
+            worker = app.worker(handle_signals=False, shutdown_timeout=1.0, scheduler=False)
+            worker.stop()
+            began = time.monotonic()
+            worker.run()
+            self.assertLess(time.monotonic() - began, 1.25 + 0.5)
+
     def test_a_second_ctrl_c_ends_a_blocked_run_on_a_loop_without_signal_handlers(self):
         took, printed = self.forced_exit("own", "unhandled", 1.0, (0.3,))
         self.assertLess(took, 1.25 + 0.5)
         self.assertEqual(printed, self.forced_outcome("own"))
+
+    @unittest.skipUnless(importlib.util.find_spec("psycopg_pool"), "needs psycopg_pool")
+    def test_a_ctrl_c_ends_a_run_whose_backend_never_answers_within_the_budget(self):
+        import signal
+        import socket
+        import subprocess
+        import sys
+
+        script = (
+            "import sys\n"
+            "from tinyjobs import TinyJobs\n"
+            "app = TinyJobs(sys.argv[1])\n"
+            "try:\n"
+            "    app.worker(handle_signals=sys.argv[2] == 'own', shutdown_timeout=1.0,"
+            " scheduler=False).run()\n"
+            "    print('returned', flush=True)\n"
+            "except KeyboardInterrupt:\n"
+            "    print('raised', flush=True)\n"
+        )
+        for handling in ("caller", "own"):
+            with self.subTest(handling=handling), socket.socket() as silent:
+                silent.bind(("127.0.0.1", 0))
+                silent.listen(8)
+                url = f"postgresql://postgres@127.0.0.1:{silent.getsockname()[1]}/silent"
+                worker = subprocess.Popen(
+                    [sys.executable, "-c", script, url, handling],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    time.sleep(1.5)
+                    self.assertIsNone(worker.poll())
+                    interrupted = time.monotonic()
+                    worker.send_signal(signal.SIGINT)
+                    printed, errors = worker.communicate(timeout=30)
+                    took = time.monotonic() - interrupted
+                finally:
+                    if worker.poll() is None:
+                        worker.kill()
+                        worker.communicate(timeout=10)
+                self.assertEqual(worker.returncode, 0, errors[-2000:])
+                self.assertEqual(printed.strip(), "returned" if handling == "own" else "raised")
+                self.assertLess(took, 1.25 + 0.5)
 
     def test_a_ctrl_c_after_a_run_ends_leaves_the_next_run_unstopped(self):
         import signal
