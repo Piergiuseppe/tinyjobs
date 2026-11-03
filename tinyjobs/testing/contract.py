@@ -88,6 +88,18 @@ class BackendContract:
         self.clock.advance(61)
         return await self.backend.reap_expired()
 
+    async def test_claimed_jobs_keep_bytes_that_look_like_separators(self):
+        payload = b'{"args":["a=b,c\\n"],"kwargs":{}}\n=,\x00\xff'
+        first = await self.enqueue(payload=payload, task="tests.a=b,c", dedup_key="k=1,2\n3")
+        second = await self.enqueue(payload=payload, task="tests.a=b,c", dedup_key="k=4,5\n6")
+        [claimed] = await self.claim(limit=1)
+        by_id = await self.backend.claim_job(second.id, worker_id="worker-b", lease_seconds=60.0)
+        for job, expected in ((claimed, first), (by_id, second)):
+            self.assertEqual(job.id, expected.id)
+            self.assertEqual(job.payload, payload)
+            self.assertEqual(job.task, "tests.a=b,c")
+            self.assertEqual(job.dedup_key, expected.dedup_key)
+
     async def test_enqueued_job_is_readable(self):
         job = await self.enqueue(payload=b'{"args":[1],"kwargs":{}}', priority=3)
         stored = await self.stored(job)

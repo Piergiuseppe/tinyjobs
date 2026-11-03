@@ -26,6 +26,6 @@ for index = 1, math.min(limit, #candidates) do
   local id = string.match(candidates[index].member, '|(.+)$')
   local job = load(id)
   take(job, worker, lease_expires_at, token)
-  claimed[#claimed + 1] = flatten(job, 'claim_token')
+  claimed[#claimed + 1] = packed(job, 'claim_token')
 end
 return claimed

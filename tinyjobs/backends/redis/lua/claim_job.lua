@@ -4,4 +4,4 @@ if not job or job.status ~= 'queued' or tonumber(job.run_at) > tonumber(HORIZON)
   return {}
 end
 take(job, worker, lease_expires_at, ARGV[5])
-return { flatten(job, 'claim_token') }
+return { packed(job, 'claim_token') }

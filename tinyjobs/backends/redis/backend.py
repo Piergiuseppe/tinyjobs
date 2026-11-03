@@ -41,7 +41,7 @@ from .keys import Keys
 from .records import (
     execution_from,
     job_from_fields,
-    job_from_flat,
+    job_from_packed,
     jobs_to_arguments,
     number,
     schedule_from,
@@ -222,7 +222,7 @@ class RedisBackend(BaseBackend):
             lease_seconds,
             self._script("claim", now, worker_id, number(now + lease_seconds), limit, token, *queues),
         )
-        return [job_from_flat(flat) for flat in claimed]
+        return [job_from_packed(blob) for blob in claimed]
 
     async def claim_job(
         self, job_id: str, *, worker_id: str, lease_seconds: float
@@ -235,7 +235,7 @@ class RedisBackend(BaseBackend):
             lease_seconds,
             self._script("claim_job", now, worker_id, number(now + lease_seconds), job_id, token),
         )
-        return job_from_flat(claimed[0]) if claimed else None
+        return job_from_packed(claimed[0]) if claimed else None
 
     async def _haunting(self, token: str, lease_seconds: float, claiming: Awaitable[T]) -> T:
         try:

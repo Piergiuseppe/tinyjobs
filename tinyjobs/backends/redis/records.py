@@ -54,8 +54,16 @@ def jobs_to_arguments(jobs: Sequence[Job]) -> list[Any]:
     return arguments
 
 
-def job_from_flat(flat: Sequence[bytes]) -> Job:
-    return job_from_fields(dict(zip(flat[::2], flat[1::2])))
+def job_from_packed(blob: bytes) -> Job:
+    head, _, body = blob.partition(b"\n")
+    fields: dict[bytes, bytes] = {}
+    at = 0
+    for item in head.split(b","):
+        name, _, size = item.partition(b"=")
+        end = at + int(size)
+        fields[name] = body[at:end]
+        at = end
+    return job_from_fields(fields)
 
 
 def job_from_fields(raw: dict[bytes, bytes]) -> Job:
