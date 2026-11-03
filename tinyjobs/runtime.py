@@ -157,6 +157,12 @@ def forking_threads(pid: int) -> set[int]:
     return {marked for marked, owner in list(_fork_marks.items()) if owner == pid}
 
 
+def fresh_thread(target: Callable[..., Any], *args: Any, name: str) -> threading.Thread:
+    return threading.Thread(
+        target=contextvars.Context().run, args=(target, *args), name=name, daemon=True
+    )
+
+
 class CountingPool(concurrent.futures.ThreadPoolExecutor):
     def __init__(self, **options: Any) -> None:
         super().__init__(**options)
@@ -167,7 +173,7 @@ class CountingPool(concurrent.futures.ThreadPoolExecutor):
         token = object()
         self._pending.add(token)
         try:
-            future = super().submit(fn, *args, **kwargs)
+            future = super().submit(contextvars.Context().run, fn, *args, **kwargs)
         except BaseException:
             self._pending.discard(token)
             raise
@@ -260,7 +266,7 @@ def _close_collected(function: Callable[..., Any], args: Any) -> None:
 
 
 def _start_closing(target: Callable[..., Any], *args: Any) -> None:
-    thread = threading.Thread(target=target, args=args, name=CLOSE_THREAD_NAME, daemon=True)
+    thread = fresh_thread(target, *args, name=CLOSE_THREAD_NAME)
     _closing.add(thread)
     try:
         thread.start()
@@ -507,9 +513,7 @@ def _control_bootstrap(resuming: bool) -> None:
         current = _control_thread
         if current is not None and _control_pid == pid and current.is_alive():
             return
-        thread = threading.Thread(
-            target=_control_main, name=CONTROL_THREAD_NAME, daemon=True
-        )
+        thread = fresh_thread(_control_main, name=CONTROL_THREAD_NAME)
         thread.start()
         _control_thread, _control_ident, _control_pid = thread, thread.ident, pid
 
@@ -628,6 +632,7 @@ class LoopRunner:
         self._keep_serving = False
         self._pool: CountingPool | None = None
         self._ready = threading.Event()
+        self._hosted: asyncio.AbstractEventLoop | None = None
         self.closing_by: Deadline | None = None
         self.exit_by: Deadline | None = None
         _runners.add(self)
@@ -654,6 +659,36 @@ class LoopRunner:
 
     def own_loop(self) -> asyncio.AbstractEventLoop:
         return self._ensure_loop()
+
+    def host(self, loop: asyncio.AbstractEventLoop) -> bool:
+        with self._guard:
+            if self._hosted is not None or self._paused is not None or self._serving():
+                return False
+            if _exiting.is_set():
+                return False
+            self._loop, self._thread = loop, threading.current_thread()
+            self._hosted = loop
+            self._ready.set()
+            return True
+
+    def unhost(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._guard:
+            if self._hosted is not loop:
+                return
+            self._hosted = None
+            if self._loop is loop:
+                self._loop, self._thread = None, None
+        if loop.is_closed():
+            return
+        with self._guard:
+            residents = self._residents.pop(loop, [])
+        _ending.add(loop)
+        _retired.add(loop)
+        closing = self.closing_by
+        for resident in residents:
+            with suppress(Exception), ending_by(closing):
+                loop.run_until_complete(resident.close())
+        self._settle_left(loop)
 
     def serves(self, loop: asyncio.AbstractEventLoop) -> bool:
         return self._loop is loop and (loop.is_running() or loop in _resting)
@@ -696,6 +731,8 @@ class LoopRunner:
     def _take_own(self) -> tuple[asyncio.AbstractEventLoop | None, Any]:
         with self._guard:
             loop, thread = self._loop, self._thread
+            if loop is not None and loop is self._hosted:
+                return None, None
             self._loop, self._thread = None, None
             if loop is None:
                 return None, None
@@ -713,6 +750,8 @@ class LoopRunner:
         try:
             loop, thread, pool = self._loop, self._thread, self._pool
             if loop is None or thread is None or not loop.is_running():
+                return False
+            if loop is self._hosted:
                 return False
             if thread is threading.current_thread() or self._paused is not None:
                 return False
@@ -747,6 +786,7 @@ class LoopRunner:
             loop for loop in (self._loop, self._paused) if loop is not None
         )
         self._loop, self._thread = None, None
+        self._hosted = None
         self._residents = {}
         self._awaiting = {}
         self._paused, self._keep_serving = None, False
@@ -771,6 +811,8 @@ class LoopRunner:
     def _serving(self) -> bool:
         if self._loop is None or self._thread is None or not self._thread.is_alive():
             return False
+        if self._loop is self._hosted:
+            return not self._loop.is_closed()
         return self._loop.is_running() or not self._ready.is_set()
 
     def _restart_paused(self) -> None:
@@ -987,9 +1029,7 @@ def _stop(loop: asyncio.AbstractEventLoop) -> None:
 def _loop_thread(
     serve: Any, loop: asyncio.AbstractEventLoop, ready: threading.Event
 ) -> threading.Thread:
-    return threading.Thread(
-        target=serve, args=(loop, ready), name="tinyjobs-loop", daemon=True
-    )
+    return fresh_thread(serve, loop, ready, name=LOOP_THREAD_PREFIX)
 
 
 def _loop_executor() -> CountingPool:

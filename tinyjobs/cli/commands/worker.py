@@ -23,6 +23,9 @@ class WorkerCommand(Command):
         )
         parser.add_argument("--concurrency", type=int, default=8)
         parser.add_argument("--async-concurrency", type=int, default=None)
+        parser.add_argument("--loops", type=int, default=1,
+                            help="event loops in this process, each with its own backend "
+                                 "connection; above 1 pays off on free-threaded Python")
         parser.add_argument("--lease", type=float, default=60.0, dest="lease_seconds")
         parser.add_argument("--reap-interval", type=float, default=30.0)
         parser.add_argument("--shutdown-timeout", type=float, default=30.0)
@@ -52,6 +55,7 @@ class WorkerCommand(Command):
             queues=[q.strip() for q in args.queues.split(",") if q.strip()],
             concurrency=args.concurrency,
             async_concurrency=args.async_concurrency,
+            loops=args.loops,
             lease_seconds=args.lease_seconds,
             reap_interval=args.reap_interval,
             shutdown_timeout=args.shutdown_timeout,

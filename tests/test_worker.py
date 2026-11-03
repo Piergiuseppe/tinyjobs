@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from tinyjobs import Abandon, Retry, TinyJobs
-from tinyjobs.exceptions import UnknownTaskError
+from tinyjobs.exceptions import ConfigurationError, UnknownTaskError
 from tinyjobs.services.execution import current_job
 from tinyjobs.status import ExecutionStatus, JobStatus
 from tests.support import seconds_to_exit
@@ -55,6 +55,46 @@ class WorkerTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def status_of(self, job) -> JobStatus:
         return (await self.app.aget(job.id)).status
+
+
+class LoopsOptionTests(WorkerTestCase):
+    def test_loops_must_fit_within_concurrency(self):
+        for loops, concurrency in ((0, 4), (5, 4), (-1, 1)):
+            with self.subTest(loops=loops, concurrency=concurrency):
+                with self.assertRaisesRegex(ConfigurationError, "loops must be at least 1"):
+                    self.make_worker(loops=loops, concurrency=concurrency)
+
+    def test_a_single_loop_keeps_the_concurrency_checks_it_had(self):
+        worker = self.make_worker(concurrency=1, async_concurrency=0)
+        self.assertEqual((worker._concurrency, worker._async_concurrency), (1, 0))
+
+    def test_loops_split_concurrency_between_them(self):
+        worker = self.make_worker(loops=3, concurrency=8, async_concurrency=4)
+        self.assertEqual(worker._concurrency, 3)
+        self.assertEqual(worker._async_concurrency, 2)
+        self.assertEqual(
+            [(options["concurrency"], options["async_concurrency"]) for options in worker._lane_options],
+            [(3, 1), (2, 1)],
+        )
+        self.assertTrue(all(not options["scheduler"] for options in worker._lane_options))
+
+    async def test_loops_above_one_refuse_a_backend_without_its_own_connections(self):
+        worker = self.make_worker(loops=2)
+        with self.assertRaisesRegex(ConfigurationError, "loops above 1"):
+            await worker.start()
+        self.assertTrue(worker.finished)
+
+
+class GilWarningTests(WorkerTestCase):
+    async def test_a_free_threaded_build_with_the_gil_back_on_is_reported(self):
+        for disabled, enabled, warned in ((1, True, True), (1, False, False), (0, True, False)):
+            with self.subTest(disabled=disabled, enabled=enabled):
+                worker = self.make_worker()
+                with mock.patch("sysconfig.get_config_var", return_value=disabled), mock.patch(
+                    "sys._is_gil_enabled", return_value=enabled, create=True
+                ), self.assertLogs("tinyjobs.worker", "INFO") as logs:
+                    await self.run_briefly(worker, 0.1)
+                self.assertEqual(any("GIL enabled" in line for line in logs.output), warned)
 
 
 class ExecutionTests(WorkerTestCase):

@@ -14,7 +14,7 @@ from functools import partial
 from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
-from .backends.loader import check_options, load_backend
+from .backends.loader import check_options, load_backend, loop_bound
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .deadlines import Deadline, finishing
@@ -75,6 +75,11 @@ NOT_READY_MESSAGE = (
 EMBEDDED_SIGNALS_MESSAGE = (
     "an embedded worker installs no signal handlers: the server owns them, and "
     "leaving serve() or the lifespan is what stops the worker"
+)
+
+EMBEDDED_LOOPS_MESSAGE = (
+    "an embedded worker runs on the server's event loop, so it takes no loops; "
+    "run tinyjobs worker --loops or worker.run() for more loops"
 )
 
 WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
@@ -160,33 +165,38 @@ class TinyJobs:
 
     @property
     def backend(self) -> ManagedBackend:
-        return self._connected(self._backend)
+        return self._connected("_backend")
 
     @property
     def dispatch(self) -> DispatchService:
-        return self._connected(self._dispatch)
+        return self._connected("_dispatch")
 
     @property
     def lifecycle(self) -> JobLifecycleService:
-        return self._connected(self._lifecycle)
+        return self._connected("_lifecycle")
 
     @property
     def execution(self) -> ExecutionService:
-        return self._connected(self._execution)
+        return self._connected("_execution")
 
     @property
     def scheduling(self) -> SchedulingService:
-        return self._connected(self._scheduling)
+        return self._connected("_scheduling")
 
     @property
     def health(self) -> HealthService:
-        return self._connected(self._health)
+        return self._connected("_health")
 
-    def _connected(self, part: T | None) -> T:
+    def _connected(self, name: str) -> Any:
+        part = getattr(self, name)
         if part is not None:
             return part
-        if self._closed or self._closes:
-            raise AppClosedError(CLOSED_MESSAGE)
+        with self._lock_guard:
+            part = getattr(self, name)
+            if part is not None:
+                return part
+            if self._closed or self._closes:
+                raise AppClosedError(CLOSED_MESSAGE)
         raise BackendNotReadyError(NOT_READY_MESSAGE)
 
     def run_sync(
@@ -238,10 +248,17 @@ class TinyJobs:
             await self.backend.follow_clock()
 
     async def ready(self) -> None:
+        await self.reopen()
+        await self._connect()
+
+    async def reopen(self) -> None:
         await settled()
         self._closed = False
         self._shutting = False
-        await self._connect()
+
+    @property
+    def loop_bound(self) -> bool:
+        return loop_bound(self._url)
 
     async def _connect(self) -> None:
         attempt = await self._elect()
@@ -607,6 +624,27 @@ class TinyJobs:
     def decode(self, job: Job) -> JobPayload:
         return self._serialization.decode_payload(job)
 
+    def host(self, loop: asyncio.AbstractEventLoop) -> bool:
+        return self._runner.host(loop)
+
+    def unhost(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._runner.unhost(loop)
+
+    def lane(self) -> "TinyJobs":
+        lane = TinyJobs(
+            self._url,
+            default_queue=self._default_queue,
+            retention=self._retention,
+            clock=self._clock,
+            eager=self._eager,
+            **self._backend_options,
+        )
+        lane._codecs = self._codecs
+        lane._registry = self._registry
+        lane._serialization = self._serialization
+        lane._hooks = self._hooks
+        return lane
+
     def worker(self, **options: Any) -> Worker:
         options.setdefault("retention", self._retention)
         return Worker(self, **options)
@@ -621,6 +659,8 @@ class TinyJobs:
         _assert_worker_requested(worker, worker_options)
         if worker_options.pop("handle_signals", False):
             raise ConfigurationError(EMBEDDED_SIGNALS_MESSAGE)
+        if worker_options.get("loops", 1) != 1:
+            raise ConfigurationError(EMBEDDED_LOOPS_MESSAGE)
         embedded = (
             EmbeddedWorker(self.worker(**worker_options, handle_signals=False))
             if worker
@@ -689,6 +729,17 @@ class TinyJobs:
             self._closing_after.add(inside)
             return True
 
+    def close_after(self, worker: Worker) -> bool:
+        with self._lock_guard:
+            if worker not in self._workers:
+                return False
+            self._closing_after.add(worker)
+            return True
+
+    def _attached(self) -> bool:
+        with self._lock_guard:
+            return bool(self._workers)
+
     def _closes_later(self, inside: object | None) -> bool:
         with self._lock_guard:
             return inside is not None and inside in self._closing_after
@@ -744,14 +795,16 @@ class TinyJobs:
 
     def _close_app(self, inside: object | None) -> None:
         try:
-            if self._backend is not None:
+            if self._backend is not None or self._attached():
                 with suppress(AppClosedError):
                     self._runner.run(partial(self._close, inside), name="close")
             elif self._backend_closing is not None:
                 concurrent.futures.wait([self._backend_closing], timeout=CLOSE_WAIT_SECONDS)
         finally:
             if not self._closes_later(inside):
-                self._closed = True
+                with self._lock_guard:
+                    self._closed = True
+                    self._shutting = True
                 self._runner.close_here()
 
     async def __aenter__(self) -> "TinyJobs":

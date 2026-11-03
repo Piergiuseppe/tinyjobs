@@ -1,8 +1,12 @@
 import asyncio
+import contextvars
 import gc
 import inspect
 import os
 import signal
+import subprocess
+import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -2153,3 +2157,42 @@ class SharedBoundTimerTests(unittest.TestCase):
         for took in results:
             self.assertIsNotNone(took)
             self.assertLess(took, deadlines.GRACE_SECONDS + 0.5)
+
+
+IMPORT_EVERY_MODULE = """
+import importlib, pkgutil, sys
+import tinyjobs
+for module in pkgutil.walk_packages(tinyjobs.__path__, "tinyjobs."):
+    if not module.name.endswith("__main__"):
+        try:
+            importlib.import_module(module.name)
+        except ImportError:
+            pass
+print(sys._is_gil_enabled())
+"""
+
+
+@unittest.skipUnless(
+    sysconfig.get_config_var("Py_GIL_DISABLED"), "only a free-threaded build can lose its GIL"
+)
+class FreeThreadingTests(unittest.TestCase):
+    def test_importing_every_module_keeps_the_gil_off(self):
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHON_GIL"}
+        result = subprocess.run(
+            [sys.executable, "-c", IMPORT_EVERY_MODULE],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "False", result.stderr)
+
+    def test_internal_threads_start_without_the_callers_context(self):
+        marker = contextvars.ContextVar("marker", default="unset")
+        marker.set("caller")
+        seen = []
+        thread = runtime.fresh_thread(lambda: seen.append(marker.get()), name="probe")
+        thread.start()
+        thread.join(5)
+        self.assertEqual(seen, ["unset"])

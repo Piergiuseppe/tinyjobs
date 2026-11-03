@@ -5,6 +5,8 @@ import contextvars
 import logging
 import math
 import os
+import sys
+import sysconfig
 import threading
 import time
 from contextlib import suppress
@@ -15,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Sequence
 from ..exceptions import (
     AppClosedError,
     BackendNotReadyError,
+    ConfigurationError,
     ExecutorClosedError,
     ForcedInterrupt,
     UnknownTaskError,
@@ -32,6 +35,7 @@ from ..flag import Flag
 from ..polling import AdaptiveInterval
 from ..services.execution import current_runner
 from ..services.lifecycle import VERIFY_SECONDS
+from .lanes import Lanes, shares
 from .signals import RunInterrupts, ShutdownWatcher
 
 if TYPE_CHECKING:
@@ -42,6 +46,21 @@ RELEASE_SHARE = 4
 CLOSE_SECONDS = 0.5
 SETTLING_TICKS = 8
 DEFAULT_EXECUTOR_THREADS = min(32, (os.cpu_count() or 1) + 4)
+LOOPS_MESSAGE = "loops must be at least 1 and at most concurrency, got loops={loops} for concurrency={concurrency}"
+GIL_MESSAGE = (
+    "this free-threaded Python runs with the GIL enabled, most likely because an extension "
+    "module turned it back on, such as hiredis; uninstall it or set PYTHON_GIL=0 so the "
+    "worker's threads and loops run in parallel"
+)
+ASYNC_LOOPS_MESSAGE = (
+    "async_concurrency is shared out among the loops, so it must be at least loops, "
+    "got async_concurrency={concurrency} for loops={loops}"
+)
+LOOP_BOUND_MESSAGE = (
+    "loops above 1 need a backend reached over the network, such as redis or postgres, "
+    "and a worker started with worker.run() or tinyjobs worker, "
+    "since each loop opens its own connection"
+)
 
 _left_behind: set[asyncio.Future] = set()
 
@@ -68,9 +87,44 @@ class Worker:
         poll_maximum: float = 0.5,
         worker_id: str | None = None,
         handle_signals: bool = True,
+        loops: int = 1,
     ) -> None:
+        if loops < 1 or (loops > 1 and loops > concurrency):
+            raise ConfigurationError(LOOPS_MESSAGE.format(loops=loops, concurrency=concurrency))
+        if loops > 1 and async_concurrency is not None and async_concurrency < loops:
+            raise ConfigurationError(
+                ASYNC_LOOPS_MESSAGE.format(loops=loops, concurrency=async_concurrency)
+            )
         self._app = app
         self._queues = tuple(queues)
+        sizes = shares(concurrency, loops)
+        async_sizes = (
+            [None] * loops
+            if async_concurrency is None
+            else shares(async_concurrency, loops)
+        )
+        concurrency, async_concurrency = sizes[0], async_sizes[0]
+        self._lane_options = [
+            dict(
+                queues=self._queues,
+                concurrency=size,
+                async_concurrency=async_size,
+                lease_seconds=lease_seconds,
+                reap_interval=reap_interval,
+                shutdown_timeout=shutdown_timeout,
+                unknown_task_delay=unknown_task_delay,
+                unknown_task_max_delay=unknown_task_max_delay,
+                scheduler=False,
+                poll_minimum=poll_minimum,
+                poll_maximum=poll_maximum,
+                handle_signals=False,
+            )
+            for size, async_size in zip(sizes[1:], async_sizes[1:])
+        ]
+        self._lanes: Lanes | None = None
+        self._parent: Worker | None = None
+        self._home = app
+        self._hosting: asyncio.AbstractEventLoop | None = None
         self._concurrency = concurrency
         self._lease_seconds = lease_seconds
         self._reap_interval = reap_interval
@@ -82,9 +136,7 @@ class Worker:
             jitter=False,
         )
         self._retention = retention or RetentionPolicy()
-        self._scheduler = (
-            app.scheduler(misfire_grace=misfire_grace) if scheduler else None
-        )
+        self._misfire_grace = misfire_grace if scheduler else None
         self._interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)
         self._async_concurrency = async_concurrency
         self._id = worker_id or new_worker_id()
@@ -148,6 +200,7 @@ class Worker:
         loop = asyncio.new_event_loop()
         loop.set_default_executor(DaemonThreadPool(DEFAULT_EXECUTOR_THREADS))
         asyncio.set_event_loop(loop)
+        self._hosting = loop
         main = loop.create_task(self.start())
         stopping = self._stopping
         interrupts = RunInterrupts(
@@ -174,17 +227,31 @@ class Worker:
             raise
         finally:
             try:
-                self._settle(loop)
+                try:
+                    self._leave_home(loop)
+                finally:
+                    self._settle(loop)
             except BaseException:
                 clean = False
                 raise
             finally:
+                self._hosting = None
                 interrupts.restore(exiting=clean and self._handle_signals)
                 asyncio.set_event_loop(None)
                 loop.close()
                 forget_loop(loop)
         if interrupts.count and not self._handle_signals:
             raise KeyboardInterrupt
+
+    def _leave_home(self, loop: asyncio.AbstractEventLoop) -> None:
+        home, self._home = self._home, self._app
+        if home is self._app:
+            return
+        try:
+            with suppress(Exception, ForcedInterrupt), finishing(self._settle_by):
+                loop.run_until_complete(home.aclose())
+        finally:
+            home.unhost(loop)
 
     def _settle(self, loop: asyncio.AbstractEventLoop) -> None:
         try:
@@ -234,42 +301,118 @@ class Worker:
         return max(timeout, window + _close_window(window))
 
     def stop(self) -> None:
-        stopping, ending, loop = self._stopping, self._ending, self._loop
+        stopping, ending = self._stopping, self._ending
+        loop = self._loop or self._hosting
         if loop is None or (
             inside_running_loop() and loop is asyncio.get_running_loop()
         ):
             self._request_stop(stopping, ending)
             return
-        with suppress(RuntimeError):
+        try:
             loop.call_soon_threadsafe(self._request_stop, stopping, ending)
+        except RuntimeError:
+            if self._loop is None:
+                self._request_stop(stopping, ending)
 
     async def start(self) -> None:
         if not await self._readied():
             self._prepare_run()
             self._finished.set()
             return
-        self._transient = tuple(getattr(self._app.backend, "transient_errors", ()))
+        if self._lane_options and self._home is self._app:
+            self._prepare_run()
+            self._finished.set()
+            raise ConfigurationError(LOOP_BOUND_MESSAGE)
+        if self._parent is None and gil_turned_back_on():
+            logger.warning(GIL_MESSAGE)
+        self._transient = tuple(getattr(self._home.backend, "transient_errors", ()))
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
         self._settle_by = Deadline()
-        self._app.attach(self)
+        try:
+            self._app.attach(self)
+        except BaseException:
+            self._prepare_run()
+            self._finished.set()
+            raise
         self._app.close_by(None)
         self._serving = True
         try:
+            self._open_lanes()
             await self._serve()
         finally:
-            self._serving = False
-            if self._reserved is not None:
-                self._reserved(self, -1)
-            self._settle_by = self._closing_end()
-            closing = self._app.detach(self, self._settle_by)
-            self._prepare_run()
-            self._finished.set()
-            if closing:
-                await self._app.aclose()
+            lanes = self._lanes
+            try:
+                if lanes is not None:
+                    await lanes.finish()
+            finally:
+                self._lanes = None
+                self._serving = False
+                if self._reserved is not None:
+                    self._reserved(self, -1)
+                self._settle_by = self._closing_end()
+                closing = self._app.detach(self, self._settle_by)
+                self._prepare_run()
+                self._finished.set()
+                if closing and not (
+                    self._parent is not None and self._app.close_after(self._parent)
+                ):
+                    await self._app.aclose()
+        if lanes is not None and lanes.error is not None:
+            raise lanes.error
+
+    def _open_lanes(self) -> None:
+        if not self._lane_options:
+            return
+        lanes = Lanes(
+            [
+                self._lane(index, options)
+                for index, options in enumerate(self._lane_options, start=1)
+            ],
+            self.stop,
+        )
+        self._lanes = lanes
+        lanes.start()
+
+    def _lane(self, index: int, options: dict[str, Any]) -> "Worker":
+        worker = self._app.worker(**options, worker_id=f"{self._id}-{index}")
+        worker._parent = self
+        return worker
+
+    def force(self) -> None:
+        self._relay(self._request_force)
+
+    def mark_forcing(self) -> None:
+        self._relay(self._mark_forcing)
+
+    def _relay(self, action: Callable[[], None]) -> None:
+        loop = self._loop or self._hosting
+        if loop is None:
+            return
+        if inside_running_loop() and loop is asyncio.get_running_loop():
+            action()
+            return
+        with suppress(RuntimeError):
+            loop.call_soon_threadsafe(action)
+
+    async def _ready_at_home(self) -> None:
+        loop = self._hosting
+        if (
+            loop is not asyncio.get_running_loop()
+            or self._home is not self._app
+            or not self._app.loop_bound
+        ):
+            await self._app.ready()
+            return
+        home = self._app.lane()
+        home.host(loop)
+        self._home = home
+        if self._parent is None:
+            await self._app.reopen()
+        await home.ready()
 
     async def _readied(self) -> bool:
-        ready = asyncio.ensure_future(self._app.ready())
+        ready = asyncio.ensure_future(self._ready_at_home())
         try:
             await asyncio.wait(
                 {ready, self._stopping.raised()}, return_when=asyncio.FIRST_COMPLETED
@@ -352,16 +495,14 @@ class Worker:
         self._capacity.set()
 
     def _start_background(self) -> list[asyncio.Task]:
-        background = [
-            asyncio.create_task(self._reaper_loop(), name="tinyjobs-reaper"),
-            asyncio.create_task(
-                self._housekeeping_loop(), name="tinyjobs-housekeeping"
-            ),
-        ]
-        if self._scheduler is not None:
+        background = [asyncio.create_task(self._reaper_loop(), name="tinyjobs-reaper")]
+        if self._parent is None:
             background.append(
-                asyncio.create_task(self._scheduler.start(), name="tinyjobs-scheduler")
+                asyncio.create_task(self._housekeeping_loop(), name="tinyjobs-housekeeping")
             )
+        if self._misfire_grace is not None:
+            cron = self._home.scheduler(misfire_grace=self._misfire_grace)
+            background.append(asyncio.create_task(cron.start(), name="tinyjobs-scheduler"))
         return background
 
     async def _claim_loop(self) -> None:
@@ -403,7 +544,7 @@ class Worker:
         self._claiming = claiming
         try:
             with under(Deadline(math.inf, self._admitting)):
-                return await self._app.backend.claim(
+                return await self._home.backend.claim(
                     worker_id=self._id,
                     queues=self._queues,
                     limit=capacity,
@@ -502,7 +643,7 @@ class Worker:
     async def _releasing(self, jobs: list[Job]) -> None:
         with under(self._ending):
             async with bounded(self._ending.at):
-                await self._app.backend.release_many(jobs)
+                await self._home.backend.release_many(jobs)
 
     def _released(self, jobs: list[Job]):
         def done(release: asyncio.Future) -> None:
@@ -540,7 +681,7 @@ class Worker:
             await self._release_unknown(job)
             return
         try:
-            attempt = await self._app.execution.execute(
+            attempt = await self._home.execution.execute(
                 self._app.bind(job),
                 task,
                 self._executors,
@@ -588,7 +729,7 @@ class Worker:
         self._request_stop()
         try:
             async with bounded(self._answer_by()):
-                await self._app.backend.hand_back(job)
+                await self._home.backend.hand_back(job)
         except Exception:
             logger.warning(
                 "could not hand back job %s; the reaper takes it back once its "
@@ -607,7 +748,7 @@ class Worker:
             format_seconds(delay),
         )
         async with bounded(self._answer_by()):
-            await self._app.backend.hand_back(job, delay)
+            await self._home.backend.hand_back(job, delay)
 
     def _closing_end(self) -> Deadline:
         at = self._ending.at
@@ -682,7 +823,7 @@ class Worker:
                 await asyncio.gather(*attempts, return_exceptions=True)
 
     async def _renew(self, job_ids: list[str]) -> Any:
-        return await self._app.backend.heartbeat(
+        return await self._home.backend.heartbeat(
             job_ids, self._lease_seconds, worker_id=self._id
         )
 
@@ -719,7 +860,7 @@ class Worker:
         while True:
             await asyncio.sleep(self._reap_interval)
             try:
-                reaped = await self._app.backend.reap_expired()
+                reaped = await self._home.backend.reap_expired()
             except AppClosedError:
                 return
             except Exception:
@@ -732,7 +873,7 @@ class Worker:
         if not self._retention.enabled:
             logger.info("retention disabled, nothing will be pruned")
             return
-        if not self._app.backend.capabilities.retention:
+        if not self._home.backend.capabilities.retention:
             logger.info("this backend prunes on its own, skipping housekeeping")
             return
         logger.info("retention: %s", self._retention.describe())
@@ -742,7 +883,7 @@ class Worker:
             policy = self._retention
             while True:
                 try:
-                    removed = await self._app.backend.purge(policy, self._app.clock.now())
+                    removed = await self._home.backend.purge(policy, self._app.clock.now())
                 except AppClosedError:
                     return
                 except Exception:
@@ -863,7 +1004,7 @@ class Worker:
 
     async def _idle(self, seconds: float) -> None:
         try:
-            backend = self._app.backend
+            backend = self._home.backend
         except BackendNotReadyError:
             backend = None
         if not getattr(backend, "wakes_workers", False):
@@ -902,12 +1043,14 @@ class Worker:
             self._bound_claim()
             if self._sparing is None:
                 self._spare()
+        if self._lanes is not None:
+            self._lanes.stop()
 
     def _spare(self) -> None:
         if not self._serving:
             return
         try:
-            backend = self._app.backend
+            backend = self._home.backend
             asyncio.get_running_loop()
         except (BackendNotReadyError, RuntimeError):
             return
@@ -933,6 +1076,8 @@ class Worker:
 
     def _mark_forcing(self) -> None:
         self._forcing = True
+        if self._lanes is not None:
+            self._lanes.mark_forcing()
 
     def _request_force(self) -> None:
         if not self._forced.is_set():
@@ -945,6 +1090,8 @@ class Worker:
         self._writing.end(now + RELEASE_SECONDS / 2)
         self._ending.end(now + RELEASE_SECONDS)
         self._give_up_claim()
+        if self._lanes is not None:
+            self._lanes.force()
         for task, run in tuple(self._running.items()):
             if self._settling.get(run.key) is False:
                 continue
@@ -953,6 +1100,11 @@ class Worker:
                 self._keep(task, thread)
                 continue
             task.cancel()
+
+
+def gil_turned_back_on() -> bool:
+    checked = getattr(sys, "_is_gil_enabled", None)
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED")) and checked is not None and checked()
 
 
 def _release_window(timeout: float) -> float:

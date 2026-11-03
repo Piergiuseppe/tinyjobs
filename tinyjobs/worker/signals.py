@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import _thread
 import asyncio
+import contextvars
 import ctypes
 import logging
 import os
@@ -10,7 +11,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager
-from functools import cache
+from functools import cache, partial
 from typing import Any, Callable, Iterable, Iterator
 
 from ..exceptions import ForcedInterrupt
@@ -98,7 +99,7 @@ class _Presses:
             if self.closed:
                 return
             number = self.poked_with()
-            timer = threading.Timer(ANSWER_SECONDS, self._unanswered)
+            timer = threading.Timer(ANSWER_SECONDS, partial(contextvars.Context().run, self._unanswered))
             timer.args = (timer, number, None if number is None else signal.getsignal(number))
             timer.daemon = True
             self._timers.add(timer)
