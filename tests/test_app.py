@@ -623,6 +623,19 @@ class ResolverTests(BackendTestCase):
         self.make_resolver("lazy.task")
         self.assertEqual(self.app.registry.get("lazy.task")(), "resolved")
 
+    def test_threads_resolving_the_same_task_at_once_share_the_first(self):
+        self.make_resolver("lazy.task")
+        ready = threading.Barrier(8)
+
+        def resolve():
+            ready.wait(5)
+            return self.app.registry.get("lazy.task")
+
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            found = list(pool.map(lambda _: resolve(), range(8)))
+        self.assertEqual(len({id(task) for task in found}), 1)
+        self.assertIs(self.app.registry.get("lazy.task"), found[0])
+
     def test_a_resolved_task_is_registered_once_and_kept(self):
         asked = self.make_resolver("lazy.task")
         first = self.app.registry.get("lazy.task")

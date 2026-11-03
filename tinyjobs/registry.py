@@ -45,8 +45,7 @@ class TaskRegistry:
         for resolver in self._resolvers:
             task = resolver(name)
             if task is not None:
-                self.register(task)
-                return task
+                return self._tasks.setdefault(task.name, task)
         return None
 
     def __contains__(self, name: object) -> bool:

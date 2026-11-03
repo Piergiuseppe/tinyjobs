@@ -15,6 +15,7 @@ TUPLE_TAG = "tuple"
 MAP_TAG = "map"
 
 _PRIMITIVES = (str, int, float, bool, type(None))
+_UNRESOLVED = object()
 
 
 class JSONCodec:
@@ -25,6 +26,7 @@ class JSONCodec:
         self._by_tag: dict[str, TypeAdapter] = {a.tag: a for a in self._adapters}
         self._by_type: dict[type, TypeAdapter | None] = {}
         self._rebuild_type_cache()
+        self._decoder = json.JSONDecoder(object_hook=self._hook)
 
     def register(self, adapter: TypeAdapter) -> None:
         self._adapters.insert(0, adapter)
@@ -45,7 +47,7 @@ class JSONCodec:
         return json.dumps(self.pack(value), separators=(",", ":")).encode("utf-8")
 
     def decode(self, raw: bytes) -> Any:
-        return json.loads(raw.decode("utf-8"), object_hook=self._hook)
+        return self._decoder.decode(raw.decode("utf-8"))
 
     def pack(self, value: Any) -> Any:
         if type(value) in _PRIMITIVES:
@@ -89,9 +91,11 @@ class JSONCodec:
         return adapter.unpack(data)
 
     def _resolve(self, value_type: type) -> TypeAdapter | None:
-        if value_type not in self._by_type:
-            self._by_type[value_type] = self._search(value_type)
-        return self._by_type[value_type]
+        cache = self._by_type
+        adapter = cache.get(value_type, _UNRESOLVED)
+        if adapter is _UNRESOLVED:
+            adapter = cache[value_type] = self._search(value_type)
+        return adapter
 
     def _search(self, value_type: type) -> TypeAdapter | None:
         for adapter in self._adapters:
@@ -100,7 +104,8 @@ class JSONCodec:
         return None
 
     def _rebuild_type_cache(self) -> None:
-        self._by_type = {}
+        by_type: dict[type, TypeAdapter | None] = {}
         for adapter in reversed(self._adapters):
             for adapter_type in adapter.types:
-                self._by_type[adapter_type] = adapter
+                by_type[adapter_type] = adapter
+        self._by_type = by_type

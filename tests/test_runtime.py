@@ -15,6 +15,7 @@ from contextlib import suppress
 from unittest import mock
 
 from tinyjobs import deadlines, runtime
+from tinyjobs.flag import Flag
 from tinyjobs.runtime import FORK_PAUSE_SECONDS, LoopRunner
 
 
@@ -378,6 +379,75 @@ class ForkPauseTests(unittest.TestCase):
         self.addCleanup(self.wait_until_stopped)
         self.addCleanup(self.loop.call_soon_threadsafe, self.loop.stop)
         self.assertIn(self.loop, runtime._inherited_loops)
+
+
+class FlagTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_flag_set_from_another_thread_wakes_the_loop(self):
+        flag = Flag()
+        raised = flag.raised()
+        errors = []
+
+        def set_from_a_thread() -> None:
+            try:
+                flag.set()
+            except BaseException as error:
+                errors.append(error)
+
+        threading.Timer(0.05, set_from_a_thread).start()
+        started = time.monotonic()
+        await asyncio.wait({raised}, timeout=1.0)
+        self.assertEqual(errors, [])
+        self.assertTrue(raised.done())
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    async def test_a_flag_set_on_its_own_loop_is_raised_at_once(self):
+        flag = Flag()
+        raised = flag.raised()
+        flag.set()
+        self.assertTrue(raised.done())
+
+    def test_a_flag_set_for_a_closed_loop_is_still_set(self):
+        flag = Flag()
+
+        async def wait_for_it():
+            return flag.raised()
+
+        asyncio.run(wait_for_it())
+        flag.set()
+        self.assertTrue(flag.is_set())
+
+
+class JobThreadsTests(unittest.TestCase):
+    def test_a_thread_that_failed_to_start_is_tried_again_on_a_later_submit(self):
+        from tinyjobs.executors import thread as job_threads
+
+        pool = job_threads._Threads(2)
+        real = job_threads.fresh_thread
+        starts = []
+
+        def flaky(*args, **kwargs):
+            starts.append(None)
+            if len(starts) == 2:
+                raise RuntimeError("can't start new thread")
+            return real(*args, **kwargs)
+
+        try:
+            with mock.patch.object(job_threads, "fresh_thread", flaky):
+                first_gate = threading.Event()
+                first = pool.submit(first_gate.wait)
+                second = pool.submit(lambda: "second")
+                self.assertEqual(len(pool._threads), 1)
+                first_gate.set()
+                self.assertEqual((first.result(2), second.result(2)), (True, "second"))
+                gate = threading.Event()
+                blocked = pool.submit(gate.wait)
+                beside = pool.submit(lambda: "beside")
+                self.assertEqual(beside.result(2), "beside")
+                gate.set()
+                self.assertTrue(blocked.result(2))
+                self.assertEqual(len(pool._threads), 2)
+        finally:
+            pool.shutdown()
 
 
 class CountingPoolTests(unittest.TestCase):
