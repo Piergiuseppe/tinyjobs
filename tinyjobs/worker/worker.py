@@ -30,6 +30,7 @@ from ..runtime import inside_running_loop
 from ..deadlines import Deadline, bounded, current, final, finishing, forget_loop, under
 from ..duration import format_seconds
 from ..executors import ExecutorResolver
+from ..executors.process import assert_process_setup
 from ..executors.thread import DaemonThreadPool
 from ..flag import Flag
 from ..polling import AdaptiveInterval
@@ -47,6 +48,11 @@ CLOSE_SECONDS = 0.5
 SETTLING_TICKS = 8
 DEFAULT_EXECUTOR_THREADS = min(32, (os.cpu_count() or 1) + 4)
 LOOPS_MESSAGE = "loops must be at least 1 and at most concurrency, got loops={loops} for concurrency={concurrency}"
+PROCESSES_MESSAGE = (
+    "processes must be at least 1, and at least loops so that every loop gets one, "
+    "got processes={processes} for loops={loops}"
+)
+JOBS_PER_PROCESS_MESSAGE = "jobs_per_process must be at least 1, got {jobs}"
 GIL_MESSAGE = (
     "this free-threaded Python runs with the GIL enabled, most likely because an extension "
     "module turned it back on, such as hiredis; uninstall it or set PYTHON_GIL=0 so the "
@@ -88,9 +94,24 @@ class Worker:
         worker_id: str | None = None,
         handle_signals: bool = True,
         loops: int = 1,
+        processes: int | None = None,
+        jobs_per_process: int | None = None,
+        process_setup: Callable[[], Any] | None = None,
     ) -> None:
         if loops < 1 or (loops > 1 and loops > concurrency):
             raise ConfigurationError(LOOPS_MESSAGE.format(loops=loops, concurrency=concurrency))
+        if processes is None:
+            processes = max(loops, min(concurrency, os.cpu_count() or 1))
+        elif processes < max(1, loops):
+            raise ConfigurationError(
+                PROCESSES_MESSAGE.format(processes=processes, loops=loops)
+            )
+        if jobs_per_process is not None and jobs_per_process < 1:
+            raise ConfigurationError(JOBS_PER_PROCESS_MESSAGE.format(jobs=jobs_per_process))
+        if process_setup is None:
+            process_setup = app.process_setup
+        elif process_setup is not None:
+            assert_process_setup(process_setup)
         if loops > 1 and async_concurrency is not None and async_concurrency < loops:
             raise ConfigurationError(
                 ASYNC_LOOPS_MESSAGE.format(loops=loops, concurrency=async_concurrency)
@@ -104,11 +125,15 @@ class Worker:
             else shares(async_concurrency, loops)
         )
         concurrency, async_concurrency = sizes[0], async_sizes[0]
+        process_sizes = shares(processes, loops)
         self._lane_options = [
             dict(
                 queues=self._queues,
                 concurrency=size,
                 async_concurrency=async_size,
+                processes=process_size,
+                jobs_per_process=jobs_per_process,
+                process_setup=process_setup,
                 lease_seconds=lease_seconds,
                 reap_interval=reap_interval,
                 shutdown_timeout=shutdown_timeout,
@@ -119,8 +144,13 @@ class Worker:
                 poll_maximum=poll_maximum,
                 handle_signals=False,
             )
-            for size, async_size in zip(sizes[1:], async_sizes[1:])
+            for size, async_size, process_size in zip(
+                sizes[1:], async_sizes[1:], process_sizes[1:]
+            )
         ]
+        self._processes = process_sizes[0]
+        self._jobs_per_process = jobs_per_process
+        self._process_setup = process_setup
         self._lanes: Lanes | None = None
         self._parent: Worker | None = None
         self._home = app
@@ -158,6 +188,9 @@ class Worker:
         self._executors = ExecutorResolver(
             concurrency=self._concurrency,
             async_concurrency=self._async_concurrency,
+            processes=self._processes,
+            jobs_per_process=self._jobs_per_process,
+            process_setup=self._process_setup,
             freed=self._freed,
         )
         self._stopping = Flag()

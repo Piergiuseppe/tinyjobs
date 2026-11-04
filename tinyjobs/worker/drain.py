@@ -46,7 +46,9 @@ class Drain:
         self._prepare_run()
 
     def _prepare_run(self) -> None:
-        self._executors = ExecutorResolver(concurrency=1, widens=True)
+        self._executors = ExecutorResolver(
+            concurrency=1, widens=True, process_setup=self._app.process_setup
+        )
         self._stopping = Flag()
         self._loop: asyncio.AbstractEventLoop | None = None
 

@@ -217,6 +217,16 @@ class AppLoadingTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
+    def test_the_worker_takes_process_options(self):
+        args = build_parser().parse_args(
+            ["worker", "--app", "x:app", "--processes", "2", "--jobs-per-process", "50",
+             "--process-setup", "tests.isolated:prepare"]
+        )
+        self.assertEqual((args.processes, args.jobs_per_process), (2, 50))
+        self.assertEqual(args.process_setup, "tests.isolated:prepare")
+        args = build_parser().parse_args(["worker", "--app", "x:app"])
+        self.assertEqual((args.processes, args.jobs_per_process), (None, None))
+
     def test_every_command_is_reachable(self):
         parser = build_parser()
         for command in (
