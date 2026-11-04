@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from ...retention import RetentionPolicy
 from ...worker.signals import owning_process
 from ..duration import parse_duration
+from ..loader import load_callable
 from .base import Command
 
 
@@ -26,6 +27,14 @@ class WorkerCommand(Command):
         parser.add_argument("--loops", type=int, default=1,
                             help="event loops in this process, each with its own backend "
                                  "connection; above 1 pays off on free-threaded Python")
+        parser.add_argument("--processes", type=int, default=None,
+                            help="job processes for isolated=True tasks (default: "
+                                 "concurrency or the CPU count, whichever is lower)")
+        parser.add_argument("--jobs-per-process", type=int, default=None,
+                            help="replace a job process after this many jobs "
+                                 "(default: never)")
+        parser.add_argument("--process-setup", default=None, metavar="MODULE:FUNCTION",
+                            help="called once in each job process before its first job")
         parser.add_argument("--lease", type=float, default=60.0, dest="lease_seconds")
         parser.add_argument("--reap-interval", type=float, default=30.0)
         parser.add_argument("--shutdown-timeout", type=float, default=30.0)
@@ -56,6 +65,9 @@ class WorkerCommand(Command):
             concurrency=args.concurrency,
             async_concurrency=args.async_concurrency,
             loops=args.loops,
+            processes=args.processes,
+            jobs_per_process=args.jobs_per_process,
+            process_setup=load_callable(args.process_setup) if args.process_setup else None,
             lease_seconds=args.lease_seconds,
             reap_interval=args.reap_interval,
             shutdown_timeout=args.shutdown_timeout,

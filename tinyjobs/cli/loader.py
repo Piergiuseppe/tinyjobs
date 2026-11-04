@@ -4,7 +4,7 @@ import importlib
 import pkgutil
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from ..app import TinyJobs
 from ..exceptions import ConfigurationError
@@ -29,6 +29,26 @@ def load_app(spec: str) -> TinyJobs:
             f"expected something like 'myproject.tasks:app'"
         )
     return instance
+
+
+def load_callable(spec: str) -> Any:
+    _ensure_cwd_importable()
+    module_name, separator, attribute = spec.partition(":")
+    if not separator or not attribute:
+        raise ConfigurationError(
+            f"{spec!r} should name a function as module:function, "
+            f"for example 'myproject.setup:prepare'"
+        )
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as error:
+        raise ConfigurationError(
+            f"cannot import {module_name!r} from {Path.cwd()}: {error}"
+        ) from None
+    target = getattr(module, attribute, None)
+    if not callable(target):
+        raise ConfigurationError(f"{spec!r} does not point at a function")
+    return target
 
 
 def import_modules(patterns: Sequence[str]) -> list[str]:
