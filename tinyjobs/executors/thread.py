@@ -14,7 +14,7 @@ from functools import partial
 from typing import Any, Callable, TYPE_CHECKING
 
 from ..exceptions import ExecutorClosedError
-from ..models import JobPayload
+from ..models import Job, JobPayload
 from ..runtime import fresh_thread
 from ..sheltered import landing, sheltered
 from .base import Executor
@@ -51,7 +51,7 @@ class ThreadExecutor(Executor):
     def stray_names(self) -> list[str]:
         return sorted(self._strays.values())
 
-    async def execute(self, task: "Task", payload: JobPayload) -> Any:
+    async def execute(self, task: "Task", payload: JobPayload, *, job: Job | None = None) -> Any:
         loop = asyncio.get_running_loop()
         owner = asyncio.current_task()
         call = partial(copy_context().run, task.function, *payload.args, **payload.kwargs)

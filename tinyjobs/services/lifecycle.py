@@ -12,7 +12,7 @@ from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
 from ..deadlines import bounded, lastly
 from ..deadlines import left as time_left
-from ..exceptions import Retry
+from ..exceptions import REMOTE_TRACEBACK, IsolatedTaskError, Retry
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
 from .serialization import SerializationService
@@ -157,10 +157,12 @@ class JobLifecycleService:
         return ExecutionStatus.FAILED
 
     def _describe(self, error: BaseException) -> ExecutionError:
+        type_name = error.type_name if isinstance(error, IsolatedTaskError) else None
         return ExecutionError(
-            type=type(error).__name__,
+            type=type_name or type(error).__name__,
             message=str(error),
-            traceback="".join(
+            traceback=getattr(error, REMOTE_TRACEBACK, None)
+            or "".join(
                 traceback_module.format_exception(
                     type(error), error, error.__traceback__
                 )
