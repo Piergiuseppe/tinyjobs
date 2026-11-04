@@ -13,6 +13,7 @@ GROUPS = {
     "Get started": [
         "keeping-the-database-from-growing-forever",
         "cron",
+        "isolated-tasks",
         "watching-it",
         "testing-your-tasks",
     ],

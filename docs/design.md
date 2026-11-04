@@ -1431,15 +1431,104 @@ the interesting decisions are in the dispatch.
 | ---------------------------- | ----------------------- | -------------- | ------------------------------ |
 | `async def`                  | worker event loop       | hard           | `asyncio.timeout`, real cancel |
 | `def`                        | daemon thread pool      | **soft**       | see below                      |
+| `def`, `isolated=True`       | a job process           | hard           | killed at the timeout, replaced on a crash |
 
 A single worker process runs an event loop plus a thread pool. Async and sync tasks share the process
-without either starving the other. A process executor for tasks declared `isolated=True` is planned,
-not in 0.7 yet.
+without either starving the other. Tasks declared `isolated=True` run in job processes the worker
+starts on demand, up to `processes`, and keeps for the next job.
+
+### Isolated tasks
+
+The job process is spawned, not forked: a worker has threads, a running event loop and open
+sockets, none of which survive a fork intact, and since 3.12 a fork from a process with threads is
+a deprecation warning. Spawning costs an interpreter start and the task module's imports, paid once per process,
+which is why processes are kept and reused; `jobs_per_process` retires one after that many jobs, for
+code that leaks, and the default is never.
+
+The job's own data is never pickled across the boundary. The parent sends the task's name, the
+module that registered it, the function's own module and qualified name, the job's payload bytes
+and codec; the process imports the registering module, or the function's when the task is not
+there, as after a helper in another module called `app.task`, and picks among its module-level
+objects the isolated `Task` with that name over that function, refusing to guess when two apps
+registered one; it decodes the arguments with the task's own app, calls the function and encodes
+the result the same way. The task is found by its name, like a task is on enqueue, and not by the
+function's module and qualified name alone: a function imported from elsewhere, registered with
+`app.task(...)(function)`, or shared by two apps would otherwise be found in the wrong place or
+not at all. What this asks of the user is only that the `Task` sit at module level of the module
+that registered it, which `@app.task` does by itself. `process_setup` is found by its own module
+and qualified name, resolved once in the worker the way the process will resolve it, so a bound
+method or an alias is refused at start instead of failing every job. A task registered in
+`__main__` resolves through `__mp_main__`, where the spawn machinery re-imports a guarded script;
+it does not re-import a `python -c` command, a REPL or a package's `__main__.py`, so a task or
+setup registered there is refused at registration. The process sends
+`started` right before it calls the function, and only then does `timeout=` start counting: the
+first job on a fresh process used to pay for the interpreter start and the imports, and a module
+slower to import than the timeout failed every job forever, each failure killing the process and
+the next job starting another. Coming up has its own bound, which covers the interpreter and the worker's main module; the
+setup, `django.setup()` and the module import have a separate one of ten minutes, long enough
+for a model to load and short enough that a connect that hangs does not hold the slot forever. An exception comes back
+pickled when it round-trips, since it is the process's own object and the pipe already carries
+pickles; failing that, as its class name, module and message, from which the parent rebuilds it
+when the class is in its own modules, so `retry_on` matches it and `TimeoutError` still means
+`TIMEOUT`, and keeps the name and the remote traceback otherwise. `Retry` and `Abandon` cross by
+their fields. A `process_setup` function, found by name the same way, runs once in each process
+before its first job; it is set on the app, so that workers, `app.drain()` and eager mode all
+honour it, or on one worker. `django.setup()` runs on its own when `DJANGO_SETTINGS_MODULE` is
+set, because a job process starts from the task module's imports and nothing the worker did at
+startup. `app.drain()` and eager mode start a process for the call and stop it after, so there
+the setup runs each time.
+
+The parent waits on the pipe from the event loop, so an isolated job costs no thread; the request
+is written from a thread, since a payload larger than the pipe buffer would otherwise stall the
+loop until the process had finished importing. A timer polls the process while a reply is pending,
+because a grandchild holding the pipe would hide the process's death from the reader, and the
+parent reads the pipe in whatever pieces arrive and frames the messages itself, so a process that
+dies halfway through a message cannot leave the loop waiting for the rest. The parent's end is
+closed only once nothing is being written to it, since closing a descriptor under a writer in
+another thread could hand the request to whichever file took the number next. A process retired
+after `jobs_per_process` is reaped from the loop shortly after, so a long run does not pile up
+descriptors or zombies. At
+`timeout=` the process is killed, the job fails with `TIMEOUT` and the pool starts a fresh process
+for the next job; a process that exits or dies of a signal fails its job with `ProcessDied`, naming
+the exit status or the signal, and retries like any failure. A process that dies before it got to
+the function is not the job's fault, so the job is tried once more on a fresh process; one that
+died while idle is reaped when the pool reaches for it, not blamed on the next job. On shutdown a
+job still running at the end of the budget is killed and handed back, where a thread can only be
+left running: the one case where the process executor is stricter than the thread pool, because it
+can be. The processes are not daemonic, so a task may start processes of its own; at interpreter
+exit the pool kills whatever is left, and a process
+whose worker died under it notices the parent change and exits, so a hung task never outlives the
+worker that could have killed it.
+
+A job process ignores `SIGINT` and `SIGTERM` so that a Ctrl-C, or a `TERM` sent to the worker's
+group, stops the worker, which decides, and not the job under it; it does so with a handler that does
+nothing rather than `SIG_IGN`, which survives `exec` and would leave every subprocess the task
+starts deaf to `terminate()`. It also moves into a process group of its own, so that the kill at
+the timeout, at shutdown or at the worker's death takes whatever the task started with it, since
+a process the task forked would otherwise outlive the job it belonged to. A process that exits
+or crashes on its own leaves its subprocesses to themselves, as any process does, and a group of
+its own means a job process stopped by the terminal's `tostop` would wait for its timeout.
+The pool is the only one that reaps its processes: each is taken out of `multiprocessing`'s
+bookkeeping as soon as it starts, so no other thread's `Process.start()` can collect its exit
+status under the pool, misreport its death or free its pid before the pool is done with it; and
+when something else in the worker did collect it, a `wait` on any child or `SIGCHLD` ignored, the
+pool notices, lets the process go and never signals the pid again. The parent blocks both signals
+around the spawn so the mask is inherited through `exec` and a signal in the first milliseconds, before the
+process has installed its handlers, stays pending and is discarded once it has; without that, a
+Ctrl-C during a spawn killed the process with a bootstrap traceback and the job failed with
+`ProcessDied`.
+
+`processes` defaults to `concurrency` or the CPU count, whichever is lower, since isolated tasks are
+there for CPU-bound and crash-prone work. Isolated jobs beyond that wait in their slot for a free
+process; the claim loop does not know a job is isolated until it has it, and a second kind of slot
+would add a scheduling problem for a case that `processes=concurrency` already solves for those who
+want every slot backed by a process. With `loops`, the processes are shared out among the loops like
+the slots.
 
 **There is no `--concurrency-model` flag.** The alternative is tempting, so here is the argument
 against it. The thing such a flag would select, threads versus processes, is not a property of the
 deployment, it is a property of the individual task: a function that holds the GIL for four seconds
-needs a process whether you run one worker or forty. `isolated=True`, once it lands, expresses that at the
+needs a process whether you run one worker or forty. `isolated=True` expresses that at the
 declaration site, where the person who knows the answer is standing. A global flag would ask the same
 question again at the layer with the least information, and answer it the same way for every task.
 
@@ -1503,9 +1592,9 @@ This catches people out, so, plainly:
 - A blocking socket read with no timeout of its own blocks past your `timeout=`.
 
 Mitigations, in order of preference: pass timeouts to the library you are calling (every HTTP client
-has one); or write the task as `async def`, where cancellation actually works. `isolated=True`, a
-process that can be killed, is planned. The documentation says all of this at the
-point where `timeout=` is introduced, not in a footnote.
+has one); or write the task as `async def`, where cancellation actually works; or declare it
+`isolated=True`, which runs it in a process the worker kills at the timeout. The documentation says
+all of this at the point where `timeout=` is introduced, not in a footnote.
 
 ### Graceful shutdown
 
@@ -2405,9 +2494,13 @@ through Django's `transaction.atomic()`.
 A worker that keeps the GIL off on free-threaded builds, and `loops=` to run several event loops
 in one process.
 
+**v0.10, isolation**
+`isolated=True`, a job process per task, spawned on demand and reused, killed at the timeout and
+replaced when it crashes, with `processes` and `jobs_per_process`.
+
 **Next**
-Transactional enqueue on SQLite, the process executor and `isolated=True`, a result size cap and
-TTL, structured log fields.
+Transactional enqueue on SQLite, a result size cap and TTL, structured log fields, jobs retried
+and cancelled from the CLI, a Prometheus exporter on the hooks.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
