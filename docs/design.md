@@ -2397,10 +2397,13 @@ FastAPI and Starlette lifespans with an embedded worker, the `django.tasks` back
 A Redis backend on Lua scripts, with per-claim tokens, batched outcomes, scripts reloaded when the
 server loses them, and the server's clock followed instead of the worker's.
 
-**v0.8, Postgres and free threading**
+**v0.8, Postgres**
 A Postgres backend with `LISTEN`/`NOTIFY` wake-ups, enqueue inside the caller's transaction, also
-through Django's `transaction.atomic()`; a worker that keeps the GIL off on free-threaded builds, and
-`loops=` to run several event loops in one process.
+through Django's `transaction.atomic()`.
+
+**v0.9, free threading**
+A worker that keeps the GIL off on free-threaded builds, and `loops=` to run several event loops
+in one process.
 
 **Next**
 Transactional enqueue on SQLite, the process executor and `isolated=True`, a result size cap and
