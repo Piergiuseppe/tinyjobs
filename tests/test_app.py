@@ -2153,28 +2153,32 @@ class ForkTests(BackendTestCase):
     def test_interrupts_during_forks_leave_the_fork_hooks_settled(self):
         parent = os.getpid()
 
-        def reap(options: int = 0) -> None:
-            while True:
+        forks: list[int] = []
+
+        def reap(wait: bool = False) -> None:
+            for pid in list(forks):
                 try:
-                    if os.waitpid(-1, options)[0] == 0:
-                        return
+                    done = os.waitpid(pid, 0 if wait else os.WNOHANG)[0]
                 except ChildProcessError:
-                    return
+                    done = pid
+                if done:
+                    forks.remove(pid)
 
         def fork_once() -> None:
             if os.getpid() != parent:
                 os._exit(1)
-            reap(os.WNOHANG)
+            reap()
             child = os.fork()
             if child == 0:
                 os._exit(0)
-            os.waitpid(child, 0)
+            forks.append(child)
+            reap(True)
 
         import sys
 
         reported: list = []
         self.app.counts()
-        self.addCleanup(reap)
+        self.addCleanup(reap, True)
         deadline = time.monotonic() + 5
         while not runtime._pause_wanted(threading.get_ident()):
             self.assertLess(
