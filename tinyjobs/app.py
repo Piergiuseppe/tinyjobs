@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import sys
 import time
 import weakref
 from contextlib import (
@@ -19,6 +20,7 @@ from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .deadlines import Deadline, finishing
 from .codecs import CodecRegistry
+from .executors.process import MAIN_MODULE, assert_process_setup, main_spawn_problem
 from .exceptions import (
     AppClosedError,
     BackendNotReadyError,
@@ -77,6 +79,15 @@ EMBEDDED_SIGNALS_MESSAGE = (
     "leaving serve() or the lifespan is what stops the worker"
 )
 
+ISOLATED_ASYNC_MESSAGE = (
+    "isolated=True runs a task in a job process of its own, which takes a def function; "
+    "{name} is async def"
+)
+ISOLATED_MAIN_MESSAGE = (
+    "isolated=True runs {name} in a job process that imports the module it was registered in, "
+    "and a job process cannot import __main__ when the worker runs from {how}; register the task "
+    "in a module of its own"
+)
 EMBEDDED_LOOPS_MESSAGE = (
     "an embedded worker runs on the server's event loop, so it takes no loops; "
     "run tinyjobs worker --loops or worker.run() for more loops"
@@ -103,6 +114,7 @@ class TinyJobs:
         retention: RetentionPolicy | None = None,
         clock: Clock | None = None,
         eager: bool = False,
+        process_setup: Callable[[], Any] | None = None,
         **backend_options: Any,
     ) -> None:
         check_options(url, backend_options)
@@ -111,6 +123,9 @@ class TinyJobs:
         self._default_queue = default_queue
         self._retention = retention or RetentionPolicy()
         self._eager = eager
+        if process_setup is not None:
+            assert_process_setup(process_setup)
+        self._process_setup = process_setup
         self._clock = FollowingClock() if clock is None else clock
         self._codecs = CodecRegistry(default=default_codec, allow_pickle=allow_pickle)
         self._registry = TaskRegistry()
@@ -146,6 +161,10 @@ class TinyJobs:
     @property
     def eager(self) -> bool:
         return self._eager
+
+    @property
+    def process_setup(self) -> Callable[[], Any] | None:
+        return self._process_setup
 
     @property
     def retention(self) -> RetentionPolicy:
@@ -408,6 +427,7 @@ class TinyJobs:
         codec: str | None = None,
         timeout: float | None = None,
         store_result: bool = False,
+        isolated: bool = False,
         max_attempts: int = 1,
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         retry_backoff: Any = "exponential",
@@ -419,6 +439,8 @@ class TinyJobs:
         misfire: str = "skip",
         overlap: bool = False,
     ) -> Any:
+        registered_in = sys._getframe(1).f_globals.get("__name__")
+
         def decorate(target: Callable[..., Any]) -> Task:
             task_name = name or f"{target.__module__}.{target.__qualname__}"
             resolved = Task(
@@ -444,7 +466,11 @@ class TinyJobs:
                 schedule=_declare_schedule(
                     task_name, cron, timezone, misfire, overlap
                 ),
+                isolated=isolated,
+                registered_in=registered_in,
             )
+            if isolated:
+                _assert_isolatable(resolved)
             if cron is not None:
                 _assert_callable_without_arguments(resolved)
             self._registry.register(resolved)
@@ -637,6 +663,7 @@ class TinyJobs:
             retention=self._retention,
             clock=self._clock,
             eager=self._eager,
+            process_setup=self._process_setup,
             **self._backend_options,
         )
         lane._codecs = self._codecs
@@ -856,6 +883,15 @@ def _assert_worker_requested(worker: bool, options: dict[str, Any]) -> None:
             f"worker options {sorted(options)} were given without worker=True, "
             f"so no worker would run to use them"
         )
+
+
+def _assert_isolatable(task: Task) -> None:
+    if task.is_coroutine:
+        raise ConfigurationError(ISOLATED_ASYNC_MESSAGE.format(name=task.name))
+    if task.registered_in == MAIN_MODULE:
+        how = main_spawn_problem()
+        if how is not None:
+            raise ConfigurationError(ISOLATED_MAIN_MESSAGE.format(name=task.name, how=how))
 
 
 def _assert_callable_without_arguments(task: Task) -> None:

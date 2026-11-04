@@ -25,6 +25,8 @@ class Task:
         timeout: float | None = None,
         store_result: bool = False,
         schedule: Schedule | None = None,
+        isolated: bool = False,
+        registered_in: str | None = None,
     ) -> None:
         self._app = app
         self._function = function
@@ -34,6 +36,8 @@ class Task:
         self._timeout = timeout
         self._store_result = store_result
         self._schedule = schedule
+        self._isolated = isolated
+        self._registered_in = registered_in or function.__module__
         self._signature = inspect.signature(function)
         self._is_coroutine = inspect.iscoroutinefunction(function)
 
@@ -48,6 +52,10 @@ class Task:
     @property
     def function(self) -> Callable[..., Any]:
         return self._function
+
+    @property
+    def registered_in(self) -> str:
+        return self._registered_in
 
     @property
     def options(self) -> EnqueueOptions:
@@ -72,6 +80,10 @@ class Task:
     @property
     def is_coroutine(self) -> bool:
         return self._is_coroutine
+
+    @property
+    def isolated(self) -> bool:
+        return self._isolated
 
     def bind(self, args: tuple, kwargs: dict) -> JobPayload:
         bound = self._signature.bind(*args, **kwargs)
