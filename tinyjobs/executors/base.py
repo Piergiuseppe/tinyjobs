@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any, TYPE_CHECKING
 
-from ..models import JobPayload
+from ..models import Job, JobPayload
 
 if TYPE_CHECKING:
     from ..task import Task
@@ -11,7 +11,9 @@ if TYPE_CHECKING:
 
 class Executor(ABC):
     @abstractmethod
-    async def execute(self, task: "Task", payload: JobPayload) -> Any: ...
+    async def execute(
+        self, task: "Task", payload: JobPayload, *, job: Job | None = None
+    ) -> Any: ...
 
     def shutdown(self) -> None:
         return None

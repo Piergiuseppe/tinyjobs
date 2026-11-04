@@ -71,6 +71,22 @@ class ExecutorClosedError(AppClosedError):
     pass
 
 
+REMOTE_TRACEBACK = "_tinyjobs_traceback"
+
+
+class ProcessDied(TinyJobsError):
+    pass
+
+
+class IsolatedTaskError(TinyJobsError):
+    def __init__(self, message: str = "", type_name: str | None = None) -> None:
+        super().__init__(message)
+        self.type_name = type_name
+
+    def __reduce__(self) -> tuple:
+        return (type(self), (self.args[0] if self.args else "", self.type_name))
+
+
 class Retry(TinyJobsError):
     def __init__(
         self, in_: float | None = None, at: float | datetime | None = None

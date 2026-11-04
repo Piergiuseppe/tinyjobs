@@ -69,7 +69,7 @@ class ExecutionService:
         started = self._clock.monotonic()
         try:
             payload = self._serialization.decode_payload(job)
-            result = await executors.resolve(task).execute(task, payload)
+            result = await executors.resolve(task).execute(task, payload, job=job)
             encoded = self._lifecycle.encode_result(job, task, result)
         except (asyncio.CancelledError, ExecutorClosedError, ForcedInterrupt):
             raise
