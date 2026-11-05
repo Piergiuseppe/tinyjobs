@@ -13,6 +13,8 @@ Contents:
 - [Serialization](#serialization)
 - [The backend protocol](#the-backend-protocol)
 - [The SQLite backend](#the-sqlite-backend)
+- [The Redis backend](#the-redis-backend)
+- [The Postgres backend](#the-postgres-backend)
 - [The scheduler](#the-scheduler)
 - [Execution model](#execution-model)
 - [Retries](#retries)
@@ -585,7 +587,7 @@ one constraint: **a single writer at a time.**
 
 ```sql
 PRAGMA journal_mode = WAL;         -- readers don't block the writer
-PRAGMA synchronous  = NORMAL;      -- durable enough with WAL; FULL on request
+PRAGMA synchronous  = NORMAL;      -- a process crash loses nothing, a power cut the last commits
 PRAGMA busy_timeout = 5000;        -- wait for the write lock instead of failing
 PRAGMA foreign_keys = ON;
 ```
@@ -594,7 +596,7 @@ Every write transaction is opened as `BEGIN IMMEDIATE`. Taking the write lock up
 contention into a bounded wait instead of a mid-transaction `SQLITE_BUSY` and a forced retry, the
 classic source of "database is locked" in multi-process SQLite.
 
-One connection per thread (`check_same_thread=True`), never shared across threads.
+One connection per thread, kept in a thread-local, never shared across threads.
 
 A cancelled call still queued behind another is taken off the backend's thread at once; one
 already running gets half a second, then the cancel goes on while it finishes in that thread. A
@@ -656,9 +658,10 @@ interval adapts: after a claim that returned work, poll again immediately; after
 off geometrically from ~5 ms to a configurable ceiling (default 500 ms), with jitter so that N workers
 starting together do not synchronize into a thundering herd.
 
-For the local single-machine case we can do better than polling alone: an optional wakeup file
-descriptor lets an in-process `enqueue` nudge a sleeping worker directly, dropping enqueue-to-start
-latency to sub-millisecond without changing the polling fallback that covers cross-process enqueues.
+For the local single-machine case polling could be helped along: a wakeup file descriptor would
+let an in-process `enqueue` nudge a sleeping worker directly, dropping enqueue-to-start latency
+to sub-millisecond without changing the polling fallback that covers cross-process enqueues. It
+is not built; Postgres gets the same effect from `LISTEN`/`NOTIFY`.
 
 ### Crash recovery
 
@@ -754,8 +757,8 @@ access, so it stays a manual command and never runs on its own.
 Expect **low thousands of jobs per second** for enqueue and claim on a local SSD, dominated by fsync
 rather than by Python. That covers most applications. It will not cover a high-volume ingestion
 pipeline, and it degrades on network filesystems. SQLite's locking over NFS is unreliable, and the
-backend refuses to run on a detected network mount rather than corrupting data quietly. Both cases are
-the reason the backend seam exists.
+backend does not detect a network mount, so the file belongs on a local disk. Both cases are the
+reason the backend seam exists.
 
 ---
 
@@ -1518,8 +1521,8 @@ process has installed its handlers, stays pending and is discarded once it has; 
 Ctrl-C during a spawn killed the process with a bootstrap traceback and the job failed with
 `ProcessDied`.
 
-`processes` defaults to `concurrency` or the CPU count, whichever is lower, since isolated tasks are
-there for CPU-bound and crash-prone work. Isolated jobs beyond that wait in their slot for a free
+`processes` defaults to `concurrency` or the CPU count, whichever is lower, and never fewer than
+`loops`, since isolated tasks are there for CPU-bound and crash-prone work. Isolated jobs beyond that wait in their slot for a free
 process; the claim loop does not know a job is isolated until it has it, and a second kind of slot
 would add a scheduling problem for a case that `processes=concurrency` already solves for those who
 want every slot backed by a process. With `loops`, the processes are shared out among the loops like
@@ -1533,9 +1536,9 @@ declaration site, where the person who knows the answer is standing. A global fl
 question again at the layer with the least information, and answer it the same way for every task.
 
 Scaling out is therefore "run more worker processes", supervised by systemd, supervisord or your
-orchestrator, which you need regardless the moment you have two machines. The worker does not fork or
-supervise children itself; that stays out of v1, where adding it later is purely additive and removing
-it would not be.
+orchestrator, which you need regardless the moment you have two machines. Apart from the job
+processes of isolated tasks, the worker does not fork or supervise children itself; that stays out
+of v1, where adding it later is purely additive and removing it would not be.
 
 Knobs: `--concurrency N` sets the thread pool size and doubles as the default ceiling for concurrent
 async tasks, overridable with `--async-concurrency` when the default does not fit.
@@ -2508,7 +2511,7 @@ protocol is a compatibility promise.
 
 **Beyond**
 Joining a SQLAlchemy session's transaction, designed against a real application rather than against a
-guess. `--processes N`, if running one worker per core under a supervisor turns out to be the
-friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
+guess. A `--workers N` that forks and supervises N workers, if running one per core under a
+supervisor turns out to be the friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
 file). Chains and groups only if usage demands them. They are where task queues usually go to become
 frameworks.

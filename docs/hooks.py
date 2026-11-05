@@ -14,11 +14,12 @@ GROUPS = {
         "keeping-the-database-from-growing-forever",
         "cron",
         "isolated-tasks",
+        "free-threaded-python",
         "watching-it",
         "testing-your-tasks",
     ],
     "Integrations": ["fastapi", "django"],
-    "Backends": ["postgres", "redis", "free-threaded-python", "other-backends"],
+    "Backends": ["sqlite", "redis", "postgres", "other-backends"],
     "About": ["what-you-get", "how-it-compares", "how-it-works", "measured", "status"],
     "Project": ["working-on-it", "tests", "license"],
 }

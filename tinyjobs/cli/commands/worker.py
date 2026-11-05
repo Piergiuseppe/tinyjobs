@@ -29,7 +29,8 @@ class WorkerCommand(Command):
                                  "connection; above 1 pays off on free-threaded Python")
         parser.add_argument("--processes", type=int, default=None,
                             help="job processes for isolated=True tasks (default: "
-                                 "concurrency or the CPU count, whichever is lower)")
+                                 "concurrency or the CPU count, whichever is lower, "
+                                 "and never fewer than loops)")
         parser.add_argument("--jobs-per-process", type=int, default=None,
                             help="replace a job process after this many jobs "
                                  "(default: never)")

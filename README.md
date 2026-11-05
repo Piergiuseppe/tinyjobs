@@ -284,6 +284,29 @@ against 3,300 threaded on 3.12, 3,600 against 4,800 on 3.14t. For a task that sp
 for a few milliseconds, 4 job processes on 3.12 do 730 jobs/s where 4 threads do 230, held by the
 GIL; on 3.14t the threads do 910 and the processes 660, since the result still crosses a pipe.
 
+## Free-threaded Python
+
+On a free-threaded build such as 3.14t the GIL stays off: no tinyjobs module turns it back on, so
+`def` tasks run in parallel in the worker's thread pool. A worker is still one event loop, and one
+loop is one thread; `loops=` gives a worker several, each in its own thread with its own Redis or
+Postgres connection, sharing `concurrency` between them:
+
+```bash
+tinyjobs worker --app tasks:app --concurrency 64 --loops 3
+```
+
+From Python, `app.worker(concurrency=64, loops=3).run()` does the same.
+
+Only the first loop fires cron and prunes. `loops` is for `tinyjobs worker` and `worker.run()`: an
+embedded worker lives on the server's loop and refuses it. SQLite refuses `loops` above 1, since its
+one writer would make them wait on each other, and with the GIL on extra loops take turns on it, so
+run more processes there instead.
+
+Two installs differ. psycopg-binary has no free-threaded wheels: install `psycopg psycopg-pool` and
+the system libpq rather than the `postgres` extra. hiredis turns the GIL back on as soon as redis-py
+imports it, so leave it out; a worker that finds the GIL on in a free-threaded build says so in its
+log.
+
 ## Watching it
 
 ```python
@@ -572,6 +595,32 @@ sync_invoice|failed|3|{"args":[8842],"kwargs":{}}
 
 That readability is most of the reason for preferring JSON over pickle.
 
+## SQLite
+
+```python
+app = TinyJobs("sqlite:///jobs.db")                   # a path next to where you run
+app = TinyJobs("sqlite:////var/lib/shop/jobs.db")     # an absolute one, four slashes
+app = TinyJobs("sqlite:///jobs.db", busy_timeout=10)  # seconds to wait for the write lock, 5 by default
+```
+
+The default, with nothing to install: `TinyJobs()` alone opens `tinyjobs.db`. The file and its
+directory are created on first use, in WAL mode with `synchronous=NORMAL`, so readers never wait
+for the writer, a crashed process loses nothing it committed, and only a power cut can roll back
+the last commits. Any number of workers and senders on the same machine can share the file. SQLite
+allows one writer at a time, so every claim and outcome takes its turn on the write lock; a process
+that finds it taken waits up to `busy_timeout` rather than failing. Workers poll, since SQLite
+cannot wake them: right after a claim that found work, then backing off from 5 ms to `--poll-max`
+(0.5 s). A worker refuses `loops` above 1 here; run more processes instead.
+
+Expect low thousands of jobs per second on a local SSD, bounded by `fsync` rather than by Python:
+four processes of eight slots drain 5,200 no-op jobs a second from one file, and three workers held
+25 jobs per second for ten hours of restarts and kills without losing one. Keep the file on a local
+disk: SQLite's locking over NFS and SMB is unreliable, and nothing detects a network mount for you.
+Pruning keeps the file at a plateau instead of shrinking it; see [retention](#keeping-the-database-from-growing-forever).
+A job cannot join your own database's transaction yet. The queue is a plain database, so the
+`sqlite3` shell reads it, as [How it works](#how-it-works) shows, and `memory://` is the same
+backend on a private in-memory database for [tests](#testing-your-tasks).
+
 ## Redis
 
 ```bash
@@ -665,29 +714,6 @@ such as a trigger, a constraint's function or an index's; otherwise pass `schema
 Behind PgBouncer use session pooling with its default `server_reset_query`. A transaction left open
 for hours anywhere on the server stops autovacuum from cleaning the jobs table. Postgres 14 to 18
 are supported, and CI tests 14 and 18.
-
-## Free-threaded Python
-
-On a free-threaded build such as 3.14t the GIL stays off: no tinyjobs module turns it back on, so
-`def` tasks run in parallel in the worker's thread pool. A worker is still one event loop, and one
-loop is one thread; `loops=` gives a worker several, each in its own thread with its own Redis or
-Postgres connection, sharing `concurrency` between them:
-
-```bash
-tinyjobs worker --app tasks:app --concurrency 64 --loops 3
-```
-
-From Python, `app.worker(concurrency=64, loops=3).run()` does the same.
-
-Only the first loop fires cron and prunes. `loops` is for `tinyjobs worker` and `worker.run()`: an
-embedded worker lives on the server's loop and refuses it. SQLite refuses `loops` above 1, since its
-one writer would make them wait on each other, and with the GIL on extra loops take turns on it, so
-run more processes there instead.
-
-Two installs differ. psycopg-binary has no free-threaded wheels: install `psycopg psycopg-pool` and
-the system libpq rather than the `postgres` extra. hiredis turns the GIL back on as soon as redis-py
-imports it, so leave it out; a worker that finds the GIL on in a free-threaded build says so in its
-log.
 
 ## Other backends
 
@@ -881,7 +907,7 @@ v0.10.0. Working and measured, but young. What's in:
 - a worker that keeps the GIL off on free-threaded builds, with `--loops` for several event loops in
   one process
 - `isolated=True`, a job process per task that is killed at its timeout and replaced when it crashes,
-  with `--processes` and `--jobs-per-process`
+  with `--processes`, `--jobs-per-process` and `process_setup`
 
 What's not in yet:
 
