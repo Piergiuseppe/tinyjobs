@@ -381,23 +381,21 @@ class ModuleEntryPointTests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_the_version_comes_from_the_package_metadata(self):
+    def test_the_source_is_the_only_place_the_version_is_written(self):
+        import re
+        import tomllib
+
         import tinyjobs
 
-        self.assertIsInstance(tinyjobs.__version__, str)
-        self.assertTrue(tinyjobs.__version__)
-
-    def test_it_is_not_duplicated_in_the_source(self):
-        from pathlib import Path
-
+        self.assertRegex(tinyjobs.__version__, r"^\d+\.\d+\.\d+")
         source = (Path(tinyjobs_dir()) / "__init__.py").read_text()
-        self.assertNotIn('__version__ = "0.', source)
-
-    def test_unknown_module_attributes_still_raise(self):
-        import tinyjobs
-
-        with self.assertRaises(AttributeError):
-            tinyjobs.__does_not_exist__
+        self.assertEqual(
+            re.findall(r'^__version__ = "(.+)"$', source, re.M), [tinyjobs.__version__]
+        )
+        with open(Path(tinyjobs_dir()).parent / "pyproject.toml", "rb") as handle:
+            project = tomllib.load(handle)
+        self.assertNotIn("version", project["project"])
+        self.assertEqual(project["tool"]["hatch"]["version"]["path"], "tinyjobs/__init__.py")
 
 
 def tinyjobs_dir() -> str:

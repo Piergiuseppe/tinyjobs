@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Any, Iterable
 
+from . import __version__
 from .models import Job, Stats
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -85,8 +86,6 @@ class Metrics:
                 self._durations.setdefault(task, _Histogram()).observe(duration)
 
     def render(self, stats: Stats | None = None, *, now: float | None = None) -> str:
-        from . import __version__
-
         with self._lock:
             lines = list(self._process_lines())
         lines.extend(_store_lines(stats, time.time() if now is None else now))

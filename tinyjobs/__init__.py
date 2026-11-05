@@ -14,6 +14,8 @@ if sys.version_info < MINIMUM_PYTHON:
         )
     )
 
+__version__ = "0.10.0"
+
 from .app import TinyJobs
 from .clock import FrozenClock
 from .exceptions import (
@@ -39,24 +41,6 @@ from .schedules import MisfirePolicy, Schedule
 from .status import ExecutionStatus, JobStatus
 from .task import Task
 from .worker import Worker
-
-UNINSTALLED_VERSION = "0.0.0+unknown"
-
-_version: str | None = None
-
-
-def __getattr__(name: str) -> str:
-    if name != "__version__":
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    global _version
-    if _version is None:
-        from importlib.metadata import PackageNotFoundError, version
-
-        try:
-            _version = version("tinyjobs")
-        except PackageNotFoundError:
-            _version = UNINSTALLED_VERSION
-    return _version
 
 __all__ = [
     "Abandon",
