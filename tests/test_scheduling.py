@@ -10,7 +10,8 @@ from pathlib import Path
 
 from tinyjobs import TinyJobs
 from tinyjobs.clock import FrozenClock
-from tinyjobs.exceptions import ConfigurationError
+from tinyjobs.exceptions import ConfigurationError, UnknownTaskError
+from tinyjobs.models import NEVER
 from tinyjobs.services.scheduling import MAXIMUM_CATCH_UP
 from tinyjobs.status import JobStatus
 
@@ -132,6 +133,15 @@ class FiringTests(SchedulingTestCase):
         self.assertEqual(state.next_run_at, TEN + 3600)
         self.assertEqual(state.last_job_id, job.id)
         self.assertEqual(tick.wake_at, TEN + 3600)
+
+    async def test_a_firing_is_logged_with_the_schedule_and_the_job(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        self.clock.advance(31)
+        with self.assertLogs("tinyjobs.scheduler", level="INFO") as logs:
+            tick = await self.app.scheduler().tick()
+        record = logs.records[0]
+        self.assertEqual((record.schedule, record.job_id), ("report.hourly", tick.created[0].id))
 
     async def test_a_second_tick_at_the_same_moment_does_nothing(self):
         declare(self.app)
@@ -376,6 +386,140 @@ class WorkerTests(SchedulingTestCase):
         self.assertEqual(
             [job.status for job in await self.jobs()], [JobStatus.QUEUED]
         )
+
+
+class PauseTests(SchedulingTestCase):
+    async def test_a_paused_schedule_does_not_fire(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        self.assertTrue(await self.app.apause_schedule("report.hourly"))
+        self.clock.advance(31)
+        tick = await self.tick()
+        self.assertEqual((tick.created, tick.rewound, tick.wake_at), ([], [], None))
+        state = await self.state()
+        self.assertTrue(state.paused)
+        self.assertEqual(state.next_run_at, NEVER)
+
+    async def test_resuming_starts_from_the_next_time_without_catching_up(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        await self.app.apause_schedule("report.hourly")
+        self.clock.advance(31 + 3600 * 2)
+        self.assertTrue(await self.app.aresume_schedule("report.hourly"))
+        state = await self.state()
+        self.assertFalse(state.paused)
+        self.assertEqual(state.next_run_at, TEN + 3600 * 3)
+        self.assertEqual((await self.tick()).created, [])
+        self.clock.advance(3600)
+        self.assertEqual(len((await self.tick()).created), 1)
+
+    async def test_pausing_twice_and_resuming_a_running_schedule_change_nothing(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        self.assertFalse(await self.app.aresume_schedule("report.hourly"))
+        self.assertTrue(await self.app.apause_schedule("report.hourly"))
+        self.assertFalse(await self.app.apause_schedule("report.hourly"))
+        self.assertEqual((await self.state()).next_run_at, NEVER)
+
+    async def test_pausing_before_any_registration_registers_first(self):
+        declare(self.app)
+        self.assertTrue(await self.app.apause_schedule("report.hourly"))
+        self.assertTrue((await self.state()).paused)
+
+    async def test_a_pause_survives_registration_and_a_changed_cron_ends_it(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        await self.app.apause_schedule("report.hourly")
+        await self.app.scheduling.register()
+        self.assertTrue((await self.state()).paused)
+        other = TinyJobs(f"sqlite:///{self.database}", clock=self.clock)
+        declare(other, cron="30 * * * *")
+        await other.ready()
+        try:
+            await other.scheduling.register()
+            self.assertEqual((await self.state()).next_run_at, TEN + 1800)
+        finally:
+            await other.aclose()
+
+    async def test_resuming_works_from_an_app_without_the_task(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        await self.app.apause_schedule("report.hourly")
+        other = TinyJobs(f"sqlite:///{self.database}", clock=self.clock)
+        await other.ready()
+        try:
+            self.assertTrue(await other.aresume_schedule("report.hourly"))
+        finally:
+            await other.aclose()
+        self.assertEqual((await self.state()).next_run_at, TEN)
+
+    async def test_an_unknown_schedule_is_refused(self):
+        with self.assertRaises(UnknownTaskError):
+            await self.app.apause_schedule("report.monthly")
+        with self.assertRaises(UnknownTaskError):
+            await self.app.aresume_schedule("report.monthly")
+
+    async def test_racing_pauses_change_the_schedule_once(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        outcomes = await asyncio.gather(
+            *(self.app.apause_schedule("report.hourly") for _ in range(RACERS))
+        )
+        self.assertEqual(sum(outcomes), 1)
+
+    async def test_the_sync_facade_pauses_and_resumes(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        self.assertTrue(await asyncio.to_thread(self.app.pause_schedule, "report.hourly"))
+        self.assertTrue(await asyncio.to_thread(self.app.resume_schedule, "report.hourly"))
+        self.assertFalse((await self.state()).paused)
+
+
+class RunNowTests(SchedulingTestCase):
+    async def test_running_now_enqueues_a_job_and_leaves_the_schedule_alone(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        job = await self.app.arun_schedule("report.hourly")
+        self.assertEqual((job.task, job.status), ("report.hourly", JobStatus.QUEUED))
+        self.assertEqual(job.run_at, START)
+        self.assertEqual((await self.state()).next_run_at, TEN)
+        self.clock.advance(31)
+        tick = await self.tick()
+        self.assertEqual((tick.created, tick.skipped), ([], ["report.hourly"]))
+        self.assertEqual((await self.state()).next_run_at, TEN + 3600)
+        self.assertEqual(len(await self.jobs()), 1)
+
+    async def test_a_run_already_queued_comes_back_instead_of_a_second_one(self):
+        declare(self.app)
+        await self.app.scheduling.register()
+        first = await self.app.arun_schedule("report.hourly")
+        second = await self.app.arun_schedule("report.hourly")
+        self.assertEqual(first.id, second.id)
+        await self.app.acancel(first.id)
+        self.clock.advance(31)
+        self.assertEqual(len((await self.tick()).created), 1)
+
+    async def test_overlap_lets_a_run_by_hand_pile_up(self):
+        declare(self.app, overlap=True)
+        first = await self.app.arun_schedule("report.hourly")
+        second = await self.app.arun_schedule("report.hourly")
+        self.assertNotEqual(first.id, second.id)
+
+    async def test_running_a_task_without_a_cron_is_refused(self):
+        @self.app.task(name="report.manual")
+        def manual():
+            return None
+
+        with self.assertRaises(UnknownTaskError):
+            await self.app.arun_schedule("report.manual")
+        with self.assertRaises(UnknownTaskError):
+            await self.app.arun_schedule("report.unknown")
+
+    async def test_a_paused_schedule_still_runs_by_hand(self):
+        declare(self.app)
+        await self.app.apause_schedule("report.hourly")
+        job = await asyncio.to_thread(self.app.run_schedule, "report.hourly")
+        self.assertIs(job.status, JobStatus.QUEUED)
 
 
 class SchedulerLifecycleTests(unittest.TestCase):

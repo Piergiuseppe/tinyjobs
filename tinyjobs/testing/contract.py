@@ -7,7 +7,7 @@ from dataclasses import replace
 from ..backends.base import Backend
 from ..clock import Clock, FrozenClock
 from ..ids import new_job_id
-from ..models import ExecutionError, Job, ScheduleState
+from ..models import NEVER, ExecutionError, Job, ScheduleState
 from ..retention import KEEP_EVERYTHING, RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
@@ -761,6 +761,23 @@ class BackendContract:
         )
         self.assertEqual(sum(outcome is not None for outcome in outcomes), 1)
         self.assertEqual(len((await self.backend.list(limit=100)).items), 1)
+
+    async def test_a_schedule_moved_to_never_round_trips_and_moves_back(self):
+        self.requires("schedules")
+        await self.backend.register_schedules([ScheduleState("s", "0 * * * *", "UTC", 100.0)])
+        self.assertIsNotNone(
+            await self.backend.fire_schedule("s", expected=100.0, next_run_at=NEVER, jobs=())
+        )
+        stored = {state.name: state for state in await self.backend.schedules()}
+        self.assertEqual(stored["s"].next_run_at, NEVER)
+        self.assertIsNone(
+            await self.backend.fire_schedule("s", expected=100.0, next_run_at=3700.0, jobs=())
+        )
+        self.assertIsNotNone(
+            await self.backend.fire_schedule("s", expected=NEVER, next_run_at=3700.0, jobs=())
+        )
+        stored = {state.name: state for state in await self.backend.schedules()}
+        self.assertEqual(stored["s"].next_run_at, 3700.0)
 
     async def test_a_firing_respects_the_dedup_key(self):
         self.requires("schedules")

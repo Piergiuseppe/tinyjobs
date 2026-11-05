@@ -474,6 +474,36 @@ class ScheduleCommandTests(FixtureApp, unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("not registered yet", output)
 
+    def test_schedules_pause_resume_and_run_act_on_the_store(self):
+        code, output = self.invoke("schedules", "pause", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick paused"))
+        code, output = self.invoke("schedules", "pause", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick is already paused"))
+        code, output = self.invoke("schedules", "list", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertIn("paused", output)
+        code, output = self.invoke("schedules", "run", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(output.strip()), 36)
+        code, output = self.invoke("schedules", "resume", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick resumed"))
+        code, output = self.invoke("schedules", "resume", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick is not paused"))
+        code, output = self.invoke("schedules", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertNotIn("paused", output)
+
+    def test_schedules_refuses_a_name_it_does_not_know(self):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.invoke("schedules", "pause", "fixture.nope", "--app", "fixture_app:app")
+        self.assertEqual(code, 2)
+        self.assertIn("no schedule named 'fixture.nope'", errors.getvalue())
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.invoke("schedules", "run", "fixture.echo", "--app", "fixture_app:app")
+        self.assertEqual(code, 2)
+        self.assertIn("does not declare a cron task named 'fixture.echo'", errors.getvalue())
+
     def test_the_scheduler_refuses_an_app_without_cron_tasks(self):
         import sys
 

@@ -156,6 +156,9 @@ class ExecutionError:
         return f"{self.type}: {self.message}" if self.message else self.type
 
 
+NEVER = 2.0**62
+
+
 @dataclass(slots=True)
 class ScheduleState:
     name: str
@@ -164,6 +167,10 @@ class ScheduleState:
     next_run_at: float
     last_run_at: float | None = None
     last_job_id: str | None = None
+
+    @property
+    def paused(self) -> bool:
+        return self.next_run_at >= NEVER
 
 
 @dataclass(frozen=True, slots=True)

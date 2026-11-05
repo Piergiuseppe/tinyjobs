@@ -107,6 +107,17 @@ class CheckTests(HealthTestCase):
         self.clock.advance(180)
         self.assertIn("schedule health.tick is", self.failures()[0])
 
+    def test_a_paused_schedule_is_reported_and_never_overdue(self):
+        @self.app.task(name="health.tick", cron="* * * * *")
+        def tick():
+            return None
+
+        self.app.pause_schedule("health.tick")
+        self.clock.advance(180)
+        self.assertEqual(self.failures(), [])
+        messages = [f.message for f in self.app.check()]
+        self.assertIn("schedule health.tick is paused", messages)
+
 
 class AgeFormattingTests(unittest.TestCase):
     def test_ages_read_naturally(self):

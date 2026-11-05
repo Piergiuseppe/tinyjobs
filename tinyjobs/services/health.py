@@ -90,13 +90,18 @@ class HealthService:
         if not self._backend.capabilities.schedules:
             return []
         declared = {task.name for task in self._registry if task.schedule}
-        return [
-            Finding(
-                False,
-                f"schedule {state.name} is {format_age(now - state.next_run_at)} "
-                f"overdue: no worker or scheduler is firing it",
-            )
-            for state in await self._backend.schedules()
-            if state.name in declared
-            and now - state.next_run_at > OVERDUE_TOLERANCE
-        ]
+        findings = []
+        for state in await self._backend.schedules():
+            if state.name not in declared:
+                continue
+            if state.paused:
+                findings.append(Finding(True, f"schedule {state.name} is paused"))
+            elif now - state.next_run_at > OVERDUE_TOLERANCE:
+                findings.append(
+                    Finding(
+                        False,
+                        f"schedule {state.name} is {format_age(now - state.next_run_at)} "
+                        f"overdue: no worker or scheduler is firing it",
+                    )
+                )
+        return findings

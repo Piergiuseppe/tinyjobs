@@ -102,7 +102,10 @@ RESULT_TTL_POSITIVE_MESSAGE = (
     "{name}: result_ttl must be a finite number of seconds above zero, got {value}"
 )
 MAX_RESULT_BYTES_MESSAGE = "max_result_bytes must be a whole number of at least 1, got {value}"
-WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
+WRITING_CALLS = frozenset(
+    {"enqueue", "send", "cancel", "retry", "purge", "drain",
+     "pause_schedule", "resume_schedule", "run_schedule"}
+)
 
 T = TypeVar("T")
 
@@ -663,6 +666,27 @@ class TinyJobs:
 
     def schedules(self) -> list[ScheduleState]:
         return self.run_sync(self.aschedules, name="schedules")
+
+    async def apause_schedule(self, name: str) -> bool:
+        await self.ensure_connected()
+        return await self.scheduling.pause(name)
+
+    def pause_schedule(self, name: str) -> bool:
+        return self.run_sync(partial(self.apause_schedule, name), name="pause_schedule")
+
+    async def aresume_schedule(self, name: str) -> bool:
+        await self.ensure_connected()
+        return await self.scheduling.resume(name)
+
+    def resume_schedule(self, name: str) -> bool:
+        return self.run_sync(partial(self.aresume_schedule, name), name="resume_schedule")
+
+    async def arun_schedule(self, name: str) -> Job:
+        await self.ensure_connected()
+        return await self.asend(name, key=self.scheduling.run_key(name))
+
+    def run_schedule(self, name: str) -> Job:
+        return self.run_sync(partial(self.arun_schedule, name), name="run_schedule")
 
     def decode(self, job: Job) -> JobPayload:
         return self._serialization.decode_payload(job)

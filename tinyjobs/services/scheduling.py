@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, TYPE_CHECKING
+from typing import Callable, Iterable, TYPE_CHECKING
 
 from ..backends.base import Backend
 from ..clock import Clock
-from ..models import Job, JobPayload, ScheduleState
+from ..exceptions import UnknownTaskError, UnsupportedCapabilityError
+from ..models import NEVER, Job, JobPayload, ScheduleState
 from ..options import EnqueueOptions
 from ..registry import TaskRegistry
 from ..schedules import MisfirePolicy, Schedule
@@ -15,6 +16,15 @@ if TYPE_CHECKING:
     from ..task import Task
 
 MAXIMUM_CATCH_UP = 100
+NO_SCHEDULE_MESSAGE = (
+    "no schedule named {name!r}; tinyjobs schedules lists the ones this app "
+    "declares and the store holds"
+)
+NO_SCHEDULES_MESSAGE = "this backend cannot store schedules, so there is nothing to {action}"
+NOT_DECLARED_MESSAGE = (
+    "this app does not declare a cron task named {name!r}, so it cannot fire it; "
+    "import the module that defines it, or pass --import"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +74,54 @@ class SchedulingService:
 
     async def fire_due(self, grace: float) -> Tick:
         tasks = self.declared()
+        states = await self._states(tasks)
+        tick = Tick()
+        for task in tasks:
+            state = states[task.name]
+            if state.paused:
+                continue
+            next_run_at = await self._fire(task, state, grace, tick)
+            if tick.wake_at is None or next_run_at < tick.wake_at:
+                tick.wake_at = next_run_at
+        return tick
+
+    async def pause(self, name: str) -> bool:
+        return await self._settle(name, paused=True, target=lambda state: NEVER)
+
+    async def resume(self, name: str) -> bool:
+        return await self._settle(
+            name,
+            paused=False,
+            target=lambda state: self._schedule_of(state).next_after(self._clock.now()),
+        )
+
+    async def _settle(
+        self, name: str, *, paused: bool, target: Callable[[ScheduleState], float]
+    ) -> bool:
+        if not self._backend.capabilities.schedules:
+            raise UnsupportedCapabilityError(
+                NO_SCHEDULES_MESSAGE.format(action="pause" if paused else "resume")
+            )
+        while True:
+            state = await self._state(name)
+            if state.paused == paused:
+                return False
+            if await self._move(state, target(state)):
+                return True
+
+    def _schedule_of(self, state: ScheduleState) -> Schedule:
+        task = self._registry.get(state.name) if state.name in self._registry else None
+        if task is not None and task.schedule is not None:
+            return task.schedule
+        return Schedule.declare(state.name, state.cron, timezone=state.timezone)
+
+    def run_key(self, name: str) -> str | None:
+        task = self._registry.get(name) if name in self._registry else None
+        if task is None or task.schedule is None:
+            raise UnknownTaskError(NOT_DECLARED_MESSAGE.format(name=name))
+        return task.schedule.dedup_key
+
+    async def _states(self, tasks: list["Task"]) -> dict[str, ScheduleState]:
         states = {state.name: state for state in await self._backend.schedules()}
         missing = [task for task in tasks if task.name not in states]
         if missing:
@@ -71,12 +129,20 @@ class SchedulingService:
             states.update(
                 (state.name, state) for state in await self._backend.schedules()
             )
-        tick = Tick()
-        for task in tasks:
-            next_run_at = await self._fire(task, states[task.name], grace, tick)
-            if tick.wake_at is None or next_run_at < tick.wake_at:
-                tick.wake_at = next_run_at
-        return tick
+        return states
+
+    async def _state(self, name: str) -> ScheduleState:
+        declared = [task for task in self.declared() if task.name == name]
+        states = await self._states(declared)
+        if name not in states:
+            raise UnknownTaskError(NO_SCHEDULE_MESSAGE.format(name=name))
+        return states[name]
+
+    async def _move(self, state: ScheduleState, next_run_at: float) -> bool:
+        stored = await self._backend.fire_schedule(
+            state.name, expected=state.next_run_at, next_run_at=next_run_at, jobs=()
+        )
+        return stored is not None
 
     def plan(
         self, schedule: Schedule, state: ScheduleState, now: float, grace: float
