@@ -300,6 +300,20 @@ class ParserTests(unittest.TestCase):
         ):
             self.assertIn(command, parser.format_help())
 
+    def test_no_purge_keeps_the_sweep_settings_of_the_app(self):
+        from tinyjobs.cli.commands.worker import WorkerCommand
+        from tinyjobs.retention import RetentionPolicy
+
+        default = RetentionPolicy(interval=60, batch=7, maximum_per_sweep=70)
+        args = build_parser().parse_args(["worker", "--app", "x:app", "--no-purge"])
+        policy = WorkerCommand()._retention(args, default)
+        self.assertFalse(policy.enabled)
+        self.assertEqual((policy.interval, policy.batch, policy.maximum_per_sweep), (60, 7, 70))
+        args = build_parser().parse_args(
+            ["worker", "--app", "x:app", "--no-purge", "--purge-interval", "2m"]
+        )
+        self.assertEqual(WorkerCommand()._retention(args, default).interval, 120)
+
 
 class FormattingTests(unittest.TestCase):
     def test_an_empty_table_says_so(self):

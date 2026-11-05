@@ -327,6 +327,13 @@ class ManagedBackend:
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return await self._forward(self._inner.purge, policy, now)
 
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int:
+        return await self._forward(
+            self._inner.expire_results, task, ttl, now, batch, since
+        )
+
     async def schedules(self) -> list[ScheduleState]:
         return await self._forward(self._inner.schedules)
 

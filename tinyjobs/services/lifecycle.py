@@ -11,7 +11,14 @@ from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
 from ..deadlines import bounded, lastly
 from ..deadlines import left as time_left
-from ..exceptions import Retry, error_message, error_traceback, error_type
+from ..exceptions import (
+    ResultTooLarge,
+    Retry,
+    UnencodableResult,
+    error_message,
+    error_traceback,
+    error_type,
+)
 from ..logs import job_fields
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
@@ -24,6 +31,10 @@ FIRST_RETRY_SECONDS = 0.25
 LAST_WORD_SECONDS = 1.0
 VERIFY_SECONDS = 1.0
 LONGEST_RETRY_SECONDS = 4.0
+RESULT_TOO_LARGE_MESSAGE = (
+    "the result of {name} is {size} bytes, over max_result_bytes={cap}; "
+    "store it elsewhere and return a key to it"
+)
 
 logger = logging.getLogger("tinyjobs.worker")
 
@@ -34,10 +45,12 @@ class JobLifecycleService:
         backend: Backend,
         serialization: SerializationService,
         clock: Clock,
+        max_result_bytes: int | None = None,
     ) -> None:
         self._backend = backend
         self._serialization = serialization
         self._clock = clock
+        self._max_result_bytes = max_result_bytes
 
     async def succeed(self, job: Job, task: "Task", result: Any) -> bool:
         return await self.complete(job, self.encode_result(job, task, result))
@@ -63,9 +76,10 @@ class JobLifecycleService:
         error: BaseException,
         *,
         held_until: Callable[[], float] | None = None,
+        final: bool = False,
     ) -> tuple[bool, bool]:
         details = self._describe(error)
-        retry_at = self._retry_at(job, task, error)
+        retry_at = None if final else self._retry_at(job, task, error)
         status = self._execution_status(error)
         write = partial(self._backend.fail, job, details, retry_at, status)
         return (
@@ -150,7 +164,16 @@ class JobLifecycleService:
     def encode_result(self, job: Job, task: "Task", result: Any) -> bytes | None:
         if not task.store_result or result is None:
             return None
-        return self._serialization.encode_result(result, job.codec)
+        try:
+            encoded = self._serialization.encode_result(result, job.codec)
+        except Exception as error:
+            raise UnencodableResult(error_message(error) or type(error).__name__) from error
+        cap = self._max_result_bytes
+        if cap is not None and len(encoded) > cap:
+            raise ResultTooLarge(
+                RESULT_TOO_LARGE_MESSAGE.format(name=task.name, size=len(encoded), cap=cap)
+            )
+        return encoded
 
     def _execution_status(self, error: BaseException) -> ExecutionStatus:
         if isinstance(error, TimeoutError):

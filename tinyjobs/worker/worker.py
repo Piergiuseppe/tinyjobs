@@ -54,6 +54,9 @@ PROCESSES_MESSAGE = (
     "got processes={processes} for loops={loops}"
 )
 JOBS_PER_PROCESS_MESSAGE = "jobs_per_process must be at least 1, got {jobs}"
+RESULT_TTL_UNSUPPORTED_MESSAGE = (
+    "this backend keeps results until their job is purged; result_ttl has no effect"
+)
 GIL_MESSAGE = (
     "this free-threaded Python runs with the GIL enabled, most likely because an extension "
     "module turned it back on, such as hiredis; uninstall it or set PYTHON_GIL=0 so the "
@@ -173,6 +176,7 @@ class Worker:
         self._id = worker_id or new_worker_id()
         self._handle_signals = handle_signals
         self._inflight: dict[tuple[str, int], Job] = {}
+        self._result_floors: dict[str, float] = {}
         self._lost: set[tuple[str, int]] = set()
         self._settling: dict[tuple[str, int], bool] = {}
         self._abandoned: set[tuple[str, int]] = set()
@@ -926,30 +930,101 @@ class Worker:
                 logger.warning("reclaimed %d job(s) with an expired lease", reaped)
 
     async def _housekeeping_loop(self) -> None:
+        capabilities = self._home.backend.capabilities
+        pruning = self._retention.enabled and capabilities.retention
         if not self._retention.enabled:
             logger.info("retention disabled, nothing will be pruned")
-            return
-        if not self._home.backend.capabilities.retention:
+        elif not capabilities.retention:
             logger.info("this backend prunes on its own, skipping housekeeping")
+        else:
+            logger.info("retention: %s", self._retention.describe())
+        ttls = self._result_ttls()
+        if ttls and not capabilities.result_ttl:
+            logger.info(RESULT_TTL_UNSUPPORTED_MESSAGE)
+        expiring = bool(ttls) and capabilities.result_ttl
+        if not pruning and not expiring:
             return
-        logger.info("retention: %s", self._retention.describe())
-        continuing = replace(self._retention, interval=0.0)
         while True:
             await asyncio.sleep(self._retention.check_interval)
-            policy = self._retention
+            if pruning and not await self._prune():
+                return
+            if expiring and not await self._expire_results():
+                return
+
+    async def _prune(self) -> bool:
+        policy = self._retention
+        continuing = replace(policy, interval=0.0)
+        while True:
+            try:
+                removed = await self._home.backend.purge(policy, self._app.clock.now())
+            except AppClosedError:
+                return False
+            except Exception:
+                logger.exception("retention sweep failed")
+                return True
+            if removed:
+                logger.info("retention: pruned %d job(s)", removed)
+            if not removed or removed < self._retention.maximum_per_sweep:
+                return True
+            policy = continuing
+
+    def _result_ttls(self) -> dict[str, float]:
+        return {
+            task.name: task.result_ttl
+            for task in self._app.registry
+            if task.result_ttl is not None
+        }
+
+    async def _expire_results(self) -> bool:
+        tasks = list(self._result_ttls().items())
+        failed: set[str] = set()
+        try:
+            while tasks:
+                capped = await self._expire_pass(tasks, failed)
+                if capped is None:
+                    break
+                tasks = [
+                    (name, ttl)
+                    for name, ttl in tasks[capped:] + tasks[:capped]
+                    if name not in failed
+                ]
+        except AppClosedError:
+            return False
+        return True
+
+    async def _expire_pass(
+        self, tasks: list[tuple[str, float]], failed: set[str]
+    ) -> int | None:
+        policy = self._retention
+        dropped = 0
+        for index, (name, ttl) in enumerate(tasks):
             while True:
+                take = min(policy.batch, policy.maximum_per_sweep - dropped)
+                now = self._app.clock.now()
                 try:
-                    removed = await self._home.backend.purge(policy, self._app.clock.now())
+                    expired = await self._home.backend.expire_results(
+                        name, ttl, now, take, since=self._result_floors.get(name, 0.0)
+                    )
                 except AppClosedError:
-                    return
+                    raise
                 except Exception:
-                    logger.exception("retention sweep failed")
+                    logger.exception("dropping the results of %s failed", name)
+                    failed.add(name)
                     break
-                if removed:
-                    logger.info("retention: pruned %d job(s)", removed)
-                if not removed or removed < self._retention.maximum_per_sweep:
+                dropped += expired
+                if expired:
+                    logger.info(
+                        "dropped %d result(s) of %s older than %s",
+                        expired,
+                        name,
+                        format_seconds(ttl),
+                    )
+                if expired < take:
+                    self._result_floors[name] = now - ttl - policy.check_interval
                     break
-                policy = continuing
+                if dropped >= policy.maximum_per_sweep:
+                    return index + 1
+        return None
 
     async def _drain(self) -> None:
         await self._wait_for_jobs()

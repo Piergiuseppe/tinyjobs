@@ -5,6 +5,7 @@ for _, id in ipairs(doomed) do
   leave(job)
   redis.call('ZREM', key('index', 'all'), id)
   redis.call('ZREM', key('index', 'queue', job.queue), id)
+  redis.call('ZREM', key('results', job.task), id)
   redis.call('DEL', job_key(id), key('executions', id))
 end
 return #doomed

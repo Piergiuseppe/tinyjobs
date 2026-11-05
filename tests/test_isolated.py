@@ -80,11 +80,13 @@ class RunsElsewhereTests(IsolatedTestCase):
         self.assertEqual(await self.result_of(job), value)
 
     async def test_a_result_the_codec_refuses_fails_only_when_it_would_be_stored(self):
-        stored = await self.send(isolated.unencodable_result)
+        stored = await self.send(isolated.unencodable_result, max_attempts=2)
         dropped = await self.send(isolated.unencodable_result_dropped)
         await self.settle(self.make_worker(), [stored, dropped])
         self.assertIs(await self.status_of(stored), JobStatus.FAILED)
-        self.assertEqual((await self.executions_of(stored))[0].error_type, "SerializationError")
+        executions = await self.executions_of(stored)
+        self.assertEqual([e.error_type for e in executions], ["UnencodableResult"])
+        self.assertIn("object", executions[0].traceback)
         self.assertIs(await self.status_of(dropped), JobStatus.SUCCESS)
 
     async def test_the_process_is_reused_across_jobs(self):
@@ -109,6 +111,18 @@ class RunsElsewhereTests(IsolatedTestCase):
 
 
 class FailureTests(IsolatedTestCase):
+    async def test_a_result_over_the_cap_fails_the_job_in_the_worker(self):
+        await self.app.aclose()
+        self.app = TinyJobs(self.app.url, max_result_bytes=8)
+        for task in isolated.TASKS:
+            self.app.registry.register(task)
+        big = await self.send(isolated.echo, "x" * 50)
+        small = await self.send(isolated.echo, "ok")
+        await self.settle(self.make_worker(processes=1), [big, small])
+        self.assertIs(await self.status_of(big), JobStatus.FAILED)
+        self.assertEqual((await self.executions_of(big))[0].error_type, "ResultTooLarge")
+        self.assertEqual(await self.result_of(small), "ok")
+
     async def test_a_process_that_exits_fails_the_job_and_is_replaced(self):
         dying = await self.send(isolated.exit_with, 3)
         after = await self.send(isolated.pid)

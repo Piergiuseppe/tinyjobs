@@ -226,6 +226,15 @@ RECORD_SCHEDULE_RUN = """
     UPDATE schedules SET last_run_at = ?, last_job_id = ? WHERE name = ?
 """
 
+EXPIRE_RESULTS = """
+    UPDATE jobs SET result = NULL
+     WHERE id IN (SELECT id FROM jobs
+                   WHERE status = 'success' AND finished_at >= ? AND finished_at < ?
+                     AND task = ? AND result IS NOT NULL
+                   ORDER BY finished_at
+                   LIMIT ?)
+"""
+
 PURGE_BATCH = """
     DELETE FROM jobs
      WHERE id IN (SELECT id FROM jobs

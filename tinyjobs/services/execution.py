@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..clock import Clock
-from ..exceptions import ExecutorClosedError, ForcedInterrupt
+from ..exceptions import ExecutorClosedError, ForcedInterrupt, ResultError
 from ..executors import ExecutorResolver
 from ..models import Job
 from .hooks import Hooks
@@ -79,7 +79,11 @@ class ExecutionService:
             if settling is not None:
                 settling()
             recorded, will_retry = await self._lifecycle.fail(
-                job, task, error, held_until=held_until
+                job,
+                task,
+                error,
+                held_until=held_until,
+                final=isinstance(error, ResultError),
             )
             if settled is not None:
                 settled()

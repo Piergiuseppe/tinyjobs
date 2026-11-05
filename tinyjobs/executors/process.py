@@ -29,6 +29,7 @@ from ..exceptions import (
     IsolatedTaskError,
     ProcessDied,
     Retry,
+    UnencodableResult,
     error_message,
 )
 from ..exiting import (
@@ -630,6 +631,10 @@ def _outcome(answer: tuple, serialization: Any, codec: str) -> Any:
         raise Retry(in_=details[0], at=details[1])
     if kind == "abandon":
         raise Abandon(details[0])
+    if kind == "unencodable":
+        error = UnencodableResult(details[2])
+        _attach(error, details[3])
+        raise error
     raise _rebuilt(*details)
 
 
@@ -742,7 +747,7 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
         try:
             answer = ("ok", serialization.encode_result(result, codec))
         except Exception as error:
-            answer = _failure(error) if store_result else ("ok", None)
+            answer = ("unencodable", *_failure(error)[1:]) if store_result else ("ok", None)
     _reply(conn, answer)
 
 

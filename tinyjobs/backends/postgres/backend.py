@@ -336,6 +336,7 @@ class PostgresBackend(BaseBackend):
         retention=True,
         schedules=True,
         max_payload_bytes=None,
+        result_ttl=True,
         loop_bound=True,
     )
 
@@ -1480,6 +1481,15 @@ class PostgresBackend(BaseBackend):
                 if gone < batch:
                     break
         return removed
+
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int:
+        rows = await self._retrying(
+            self._queries.expire_results,
+            self._at(now, task=task, since=since, cutoff=now - ttl, batch=batch),
+        )
+        return rows[0]["expired"]
 
     async def schedules(self) -> list[ScheduleState]:
         await self._now()

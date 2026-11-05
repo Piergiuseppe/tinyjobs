@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import replace
 
 from ...retention import RetentionPolicy
 from ...worker.signals import owning_process
@@ -89,7 +90,13 @@ class WorkerCommand(Command):
         self, args: argparse.Namespace, default: RetentionPolicy
     ) -> RetentionPolicy:
         if args.no_purge:
-            return RetentionPolicy(success=0, cancelled=0, failed=0)
+            return replace(
+                default,
+                success=0,
+                cancelled=0,
+                failed=0,
+                interval=_or(args.purge_interval, default.interval),
+            )
         return RetentionPolicy(
             success=_or(args.retain_success, default.success),
             cancelled=_or(args.retain_cancelled, default.cancelled),

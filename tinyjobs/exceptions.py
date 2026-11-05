@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import traceback
 from datetime import datetime
+from typing import Any
 
 
 class TinyJobsError(Exception):
@@ -29,6 +30,18 @@ class UnknownCodecError(ConfigurationError):
 
 
 class SerializationError(TinyJobsError):
+    pass
+
+
+class ResultError(SerializationError):
+    pass
+
+
+class ResultTooLarge(ResultError):
+    pass
+
+
+class UnencodableResult(ResultError):
     pass
 
 
@@ -106,6 +119,26 @@ def error_traceback(error: BaseException) -> str:
     if remote:
         return remote
     return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+
+SHOWN_CHARACTERS = 24
+
+
+def described(value: Any) -> str:
+    if isinstance(value, (str, bytes)):
+        return repr(_cut(value))
+    try:
+        return _cut(repr(value))
+    except Exception:
+        if isinstance(value, int):
+            return f"an int of {value.bit_length()} bits"
+        return f"a {type(value).__name__} that cannot be shown"
+
+
+def _cut(text: Any) -> Any:
+    if len(text) <= SHOWN_CHARACTERS:
+        return text
+    return text[:SHOWN_CHARACTERS] + ("..." if isinstance(text, str) else b"...")
 
 
 class Retry(TinyJobsError):

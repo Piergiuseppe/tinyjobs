@@ -19,6 +19,7 @@ from .backends.loader import check_options, load_backend, loop_bound
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .deadlines import Deadline, finishing
+from .duration import is_finite_seconds
 from .codecs import CodecRegistry
 from .executors.process import MAIN_MODULE, assert_process_setup, main_spawn_problem
 from .exceptions import (
@@ -26,6 +27,7 @@ from .exceptions import (
     BackendNotReadyError,
     ConfigurationError,
     UnsupportedCapabilityError,
+    described,
 )
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
@@ -93,6 +95,13 @@ EMBEDDED_LOOPS_MESSAGE = (
     "run tinyjobs worker --loops or worker.run() for more loops"
 )
 
+RESULT_TTL_MESSAGE = (
+    "{name}: result_ttl only applies to a stored result; pass store_result=True as well"
+)
+RESULT_TTL_POSITIVE_MESSAGE = (
+    "{name}: result_ttl must be a finite number of seconds above zero, got {value}"
+)
+MAX_RESULT_BYTES_MESSAGE = "max_result_bytes must be a whole number of at least 1, got {value}"
 WRITING_CALLS = frozenset({"enqueue", "send", "cancel", "retry", "purge", "drain"})
 
 T = TypeVar("T")
@@ -115,9 +124,12 @@ class TinyJobs:
         clock: Clock | None = None,
         eager: bool = False,
         process_setup: Callable[[], Any] | None = None,
+        max_result_bytes: int | None = None,
         **backend_options: Any,
     ) -> None:
         check_options(url, backend_options)
+        _assert_max_result_bytes(max_result_bytes)
+        self._max_result_bytes = max_result_bytes
         self._url = url
         self._backend_options = backend_options
         self._default_queue = default_queue
@@ -387,7 +399,9 @@ class TinyJobs:
             self._default_queue,
             self._registry,
         )
-        self._lifecycle = JobLifecycleService(backend, self._serialization, self._clock)
+        self._lifecycle = JobLifecycleService(
+            backend, self._serialization, self._clock, self._max_result_bytes
+        )
         self._execution = ExecutionService(
             self._serialization, self._lifecycle, self._hooks, self._clock
         )
@@ -427,6 +441,7 @@ class TinyJobs:
         codec: str | None = None,
         timeout: float | None = None,
         store_result: bool = False,
+        result_ttl: float | None = None,
         isolated: bool = False,
         max_attempts: int = 1,
         retry_on: tuple[type[BaseException], ...] = (Exception,),
@@ -443,6 +458,7 @@ class TinyJobs:
 
         def decorate(target: Callable[..., Any]) -> Task:
             task_name = name or f"{target.__module__}.{target.__qualname__}"
+            _assert_result_ttl(task_name, store_result, result_ttl)
             resolved = Task(
                 self,
                 target,
@@ -463,6 +479,7 @@ class TinyJobs:
                 ),
                 timeout=timeout,
                 store_result=store_result,
+                result_ttl=result_ttl,
                 schedule=_declare_schedule(
                     task_name, cron, timezone, misfire, overlap
                 ),
@@ -664,6 +681,7 @@ class TinyJobs:
             clock=self._clock,
             eager=self._eager,
             process_setup=self._process_setup,
+            max_result_bytes=self._max_result_bytes,
             **self._backend_options,
         )
         lane._codecs = self._codecs
@@ -882,6 +900,24 @@ def _assert_worker_requested(worker: bool, options: dict[str, Any]) -> None:
         raise ConfigurationError(
             f"worker options {sorted(options)} were given without worker=True, "
             f"so no worker would run to use them"
+        )
+
+
+def _assert_max_result_bytes(value: int | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ConfigurationError(MAX_RESULT_BYTES_MESSAGE.format(value=described(value)))
+
+
+def _assert_result_ttl(name: str, store_result: bool, ttl: float | None) -> None:
+    if ttl is None:
+        return
+    if not store_result:
+        raise ConfigurationError(RESULT_TTL_MESSAGE.format(name=name))
+    if not is_finite_seconds(ttl) or ttl <= 0:
+        raise ConfigurationError(
+            RESULT_TTL_POSITIVE_MESSAGE.format(name=name, value=described(ttl))
         )
 
 
