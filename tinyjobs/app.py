@@ -33,7 +33,7 @@ from .metrics import Metrics
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
-from .retention import RetentionPolicy
+from .retention import RetentionPolicy, assert_retention_policy
 from .retry import RetryPolicy
 from .runtime import (
     CLOSED_MESSAGE,
@@ -132,6 +132,7 @@ class TinyJobs:
         **backend_options: Any,
     ) -> None:
         check_options(url, backend_options)
+        assert_retention_policy(retention)
         _assert_max_result_bytes(max_result_bytes)
         self._max_result_bytes = max_result_bytes
         self._url = url

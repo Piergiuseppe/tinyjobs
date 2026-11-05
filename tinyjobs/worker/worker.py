@@ -24,7 +24,7 @@ from ..exceptions import (
 )
 from ..ids import new_worker_id
 from ..models import Job
-from ..retention import RetentionPolicy
+from ..retention import RetentionPolicy, assert_retention_policy
 from ..retry import RetryPolicy
 from ..runtime import inside_running_loop
 from ..deadlines import Deadline, bounded, current, final, finishing, forget_loop, under
@@ -169,6 +169,7 @@ class Worker:
             maximum=max(unknown_task_max_delay, unknown_task_delay),
             jitter=False,
         )
+        assert_retention_policy(retention)
         self._retention = retention or RetentionPolicy()
         self._misfire_grace = misfire_grace if scheduler else None
         self._interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)

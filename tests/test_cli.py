@@ -456,6 +456,19 @@ class PurgeCommandTests(FixtureApp, unittest.TestCase):
             build_parser().parse_args(
                 ["purge", "--app", "x:y", "--before", "domani"]
             )
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+            build_parser().parse_args(["purge", "--app", "x:y", "--before", "x" * 400])
+        self.assertIn("'xxxxxxxxxxxxxxxxxxxxxxxx...' is not a duration", stderr.getvalue())
+
+    def test_a_duration_beyond_counting_is_rejected_by_its_flag(self):
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+            build_parser().parse_args(
+                ["purge", "--app", "x:y", "--before", "9" * 400]
+            )
+        self.assertIn("--before", stderr.getvalue())
+        self.assertIn("'999999999999999999999999...' is too long a duration", stderr.getvalue())
 
 
 class ScheduleCommandTests(FixtureApp, unittest.TestCase):
