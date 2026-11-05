@@ -74,7 +74,20 @@ job.refresh().result()     # '/tmp/123.pdf'
 ```
 
 Results are off by default because most jobs are run for their side effects, and storing return
-values nobody reads is write amplification on the hot path.
+values nobody reads is write amplification on the hot path. A stored result lives as long as its job
+unless `result_ttl` says otherwise, and `max_result_bytes` keeps a big one out of the queue:
+
+```python
+app = TinyJobs("sqlite:///jobs.db", max_result_bytes=64 * 1024)
+
+@app.task(store_result=True, result_ttl=3600)
+async def generate_pdf(document_id: int) -> str: ...
+```
+
+Within a few minutes of the TTL a worker that registers the task drops the result and keeps the
+job, so `jobs show` still tells what happened. A result over the cap fails the job with
+`ResultTooLarge` and is not retried, since the function ran and would produce the same result
+again; put the file in object storage and return its key.
 
 ## Keeping the database from growing forever
 
@@ -201,6 +214,28 @@ tasks.refresh_cache   */15 * * * *  UTC          2026-10-10 14:15:00  2026-10-10
 tinyjobs worker --app tasks:app --no-scheduler     # runs jobs, fires nothing
 tinyjobs scheduler --app tasks:app                 # fires schedules, runs nothing
 ```
+
+A schedule can be stopped for a while, or run now, without touching code:
+
+```bash
+tinyjobs schedules pause tasks.nightly_report --app tasks:app
+tinyjobs schedules resume tasks.nightly_report --app tasks:app
+tinyjobs schedules run tasks.nightly_report --app tasks:app       # one job, now
+```
+
+In code they are `app.pause_schedule(name)`, `app.resume_schedule(name)` and
+`app.run_schedule(name)`. A paused schedule shows `paused` as its next run and as an ok line in
+`check`, fires nothing until resumed, and survives restarts and deploys; resuming picks the next
+time from now, with no catch-up.
+
+Changing the cron expression or the timezone starts the schedule afresh, which also un-pauses it,
+and so does any worker or scheduler older than 0.11, which reads a pause as a clock that moved
+back, while an older `tinyjobs schedules` fails to list one: upgrade them all before pausing
+anything.
+
+`run` enqueues one ordinary job with the schedule's dedup key, so while the previous run is still
+queued or running you get that job back instead of a new one, unless `overlap=True`; the next
+scheduled firing stays where it was.
 
 When nothing was running at the moment a schedule was due, `misfire` decides what happens on restart:
 
@@ -340,9 +375,91 @@ running past their lease: 2
 ```
 
 A job past its lease means the worker holding it stopped reporting, usually because it died. `check`
-fails on that, on queued jobs for a task the app doesn't register (a missing `--import`), on a due job
-waiting longer than `--max-wait`, and on a cron schedule more than a minute overdue, which means no
-worker or scheduler is running. Both are `app.stats()` and `app.check()` in code.
+fails on that, on an app that registers no tasks, on queued jobs for a task the app doesn't register
+(a missing `--import`), on a due job waiting longer than `--max-wait`, and on a cron schedule more
+than a minute overdue, which means no worker or scheduler is running. Both are `app.stats()` and
+`app.check()` in code.
+
+Every log record about a job carries the job as fields, so a log pipeline can filter on them without
+parsing the message. `--log-format json` writes one object per line, on every command (wrapped
+here); a `tinyjobs` logger your settings configured, as under `manage.py tinyjobs`, or a root
+logger that already has handlers in a standalone run, is left alone, with a warning when the flag
+was given:
+
+```bash
+tinyjobs worker --app tasks:app --log-format json
+```
+
+```json
+{"time": "2026-11-05T09:12:44.118Z", "level": "INFO", "logger": "tinyjobs.worker",
+ "message": "job 01a1ab2e-... succeeded on attempt 1", "job_id": "01a1ab2e-...",
+ "task": "tasks.generate_pdf", "queue": "default", "attempt": 1,
+ "worker_id": "laptop/8821/9389541d", "duration_ms": 12.4}
+```
+
+A failure adds `error`, `error_message` and `will_retry`, with the traceback in `traceback` on
+the last attempt, which the text format prints under the line; a record about a schedule carries
+`schedule`. The fields are `extra` on the standard `logging` record, so your own handlers see
+them too, and the last attempt also carries the exception as `exc_info`, for Sentry and plain
+formatters. `tinyjobs.logs.JSONFormatter` and `TextFormatter` are what the flag installs, for a
+logging config of your own.
+
+Prometheus can scrape the worker:
+
+```bash
+tinyjobs worker --app tasks:app --metrics-port 9464        # --metrics-host 0.0.0.0 to expose it
+curl -s localhost:9464/metrics
+```
+
+```
+tinyjobs_jobs_total{task="tasks.generate_pdf",outcome="retry"} 3
+tinyjobs_jobs_total{task="tasks.generate_pdf",outcome="success"} 1842
+tinyjobs_job_duration_seconds_bucket{task="tasks.generate_pdf",le="0.5"} 1790
+tinyjobs_jobs_running{task="tasks.generate_pdf"} 2
+tinyjobs_store_jobs{queue="default",status="queued"} 14
+tinyjobs_store_oldest_due_seconds{queue="default"} 0.8
+tinyjobs_store_expired_leases 0
+```
+
+The counters, the duration histogram and the running gauge are this process's, fed by the job
+events behind the hooks above. The `tinyjobs_store_*` gauges are the store's, read with one `stats`
+query per scrape that gets five seconds to answer, so a slow store costs the scrape its gauges and
+not the target; they are the same from every worker, so scrape them from one, or take `max()`
+across instances rather than `sum()`. An embedded worker has no port of its own: return
+`app.metrics.render(await app.astats())` from a route, with `tinyjobs.metrics.CONTENT_TYPE` as
+the content type, and give the stats query the budget and the fallback to `app.metrics.render()`
+that your route gives any store query.
+
+## Operating it
+
+The runbook, in the order things come up.
+
+**Deploy.** There is nothing to run besides `tinyjobs worker --app tasks:app`: add processes to
+scale, and `--queues` to keep slow queues from starving fast ones. A new version of your tasks is a
+rolling restart, one worker at a time. A change to the store's schema, announced in
+[Status](#status), is the one time to stop every worker first, since a running worker does not
+notice the migration; an older worker started later refuses a schema newer than itself, so a
+rollback fails loudly instead of corrupting the queue. Upgrading to 0.11 needs no migration; the
+upgrade order that pausing needs is under [Cron](#cron).
+
+**Stop.** `SIGTERM` stops claiming and exits within `--shutdown-timeout` (30 s): running jobs get
+most of it, and the async and isolated ones still running at the end are handed back so another
+worker takes them at once; what a second Ctrl-C does and why the timeout must stay under the
+orchestrator's grace period are in [FastAPI](#fastapi). A worker killed outright leaves its jobs to
+their leases, 60 s by default (`--lease`), before the reaper returns them to the queue.
+
+**Watch.** Alert on `tinyjobs check` exiting 1, or on `tinyjobs_store_expired_leases` above zero:
+any value means a worker died, and the next worker's reaper returns its jobs within
+`--reap-interval` (30 s); no worker left at all shows as the scrape target going down. A rising
+`tinyjobs_store_oldest_due_seconds` is a backlog: more workers, or a queue of its own for the slow
+task. `tinyjobs_jobs_total` by `outcome` and the `--log-format json` fields tell which task is
+failing and why.
+
+**Fix.** `jobs retry` requeues a failed or cancelled job and `jobs cancel` stops a queued one, or
+a running one cooperatively. A cron job that keeps failing is `schedules pause`, and `jobs cancel`
+on its queued retry, until the fix ships, then `schedules run` for the missed one and
+`schedules resume`. Queued jobs for a task the app no longer registers are a missing `--import` on
+the worker, or `jobs cancel` when the task is gone for good.
 
 ## FastAPI
 
@@ -502,6 +619,8 @@ ones. To run the rest of the queue, call `app.drain()`.
 | Retention | old terminal jobs are pruned so the database stops growing |
 | Hooks | `on_job_start`, `on_job_success`, `on_job_failure`, for metrics and alerts |
 | Health | `tinyjobs stats`, and `tinyjobs check` for probes |
+| Observability | job fields on every log record, `--log-format json`, Prometheus metrics on `--metrics-port` |
+| Operations | schedules paused, resumed and run by hand, results capped per app and expired per task |
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 | FastAPI | `lifespan()`, with an optional worker inside the server process |
 | Django | a `django.tasks` backend and `manage.py tinyjobs` |
@@ -908,6 +1027,10 @@ v0.10.0. Working and measured, but young. What's in:
   one process
 - `isolated=True`, a job process per task that is killed at its timeout and replaced when it crashes,
   with `--processes`, `--jobs-per-process` and `process_setup`
+- `tinyjobs schedules pause` / `resume` / `run`, and the same from the app
+- `max_result_bytes` and a per-task `result_ttl`
+- the job fields on every log record and `--log-format json`
+- a Prometheus exporter on `tinyjobs worker --metrics-port`
 
 What's not in yet:
 
