@@ -491,6 +491,55 @@ class UndecodableJobTests(WorkerTestCase):
         self.assertIs(await self.status_of(job), JobStatus.FAILED)
 
 
+class StructuredLogTests(WorkerTestCase):
+    async def test_job_outcomes_carry_the_job_fields(self):
+        @self.app.task(queue="mail", max_attempts=2, retry_base=0.01)
+        def handler(value):
+            if value == "fail":
+                raise ValueError("boom")
+            return value
+
+        done = await handler.aenqueue("ok")
+        failing = await handler.aenqueue("fail")
+        worker = self.make_worker(queues=("mail",))
+        with self.assertLogs("tinyjobs.worker", level="INFO") as logs:
+            await self.settle(worker, [done, failing])
+        succeeded = next(r for r in logs.records if r.msg.startswith("job %s succeeded"))
+        self.assertEqual(
+            (succeeded.job_id, succeeded.task, succeeded.queue, succeeded.attempt, succeeded.worker_id),
+            (done.id, handler.name, "mail", 1, worker.id),
+        )
+        self.assertGreaterEqual(succeeded.duration_ms, 0)
+        failed = [r for r in logs.records if r.msg.startswith("job %s failed")]
+        self.assertEqual([(r.job_id, r.attempt, r.error, r.will_retry) for r in failed],
+                         [(failing.id, 1, "ValueError", True), (failing.id, 2, "ValueError", False)])
+        self.assertEqual([r.error_message for r in failed], ["boom", "boom"])
+        self.assertEqual([hasattr(r, "traceback") for r in failed], [False, True])
+        self.assertIn("raise ValueError", failed[1].traceback)
+        self.assertEqual([r.exc_info is None for r in failed], [True, False])
+        self.assertIn("ValueError: boom", next(o for o in logs.output if "attempt 2/2" in o))
+
+    async def test_an_error_whose_str_fails_is_still_recorded_and_logged(self):
+        class Weird(Exception):
+            def __str__(self):
+                raise RuntimeError("no words")
+
+        @self.app.task(max_attempts=1)
+        def handler():
+            raise Weird()
+
+        job = await handler.aenqueue()
+        with self.assertLogs("tinyjobs.worker", level="WARNING") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
+        execution = (await self.app.aexecutions(job.id))[0]
+        self.assertEqual(execution.error_type, "Weird")
+        self.assertIn("<Weird: str() failed>", (await self.app.aget(job.id)).last_error)
+        failed = next(r for r in logs.records if r.msg.startswith("job %s failed"))
+        self.assertEqual(failed.error_message, "<Weird: str() failed>")
+        self.assertIn("raise Weird()", failed.traceback)
+
+
 class RoutingTests(WorkerTestCase):
     async def test_a_worker_only_consumes_the_queues_it_subscribes_to(self):
         @self.app.task(queue="slow")

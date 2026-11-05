@@ -33,6 +33,7 @@ from ..executors import ExecutorResolver
 from ..executors.process import assert_process_setup
 from ..executors.thread import DaemonThreadPool
 from ..flag import Flag
+from ..logs import failure_fields, job_fields
 from ..polling import AdaptiveInterval
 from ..services.execution import current_runner
 from ..services.lifecycle import VERIFY_SECONDS
@@ -649,6 +650,7 @@ class Worker:
                     "job %s ended while its outcome was being recorded; if it was not, "
                     "the reaper takes it back once its lease expires",
                     job.id,
+                    extra=job_fields(job, worker_id=self._id),
                 )
                 return
             if stopped:
@@ -656,7 +658,10 @@ class Worker:
                 return
             if error is not None:
                 logger.exception(
-                    "job %s crashed the worker loop", job.id, exc_info=error
+                    "job %s crashed the worker loop",
+                    job.id,
+                    exc_info=error,
+                    extra=job_fields(job, worker_id=self._id),
                 )
 
         return done
@@ -686,6 +691,7 @@ class Worker:
             if not release.cancelled() and failure is None:
                 return
             one = len(jobs) == 1
+            fields = job_fields(jobs[0], worker_id=self._id) if one else {"worker_id": self._id}
             if failure is None or isinstance(failure, TimeoutError):
                 logger.warning(
                     "the release of %s did not answer in time; unless it went through, "
@@ -693,6 +699,7 @@ class Worker:
                     _named(jobs),
                     "it" if one else "them",
                     "its" if one else "their",
+                    extra=fields,
                 )
                 return
             logger.warning(
@@ -701,6 +708,7 @@ class Worker:
                 str(failure) or type(failure).__name__,
                 "it" if one else "them",
                 "its" if one else "their",
+                extra=fields,
             )
 
         return done
@@ -731,8 +739,12 @@ class Worker:
                 "could not record the outcome of job %s; the reaper takes it back "
                 "once its lease expires",
                 job.id,
+                extra=job_fields(job, worker_id=self._id),
             )
             return
+        fields = job_fields(
+            job, worker_id=self._id, duration_ms=round(attempt.duration * 1000, 3)
+        )
         if not attempt.recorded:
             logger.warning(
                 "job %s attempt %d is no longer held by worker %s; its outcome "
@@ -740,18 +752,24 @@ class Worker:
                 job.id,
                 job.attempts,
                 self._id,
+                extra=fields,
             )
             return
         if attempt.error is None:
-            logger.info("job %s succeeded on attempt %d", job.id, job.attempts)
+            logger.info(
+                "job %s succeeded on attempt %d", job.id, job.attempts, extra=fields
+            )
             return
+        failure = failure_fields(attempt.error, attempt.will_retry)
         logger.warning(
             "job %s failed on attempt %d/%d (%s)%s",
             job.id,
             job.attempts,
             job.max_attempts,
-            type(attempt.error).__name__,
+            failure["error"],
             "; will retry" if attempt.will_retry else "",
+            exc_info=None if attempt.will_retry else attempt.error,
+            extra={**fields, **failure},
         )
 
     async def _hand_back_unstarted(self, job: Job) -> None:
@@ -759,6 +777,7 @@ class Worker:
             "the job threads are shut down; worker %s hands job %s back and stops",
             self._id,
             job.id,
+            extra=job_fields(job, worker_id=self._id),
         )
         self._request_stop()
         try:
@@ -770,6 +789,7 @@ class Worker:
                 "lease expires",
                 job.id,
                 exc_info=True,
+                extra=job_fields(job, worker_id=self._id),
             )
 
     async def _release_unknown(self, job: Job) -> None:
@@ -780,6 +800,7 @@ class Worker:
             job.task,
             job.id,
             format_seconds(delay),
+            extra=job_fields(job, worker_id=self._id),
         )
         async with bounded(self._answer_by()):
             await self._home.backend.hand_back(job, delay)
@@ -888,6 +909,7 @@ class Worker:
                 "run it; its outcome will not be recorded here",
                 self._id,
                 key[0],
+                extra=job_fields(self._inflight[key], worker_id=self._id),
             )
 
     async def _reaper_loop(self) -> None:

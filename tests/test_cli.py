@@ -12,6 +12,7 @@ from pathlib import Path
 from tinyjobs import TinyJobs
 from tinyjobs.cli import build_parser, main
 from tinyjobs.cli.formatting import format_duration, render_table, shorten
+from tinyjobs.cli.main import host_logging_message
 from tinyjobs.duration import format_seconds
 from tinyjobs.cli.loader import load_app
 from tinyjobs.exceptions import ConfigurationError
@@ -158,9 +159,50 @@ class CommandLineTests(FixtureApp, unittest.TestCase):
             ["--log-level", "WARNING", "jobs", "--app", "fixture_app:app", "list"],
             ["jobs", "--app", "fixture_app:app", "--log-level", "WARNING", "list"],
             ["jobs", "list", "--app", "fixture_app:app", "--log-level", "WARNING"],
+            ["--log-format", "json", "jobs", "--app", "fixture_app:app", "list"],
+            ["jobs", "list", "--app", "fixture_app:app", "--log-format", "json"],
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(self.invoke(*argv)[0], 0)
+
+    def test_a_standalone_run_can_ask_for_json_logs(self):
+        from tinyjobs.logs import JSONFormatter, TextFormatter
+
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        root.handlers[:] = []
+        self.assertEqual(self.invoke("--log-format", "json", "stats", "--app", "fixture_app:app")[0], 0)
+        self.assertIsInstance(root.handlers[0].formatter, JSONFormatter)
+        self.assertEqual(self.invoke("stats", "--app", "fixture_app:app")[0], 0)
+        self.assertIsInstance(root.handlers[0].formatter, TextFormatter)
+        self.assertEqual(len(root.handlers), 1)
+
+    def test_a_standalone_run_sets_the_level_every_time(self):
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        root.handlers[:] = []
+        self.invoke("--log-level", "WARNING", "stats", "--app", "fixture_app:app")
+        self.assertEqual(root.level, logging.WARNING)
+        self.invoke("--log-level", "DEBUG", "stats", "--app", "fixture_app:app")
+        self.assertEqual(root.level, logging.DEBUG)
+
+    def test_a_standalone_run_under_foreign_root_handlers_is_told_the_format_is_ignored(self):
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        seen = []
+        handler = logging.Handler()
+        handler.emit = lambda record: seen.append(record.getMessage())
+        root.handlers[:] = [handler]
+        self.invoke("--log-format", "json", "stats", "--app", "fixture_app:app")
+        self.invoke("stats", "--app", "fixture_app:app")
+        self.assertEqual(
+            [m for m in seen if "--log-format is ignored" in m],
+            [host_logging_message("root", "json")],
+        )
+        self.assertEqual(root.handlers, [handler])
 
     def test_filtering_by_status_narrows_the_listing(self):
         self.invoke(
@@ -194,6 +236,30 @@ class EmbeddedAppTests(unittest.TestCase):
             code = main(["send", "hosted.task"], app=self.app)
         self.assertEqual(code, 0)
         self.assertEqual(self.app.get(buffer.getvalue().strip()).task, "hosted.task")
+
+    def test_a_hosted_run_can_ask_for_json_logs(self):
+        from tinyjobs.logs import JSONFormatter, TextFormatter
+
+        self.logger.handlers[:] = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--log-format", "json", "stats"], app=self.app)
+            self.assertIsInstance(self.logger.handlers[0].formatter, JSONFormatter)
+            main(["stats"], app=self.app)
+            self.assertIsInstance(self.logger.handlers[0].formatter, TextFormatter)
+
+    def test_a_host_that_configured_the_logger_is_told_the_format_is_ignored(self):
+        seen = []
+        handler = logging.Handler()
+        handler.emit = lambda record: seen.append(record.getMessage())
+        self.logger.handlers[:] = [handler]
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--log-level", "ERROR", "--log-format", "json", "stats"], app=self.app)
+            main(["--log-format", "text", "stats"], app=self.app)
+            main(["stats"], app=self.app)
+        self.assertEqual(
+            [m for m in seen if "--log-format is ignored" in m],
+            [host_logging_message("tinyjobs", "json"), host_logging_message("tinyjobs", "text")],
+        )
 
     def test_a_hosted_run_leaves_the_root_logger_to_the_host(self):
         self.logger.handlers[:] = []

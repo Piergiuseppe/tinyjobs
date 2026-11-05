@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from tinyjobs import Abandon, Retry, TinyJobs
@@ -81,6 +82,26 @@ def unencodable_result_dropped() -> object:
 @app.task(isolated=True, retry_on=(Picky,))
 def picky_retried() -> None:
     raise Picky(7, "bad")
+
+
+class Mute(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("no words")
+
+
+@app.task(isolated=True, max_attempts=1)
+def mute() -> None:
+    raise Mute()
+
+
+@dataclass(frozen=True)
+class Frozen(Exception):
+    code: int
+
+
+@app.task(isolated=True, retry_on=(Frozen,))
+def frozen_error() -> None:
+    raise Frozen(3)
 
 
 @app.task(isolated=True, retry_on=(ValueError,))
@@ -193,6 +214,7 @@ TASKS = [
     imported_pid,
     terminate_subprocess,
     picky_retried,
+    frozen_error,
     unicode_error,
     grandchild_pid,
     was_prepared,
@@ -208,4 +230,5 @@ TASKS = [
     picky,
     unencodable_result,
     unencodable_result_dropped,
+    mute,
 ]

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import traceback as traceback_module
 from functools import partial
 from contextlib import nullcontext
 from typing import Any, Awaitable, Callable, ContextManager, TYPE_CHECKING
@@ -12,7 +11,8 @@ from ..backends.base import Backend
 from ..clock import Clock, epoch, from_wall
 from ..deadlines import bounded, lastly
 from ..deadlines import left as time_left
-from ..exceptions import REMOTE_TRACEBACK, IsolatedTaskError, Retry
+from ..exceptions import Retry, error_message, error_traceback, error_type
+from ..logs import job_fields
 from ..models import ExecutionError, Job
 from ..status import ExecutionStatus
 from .serialization import SerializationService
@@ -99,8 +99,9 @@ class JobLifecycleService:
                 logger.warning(
                     "could not record the outcome of job %s (%s); trying again in %.2gs",
                     job.id,
-                    str(error) or type(error).__name__,
+                    error_message(error) or type(error).__name__,
                     pause,
+                    extra=job_fields(job),
                 )
                 await asyncio.sleep(pause)
                 delay = min(delay * 2, LONGEST_RETRY_SECONDS)
@@ -157,14 +158,8 @@ class JobLifecycleService:
         return ExecutionStatus.FAILED
 
     def _describe(self, error: BaseException) -> ExecutionError:
-        type_name = error.type_name if isinstance(error, IsolatedTaskError) else None
         return ExecutionError(
-            type=type_name or type(error).__name__,
-            message=str(error),
-            traceback=getattr(error, REMOTE_TRACEBACK, None)
-            or "".join(
-                traceback_module.format_exception(
-                    type(error), error, error.__traceback__
-                )
-            ),
+            type=error_type(error),
+            message=error_message(error),
+            traceback=error_traceback(error),
         )

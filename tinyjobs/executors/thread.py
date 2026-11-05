@@ -14,6 +14,7 @@ from functools import partial
 from typing import Any, Callable, TYPE_CHECKING
 
 from ..exceptions import ExecutorClosedError
+from ..logs import job_fields
 from ..models import Job, JobPayload
 from ..runtime import fresh_thread
 from ..sheltered import landing, sheltered
@@ -85,21 +86,24 @@ class ThreadExecutor(Executor):
             if self._threaded.get(owner) is running:
                 del self._threaded[owner]
             if not running.done() and not running.cancel():
-                self._stray(loop, running, task)
+                self._stray(loop, running, task, job)
 
     def _stray(
         self,
         loop: asyncio.AbstractEventLoop,
         running: Future,
         task: "Task",
+        job: Job | None,
     ) -> None:
         self._strays[running] = task.name
+        fields = {"task": task.name} if job is None else job_fields(job)
         if self._widens:
             self._replaced.add(running)
             self._pool.widen(1)
             logger.warning(
                 "%s ended while its thread still runs; a new thread takes its place until it returns",
                 task.name,
+                extra=fields,
             )
         else:
             logger.warning(
@@ -107,6 +111,7 @@ class ThreadExecutor(Executor):
                 "so that many fewer jobs run at once until they return",
                 task.name,
                 self.strays,
+                extra={**fields, "strays": self.strays},
             )
         running.add_done_callback(partial(_returned, loop, partial(self._back, running)))
 

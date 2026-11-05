@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .duration import format_seconds
 from .exceptions import AppClosedError
+from .logs import job_fields
 from .runtime import inside_running_loop
 from .services import Tick
 from .worker.signals import ShutdownWatcher
@@ -88,11 +89,17 @@ class Scheduler:
         await self._app.ensure_connected()
         tick = await self._app.scheduling.fire_due(self._grace)
         for job in tick.created:
-            logger.info("schedule %s created job %s", job.task, job.id)
+            logger.info(
+                "schedule %s created job %s",
+                job.task,
+                job.id,
+                extra=job_fields(job, schedule=job.task),
+            )
         for name in tick.skipped:
             logger.warning(
                 "schedule %s skipped a run: the previous one is still queued or running",
                 name,
+                extra={"schedule": name},
             )
         for name in tick.missed:
             logger.warning(
@@ -100,12 +107,14 @@ class Scheduler:
                 "fire it; applying its misfire policy",
                 name,
                 format_seconds(self._grace),
+                extra={"schedule": name},
             )
         for name in tick.rewound:
             logger.warning(
                 "schedule %s was due further ahead than its cron allows; the clock "
                 "moved back, so its next run was recomputed",
                 name,
+                extra={"schedule": name},
             )
         return tick
 

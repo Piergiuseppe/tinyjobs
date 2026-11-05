@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from datetime import datetime
 
 
@@ -85,6 +86,26 @@ class IsolatedTaskError(TinyJobsError):
 
     def __reduce__(self) -> tuple:
         return (type(self), (self.args[0] if self.args else "", self.type_name))
+
+
+def error_type(error: BaseException) -> str:
+    if isinstance(error, IsolatedTaskError) and error.type_name:
+        return error.type_name
+    return type(error).__name__
+
+
+def error_message(error: BaseException) -> str:
+    try:
+        return str(error)
+    except Exception:
+        return f"<{type(error).__name__}: str() failed>"
+
+
+def error_traceback(error: BaseException) -> str:
+    remote = getattr(error, REMOTE_TRACEBACK, None)
+    if remote:
+        return remote
+    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
 
 class Retry(TinyJobsError):

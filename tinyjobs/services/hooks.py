@@ -4,6 +4,7 @@ import inspect
 import logging
 from typing import Any, Callable, TypeVar
 
+from ..logs import job_fields
 from ..models import Job
 
 logger = logging.getLogger("tinyjobs.hooks")
@@ -43,8 +44,12 @@ class Hooks:
                 if inspect.isawaitable(outcome):
                     await outcome
             except Exception:
-                logger.exception(
-                    "on_job_%s hook %s raised; the job is unaffected",
-                    event,
-                    getattr(listener, "__qualname__", listener),
-                )
+                self._report(event, listener, args[0])
+
+    def _report(self, event: str, listener: Callable[..., Any], job: Job) -> None:
+        logger.exception(
+            "on_job_%s hook %s raised; the job is unaffected",
+            event,
+            getattr(listener, "__qualname__", listener),
+            extra=job_fields(job),
+        )

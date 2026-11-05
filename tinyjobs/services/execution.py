@@ -25,6 +25,7 @@ class Attempt:
     error: BaseException | None = None
     will_retry: bool = False
     recorded: bool = True
+    duration: float = 0.0
 
 
 class ExecutionService:
@@ -74,6 +75,7 @@ class ExecutionService:
         except (asyncio.CancelledError, ExecutorClosedError, ForcedInterrupt):
             raise
         except BaseException as error:
+            duration = self._clock.monotonic() - started
             if settling is not None:
                 settling()
             recorded, will_retry = await self._lifecycle.fail(
@@ -82,9 +84,9 @@ class ExecutionService:
             if settled is not None:
                 settled()
             if not recorded:
-                return Attempt(error, will_retry, recorded=False)
+                return Attempt(error, will_retry, recorded=False, duration=duration)
             await self._hooks.failed(job, error, will_retry)
-            return Attempt(error, will_retry)
+            return Attempt(error, will_retry, duration=duration)
         duration = self._clock.monotonic() - started
         if settling is not None:
             settling()
@@ -92,6 +94,6 @@ class ExecutionService:
         if settled is not None:
             settled()
         if not recorded:
-            return Attempt(recorded=False)
+            return Attempt(recorded=False, duration=duration)
         await self._hooks.succeeded(job, result, duration)
-        return Attempt()
+        return Attempt(duration=duration)

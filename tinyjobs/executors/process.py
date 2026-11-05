@@ -29,6 +29,7 @@ from ..exceptions import (
     IsolatedTaskError,
     ProcessDied,
     Retry,
+    error_message,
 )
 from ..exiting import (
     ignore_stop_signals,
@@ -632,6 +633,16 @@ def _outcome(answer: tuple, serialization: Any, codec: str) -> Any:
     raise _rebuilt(*details)
 
 
+class RemoteTraceback(Exception):
+    pass
+
+
+def _attach(error: BaseException, remote_traceback: str) -> None:
+    with suppress(Exception):
+        object.__setattr__(error, REMOTE_TRACEBACK, remote_traceback)
+    BaseException.__cause__.__set__(error, RemoteTraceback(remote_traceback))
+
+
 def _rebuilt(
     module: str, qualname: str, message: str, remote_traceback: str, pickled: bytes | None
 ) -> BaseException:
@@ -652,8 +663,7 @@ def _rebuilt(
                     error = candidate
     if not isinstance(error, Exception):
         error = IsolatedTaskError(message, qualname.rsplit(".", 1)[-1])
-    with suppress(AttributeError, TypeError):
-        setattr(error, REMOTE_TRACEBACK, remote_traceback)
+    _attach(error, remote_traceback)
     return error
 
 
@@ -756,15 +766,11 @@ def _failure(error: Exception) -> tuple:
     pickled: bytes | None = None
     with suppress(Exception):
         pickled = pickle.dumps(error)
-    try:
-        message = str(error)
-    except Exception:
-        message = f"<{cls.__name__}: str() failed>"
     return (
         "error",
         cls.__module__,
         cls.__qualname__,
-        message,
+        error_message(error),
         "".join(traceback.format_exception(error)),
         pickled,
     )
