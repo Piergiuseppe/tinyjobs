@@ -8,12 +8,16 @@ from typing import Sequence
 from .. import __version__
 from ..app import TinyJobs
 from ..exceptions import TinyJobsError
+from ..logs import JSONFormatter, TextFormatter
 from .commands import COMMANDS
 from .commands.base import build_app_options
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
+LOG_FORMATTERS = {"text": TextFormatter, "json": JSONFormatter}
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_FORMATS = tuple(LOG_FORMATTERS)
 DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_LOG_FORMAT = "text"
 
 
 def build_global_options() -> argparse.ArgumentParser:
@@ -23,6 +27,13 @@ def build_global_options() -> argparse.ArgumentParser:
         choices=LOG_LEVELS,
         default=argparse.SUPPRESS,
         help=f"logging verbosity (default: {DEFAULT_LOG_LEVEL})",
+    )
+    shared.add_argument(
+        "--log-format",
+        choices=LOG_FORMATS,
+        default=argparse.SUPPRESS,
+        help="text lines, or one JSON object per line with the job fields "
+             f"(default: {DEFAULT_LOG_FORMAT})",
     )
     return shared
 
@@ -50,15 +61,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def configure_own_logger(level: str) -> None:
-    logger = logging.getLogger("tinyjobs")
+HOST_LOGGING_MESSAGE = (
+    "--log-format is ignored: the {logger} logger already has handlers of its own; "
+    "set tinyjobs.logs.{formatter} on them for {format} lines"
+)
+
+
+def host_logging_message(logger_name: str, log_format: str) -> str:
+    return HOST_LOGGING_MESSAGE.format(
+        logger=logger_name, formatter=LOG_FORMATTERS[log_format].__name__, format=log_format
+    )
+
+
+class OwnHandler(logging.StreamHandler):
+    pass
+
+
+def log_handler(log_format: str) -> logging.Handler:
+    handler = OwnHandler(sys.stderr)
+    handler.setFormatter(log_formatter(log_format))
+    return handler
+
+
+def log_formatter(log_format: str) -> logging.Formatter:
+    return LOG_FORMATTERS[log_format](LOG_FORMAT)
+
+
+def configure_logging(
+    logger: logging.Logger, level: str, log_format: str, *, format_requested: bool
+) -> None:
     logger.setLevel(level)
-    if logger.handlers:
+    if _reformat(logger, log_format):
         return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    logger.addHandler(handler)
-    logger.propagate = False
+    if not logger.handlers:
+        logger.addHandler(log_handler(log_format))
+        logger.propagate = False
+    elif format_requested:
+        message = host_logging_message(logger.name, log_format)
+        logger.handle(
+            logger.makeRecord(logger.name, logging.WARNING, __file__, 0, message, (), None)
+        )
+
+
+def _reformat(logger: logging.Logger, log_format: str) -> bool:
+    own = [handler for handler in logger.handlers if isinstance(handler, OwnHandler)]
+    for handler in own:
+        handler.setFormatter(log_formatter(log_format))
+    return bool(own)
 
 
 def main(
@@ -70,11 +119,13 @@ def main(
     parser = build_parser()
     parser.set_defaults(instance=app, owns_process=owns_process)
     args = parser.parse_args(argv)
-    level = getattr(args, "log_level", DEFAULT_LOG_LEVEL)
-    if app is None:
-        logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
-    else:
-        configure_own_logger(level)
+    logger = logging.getLogger() if app is None else logging.getLogger("tinyjobs")
+    configure_logging(
+        logger,
+        getattr(args, "log_level", DEFAULT_LOG_LEVEL),
+        getattr(args, "log_format", DEFAULT_LOG_FORMAT),
+        format_requested=hasattr(args, "log_format"),
+    )
     try:
         return args.handler.run(args)
     except TinyJobsError as error:

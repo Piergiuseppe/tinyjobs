@@ -7,7 +7,7 @@ from dataclasses import replace
 from ..backends.base import Backend
 from ..clock import Clock, FrozenClock
 from ..ids import new_job_id
-from ..models import ExecutionError, Job, ScheduleState
+from ..models import NEVER, ExecutionError, Job, ScheduleState
 from ..retention import KEEP_EVERYTHING, RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
@@ -590,6 +590,59 @@ class BackendContract:
         await self.backend.complete(running, None)
         self.assertEqual((await self.backend.counts_by_status())["success"], 1)
 
+    async def test_expire_results_drops_results_older_than_the_ttl(self):
+        self.requires("result_ttl")
+        old = await self.completed_with(b'"old"', at=100)
+        fresh = await self.completed_with(b'"fresh"', at=900)
+        other = await self.completed_with(b'"other"', at=100, task="tests.mail")
+        bare = await self.finished(JobStatus.SUCCESS, 100)
+        self.assertEqual(await self.backend.expire_results("tests.noop", 500.0, 1000.0), 1)
+        stored = await self.stored(old)
+        self.assertIsNone(stored.result_payload)
+        self.assertIs(stored.status, JobStatus.SUCCESS)
+        self.assertEqual(stored.finished_at, 100.0)
+        self.assertEqual((await self.stored(fresh)).result_payload, b'"fresh"')
+        self.assertEqual((await self.stored(other)).result_payload, b'"other"')
+        self.assertIsNone((await self.stored(bare)).result_payload)
+        self.assertEqual(await self.backend.expire_results("tests.noop", 500.0, 1000.0), 0)
+
+    async def test_expire_results_works_in_batches_oldest_first(self):
+        self.requires("result_ttl")
+        jobs = [await self.completed_with(b'"r"', at=at) for at in (300, 100, 200)]
+        self.assertEqual(await self.backend.expire_results("tests.noop", 1.0, 1000.0, batch=2), 2)
+        self.assertIsNone((await self.stored(jobs[1])).result_payload)
+        self.assertIsNone((await self.stored(jobs[2])).result_payload)
+        self.assertEqual((await self.stored(jobs[0])).result_payload, b'"r"')
+        self.assertEqual(await self.backend.expire_results("tests.noop", 1.0, 1000.0, batch=2), 1)
+
+    async def test_expire_results_starts_from_the_floor_it_is_given(self):
+        self.requires("result_ttl")
+        before = await self.completed_with(b'"before"', at=100)
+        after = await self.completed_with(b'"after"', at=300)
+        self.assertEqual(
+            await self.backend.expire_results("tests.noop", 1.0, 1000.0, since=200.0), 1
+        )
+        self.assertEqual((await self.stored(before)).result_payload, b'"before"')
+        self.assertIsNone((await self.stored(after)).result_payload)
+
+    async def test_purge_takes_the_result_index_with_the_job(self):
+        self.requires("result_ttl")
+        self.requires("retention")
+        job = await self.completed_with(b'"r"', at=100)
+        self.assertEqual(await self.backend.purge(pruning(success=50), 1000.0), 1)
+        self.assertIsNone(await self.stored(job))
+        self.assertEqual(await self.backend.expire_results("tests.noop", 1.0, 1000.0), 0)
+
+    async def completed_with(self, result: bytes, at: float, **overrides) -> Job:
+        claimed = await self.claimed_one(**overrides)
+        now = self.clock.now()
+        self.clock.advance(at - now)
+        try:
+            await self.backend.complete(claimed, result)
+        finally:
+            self.clock.advance(now - at)
+        return claimed
+
     async def test_purge_prunes_past_the_horizon_oldest_first(self):
         self.requires("retention")
         doomed = [await self.finished(JobStatus.SUCCESS, at) for at in (300, 100, 200)]
@@ -708,6 +761,23 @@ class BackendContract:
         )
         self.assertEqual(sum(outcome is not None for outcome in outcomes), 1)
         self.assertEqual(len((await self.backend.list(limit=100)).items), 1)
+
+    async def test_a_schedule_moved_to_never_round_trips_and_moves_back(self):
+        self.requires("schedules")
+        await self.backend.register_schedules([ScheduleState("s", "0 * * * *", "UTC", 100.0)])
+        self.assertIsNotNone(
+            await self.backend.fire_schedule("s", expected=100.0, next_run_at=NEVER, jobs=())
+        )
+        stored = {state.name: state for state in await self.backend.schedules()}
+        self.assertEqual(stored["s"].next_run_at, NEVER)
+        self.assertIsNone(
+            await self.backend.fire_schedule("s", expected=100.0, next_run_at=3700.0, jobs=())
+        )
+        self.assertIsNotNone(
+            await self.backend.fire_schedule("s", expected=NEVER, next_run_at=3700.0, jobs=())
+        )
+        stored = {state.name: state for state in await self.backend.schedules()}
+        self.assertEqual(stored["s"].next_run_at, 3700.0)
 
     async def test_a_firing_respects_the_dedup_key(self):
         self.requires("schedules")

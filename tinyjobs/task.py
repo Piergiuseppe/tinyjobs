@@ -24,6 +24,7 @@ class Task:
         retry_policy: RetryPolicy,
         timeout: float | None = None,
         store_result: bool = False,
+        result_ttl: float | None = None,
         schedule: Schedule | None = None,
         isolated: bool = False,
         registered_in: str | None = None,
@@ -35,6 +36,7 @@ class Task:
         self._retry_policy = retry_policy
         self._timeout = timeout
         self._store_result = store_result
+        self._result_ttl = result_ttl
         self._schedule = schedule
         self._isolated = isolated
         self._registered_in = registered_in or function.__module__
@@ -72,6 +74,10 @@ class Task:
     @property
     def store_result(self) -> bool:
         return self._store_result
+
+    @property
+    def result_ttl(self) -> float | None:
+        return self._result_ttl
 
     @property
     def schedule(self) -> Schedule | None:

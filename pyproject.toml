@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tinyjobs"
-version = "0.10.0"
+dynamic = ["version"]
 description = "Background jobs and cron for Python, on SQLite with zero dependencies, or on Postgres or Redis"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -46,6 +46,9 @@ tinyjobs = "tinyjobs.cli:run"
 
 [project.entry-points."tinyjobs.backends"]
 sqlite = "tinyjobs.backends.sqlite:SQLiteBackend.from_url"
+
+[tool.hatch.version]
+path = "tinyjobs/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tinyjobs"]

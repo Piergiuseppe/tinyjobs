@@ -33,7 +33,7 @@ class JobsCommand(Command):
         show.add_argument("job_id")
 
         retry = actions.add_parser(
-            "retry", help="requeue a failed job", parents=[shared]
+            "retry", help="requeue a failed or cancelled job", parents=[shared]
         )
         retry.add_argument("job_id")
 

@@ -1372,6 +1372,34 @@ waiting out its retry backoff is still queued, so it holds the key too: a failin
 pile up a second one behind it. `run_all` requires `overlap=True`, since its catch-up jobs would
 otherwise collapse into one.
 
+### Pausing and firing by hand
+
+Two things an operator does to a schedule without touching code: stop it for a while, and run it
+now. Both are the firing above with no jobs in it.
+
+```python
+app.pause_schedule("report.hourly")      # tinyjobs schedules pause report.hourly
+app.resume_schedule("report.hourly")     # tinyjobs schedules resume report.hourly
+app.run_schedule("report.hourly")        # tinyjobs schedules run report.hourly
+```
+
+A paused schedule is one whose next firing never comes: `next_run_at` is set to `NEVER`, 2^62
+seconds past the epoch, with the same compare-and-set that a firing uses, so a firing that races
+the pause cannot write over it, and a pause that loses the race reads the row again and retries
+until it holds, so it never reports a schedule paused that is not. Every backend already has the
+operation. No column, no migration, no new script. The scheduler leaves a row at `NEVER` alone
+instead of reading it as a clock that jumped back, `tinyjobs schedules` prints `paused` in place
+of the time, and `check` reports the schedule as paused rather than overdue. Registration keeps a
+stored time unless the cron or the timezone changed, so a pause survives restarts and deploys, and
+a changed cron starts the schedule afresh, as it always did, which un-pauses it. Resuming computes
+the next time from the task's cron and timezone, or from the stored ones when this process does
+not register the task, so it works from any process; firing by hand needs the task, since the
+job it creates is the task's.
+
+Running by hand is an ordinary enqueue carrying the schedule's dedup key, so with `overlap=False`
+a run that is already queued or running comes back instead of a second one, and the schedule's own
+next time is untouched: a job fired by hand at 10:40 does not move the 11:00 firing.
+
 ### Cron syntax
 
 Standard five-field expressions (`minute hour day month weekday`) with `*`, ranges, steps, lists, and
@@ -1473,8 +1501,10 @@ for a model to load and short enough that a connect that hangs does not hold the
 pickled when it round-trips, since it is the process's own object and the pipe already carries
 pickles; failing that, as its class name, module and message, from which the parent rebuilds it
 when the class is in its own modules, so `retry_on` matches it and `TimeoutError` still means
-`TIMEOUT`, and keeps the name and the remote traceback otherwise. `Retry` and `Abandon` cross by
-their fields. A `process_setup` function, found by name the same way, runs once in each process
+`TIMEOUT`, and keeps the name and the remote traceback otherwise; either way the child's
+traceback becomes the direct cause of the error the parent holds, so a plain formatter and
+Sentry print the child's frames before the parent's. `Retry` and `Abandon` cross by their
+fields. A `process_setup` function, found by name the same way, runs once in each process
 before its first job; it is set on the app, so that workers, `app.drain()` and eager mode all
 honour it, or on one worker. `django.setup()` runs on its own when `DJANGO_SETTINGS_MODULE` is
 set, because a job process starts from the task module's imports and nothing the worker did at
@@ -1907,8 +1937,41 @@ result = job.wait(timeout=30).result()     # polls, then decodes the stored valu
 ```
 
 Results are serialized with the same codec as the arguments and stored on the job row, so they live
-as long as the job does and go when retention purges it. There is no size cap; a large result belongs
-in object storage, with the job returning a key. A cap and a per-task TTL are planned.
+as long as the job does and go when retention purges it, or earlier with a TTL:
+
+```python
+app = TinyJobs("sqlite:///jobs.db", max_result_bytes=64 * 1024)
+
+@app.task(store_result=True, result_ttl=3600)
+async def render_report(report_id: int) -> str: ...
+```
+
+A large result belongs in object storage, with the job returning a key, and `max_result_bytes`,
+off by default, makes that a rule rather than advice: an encoded result over the cap fails the job
+with `ResultTooLarge`, and a result the codec refuses fails it with `UnencodableResult`; both are
+a `ResultError`, a kind of `SerializationError`. The function already ran, so neither failure is
+retried: retrying would run the side effects again to hit the same deterministic error. The cap is
+checked in the worker after encoding, so it holds for isolated tasks too, whose result is decoded
+from the job process and encoded again; a job process whose result the codec refuses answers with
+that, so the parent fails the job the same way.
+
+`result_ttl` drops the stored result that many seconds after the job finished, leaving the row
+and its history; `job.result()` then returns `None`. The sweep runs at every retention check of
+every worker's housekeeping loop, a quarter of the retention interval and at most five minutes,
+for the tasks that worker registers, without the election that pruning uses: it is an idempotent
+batched `UPDATE` per task with a TTL, repeated until a batch comes back short, over the same
+`(status, finished_at)` index that pruning walks. A pass over the tasks stops at
+`maximum_per_sweep` results, like pruning, and the next pass starts from the task after the one
+that used them up, so a busy task cannot starve the others; passes go on until one comes back
+short everywhere, as pruning does, and every check starts again from the first task. A task
+whose sweep fails is logged once and sits out the rest of that check, as a failing prune does.
+A task that came back short has nothing older than its cutoff, so the worker keeps that cutoff,
+less one check interval of slack for a job finished just before it on a clock slightly behind, as
+the floor of its next sweep: the first sweep after a start walks every old success of the task
+once, and the ones after it only the window since the last. On Redis a per-task sorted set of
+the jobs holding a result, scored by `finished_at`, is kept by `complete` and trimmed by the sweep
+and by pruning, so the sweep never scans the finished jobs. A result stored before the set
+existed is not in it and lives until its job is purged.
 
 `job.wait(timeout=...)` and `await job.awaited(timeout=...)` poll with the same adaptive backoff as
 the worker loop, and return the job rather than raising on failure: a job that failed still has a
@@ -2333,8 +2396,43 @@ the task has already run by the time `enqueue()` returns.
 ### Observability
 
 Logging goes through the stdlib `logging` module, on the `tinyjobs` logger and its children, with the
-job id in the message. Structured `extra` fields (`job_id`, `task`, `queue`, `attempt`,
-`duration_ms`) are planned. No logging is configured by the library. A library that calls `basicConfig` is a library that fights your application.
+job id in the message and, on every record about a job, the same facts as `extra` fields: `job_id`,
+`task`, `queue` and `attempt`, plus `worker_id` on the worker's own records, `duration_ms` on an
+outcome, and `error`, `error_message` and `will_retry` on a failure, whose last attempt also
+carries the traceback twice: as a `traceback` field, the child's own traceback alone for an
+isolated task, and as `exc_info`, the rebuilt error with that traceback chained as its direct
+cause, which is what Sentry and a plain formatter read; a record about a schedule carries
+`schedule`. The two formatters in `tinyjobs.logs` prefer the field: `JSONFormatter` writes one
+JSON object per line with `time`, `level`, `logger`, `message`, the fields, and `traceback` when
+there is one, and `TextFormatter` prints the traceback under the line. `--log-format` installs
+them on every CLI command, on the `tinyjobs` logger when the host left it alone and on the root
+logger in a standalone run, and, when the flag was given, warns when either already has
+handlers. No logging is configured by the library. A library that calls
+`basicConfig` is a library that fights your application.
+
+`app.metrics` hooks the job events and keeps counters with no dependency: `tinyjobs_jobs_total`
+by task and outcome (`success`, `failure`, `retry`), a `tinyjobs_job_duration_seconds` histogram of
+successful attempts by task, and `tinyjobs_jobs_running` by task, which an internal end event
+decrements even when an attempt is cancelled or its outcome is not recorded, since the public hooks
+fire only for recorded outcomes; it keys the running attempts by job and claim, so an end without a
+start, or two ends, cannot drive the gauge negative. The collector is created with the app's hooks,
+so nothing is missed before the first scrape, and one per app is shared by its lanes, so `--loops N`
+counts once; it takes a lock, since the lanes' loops run on different threads. `render()` writes the
+Prometheus text format with a `tinyjobs_info` gauge carrying the version and, given a `Stats`,
+adds the store's gauges: `tinyjobs_store_jobs` by queue and status, `tinyjobs_store_queued_jobs`
+by task, `tinyjobs_store_oldest_due_seconds` by queue and `tinyjobs_store_expired_leases`.
+`tinyjobs worker --metrics-port 9464` serves it at `/metrics` from a thread on the stdlib
+`http.server`, loaded only when a worker serves metrics, asking the store for its stats on each
+scrape, so a 15 second scrape is one `stats` query per 15 seconds, with five seconds to answer
+on the scrape's clock, not the query's, since a driver can take as long again to deliver a
+cancel; under Prometheus' default scrape timeout of ten, a store that cannot answer, or not in
+time, costs the scrape its gauges, not the counters. A host name binds IPv4 first, a taken port
+is refused rather than retried on the other family, and the socket has `SO_REUSEADDR` so a
+restart takes its port back at once, which on macOS also lets it sit beside a server holding the
+same port on every address, where Linux refuses. An embedded worker returns
+`app.metrics.render(await app.astats())` from a route of its own. The counters are per process,
+as Prometheus expects; the store's numbers are the same from every worker, so scrape them from one,
+or aggregate them with `max()` across instances rather than `sum()`.
 
 Lifecycle hooks for metrics, tracing or alerting, with no framework assumptions:
 
@@ -2501,9 +2599,15 @@ in one process.
 `isolated=True`, a job process per task, spawned on demand and reused, killed at the timeout and
 replaced when it crashes, with `processes` and `jobs_per_process`.
 
+**v0.11, operations**
+Schedules paused, resumed and fired by hand, a result size cap and a per-task result TTL,
+structured log fields and a JSON log format, a Prometheus exporter on the hooks, and a guide to
+running it.
+
 **Next**
-Transactional enqueue on SQLite, a result size cap and TTL, structured log fields, jobs retried
-and cancelled from the CLI, a Prometheus exporter on the hooks.
+A dashboard, dependency-free (`http.server` and one HTML file) on the same service calls as the
+CLI: jobs and their attempts, schedules paused, resumed and run from the page. Then transactional
+enqueue on SQLite.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
@@ -2512,6 +2616,5 @@ protocol is a compatibility promise.
 **Beyond**
 Joining a SQLAlchemy session's transaction, designed against a real application rather than against a
 guess. A `--workers N` that forks and supervises N workers, if running one per core under a
-supervisor turns out to be the friction people report. A read-only web dashboard, also dependency-free (`http.server` and one HTML
-file). Chains and groups only if usage demands them. They are where task queues usually go to become
-frameworks.
+supervisor turns out to be the friction people report. Chains and groups only if usage demands
+them. They are where task queues usually go to become frameworks.

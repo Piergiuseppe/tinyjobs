@@ -54,6 +54,38 @@ class TaskDeclarationTests(BackendTestCase):
         self.assertIn(handler.name, self.app.registry)
         self.assertIs(self.app.registry.get(handler.name), handler)
 
+    def test_a_result_ttl_needs_a_stored_result_and_a_positive_duration(self):
+        with self.assertRaises(ConfigurationError) as caught:
+            @self.app.task(result_ttl=60)
+            def unstored():
+                return None
+
+        self.assertIn("result_ttl only applies to a stored result", str(caught.exception))
+        with self.assertRaises(ConfigurationError) as caught:
+            @self.app.task(store_result=True, result_ttl=0)
+            def zero():
+                return None
+
+        self.assertIn("must be a finite number of seconds above zero", str(caught.exception))
+        for value in (float("nan"), float("inf"), 10**400, 10**5000, -1, True, "1h"):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                self.app.task(store_result=True, result_ttl=value)(lambda: None)
+        with self.assertRaises(ConfigurationError) as caught:
+            self.app.task(store_result=True, result_ttl=10**5000)(lambda: None)
+        self.assertIn("got an int of 16610 bits", str(caught.exception))
+
+        @self.app.task(store_result=True, result_ttl=3600)
+        def kept():
+            return None
+
+        self.assertEqual(kept.result_ttl, 3600)
+
+    def test_max_result_bytes_must_be_positive(self):
+        for value in (0, True, 1.5, "65536"):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError) as caught:
+                TinyJobs("memory://", max_result_bytes=value)
+            self.assertIn("max_result_bytes must be a whole number of at least 1", str(caught.exception))
+
     def test_decorator_with_options_registers_the_task(self):
         @self.app.task(queue="urgent", max_attempts=4, timeout=12.0)
         def handler():

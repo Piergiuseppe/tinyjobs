@@ -574,6 +574,24 @@ class Queries:
             RETURNING key
         """
 
+        self.expire_results = f"""
+            WITH expired AS (
+                UPDATE {jobs} SET result = NULL
+                 WHERE id IN (
+                       SELECT id FROM {jobs}
+                        WHERE status = 'success'
+                          AND finished_at >= %(since)s - ({NOW} - {horizon})
+                          AND finished_at < %(cutoff)s - ({NOW} - {horizon})
+                          AND task = %(task)s AND result IS NOT NULL
+                        ORDER BY finished_at
+                        LIMIT %(batch)s
+                        FOR UPDATE SKIP LOCKED
+                 )
+                RETURNING id
+            )
+            SELECT count(*) AS expired FROM expired
+        """
+
         self.purge_batch = f"""
             WITH gone AS (
                 DELETE FROM {jobs}

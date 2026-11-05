@@ -16,6 +16,7 @@ GROUPS = {
         "isolated-tasks",
         "free-threaded-python",
         "watching-it",
+        "operating-it",
         "testing-your-tasks",
     ],
     "Integrations": ["fastapi", "django"],

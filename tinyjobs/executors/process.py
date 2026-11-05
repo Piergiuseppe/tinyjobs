@@ -29,6 +29,8 @@ from ..exceptions import (
     IsolatedTaskError,
     ProcessDied,
     Retry,
+    UnencodableResult,
+    error_message,
 )
 from ..exiting import (
     ignore_stop_signals,
@@ -629,7 +631,21 @@ def _outcome(answer: tuple, serialization: Any, codec: str) -> Any:
         raise Retry(in_=details[0], at=details[1])
     if kind == "abandon":
         raise Abandon(details[0])
+    if kind == "unencodable":
+        error = UnencodableResult(details[2])
+        _attach(error, details[3])
+        raise error
     raise _rebuilt(*details)
+
+
+class RemoteTraceback(Exception):
+    pass
+
+
+def _attach(error: BaseException, remote_traceback: str) -> None:
+    with suppress(Exception):
+        object.__setattr__(error, REMOTE_TRACEBACK, remote_traceback)
+    BaseException.__cause__.__set__(error, RemoteTraceback(remote_traceback))
 
 
 def _rebuilt(
@@ -652,8 +668,7 @@ def _rebuilt(
                     error = candidate
     if not isinstance(error, Exception):
         error = IsolatedTaskError(message, qualname.rsplit(".", 1)[-1])
-    with suppress(AttributeError, TypeError):
-        setattr(error, REMOTE_TRACEBACK, remote_traceback)
+    _attach(error, remote_traceback)
     return error
 
 
@@ -732,7 +747,7 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
         try:
             answer = ("ok", serialization.encode_result(result, codec))
         except Exception as error:
-            answer = _failure(error) if store_result else ("ok", None)
+            answer = ("unencodable", *_failure(error)[1:]) if store_result else ("ok", None)
     _reply(conn, answer)
 
 
@@ -756,15 +771,11 @@ def _failure(error: Exception) -> tuple:
     pickled: bytes | None = None
     with suppress(Exception):
         pickled = pickle.dumps(error)
-    try:
-        message = str(error)
-    except Exception:
-        message = f"<{cls.__name__}: str() failed>"
     return (
         "error",
         cls.__module__,
         cls.__qualname__,
-        message,
+        error_message(error),
         "".join(traceback.format_exception(error)),
         pickled,
     )

@@ -25,6 +25,7 @@ class Capabilities:
     schedules: bool = False
     max_payload_bytes: int | None = None
     loop_bound: bool = False
+    result_ttl: bool = False
 
 
 @runtime_checkable
@@ -98,6 +99,10 @@ class Backend(Protocol):
         self, policy: RetentionPolicy, now: float
     ) -> int | None: ...
 
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int: ...
+
     async def schedules(self) -> list[ScheduleState]: ...
 
     async def register_schedules(self, states: Sequence[ScheduleState]) -> None: ...
@@ -139,6 +144,11 @@ class BaseBackend(ABC):
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return None
+
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int:
+        return 0
 
     async def schedules(self) -> list[ScheduleState]:
         return []

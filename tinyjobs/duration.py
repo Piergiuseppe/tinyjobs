@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import math
 from decimal import Decimal
+from typing import Any
 
 UNITS = (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60))
+
+
+def is_finite_seconds(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def format_duration(seconds: float) -> str:

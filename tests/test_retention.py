@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 
+from tinyjobs import TinyJobs
+from tinyjobs.exceptions import ConfigurationError
 from tinyjobs.retention import KEEP_EVERYTHING, RetentionPolicy
 from tinyjobs.status import JobStatus
 
@@ -16,6 +18,34 @@ class PolicyTests(unittest.TestCase):
         policy = RetentionPolicy()
         self.assertGreater(policy.failed, policy.success)
         self.assertEqual(policy.success, policy.cancelled)
+
+    def test_the_sweep_sizes_must_be_at_least_one(self):
+        for field, value in (("batch", 0), ("batch", -1), ("batch", 1.5), ("batch", True),
+                             ("maximum_per_sweep", 0)):
+            with self.subTest(field=field, value=value), self.assertRaises(ConfigurationError) as caught:
+                RetentionPolicy(**{field: value})
+            self.assertIn(f"retention {field} must be a whole number of at least 1", str(caught.exception))
+
+    def test_the_durations_must_be_finite_seconds(self):
+        for field, value in (("interval", float("nan")), ("interval", float("inf")),
+                             ("success", -1), ("success", 10**400), ("failed", "7d"),
+                             ("cancelled", True), ("failed", 10**5000),
+                             ("failed", [10**5000])):
+            with self.subTest(field=field, value=value), self.assertRaises(ConfigurationError) as caught:
+                RetentionPolicy(**{field: value})
+            self.assertIn(f"retention {field} must be a finite number of seconds", str(caught.exception))
+        self.assertEqual(RetentionPolicy(interval=0).check_interval, 1.0)
+
+    def test_an_app_and_a_worker_refuse_anything_but_a_policy(self):
+        for value in ({"success": 3600}, 3600, "1h"):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError) as caught:
+                TinyJobs("memory://", retention=value)
+            self.assertIn("retention must be a RetentionPolicy", str(caught.exception))
+        app = TinyJobs("memory://")
+        self.addCleanup(app.close)
+        with self.assertRaises(ConfigurationError) as caught:
+            app.worker(retention={"success": 3600})
+        self.assertIn("retention must be a RetentionPolicy, got dict", str(caught.exception))
 
     def test_zero_means_forever(self):
         self.assertFalse(KEEP_EVERYTHING.enabled)

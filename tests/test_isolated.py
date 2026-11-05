@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 import subprocess
@@ -79,11 +80,13 @@ class RunsElsewhereTests(IsolatedTestCase):
         self.assertEqual(await self.result_of(job), value)
 
     async def test_a_result_the_codec_refuses_fails_only_when_it_would_be_stored(self):
-        stored = await self.send(isolated.unencodable_result)
+        stored = await self.send(isolated.unencodable_result, max_attempts=2)
         dropped = await self.send(isolated.unencodable_result_dropped)
         await self.settle(self.make_worker(), [stored, dropped])
         self.assertIs(await self.status_of(stored), JobStatus.FAILED)
-        self.assertEqual((await self.executions_of(stored))[0].error_type, "SerializationError")
+        executions = await self.executions_of(stored)
+        self.assertEqual([e.error_type for e in executions], ["UnencodableResult"])
+        self.assertIn("object", executions[0].traceback)
         self.assertIs(await self.status_of(dropped), JobStatus.SUCCESS)
 
     async def test_the_process_is_reused_across_jobs(self):
@@ -108,6 +111,18 @@ class RunsElsewhereTests(IsolatedTestCase):
 
 
 class FailureTests(IsolatedTestCase):
+    async def test_a_result_over_the_cap_fails_the_job_in_the_worker(self):
+        await self.app.aclose()
+        self.app = TinyJobs(self.app.url, max_result_bytes=8)
+        for task in isolated.TASKS:
+            self.app.registry.register(task)
+        big = await self.send(isolated.echo, "x" * 50)
+        small = await self.send(isolated.echo, "ok")
+        await self.settle(self.make_worker(processes=1), [big, small])
+        self.assertIs(await self.status_of(big), JobStatus.FAILED)
+        self.assertEqual((await self.executions_of(big))[0].error_type, "ResultTooLarge")
+        self.assertEqual(await self.result_of(small), "ok")
+
     async def test_a_process_that_exits_fails_the_job_and_is_replaced(self):
         dying = await self.send(isolated.exit_with, 3)
         after = await self.send(isolated.pid)
@@ -170,6 +185,29 @@ class FailureTests(IsolatedTestCase):
         self.assertEqual((await self.executions_of(job))[0].error_type, "Picky")
         self.assertIn("7: bad", (await self.app.aget(job.id)).last_error)
 
+    async def test_the_final_failure_log_carries_the_child_traceback(self):
+        job = await self.send(isolated.picky)
+        with self.assertLogs("tinyjobs.worker", level="WARNING") as logs:
+            await self.settle(self.make_worker(), [job])
+        failed = next(r for r in logs.records if r.msg.startswith("job %s failed"))
+        self.assertEqual((failed.error, failed.will_retry), ("Picky", False))
+        self.assertIn('raise Picky(7, "bad")', failed.traceback)
+        self.assertIn("isolated.py", failed.traceback)
+        self.assertNotIn("_rebuilt", failed.traceback)
+        standard = logging.Formatter().formatException(failed.exc_info)
+        self.assertIn('raise Picky(7, "bad")', standard)
+        self.assertIn("direct cause", standard)
+
+    async def test_an_error_whose_str_fails_in_the_child_is_still_recorded(self):
+        job = await self.send(isolated.mute)
+        with self.assertLogs("tinyjobs.worker", level="WARNING") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
+        self.assertEqual((await self.executions_of(job))[0].error_type, "Mute")
+        self.assertIn("<Mute: str() failed>", (await self.app.aget(job.id)).last_error)
+        failed = next(r for r in logs.records if r.msg.startswith("job %s failed"))
+        self.assertEqual((failed.error, failed.error_message), ("Mute", "<Mute: str() failed>"))
+
     async def test_exceptions_with_their_own_constructor_still_match_retry_on(self):
         picky = await self.send(isolated.picky_retried, max_attempts=2)
         unicode = await self.send(isolated.unicode_error, max_attempts=2)
@@ -178,6 +216,14 @@ class FailureTests(IsolatedTestCase):
         executions = await self.executions_of(unicode)
         self.assertEqual(len(executions), 2)
         self.assertEqual(executions[0].error_type, "UnicodeDecodeError")
+
+    async def test_an_exception_that_refuses_new_attributes_still_matches_retry_on(self):
+        job = await self.send(isolated.frozen_error, max_attempts=2)
+        await self.settle(self.make_worker(), [job])
+        executions = await self.executions_of(job)
+        self.assertEqual(len(executions), 2)
+        self.assertEqual(executions[0].error_type, "Frozen")
+        self.assertIn("raise Frozen(3)", executions[0].traceback)
 
     async def test_a_process_that_died_while_idle_is_not_blamed_on_the_next_job(self):
         worker = self.make_worker(processes=1)

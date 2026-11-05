@@ -490,6 +490,152 @@ class UndecodableJobTests(WorkerTestCase):
         await self.settle(self.make_worker(), [job])
         self.assertIs(await self.status_of(job), JobStatus.FAILED)
 
+    async def test_a_result_the_pickle_codec_cannot_write_is_not_retried_either(self):
+        import threading
+
+        await self.app.aclose()
+        self.app = TinyJobs(
+            f"sqlite:///{Path(self.directory.name) / 'pickled.db'}", allow_pickle=True
+        )
+
+        @self.app.task(store_result=True, max_attempts=3, retry_base=0.01, codec="pickle")
+        def handler():
+            self.calls.append("ran")
+            return threading.Lock()
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.FAILED, 1))
+        self.assertEqual(self.calls, ["ran"])
+        self.assertIn("UnencodableResult", stored.last_error)
+        self.assertIn("lock", stored.last_error)
+
+    async def test_a_result_that_cannot_be_encoded_is_not_retried(self):
+        class Unserializable:
+            pass
+
+        @self.app.task(store_result=True, max_attempts=3, retry_base=0.01)
+        def handler():
+            self.calls.append("ran")
+            return Unserializable()
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.FAILED, 1))
+        self.assertEqual(self.calls, ["ran"])
+        self.assertIn("UnencodableResult", stored.last_error)
+
+
+class StructuredLogTests(WorkerTestCase):
+    async def test_job_outcomes_carry_the_job_fields(self):
+        @self.app.task(queue="mail", max_attempts=2, retry_base=0.01)
+        def handler(value):
+            if value == "fail":
+                raise ValueError("boom")
+            return value
+
+        done = await handler.aenqueue("ok")
+        failing = await handler.aenqueue("fail")
+        worker = self.make_worker(queues=("mail",))
+        with self.assertLogs("tinyjobs.worker", level="INFO") as logs:
+            await self.settle(worker, [done, failing])
+        succeeded = next(r for r in logs.records if r.msg.startswith("job %s succeeded"))
+        self.assertEqual(
+            (succeeded.job_id, succeeded.task, succeeded.queue, succeeded.attempt, succeeded.worker_id),
+            (done.id, handler.name, "mail", 1, worker.id),
+        )
+        self.assertGreaterEqual(succeeded.duration_ms, 0)
+        failed = [r for r in logs.records if r.msg.startswith("job %s failed")]
+        self.assertEqual([(r.job_id, r.attempt, r.error, r.will_retry) for r in failed],
+                         [(failing.id, 1, "ValueError", True), (failing.id, 2, "ValueError", False)])
+        self.assertEqual([r.error_message for r in failed], ["boom", "boom"])
+        self.assertEqual([hasattr(r, "traceback") for r in failed], [False, True])
+        self.assertIn("raise ValueError", failed[1].traceback)
+        self.assertEqual([r.exc_info is None for r in failed], [True, False])
+        self.assertIn("ValueError: boom", next(o for o in logs.output if "attempt 2/2" in o))
+
+    async def test_an_error_whose_str_fails_is_still_recorded_and_logged(self):
+        class Weird(Exception):
+            def __str__(self):
+                raise RuntimeError("no words")
+
+        @self.app.task(max_attempts=1)
+        def handler():
+            raise Weird()
+
+        job = await handler.aenqueue()
+        with self.assertLogs("tinyjobs.worker", level="WARNING") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.FAILED)
+        execution = (await self.app.aexecutions(job.id))[0]
+        self.assertEqual(execution.error_type, "Weird")
+        self.assertIn("<Weird: str() failed>", (await self.app.aget(job.id)).last_error)
+        failed = next(r for r in logs.records if r.msg.startswith("job %s failed"))
+        self.assertEqual(failed.error_message, "<Weird: str() failed>")
+        self.assertIn("raise Weird()", failed.traceback)
+
+
+class EndEventTests(WorkerTestCase):
+    async def test_a_listener_that_raises_at_the_end_is_logged_and_the_job_unaffected(self):
+        from tinyjobs.services.hooks import END
+
+        @self.app.task
+        def handler():
+            return "done"
+
+        def broken(job):
+            raise RuntimeError("boom")
+
+        self.app._hooks.add(END, broken)
+        job = await handler.aenqueue()
+        with self.assertLogs("tinyjobs.hooks", "ERROR") as logs:
+            await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertEqual(logs.records[0].job_id, job.id)
+        self.assertIn("job-end listener", logs.output[0])
+
+
+class ResultCapTests(WorkerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.app.close()
+        self.app = TinyJobs(self.app.url, max_result_bytes=16)
+
+    async def test_a_result_over_the_cap_fails_the_job_without_a_retry(self):
+        @self.app.task(store_result=True, max_attempts=3, retry_base=0.01)
+        def handler():
+            self.calls.append("ran")
+            return "x" * 100
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        stored = await self.app.aget(job.id)
+        self.assertEqual((stored.status, stored.attempts), (JobStatus.FAILED, 1))
+        self.assertEqual(self.calls, ["ran"])
+        self.assertIn("ResultTooLarge", stored.last_error)
+        self.assertIn("102 bytes, over max_result_bytes=16", stored.last_error)
+        self.assertIsNone(stored.result())
+
+    async def test_a_result_within_the_cap_is_stored(self):
+        @self.app.task(store_result=True)
+        def handler():
+            return "ok"
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual((await self.app.aget(job.id)).result(), "ok")
+
+    async def test_a_result_that_is_not_stored_is_never_measured(self):
+        @self.app.task
+        def handler():
+            return "x" * 100
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+
 
 class RoutingTests(WorkerTestCase):
     async def test_a_worker_only_consumes_the_queues_it_subscribes_to(self):
@@ -3226,6 +3372,142 @@ class HousekeepingTests(WorkerTestCase):
         worker.stop()
         await asyncio.wait_for(runner, timeout=10)
         self.assertEqual(remaining, 0)
+
+    async def test_results_are_dropped_after_their_ttl_and_the_job_stays(self):
+        from tinyjobs.retention import KEEP_EVERYTHING
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def keeper(value):
+            return value
+
+        @self.app.task(store_result=True)
+        async def forever(value):
+            return value
+
+        kept = await keeper.aenqueue(1)
+        held = await forever.aenqueue(2)
+        worker = self.make_worker(retention=KEEP_EVERYTHING)
+        with mock.patch.object(
+            type(worker._retention), "check_interval", property(lambda policy: 0.1)
+        ):
+            runner = asyncio.create_task(worker.start())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                stored = await self.app.aget(kept.id)
+                if stored.status is JobStatus.SUCCESS and stored.result_payload is None:
+                    break
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertIs(stored.status, JobStatus.SUCCESS)
+        self.assertIsNone(stored.result())
+        self.assertEqual((await self.app.aget(held.id)).result(), 2)
+
+    async def test_a_capped_sweep_goes_on_until_every_task_is_swept(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def busy(value):
+            return value
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def quiet(value):
+            return value
+
+        jobs = [await busy.aenqueue(n) for n in range(12)] + [await quiet.aenqueue(n) for n in range(3)]
+        policy = RetentionPolicy(success=0, cancelled=0, failed=0, batch=3, maximum_per_sweep=5)
+        worker = self.make_worker(retention=policy)
+        with mock.patch.object(
+            type(worker._retention), "check_interval", property(lambda policy: 0.1)
+        ):
+            runner = asyncio.create_task(worker.start())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.1)
+                stored = [await self.app.aget(job.id) for job in jobs]
+                if all(
+                    job.status is JobStatus.SUCCESS and job.result_payload is None
+                    for job in stored
+                ):
+                    break
+            worker.stop()
+            await asyncio.wait_for(runner, timeout=10)
+        self.assertTrue(all(job.result_payload is None for job in stored))
+
+    async def test_a_task_that_fills_every_batch_does_not_starve_the_others(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def busy(value):
+            return value
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def quiet(value):
+            return value
+
+        policy = RetentionPolicy(success=0, cancelled=0, failed=0, batch=3, maximum_per_sweep=5)
+        worker = self.make_worker(retention=policy)
+        swept = []
+
+        left = {busy.name: 13, quiet.name: 0}
+
+        async def expire_results(task, ttl, now, batch, since=0.0):
+            swept.append((task, batch))
+            dropped = min(batch, left[task])
+            left[task] -= dropped
+            return dropped
+
+        await self.app.ready()
+        with mock.patch.object(worker._home.backend, "expire_results", expire_results):
+            self.assertTrue(await asyncio.wait_for(worker._expire_results(), 5))
+        self.assertEqual(
+            swept,
+            [
+                (busy.name, 3), (busy.name, 2),
+                (quiet.name, 3), (busy.name, 3), (busy.name, 2),
+                (quiet.name, 3), (busy.name, 3), (busy.name, 2),
+            ],
+        )
+        self.assertEqual(left[busy.name], 0)
+
+    async def test_a_task_whose_expiry_fails_sits_out_the_rest_of_the_check(self):
+        from tinyjobs.retention import RetentionPolicy
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def busy(value):
+            return value
+
+        @self.app.task(store_result=True, result_ttl=0.2)
+        async def broken(value):
+            return value
+
+        policy = RetentionPolicy(success=0, cancelled=0, failed=0, batch=3, maximum_per_sweep=5)
+        worker = self.make_worker(retention=policy)
+        left = {busy.name: 20}
+
+        async def expire_results(task, ttl, now, batch, since=0.0):
+            if task == broken.name:
+                raise RuntimeError("statement timeout")
+            dropped = min(batch, left[task])
+            left[task] -= dropped
+            return dropped
+
+        await self.app.ready()
+        with mock.patch.object(worker._home.backend, "expire_results", expire_results):
+            with self.assertLogs("tinyjobs.worker", level="ERROR") as logs:
+                self.assertTrue(await asyncio.wait_for(worker._expire_results(), 5))
+        self.assertEqual(
+            [r.getMessage() for r in logs.records],
+            [f"dropping the results of {broken.name} failed"],
+        )
+        self.assertEqual(left[busy.name], 0)
+
+    async def test_housekeeping_ends_at_once_with_nothing_to_prune_or_expire(self):
+        from tinyjobs.retention import KEEP_EVERYTHING
+
+        worker = self.make_worker(retention=KEEP_EVERYTHING)
+        await self.app.ready()
+        await asyncio.wait_for(worker._housekeeping_loop(), 1)
 
     async def test_a_disabled_policy_leaves_everything_alone(self):
         from tinyjobs.retention import KEEP_EVERYTHING

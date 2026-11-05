@@ -11,6 +11,7 @@ NO_SCHEDULES = (
     "no cron tasks in this app; declare one with @app.task(cron='*/5 * * * *')"
 )
 NOT_REGISTERED = "not registered yet"
+PAUSED = "paused"
 NOT_IN_APP = " (not in this app)"
 
 
@@ -40,15 +41,48 @@ class SchedulerCommand(Command):
 
 class SchedulesCommand(Command):
     name = "schedules"
-    help = "list cron schedules and when they fire next"
+    help = "list cron schedules, pause and resume them, or fire one now"
 
     def configure(
         self, parser: argparse.ArgumentParser, shared: argparse.ArgumentParser
     ) -> None:
-        return None
+        actions = parser.add_subparsers(dest="action")
+        actions.add_parser(
+            "list", help="list cron schedules and when they fire next", parents=[shared]
+        )
+        for action, help in (
+            ("pause", "stop a schedule from firing until it is resumed"),
+            ("resume", "let a paused schedule fire again, from its next time on"),
+            ("run", "enqueue a run of a cron task now, leaving its schedule as it is"),
+        ):
+            actions.add_parser(action, help=help, parents=[shared]).add_argument(
+                "name", help="the cron task's name, as tinyjobs schedules lists it"
+            )
 
     def run(self, args: argparse.Namespace) -> int:
         app = self.resolve_app(args)
+        handler = getattr(self, f"_{args.action or 'list'}")
+        return handler(app, args)
+
+    def _pause(self, app, args: argparse.Namespace) -> int:
+        if app.pause_schedule(args.name):
+            print(f"{args.name} paused")
+            return 0
+        print(f"{args.name} is already paused")
+        return 0
+
+    def _resume(self, app, args: argparse.Namespace) -> int:
+        if app.resume_schedule(args.name):
+            print(f"{args.name} resumed")
+            return 0
+        print(f"{args.name} is not paused")
+        return 0
+
+    def _run(self, app, args: argparse.Namespace) -> int:
+        print(app.run_schedule(args.name).id)
+        return 0
+
+    def _list(self, app, args: argparse.Namespace) -> int:
         declared = {task.name: task for task in app.registry if task.schedule}
         stored = {state.name: state for state in app.schedules()}
         rows = []
@@ -66,7 +100,7 @@ class SchedulesCommand(Command):
                     name + ("" if name in declared else NOT_IN_APP),
                     state.cron,
                     state.timezone,
-                    format_timestamp(state.next_run_at),
+                    PAUSED if state.paused else format_timestamp(state.next_run_at),
                     format_timestamp(state.last_run_at),
                     state.last_job_id or "-",
                 )

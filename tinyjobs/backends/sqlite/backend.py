@@ -39,6 +39,7 @@ from .queries import (
     COUNT_BY_STATUS,
     COUNT_EXPIRED_LEASES,
     DELETE_EXECUTION,
+    EXPIRE_RESULTS,
     FAIL_JOB,
     FINISH_EXECUTION,
     HAND_BACK_JOB,
@@ -139,6 +140,7 @@ class SQLiteBackend(BaseBackend):
         retention=True,
         schedules=True,
         max_payload_bytes=None,
+        result_ttl=True,
     )
 
     def __init__(
@@ -301,6 +303,11 @@ class SQLiteBackend(BaseBackend):
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return await self._call(self._purge_sync, policy, now)
+
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int:
+        return await self._call(self._expire_results_sync, task, since, now - ttl, batch)
 
     async def counts_by_status(self) -> dict[str, int]:
         return await self._call(self._counts_by_status_sync)
@@ -646,6 +653,12 @@ class SQLiteBackend(BaseBackend):
                 if len(gone) < batch:
                     break
         return removed
+
+    def _expire_results_sync(
+        self, task: str, since: float, cutoff: float, batch: int
+    ) -> int:
+        with self._connections.write() as connection:
+            return connection.execute(EXPIRE_RESULTS, (since, cutoff, task, batch)).rowcount
 
     def _counts_by_status_sync(self) -> dict[str, int]:
         rows = self._connections.connection.execute(COUNT_BY_STATUS).fetchall()

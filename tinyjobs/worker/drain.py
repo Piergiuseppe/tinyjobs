@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar
 from ..exceptions import AppClosedError, ExecutorClosedError, UnknownTaskError
 from ..executors import ExecutorResolver
 from ..flag import Flag
+from ..logs import job_fields
 from ..models import Job
 from ..runtime import CLOSED_MESSAGE, inside_running_loop
 from ..services.execution import current_runner
@@ -165,6 +166,7 @@ class Drain:
                 "job %s runs in a thread that cannot be stopped; the drain waits for it "
                 "and records its outcome",
                 job.id,
+                extra=job_fields(job),
             )
             await asyncio.wait((running,))
         if running.done():
@@ -180,6 +182,7 @@ class Drain:
                 "job %s still runs in a thread that cannot be stopped; it is not released, and "
                 "its outcome is recorded if it returns while the loop runs, else its lease ends",
                 job.id,
+                extra=job_fields(job),
             )
             return
         running.cancel()
@@ -253,6 +256,7 @@ class _Renewal:
                     job.id,
                     DRAIN_RENEW_SECONDS,
                     error,
+                    extra=job_fields(job),
                 )
         finally:
             if asyncio.current_task() is self._beating:

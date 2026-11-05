@@ -81,6 +81,7 @@ class RedisBackend(BaseBackend):
         retention=True,
         schedules=True,
         max_payload_bytes=None,
+        result_ttl=True,
         loop_bound=True,
     )
 
@@ -437,6 +438,13 @@ class RedisBackend(BaseBackend):
                 if gone < batch:
                     break
         return removed
+
+    async def expire_results(
+        self, task: str, ttl: float, now: float, batch: int = 500, since: float = 0.0
+    ) -> int:
+        return await self._run(
+            "expire_results", task, number(now - ttl), batch, number(since)
+        )
 
     async def follow_clock(self) -> None:
         await self._now()

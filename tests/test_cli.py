@@ -12,6 +12,7 @@ from pathlib import Path
 from tinyjobs import TinyJobs
 from tinyjobs.cli import build_parser, main
 from tinyjobs.cli.formatting import format_duration, render_table, shorten
+from tinyjobs.cli.main import host_logging_message
 from tinyjobs.duration import format_seconds
 from tinyjobs.cli.loader import load_app
 from tinyjobs.exceptions import ConfigurationError
@@ -158,9 +159,50 @@ class CommandLineTests(FixtureApp, unittest.TestCase):
             ["--log-level", "WARNING", "jobs", "--app", "fixture_app:app", "list"],
             ["jobs", "--app", "fixture_app:app", "--log-level", "WARNING", "list"],
             ["jobs", "list", "--app", "fixture_app:app", "--log-level", "WARNING"],
+            ["--log-format", "json", "jobs", "--app", "fixture_app:app", "list"],
+            ["jobs", "list", "--app", "fixture_app:app", "--log-format", "json"],
         ):
             with self.subTest(argv=argv):
                 self.assertEqual(self.invoke(*argv)[0], 0)
+
+    def test_a_standalone_run_can_ask_for_json_logs(self):
+        from tinyjobs.logs import JSONFormatter, TextFormatter
+
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        root.handlers[:] = []
+        self.assertEqual(self.invoke("--log-format", "json", "stats", "--app", "fixture_app:app")[0], 0)
+        self.assertIsInstance(root.handlers[0].formatter, JSONFormatter)
+        self.assertEqual(self.invoke("stats", "--app", "fixture_app:app")[0], 0)
+        self.assertIsInstance(root.handlers[0].formatter, TextFormatter)
+        self.assertEqual(len(root.handlers), 1)
+
+    def test_a_standalone_run_sets_the_level_every_time(self):
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        root.handlers[:] = []
+        self.invoke("--log-level", "WARNING", "stats", "--app", "fixture_app:app")
+        self.assertEqual(root.level, logging.WARNING)
+        self.invoke("--log-level", "DEBUG", "stats", "--app", "fixture_app:app")
+        self.assertEqual(root.level, logging.DEBUG)
+
+    def test_a_standalone_run_under_foreign_root_handlers_is_told_the_format_is_ignored(self):
+        root = logging.getLogger()
+        self.addCleanup(setattr, root, "handlers", root.handlers[:])
+        self.addCleanup(root.setLevel, root.level)
+        seen = []
+        handler = logging.Handler()
+        handler.emit = lambda record: seen.append(record.getMessage())
+        root.handlers[:] = [handler]
+        self.invoke("--log-format", "json", "stats", "--app", "fixture_app:app")
+        self.invoke("stats", "--app", "fixture_app:app")
+        self.assertEqual(
+            [m for m in seen if "--log-format is ignored" in m],
+            [host_logging_message("root", "json")],
+        )
+        self.assertEqual(root.handlers, [handler])
 
     def test_filtering_by_status_narrows_the_listing(self):
         self.invoke(
@@ -194,6 +236,30 @@ class EmbeddedAppTests(unittest.TestCase):
             code = main(["send", "hosted.task"], app=self.app)
         self.assertEqual(code, 0)
         self.assertEqual(self.app.get(buffer.getvalue().strip()).task, "hosted.task")
+
+    def test_a_hosted_run_can_ask_for_json_logs(self):
+        from tinyjobs.logs import JSONFormatter, TextFormatter
+
+        self.logger.handlers[:] = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--log-format", "json", "stats"], app=self.app)
+            self.assertIsInstance(self.logger.handlers[0].formatter, JSONFormatter)
+            main(["stats"], app=self.app)
+            self.assertIsInstance(self.logger.handlers[0].formatter, TextFormatter)
+
+    def test_a_host_that_configured_the_logger_is_told_the_format_is_ignored(self):
+        seen = []
+        handler = logging.Handler()
+        handler.emit = lambda record: seen.append(record.getMessage())
+        self.logger.handlers[:] = [handler]
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--log-level", "ERROR", "--log-format", "json", "stats"], app=self.app)
+            main(["--log-format", "text", "stats"], app=self.app)
+            main(["stats"], app=self.app)
+        self.assertEqual(
+            [m for m in seen if "--log-format is ignored" in m],
+            [host_logging_message("tinyjobs", "json"), host_logging_message("tinyjobs", "text")],
+        )
 
     def test_a_hosted_run_leaves_the_root_logger_to_the_host(self):
         self.logger.handlers[:] = []
@@ -233,6 +299,20 @@ class ParserTests(unittest.TestCase):
             "worker", "scheduler", "jobs", "schedules", "stats", "check", "send", "purge"
         ):
             self.assertIn(command, parser.format_help())
+
+    def test_no_purge_keeps_the_sweep_settings_of_the_app(self):
+        from tinyjobs.cli.commands.worker import WorkerCommand
+        from tinyjobs.retention import RetentionPolicy
+
+        default = RetentionPolicy(interval=60, batch=7, maximum_per_sweep=70)
+        args = build_parser().parse_args(["worker", "--app", "x:app", "--no-purge"])
+        policy = WorkerCommand()._retention(args, default)
+        self.assertFalse(policy.enabled)
+        self.assertEqual((policy.interval, policy.batch, policy.maximum_per_sweep), (60, 7, 70))
+        args = build_parser().parse_args(
+            ["worker", "--app", "x:app", "--no-purge", "--purge-interval", "2m"]
+        )
+        self.assertEqual(WorkerCommand()._retention(args, default).interval, 120)
 
 
 class FormattingTests(unittest.TestCase):
@@ -301,23 +381,21 @@ class ModuleEntryPointTests(unittest.TestCase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_the_version_comes_from_the_package_metadata(self):
+    def test_the_source_is_the_only_place_the_version_is_written(self):
+        import re
+        import tomllib
+
         import tinyjobs
 
-        self.assertIsInstance(tinyjobs.__version__, str)
-        self.assertTrue(tinyjobs.__version__)
-
-    def test_it_is_not_duplicated_in_the_source(self):
-        from pathlib import Path
-
+        self.assertRegex(tinyjobs.__version__, r"^\d+\.\d+\.\d+")
         source = (Path(tinyjobs_dir()) / "__init__.py").read_text()
-        self.assertNotIn('__version__ = "0.', source)
-
-    def test_unknown_module_attributes_still_raise(self):
-        import tinyjobs
-
-        with self.assertRaises(AttributeError):
-            tinyjobs.__does_not_exist__
+        self.assertEqual(
+            re.findall(r'^__version__ = "(.+)"$', source, re.M), [tinyjobs.__version__]
+        )
+        with open(Path(tinyjobs_dir()).parent / "pyproject.toml", "rb") as handle:
+            project = tomllib.load(handle)
+        self.assertNotIn("version", project["project"])
+        self.assertEqual(project["tool"]["hatch"]["version"]["path"], "tinyjobs/__init__.py")
 
 
 def tinyjobs_dir() -> str:
@@ -376,6 +454,19 @@ class PurgeCommandTests(FixtureApp, unittest.TestCase):
             build_parser().parse_args(
                 ["purge", "--app", "x:y", "--before", "domani"]
             )
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+            build_parser().parse_args(["purge", "--app", "x:y", "--before", "x" * 400])
+        self.assertIn("'xxxxxxxxxxxxxxxxxxxxxxxx...' is not a duration", stderr.getvalue())
+
+    def test_a_duration_beyond_counting_is_rejected_by_its_flag(self):
+        stderr = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+            build_parser().parse_args(
+                ["purge", "--app", "x:y", "--before", "9" * 400]
+            )
+        self.assertIn("--before", stderr.getvalue())
+        self.assertIn("'999999999999999999999999...' is too long a duration", stderr.getvalue())
 
 
 class ScheduleCommandTests(FixtureApp, unittest.TestCase):
@@ -393,6 +484,36 @@ class ScheduleCommandTests(FixtureApp, unittest.TestCase):
         code, output = self.invoke("schedules", "--app", "fixture_app:app")
         self.assertEqual(code, 0)
         self.assertNotIn("not registered yet", output)
+
+    def test_schedules_pause_resume_and_run_act_on_the_store(self):
+        code, output = self.invoke("schedules", "pause", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick paused"))
+        code, output = self.invoke("schedules", "pause", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick is already paused"))
+        code, output = self.invoke("schedules", "list", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertIn("paused", output)
+        code, output = self.invoke("schedules", "run", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(output.strip()), 36)
+        code, output = self.invoke("schedules", "resume", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick resumed"))
+        code, output = self.invoke("schedules", "resume", "fixture.tick", "--app", "fixture_app:app")
+        self.assertEqual((code, output.strip()), (0, "fixture.tick is not paused"))
+        code, output = self.invoke("schedules", "--app", "fixture_app:app")
+        self.assertEqual(code, 0)
+        self.assertNotIn("paused", output)
+
+    def test_schedules_refuses_a_name_it_does_not_know(self):
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.invoke("schedules", "pause", "fixture.nope", "--app", "fixture_app:app")
+        self.assertEqual(code, 2)
+        self.assertIn("no schedule named 'fixture.nope'", errors.getvalue())
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.invoke("schedules", "run", "fixture.echo", "--app", "fixture_app:app")
+        self.assertEqual(code, 2)
+        self.assertIn("does not declare a cron task named 'fixture.echo'", errors.getvalue())
 
     def test_the_scheduler_refuses_an_app_without_cron_tasks(self):
         import sys

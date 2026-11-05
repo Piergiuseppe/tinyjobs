@@ -23,6 +23,7 @@ NAMES = (
     "reap",
     "claim_sweep",
     "purge_batch",
+    "expire_results",
     "register_schedules",
     "fire_schedule",
     "schema",
