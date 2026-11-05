@@ -66,7 +66,21 @@ class ExecutionService:
         settling: Callable[[], None] | None,
         settled: Callable[[], None] | None,
     ) -> Attempt:
-        await self._hooks.started(job)
+        try:
+            await self._hooks.started(job)
+            return await self._run(job, task, executors, held_until, settling, settled)
+        finally:
+            self._hooks.ended(job)
+
+    async def _run(
+        self,
+        job: Job,
+        task: "Task",
+        executors: ExecutorResolver,
+        held_until: Callable[[], float] | None,
+        settling: Callable[[], None] | None,
+        settled: Callable[[], None] | None,
+    ) -> Attempt:
         started = self._clock.monotonic()
         try:
             payload = self._serialization.decode_payload(job)

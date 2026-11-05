@@ -410,6 +410,16 @@ class LoopBoundAppCases:
     def settled(self, total: int):
         return lambda: self.app.counts().get("success", 0) >= total
 
+    def test_several_loops_count_each_job_once_in_the_metrics(self):
+        for value in range(6):
+            self.handler.enqueue(value)
+        worker = self.app.worker(concurrency=4, loops=2, scheduler=False, handle_signals=False)
+        self.run_worker(worker, until=self.settled(6))
+        self.assertIn(
+            f'tinyjobs_jobs_total{{task="{self.handler.name}",outcome="success"}} 6\n',
+            self.app.metrics.render(),
+        )
+
     def test_a_worker_run_claims_through_a_connection_on_its_own_loop(self):
         from tinyjobs.services.execution import current_runner
 

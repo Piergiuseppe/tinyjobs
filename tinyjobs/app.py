@@ -29,6 +29,7 @@ from .exceptions import (
     UnsupportedCapabilityError,
     described,
 )
+from .metrics import Metrics
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
@@ -506,6 +507,10 @@ class TinyJobs:
 
     def on_job_failure(self, listener: Listener) -> Listener:
         return self._hooks.add(FAILURE, listener)
+
+    @property
+    def metrics(self) -> Metrics:
+        return self._hooks.metrics
 
     async def asend(
         self,
