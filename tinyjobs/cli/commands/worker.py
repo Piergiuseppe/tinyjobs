@@ -1,29 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import errno
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import Any, Callable
 
 from ...app import TinyJobs
+from ...deadlines import STATS_BUDGET, within
 from ...exceptions import ConfigurationError
 from ...models import Stats
 from ...retention import RetentionPolicy
 from ...worker.signals import owning_process
+from ..address import parse_port
 from ..duration import parse_duration
 from ..loader import load_callable
 from .base import Command
 
-
-METRICS_BIND_MESSAGE = "cannot serve metrics on {address}: {error}; {remedy}"
-ADDRESS_REMEDY = (
-    "give --metrics-host an address of this machine, such as 127.0.0.1 or 0.0.0.0"
-)
-PORT_REMEDY = "pick a free --metrics-port, or 0 for any"
-PRIVILEGED_REMEDY = "pick a --metrics-port above 1023, or 0 for any"
-STATS_BUDGET = 5.0
 STATS_TIMEOUT_MESSAGE = "the store did not answer the stats query within {budget:g}s"
 
 
@@ -74,7 +66,7 @@ class WorkerCommand(Command):
                             metavar="DURATION",
                             help="how late a cron firing may be and still count "
                                  "as on time (default: 60s)")
-        parser.add_argument("--metrics-port", type=port, default=None, metavar="PORT",
+        parser.add_argument("--metrics-port", type=parse_port, default=None, metavar="PORT",
                             help="serve Prometheus metrics at /metrics on this port "
                                  "(default: off)")
         parser.add_argument("--metrics-host", default="127.0.0.1",
@@ -112,24 +104,18 @@ class WorkerCommand(Command):
     def _metrics(self, app: TinyJobs, args: argparse.Namespace) -> AbstractContextManager[Any]:
         if args.metrics_port is None:
             return nullcontext()
-        from ...exporter import MetricsServer, address, unreachable
+        from ...exporter import MetricsServer
+        from ...web import bind_problem
 
         try:
             return MetricsServer(
                 app.metrics, stats_within(app, STATS_BUDGET), args.metrics_host, args.metrics_port
             )
         except OSError as error:
-            if unreachable(error):
-                remedy = ADDRESS_REMEDY
-            elif error.errno == errno.EACCES:
-                remedy = PRIVILEGED_REMEDY
-            else:
-                remedy = PORT_REMEDY
             raise ConfigurationError(
-                METRICS_BIND_MESSAGE.format(
-                    address=address(args.metrics_host, args.metrics_port),
-                    error=error,
-                    remedy=remedy,
+                bind_problem(
+                    "metrics", args.metrics_host, args.metrics_port, error,
+                    host_flag="--metrics-host", port_flag="--metrics-port",
                 )
             ) from error
 
@@ -159,30 +145,10 @@ def _or(value: float | None, fallback: float) -> float:
 
 
 def stats_within(app: TinyJobs, budget: float) -> Callable[[], Stats]:
-    async def stats_or_timeout() -> Stats:
-        query = asyncio.ensure_future(app.astats())
-        query.add_done_callback(_settled)
-        try:
-            done, _ = await asyncio.wait({query}, timeout=budget)
-            if done:
-                return query.result()
-        finally:
-            query.cancel()
-        raise TimeoutError(STATS_TIMEOUT_MESSAGE.format(budget=budget))
-
     def stats() -> Stats:
-        return app.run_sync(stats_or_timeout, name="stats")
+        return app.run_sync(
+            lambda: within(budget, app.astats, STATS_TIMEOUT_MESSAGE.format(budget=budget)),
+            name="stats",
+        )
 
     return stats
-
-
-def _settled(query: asyncio.Future[Stats]) -> None:
-    if not query.cancelled():
-        query.exception()
-
-
-def port(value: str) -> int:
-    number = int(value)
-    if not 0 <= number <= 65535:
-        raise argparse.ArgumentTypeError(f"a port is between 0 and 65535, not {value}")
-    return number

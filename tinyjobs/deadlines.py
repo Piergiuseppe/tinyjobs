@@ -6,9 +6,12 @@ import math
 import time
 import weakref
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Coroutine, Iterator, TypeVar
+
+T = TypeVar("T")
 
 GRACE_SECONDS = 0.5
+STATS_BUDGET = 5.0
 WATCH_SLACK_SECONDS = 0.001
 
 
@@ -223,3 +226,20 @@ async def lastly(seconds: float) -> AsyncIterator[Deadline]:
     with under(deadline):
         async with asyncio.timeout(cut):
             yield deadline
+
+
+async def within(budget: float, start: Callable[[], Coroutine[Any, Any, T]], message: str) -> T:
+    query = asyncio.ensure_future(start())
+    query.add_done_callback(_settled)
+    try:
+        done, _ = await asyncio.wait({query}, timeout=budget)
+        if done:
+            return query.result()
+    finally:
+        query.cancel()
+    raise TimeoutError(message)
+
+
+def _settled(query: asyncio.Future[Any]) -> None:
+    if not query.cancelled():
+        query.exception()

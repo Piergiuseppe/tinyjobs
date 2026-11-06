@@ -26,9 +26,12 @@ class HealthService:
     async def stats(self) -> Stats:
         return await self._backend.stats(self._clock.now())
 
-    async def check(self, *, max_wait: float | None = None) -> list[Finding]:
+    async def check(
+        self, *, max_wait: float | None = None, stats: Stats | None = None
+    ) -> list[Finding]:
         now = self._clock.now()
-        stats = await self._backend.stats(now)
+        if stats is None:
+            stats = await self._backend.stats(now)
         return [
             self._tasks(),
             *self._unknown_tasks(stats),

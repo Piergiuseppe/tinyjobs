@@ -19,6 +19,7 @@ Contents:
 - [Execution model](#execution-model)
 - [Retries](#retries)
 - [Results](#results)
+- [The dashboard](#the-dashboard)
 - [Public API](#public-api)
 - [Operations](#operations)
 - [Testing](#testing)
@@ -1982,6 +1983,73 @@ request thread on a background job means you did not need a background job.
 
 ---
 
+## The dashboard
+
+`tinyjobs dashboard --app tasks:app` serves a page of queues, jobs and schedules, with the same
+service calls behind it as the CLI: `stats`, `check`, `jobs`, `get`, `executions`, `retry`,
+`cancel`, `schedules`, `pause_schedule`, `resume_schedule` and `run_schedule`. It adds no
+dependency. The pages are HTML rendered in Python with `html.escape`, one stylesheet and one
+script of a hundred lines, served by the same stdlib `http.server` plumbing as the Prometheus
+exporter, in `tinyjobs.serving`, and loaded only when the command runs or the app is mounted.
+Flower needs Tornado and rq-dashboard needs Flask; the point of tinyjobs is that `pip install
+tinyjobs` is the whole install, and a dashboard that changed that would have cost more than it
+gave. An optional extra was considered and rejected for the same reason: there is nothing to put
+in it. Should the pages ever want a frontend build or a framework, `tinyjobs[dashboard]` is the
+place, and adding it later breaks nobody.
+
+The core is one object, `Dashboard(app)`, whose `handle(request)` is a coroutine taking a
+`Request` of method, path, query and root and returning a `Response` of status, body, content
+type and headers. The action forms carry no fields, so no entry point reads a request body: the
+stdlib server discards one up to 64 KiB and refuses a larger one with 413 before acting, and a
+WSGI or ASGI server keeps it. A schedule name is one URL
+segment, percent-encoded in the form action and decoded by the server, so a name with spaces or
+accents works, and one with a slash does not, so such a schedule gets no buttons. The core calls
+the app's async methods, so it runs on any loop: the stdlib server and the WSGI callable hand
+each request to `app.run_sync`, under the name of the writing call it carries so
+that the Postgres guard against a held Django transaction applies to a retry from the page as it
+does to an enqueue from a view; the ASGI callable awaits it in place. Mounting is `wsgi(app)` and
+`asgi(app)` from `tinyjobs.dashboard`, at any prefix, since every link is built from the
+request's root (`SCRIPT_NAME`, `root_path`). Each page is built as a dict first and rendered
+after, so the same handlers answer `/api/...` with JSON: that is what the tests assert on, and
+what a script that wants the numbers reads, with `curl`.
+
+The pages are what the runbook needs. The overview is `stats` and `check` on one screen: counts by
+queue and status, the oldest due job, leases past their time, queued jobs by task and every
+finding of the health check. The job list is the store's own `list`: newest first, by status and
+queue, fifty a page, with the cursor the backend returns, so it costs the same on a million rows
+as on ten, except status and queue together, which walk the status index and filter by queue; a filter by task would need an index no backend has, so a task is searched from the
+overview's counts and by its queue, and a job by id in the address bar. The job page shows the
+job's fields, its arguments and result decoded with the app's codecs (a payload the app cannot
+decode shows the error in their place), the last error, and every attempt with its traceback
+folded under a `<details>`, with retry and cancel where the lifecycle allows them. The schedules
+page is `tinyjobs schedules` with its three actions as buttons. A worker list was left out: the
+store knows workers only through the jobs they hold, and a list of worker ids taken from running
+jobs would be empty exactly when the question matters. A heartbeat table is a backend change, and a
+later one.
+
+Actions are `POST` forms answered with a redirect back to the page and a one-line notice, so a
+refresh never repeats them. The page reloads its main block every five seconds through `fetch`,
+keeps the notice and the open tracebacks across the reload, and skips it while a form control or a
+keyboard-focused link has focus, text is selected, a filter has unsent edits or the tab is hidden. Timestamps are shown in UTC with the age beside them, both
+from the app's clock, so a test with a frozen clock reads the page it expects; the lists show the
+age alone, with the clock time on hover, so nine columns fit on one screen.
+
+The server binds `127.0.0.1:8070` by default, `--host 0.0.0.0` exposes it, and the bind errors are
+the exporter's, with their remedies. The command serves until Ctrl-C or, when it owns the
+process, `SIGTERM`, through `stop_on_signals()` in `tinyjobs.exiting`, the one module beside the
+worker's handlers that touches the signal API; it installs its handlers only on the main thread and
+only over the defaults, and restores them on exit. `HEAD` is answered like `GET` without the body, so `curl -I`
+and a load balancer's probe work; a wrong method is a 405 with `Allow`, decided before the store
+is asked, and an unknown path a 404. There is no authentication and no CSRF guard, by design: the
+dashboard retries and cancels jobs, so it belongs behind the reverse proxy that already guards the
+rest of the deployment, where Flower and rq-dashboard sit too; a login of its own would be a second
+one to configure and keep secure. A page that cannot reach the store answers 503 with the error,
+so a load balancer sees the store's trouble rather than a hung page: every page's reads run under
+the exporter's budget, shared through `within()` in `tinyjobs.deadlines`, and on the overview the
+stats query and the health check share one deadline, the check reusing the stats it is handed
+instead of asking the store twice. The actions are not cut short, since a write cancelled
+mid-flight could still commit and then be reported as a failure.
+
 ## Public API
 
 ### Async core, sync facade
@@ -2604,10 +2672,13 @@ Schedules paused, resumed and fired by hand, a result size cap and a per-task re
 structured log fields and a JSON log format, a Prometheus exporter on the hooks, and a guide to
 running it.
 
+**v0.12, the dashboard**
+A dependency-free dashboard on the stdlib server and the same service calls as the CLI: queues
+and health, jobs and their attempts, retry and cancel, schedules paused, resumed and run from the
+page, mountable in a WSGI or ASGI app.
+
 **Next**
-A dashboard, dependency-free (`http.server` and one HTML file) on the same service calls as the
-CLI: jobs and their attempts, schedules paused, resumed and run from the page. Then transactional
-enqueue on SQLite.
+Transactional enqueue on SQLite.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
