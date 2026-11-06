@@ -3,9 +3,27 @@ import os
 import signal
 import sys
 from contextlib import contextmanager, suppress
-from typing import Any, Iterator
+from threading import Event, current_thread, main_thread
+from typing import Any, Callable, Iterator
 
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+def stop_on_signals(stopped: Event, *, ends_process: bool) -> Callable[[], None]:
+    previous = {}
+    if current_thread() is main_thread():
+        defaults = {signal.SIGINT: signal.default_int_handler}
+        if ends_process:
+            defaults[signal.SIGTERM] = signal.SIG_DFL
+        for number, default in defaults.items():
+            if signal.getsignal(number) is default:
+                previous[number] = signal.signal(number, lambda *_: stopped.set())
+
+    def restore() -> None:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+    return restore
 
 
 @contextmanager
