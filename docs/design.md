@@ -1,6 +1,6 @@
 # tinyjobs design notes
 
-Why tinyjobs is built the way it is. The README covers usage; this covers the reasoning, including
+Why tinyjobs is built the way it is. The documentation covers usage; this covers the reasoning, including
 for the parts that are not written yet. Sections describing unbuilt features say so.
 
 Contents:
@@ -64,7 +64,7 @@ Where we *can* help:
 
 ## Guarantees
 
-The numbers in the README's "Measured" section came from harnesses written for each run and thrown
+The numbers on the "Measured" page came from harnesses written for each run and thrown
 away, so a reader had to take them on trust, and a store configured against the guarantees, a
 Redis on snapshots or a SQLite file on NFS, broke them silently. The point of a small queue is that
 it can be trusted, so the guarantees are declared in one place, checked against the store that is
@@ -130,8 +130,14 @@ Redis, one query of three settings and the recovery state on Postgres.
   missing or in an unexpected form, `role`, `aof_enabled`, the write and snapshot statuses,
   `maxmemory`, `maxmemory_policy` or `used_memory`, is reported as not checked.
 - **Postgres.** `synchronous_commit` must not be `off`, since a crash then loses the last commits
-  and a job acknowledged to the caller vanishes, which is the one thing promised not to happen;
-  `fsync` must be on, since off it can lose or corrupt what was committed, except on Neon, told
+  and a job acknowledged to the caller vanishes, which is the one thing promised not to happen.
+  It is a session setting, so tinyjobs does not leave it to the server: every connection it
+  opens sets it to `on` when the session starts with `off`, and keeps `local`, `remote_write`
+  or `remote_apply` as they are, since forcing `on` would weaken a server that waits for its
+  standbys. The audit reads the session value, which fails only when something reset it after
+  tinyjobs, and the server's default from `pg_settings.reset_val`, named beside a passing value
+  when it is `off`, since a job enqueued through the caller's own connection and transaction
+  commits under that default and the caller's own rows with it. `fsync` must be on, since off it can lose or corrupt what was committed, except on Neon, told
   by its `neon.timeline_id` setting, which runs every compute with `fsync` off and keeps
   durability in its storage layer; and the connection must not be in recovery, since a standby
   refuses every write. The settings are read with
@@ -144,9 +150,17 @@ failures, the only line when nothing fails, saying what the store runs with. A s
 server will not reveal, a mount table or a disk that does not answer, is reported as not
 checked, not as a failure, since the guarantee may still hold.
 
+A development setup breaks the guarantees on purpose, a Redis on snapshots in a compose file or
+a SQLite file on the container's layer, and a readiness probe on `check` would keep such a
+container from starting. `tinyjobs check --store-warnings`, `store_warnings=True` on
+`app.check()`, turns the audit's failures into findings that pass with `warning` set, printed as
+`WARN` by the command, and leaves the exit status to the rest of the check. The switch is on the
+command and the call, not on the app, since the problem is in the store's configuration and not
+in the code, and an app option that accepts losing jobs would end up in production settings.
+
 ### Proving it on your own setup
 
-`tinyjobs verify URL` is the README's crash-recovery harness, shipped: it runs on a store that holds
+`tinyjobs verify URL` is the crash-recovery harness of the "Measured" page, shipped: it runs on a store that holds
 no other jobs, which it checks first and refuses otherwise, and leaves it as it found it but for
 the schema rows, so it can run against a fresh file, a spare Redis database or a scratch Postgres
 database, before a deploy or in a pipeline. The URL is required rather than taken from `--app`,
@@ -234,8 +248,8 @@ a run that failed before clearing says the store was not cleared. The workers' e
 the verifier's own without any `TINYJOBS_VERIFY_*` variable inherited from the shell, so a
 leftover prefix cannot send them to another namespace.
 
-What it does not do: stop the store, skew clocks or saturate the machine. Those runs are in the
-README, measured once by hand, and their value is the number, not the harness. The verifier
+What it does not do: stop the store, skew clocks or saturate the machine. Those runs are on the
+"Measured" page, measured once by hand, and their value is the number, not the harness. The verifier
 answers the one question a reader has before trusting a queue: on my store, with my settings,
 does a killed worker lose a job. It needs a POSIX platform for the signals.
 
@@ -1041,7 +1055,7 @@ apps on two servers whose times differ by more than a second raises instead of m
 
 - **Persistence is Redis's job.** On its default snapshots a crash loses everything since the last
   one, which in testing was the whole queue. `appendonly yes` with the default `everysec` lost nothing
-  when Redis was killed mid-run. The README says so where people will read it.
+  when Redis was killed mid-run. The Redis page says so where people will read it.
 - **One hash slot.** The hash tag puts every key in the same slot, which is what lets a script touch
   them all. It runs on a single Redis or a primary with replicas; a cluster would hold the queue on one
   node.
@@ -1307,7 +1321,8 @@ outcome writes either: no worker logged a failed claim. Resizing the pool opens 
 it lacks, never past `max_connections=`: psycopg's own resize opens one per step of the minimum,
 which with both connections of a two connection pool busy opened a third. Every pooled connection
 is set to read committed, a 30 second `statement_timeout` and a one minute
-`idle_in_transaction_session_timeout`, with `jit` off: the recursive queries behind the
+`idle_in_transaction_session_timeout`, with `jit` off and `synchronous_commit` raised to `on` when
+the session starts with `off`: the recursive queries behind the
 trust guard carry cost estimates high enough that a server built with LLVM compiled them at every
 call, which took a setup 3.5 seconds instead of 50 milliseconds and a `tx=` call 1.3 seconds
 instead of 10. On a server that can compile, a `tx=` call turns `jit` off for its own statements
@@ -2054,7 +2069,7 @@ Where the limits are:
 
 - **One loop for both.** An `async` task that blocks stalls every request in that process, not only
   other jobs.
-- **One GIL for both.** CPU-bound `def` tasks raise request latency; the README has the numbers. Moving
+- **One GIL for both.** CPU-bound `def` tasks raise request latency; "Measured" has the numbers. Moving
   them to `tinyjobs worker` changes nothing in the task code.
 - **No forced stop.** The standalone worker's second signal has no equivalent, because the server
   keeps the signals. Under `docker stop` with the default 30 s timeout, a 15 s job was killed at
