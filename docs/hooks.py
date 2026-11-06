@@ -17,6 +17,7 @@ GROUPS = {
         "free-threaded-python",
         "watching-it",
         "operating-it",
+        "guarantees",
         "dashboard",
         "testing-your-tasks",
     ],
