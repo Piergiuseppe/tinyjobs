@@ -256,7 +256,7 @@ class ServerTests(unittest.TestCase):
         if {info[0] for info in infos} != {socket.AF_INET, socket.AF_INET6}:
             self.skipTest("localhost does not have both families here")
         ordered = sorted(infos, key=lambda info: info[0] != socket.AF_INET6)
-        with mock.patch("tinyjobs.exporter.socket.getaddrinfo", return_value=ordered):
+        with mock.patch("tinyjobs.web.socket.getaddrinfo", return_value=ordered):
             with MetricsServer(self.app.metrics, None, "localhost", 0) as server:
                 self.assertEqual(server.host, "127.0.0.1")
 
@@ -270,6 +270,30 @@ class ServerTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(f"http://{server.host}:{server.port}/", timeout=5)
         self.assertEqual(caught.exception.code, 404)
+
+    def test_head_is_answered_without_a_body_and_other_methods_are_refused(self):
+        calls = []
+
+        def stats():
+            calls.append(1)
+            return self.app.stats()
+
+        with MetricsServer(self.app.metrics, stats) as server:
+            head = urllib.request.Request(server.url, method="HEAD")
+            with urllib.request.urlopen(head, timeout=5) as response:
+                self.assertEqual(response.status, 200)
+                self.assertGreater(int(response.headers["Content-Length"]), 100)
+                self.assertEqual(response.read(), b"")
+            self.assertEqual(len(calls), 1)
+            for method in ("POST", "PUT", "DELETE", "OPTIONS"):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(
+                        urllib.request.Request(server.url, method=method, data=b""), timeout=5
+                    )
+                with caught.exception as refused:
+                    self.assertEqual(refused.code, 405, method)
+                    self.assertEqual(refused.headers["Allow"], "GET, HEAD")
+            self.assertEqual(len(calls), 1)
 
     def test_a_client_that_leaves_before_the_answer_is_not_a_traceback(self):
         gone = threading.Event()
