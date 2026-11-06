@@ -1,5 +1,5 @@
 site_name: tinyjobs
-site_description: Background jobs and cron for Python, on SQLite with zero dependencies, or on Postgres or Redis
+site_description: "Background jobs and cron for Python. No broker, no result backend, no daemon: the queue is a file, or Postgres or Redis"
 site_url: https://tinyjobs.readthedocs.io/
 repo_url: https://github.com/Piergiuseppe/tinyjobs
 repo_name: Piergiuseppe/tinyjobs
@@ -13,6 +13,37 @@ exclude_docs: |
 
 hooks:
   - docs/hooks.py
+
+nav:
+  - Get started:
+      - Introduction: index.md
+      - Jobs: jobs.md
+      - Retention: keeping-the-database-from-growing-forever.md
+      - Cron: cron.md
+      - Isolated tasks: isolated-tasks.md
+      - Free-threaded Python: free-threaded-python.md
+      - Watching it: watching-it.md
+      - Operating it: operating-it.md
+      - Guarantees: guarantees.md
+      - Dashboard: dashboard.md
+      - Testing your tasks: testing-your-tasks.md
+  - Integrations:
+      - FastAPI: fastapi.md
+      - Django: django.md
+  - Backends:
+      - SQLite: sqlite.md
+      - Redis: redis.md
+      - Postgres: postgres.md
+      - Other backends: other-backends.md
+  - About:
+      - How it compares: how-it-compares.md
+      - How it works: how-it-works.md
+      - Measured: measured.md
+      - Status: status.md
+  - Project:
+      - Working on it: working-on-it.md
+      - Tests: tests.md
+      - Design notes: design.md
 
 theme:
   name: material
