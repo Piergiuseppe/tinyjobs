@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from ...duration import format_age
+from ...models import Finding
 from ...status import JobStatus
 from ..duration import parse_duration
 from ..formatting import render_table
@@ -56,9 +57,23 @@ class CheckCommand(Command):
             metavar="DURATION",
             help="fail when a due job has waited longer than this",
         )
+        parser.add_argument(
+            "--store-warnings",
+            action="store_true",
+            help="report what the store's configuration would lose without failing on it, "
+            "for a development setup",
+        )
 
     def run(self, args: argparse.Namespace) -> int:
-        findings = self.resolve_app(args).check(max_wait=args.max_wait)
+        findings = self.resolve_app(args).check(
+            max_wait=args.max_wait, store_warnings=args.store_warnings
+        )
         for finding in findings:
-            print(f"{'ok  ' if finding.ok else 'FAIL'}  {finding.message}")
+            print(f"{_verdict(finding)}  {finding.message}")
         return 0 if all(finding.ok for finding in findings) else 1
+
+
+def _verdict(finding: Finding) -> str:
+    if not finding.ok:
+        return "FAIL"
+    return "WARN" if finding.warning else "ok  "

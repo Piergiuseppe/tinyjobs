@@ -1174,6 +1174,21 @@ class HealthCommandTests(FixtureApp, unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL  1 queued job(s) for nobody.home", output)
 
+    def test_check_store_warnings_reports_the_store_without_failing_on_it(self):
+        from unittest import mock
+
+        volatile = [("/", "tmpfs", "0:1")]
+        with mock.patch("tinyjobs.backends.sqlite.audit._mounts", return_value=volatile):
+            failing, failed = self.invoke("check", "--app", "fixture_app:app")
+            warning, warned = self.invoke(
+                "check", "--app", "fixture_app:app", "--store-warnings"
+            )
+        self.assertEqual(failing, 1)
+        self.assertIn("FAIL  the file is on tmpfs", failed)
+        self.assertEqual(warning, 0)
+        self.assertIn("WARN  the file is on tmpfs", warned)
+        self.assertNotIn("FAIL", warned)
+
 
 if __name__ == "__main__":
     unittest.main()

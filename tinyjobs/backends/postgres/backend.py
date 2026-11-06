@@ -1453,15 +1453,17 @@ class PostgresBackend(BaseBackend):
         )
 
     async def audit(self) -> list[Finding]:
-        commit, fsync, standby, neon = await _again(self._settings_row)
-        return audit_settings(commit, fsync, standby, neon)
+        commit, fsync, standby, neon, default_commit = await _again(self._settings_row)
+        return audit_settings(commit, fsync, standby, neon, default_commit)
 
-    async def _settings_row(self) -> tuple[str | None, str | None, bool, bool]:
+    async def _settings_row(
+        self,
+    ) -> tuple[str | None, str | None, bool, bool, str | None]:
         async with self._connection() as connection:
             row = await (await connection.execute(SETTINGS)).fetchone()
         return (
             _setting(row["commit"]), _setting(row["fsync"]), bool(row["standby"]),
-            bool(row["neon"]),
+            bool(row["neon"]), _setting(row["default_commit"]),
         )
 
     async def _counted(self, now: float) -> list[list[dict[str, Any]]]:
@@ -1751,6 +1753,9 @@ class PostgresBackend(BaseBackend):
                 "set_config('statement_timeout', %(statement)s, false), "
                 "set_config('idle_in_transaction_session_timeout', %(idle)s, false), "
                 "set_config('jit', 'off', false), "
+                "set_config('synchronous_commit', CASE WHEN "
+                "current_setting('synchronous_commit') OPERATOR(pg_catalog.=) 'off' THEN 'on' "
+                "ELSE current_setting('synchronous_commit') END, false), "
                 "pg_catalog.pg_backend_pid() AS pid, (SELECT backend_start FROM "
                 "pg_catalog.pg_stat_get_activity(pg_catalog.pg_backend_pid())) AS born",
                 {"statement": statement, "idle": f"{IDLE_IN_TRANSACTION_SECONDS}s"},

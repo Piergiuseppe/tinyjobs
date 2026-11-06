@@ -6,23 +6,43 @@ SETTINGS = (
     "SELECT pg_catalog.current_setting('synchronous_commit', true) AS commit, "
     "pg_catalog.current_setting('fsync', true) AS fsync, "
     "pg_catalog.pg_is_in_recovery() AS standby, "
-    "coalesce(pg_catalog.current_setting('neon.timeline_id', true), '') <> '' AS neon"
+    "coalesce(pg_catalog.current_setting('neon.timeline_id', true), '') <> '' AS neon, "
+    "(SELECT reset_val FROM pg_catalog.pg_settings "
+    "WHERE name OPERATOR(pg_catalog.=) 'synchronous_commit') AS default_commit"
 )
 
 
 def audit(
-    commit: str | None, fsync: str | None, standby: bool, neon: bool = False
+    commit: str | None,
+    fsync: str | None,
+    standby: bool,
+    neon: bool = False,
+    default_commit: str | None = None,
 ) -> list[Finding]:
-    return concluded([*_commit(commit), *_fsync(fsync, neon), *_standby(standby)])
+    return concluded(
+        [*_commit(commit, default_commit), *_fsync(fsync, neon), *_standby(standby)]
+    )
 
 
-def _commit(commit: str | None) -> list[Finding]:
+def _commit(commit: str | None, default_commit: str | None) -> list[Finding]:
     if commit == "off":
         return [
             Finding(
                 False,
                 "synchronous_commit is off: a crash loses the last commits, so a job "
-                "acknowledged to its sender can vanish; set it to on",
+                "acknowledged to its sender can vanish; tinyjobs sets it to on on every "
+                "connection it opens, so something else reset it",
+            )
+        ]
+    if commit is None:
+        return [_setting("synchronous_commit", commit)]
+    if default_commit == "off":
+        return [
+            Finding(
+                True,
+                f"synchronous_commit {commit}, set by tinyjobs where the server's default "
+                f"is off: a job enqueued through a connection of your own commits under "
+                f"that default",
             )
         ]
     return [_setting("synchronous_commit", commit)]

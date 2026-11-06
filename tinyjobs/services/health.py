@@ -19,14 +19,18 @@ class HealthService:
         return await self._backend.stats(self._clock.now())
 
     async def check(
-        self, *, max_wait: float | None = None, stats: Stats | None = None
+        self,
+        *,
+        max_wait: float | None = None,
+        stats: Stats | None = None,
+        store_warnings: bool = False,
     ) -> list[Finding]:
         now = self._clock.now()
         if stats is None:
             stats = await self._backend.stats(now)
         return [
             self._tasks(),
-            *await self._audit(),
+            *await self._audit(store_warnings),
             *self._unknown_tasks(stats),
             self._leases(stats),
             *self._waiting(stats, now, max_wait),
@@ -43,11 +47,17 @@ class HealthService:
         cron = sum(1 for task in self._registry if task.schedule)
         return Finding(True, f"{len(self._registry)} task(s) registered, {cron} on cron")
 
-    async def _audit(self) -> list[Finding]:
+    async def _audit(self, store_warnings: bool) -> list[Finding]:
         audit = getattr(self._backend, "audit", None)
         if audit is None:
             return []
-        return list(await audit())
+        findings = list(await audit())
+        if not store_warnings:
+            return findings
+        return [
+            finding if finding.ok else Finding(True, finding.message, warning=True)
+            for finding in findings
+        ]
 
     def _unknown_tasks(self, stats: Stats) -> list[Finding]:
         return [

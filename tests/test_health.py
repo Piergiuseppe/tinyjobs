@@ -106,6 +106,17 @@ class CheckTests(HealthTestCase):
         self.assertEqual(len(self.failures()), 1)
         self.assertIn("2 queued job(s) for elsewhere.task", self.failures()[0])
 
+    def test_store_warnings_report_the_audit_without_failing_on_it(self):
+        audited = [Finding(False, "the file is on tmpfs"), Finding(True, "journal mode WAL")]
+        with mock.patch.object(self.app.backend, "audit", mock.AsyncMock(return_value=audited)):
+            self.assertEqual(self.failures(), ["the file is on tmpfs"])
+            self.assertEqual(self.failures(store_warnings=True), [])
+            findings = self.app.check(store_warnings=True)
+        warned = [f for f in findings if f.warning]
+        self.assertEqual(warned, [Finding(True, "the file is on tmpfs", warning=True)])
+        self.assertIn(Finding(True, "journal mode WAL"), findings)
+        self.assertFalse(any(f.warning for f in self.app.check()))
+
     def test_a_job_past_its_lease_fails(self):
         self.echo.enqueue()
         self.claim(lease_seconds=30)
@@ -418,6 +429,22 @@ class StoreAuditTests(unittest.TestCase):
         self.assertEqual(neon.message, "synchronous_commit on; fsync off, with durability from "
                                        "Neon's storage; on the primary")
         self.assertFalse(postgres_audit.audit("on", "off", False, False)[0].ok)
+
+    @unittest.skipIf(postgres_audit is None, "needs the postgres extra")
+    def test_a_server_default_of_commit_off_is_told_beside_the_connection_setting(self):
+        [forced] = postgres_audit.audit("on", "on", False, False, "off")
+        self.assertTrue(forced.ok)
+        self.assertEqual(forced.message, "synchronous_commit on, set by tinyjobs where the "
+                                         "server's default is off: a job enqueued through a "
+                                         "connection of your own commits under that default; "
+                                         "fsync on; on the primary")
+        [plain] = postgres_audit.audit("on", "on", False, False, "on")
+        self.assertEqual(plain.message, "synchronous_commit on; fsync on; on the primary")
+        [unknown] = postgres_audit.audit(None, "on", False, False, "off")
+        self.assertTrue(unknown.message.startswith("synchronous_commit not checked"))
+        [reset, _] = postgres_audit.audit("off", "on", False, False, "off")
+        self.assertFalse(reset.ok)
+        self.assertIn("so something else reset it", reset.message)
 
     def test_a_backend_without_an_audit_adds_nothing(self):
         class Plain:
