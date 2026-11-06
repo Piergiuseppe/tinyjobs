@@ -21,11 +21,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from wsgiref.util import setup_testing_defaults
 
 import tinyjobs
 from tinyjobs import TinyJobs
 from tinyjobs.cli.main import build_parser, main
-from tinyjobs.dashboard import Dashboard
+from tinyjobs.dashboard import Dashboard, asgi, wsgi
 from tinyjobs.dashboard.server import DashboardServer
 from tinyjobs.web import Request, Response
 
@@ -551,6 +552,136 @@ def whole_answer(client: socket.socket) -> bytes:
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
+
+
+class MountingTests(DashboardCase):
+    def test_the_wsgi_app_serves_under_its_script_name(self):
+        job = self.add.enqueue(1, 2)
+        application = wsgi(self.app)
+        environ = {}
+        setup_testing_defaults(environ)
+        environ["SCRIPT_NAME"] = "/admin"
+        environ["PATH_INFO"] = "/jobs"
+        environ["QUERY_STRING"] = "status=queued"
+        started = []
+        body = b"".join(application(environ, lambda status, headers: started.append((status, headers))))
+        self.assertEqual(started[0][0], "200 OK")
+        self.assertIn(("Content-Type", "text/html; charset=utf-8"), started[0][1])
+        self.assertIn(f'href="/admin/jobs/{job.id}"'.encode(), body)
+        self.assertIn(b'<option value="queued" selected>', body)
+
+    def test_the_wsgi_app_answers_a_posted_action_with_a_redirect(self):
+        job = self.add.enqueue(1, 2)
+        application = wsgi(self.app)
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(
+            REQUEST_METHOD="POST", SCRIPT_NAME="/admin/", PATH_INFO=f"/jobs/{job.id}/cancel",
+            CONTENT_TYPE="application/x-www-form-urlencoded", CONTENT_LENGTH="abc",
+        )
+        started = []
+        list(application(environ, lambda status, headers: started.append((status, headers))))
+        self.assertEqual(started[0][0], "303 See Other")
+        self.assertIn(("Location", f"/admin/jobs/{job.id}?notice=cancelled"), started[0][1])
+        self.assertEqual(self.app.get(job.id).status.value, "cancelled")
+
+    def test_the_wsgi_app_decodes_the_latin_1_path_and_answers_head(self):
+        application = wsgi(self.app)
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(
+            REQUEST_METHOD="POST",
+            PATH_INFO="/schedules/nightly report (eu)/pause".encode().decode("latin-1"),
+        )
+        started = []
+        list(application(environ, lambda status, headers: started.append((status, headers))))
+        self.assertEqual(started[0][0], "303 See Other")
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(REQUEST_METHOD="HEAD", PATH_INFO="/schedules")
+        started = []
+        body = list(application(environ, lambda status, headers: started.append((status, headers))))
+        self.assertEqual(started[0][0], "200 OK")
+        self.assertEqual(body, [])
+        self.assertTrue(any(name == "Content-Length" and int(value) > 500 for name, value in started[0][1]))
+
+    def test_the_asgi_app_strips_the_root_path_and_answers_lifespan(self):
+        job = self.add.enqueue(1, 2)
+        application = asgi(self.app)
+
+        async def drive(scope, incoming):
+            sent = []
+            received = iter(incoming)
+
+            async def receive():
+                return next(received)
+
+            async def send(message):
+                sent.append(message)
+
+            await application(scope, receive, send)
+            return sent
+
+        async def scenario():
+            lifespan = await drive(
+                {"type": "lifespan"},
+                [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}],
+            )
+            self.assertEqual(
+                [message["type"] for message in lifespan],
+                ["lifespan.startup.complete", "lifespan.shutdown.complete"],
+            )
+            page = await drive(
+                {
+                    "type": "http", "method": "GET", "path": "/admin/jobs", "root_path": "/admin/",
+                    "query_string": "status=&from=caf\xe9".encode("latin-1"),
+                    "headers": [],
+                },
+                [],
+            )
+            self.assertEqual(page[0]["status"], 200)
+            self.assertIn(f'href="/admin/jobs/{job.id}"'.encode(), page[1]["body"])
+            self.assertIn(b'href="/admin/static/style.css', page[1]["body"])
+            mounted_at_jobs = await drive(
+                {
+                    "type": "http", "method": "GET", "path": "/jobs/jobs", "root_path": "/jobs",
+                    "query_string": b"", "headers": [],
+                },
+                [],
+            )
+            self.assertIn(b"<h1>Jobs</h1>", mounted_at_jobs[1]["body"])
+            sibling = await drive(
+                {
+                    "type": "http", "method": "GET", "path": "/jobs", "root_path": "/j",
+                    "query_string": b"", "headers": [],
+                },
+                [],
+            )
+            self.assertIn(b"<h1>Jobs</h1>", sibling[1]["body"])
+            head = await drive(
+                {
+                    "type": "http", "method": "HEAD", "path": "/jobs", "root_path": "",
+                    "query_string": b"", "headers": [],
+                },
+                [],
+            )
+            self.assertEqual(head[0]["status"], 200)
+            self.assertEqual(head[1]["body"], b"")
+            action = await drive(
+                {
+                    "type": "http", "method": "POST", "path": f"/jobs/{job.id}/cancel",
+                    "root_path": "", "query_string": b"",
+                    "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+                },
+                [],
+            )
+            self.assertEqual(action[0]["status"], 303)
+            self.assertIn((b"location", f"/jobs/{job.id}?notice=cancelled".encode()), action[0]["headers"])
+            ignored = await drive({"type": "websocket"}, [])
+            self.assertEqual(ignored, [])
+
+        asyncio.run(scenario())
+        self.assertEqual(self.app.get(job.id).status.value, "cancelled")
 
 
 class CommandLineTests(unittest.TestCase):
