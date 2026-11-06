@@ -2996,6 +2996,32 @@ class PostgresConfigurationTests(unittest.IsolatedAsyncioTestCase):
         await backend.setup()
         self.assertEqual(await self.show(backend, "statement_timeout"), "0")
 
+    async def test_synchronous_commit_is_on_on_every_connection_whatever_the_server_default(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=prefix, options="-c synchronous_commit=off"
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        self.assertEqual(await self.show(backend, "synchronous_commit"), "on")
+        [finding] = await backend.audit()
+        self.assertTrue(finding.ok)
+        self.assertIn("synchronous_commit on, set by tinyjobs where the server's default is off",
+                      finding.message)
+
+    async def test_a_stronger_synchronous_commit_than_on_is_kept(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=prefix, options="-c synchronous_commit=remote_apply"
+        )
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        self.assertEqual(await self.show(backend, "synchronous_commit"), "remote_apply")
+        [finding] = await backend.audit()
+        self.assertTrue(finding.message.startswith("synchronous_commit remote_apply; "))
+
     def test_connection_settings_in_the_url_win_over_the_defaults(self):
         from tinyjobs.backends.postgres.backend import _connection_kwargs
 
@@ -3877,11 +3903,16 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_audit_reads_the_server_settings(self):
         from tinyjobs.backends.postgres.audit import audit
 
-        [[commit, fsync, standby]] = await sql(
+        [[commit, fsync, standby, default_commit]] = await sql(
             "SELECT current_setting('synchronous_commit'), current_setting('fsync'), "
-            "pg_is_in_recovery()"
+            "pg_is_in_recovery(), "
+            "(SELECT reset_val FROM pg_settings WHERE name = 'synchronous_commit')"
         )
-        self.assertEqual(await self.app.backend.audit(), audit(commit, fsync, standby, False))
+        forced = "on" if commit == "off" else commit
+        self.assertEqual(
+            await self.app.backend.audit(),
+            audit(forced, fsync, standby, False, default_commit),
+        )
         self.assertIn(commit, ("on", "off", "local", "remote_write", "remote_apply"))
         self.assertIn(fsync, ("on", "off"))
         self.assertFalse(standby)

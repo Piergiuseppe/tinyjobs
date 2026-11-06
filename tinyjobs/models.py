@@ -197,6 +197,7 @@ class Page:
 class Finding:
     ok: bool
     message: str
+    warning: bool = False
 
 
 def concluded(findings: list[Finding]) -> list[Finding]:

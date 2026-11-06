@@ -642,12 +642,19 @@ class TinyJobs:
     def stats(self) -> Stats:
         return self.run_sync(self.astats, name="stats")
 
-    async def acheck(self, *, max_wait: float | None = None) -> list[Finding]:
+    async def acheck(
+        self, *, max_wait: float | None = None, store_warnings: bool = False
+    ) -> list[Finding]:
         await self.ensure_connected()
-        return await self.health.check(max_wait=max_wait)
+        return await self.health.check(max_wait=max_wait, store_warnings=store_warnings)
 
-    def check(self, *, max_wait: float | None = None) -> list[Finding]:
-        return self.run_sync(partial(self.acheck, max_wait=max_wait), name="check")
+    def check(
+        self, *, max_wait: float | None = None, store_warnings: bool = False
+    ) -> list[Finding]:
+        return self.run_sync(
+            partial(self.acheck, max_wait=max_wait, store_warnings=store_warnings),
+            name="check",
+        )
 
     async def adrain(self, queues: Sequence[str] | None = None) -> int:
         return await Drain(self, queues).run()
