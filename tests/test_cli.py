@@ -1161,7 +1161,10 @@ class HealthCommandTests(FixtureApp, unittest.TestCase):
         self.assertIn("running past their lease: 0", output)
 
     def test_check_passes_on_a_healthy_app(self):
-        code, output = self.invoke("check", "--app", "fixture_app:app")
+        from unittest import mock
+
+        with mock.patch("tinyjobs.backends.sqlite.audit._mounts", return_value=[]):
+            code, output = self.invoke("check", "--app", "fixture_app:app")
         self.assertEqual(code, 0)
         self.assertNotIn("FAIL", output)
 

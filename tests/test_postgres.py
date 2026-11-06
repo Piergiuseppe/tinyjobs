@@ -3869,9 +3869,22 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
         await self.app.asend("elsewhere.task")
         stats = await self.app.astats()
         self.assertEqual(stats.queues[0].counts, {"queued": 2})
-        failures = [f.message for f in await self.app.acheck() if not f.ok]
+        with mock.patch.object(self.app.backend, "audit", mock.AsyncMock(return_value=[])):
+            failures = [f.message for f in await self.app.acheck() if not f.ok]
         self.assertEqual(len(failures), 1)
         self.assertIn("elsewhere.task", failures[0])
+
+    async def test_the_audit_reads_the_server_settings(self):
+        from tinyjobs.backends.postgres.audit import audit
+
+        [[commit, fsync, standby]] = await sql(
+            "SELECT current_setting('synchronous_commit'), current_setting('fsync'), "
+            "pg_is_in_recovery()"
+        )
+        self.assertEqual(await self.app.backend.audit(), audit(commit, fsync, standby, False))
+        self.assertIn(commit, ("on", "off", "local", "remote_write", "remote_apply"))
+        self.assertIn(fsync, ("on", "off"))
+        self.assertFalse(standby)
 
     async def test_a_burst_larger_than_the_pool_waits_instead_of_failing(self):
         small = TinyJobs(POSTGRES_URL, prefix=self.prefix, max_connections=4)

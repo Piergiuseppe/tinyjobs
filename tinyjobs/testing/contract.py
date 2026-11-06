@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import unittest
 from dataclasses import replace
 
@@ -788,3 +789,16 @@ class BackendContract:
             "s", expected=100.0, next_run_at=3700.0, jobs=[make_job(dedup_key="tinyjobs:schedule:s")]
         )
         self.assertEqual([job.id for job in stored], [running.id])
+
+    async def test_an_audit_answers_with_findings(self):
+        audit = getattr(self.backend, "audit", None)
+        if audit is None:
+            raise unittest.SkipTest("the backend audits nothing")
+        findings = audit()
+        if inspect.isawaitable(findings):
+            findings = await findings
+        self.assertTrue(findings)
+        for finding in findings:
+            self.assertIsInstance(finding.ok, bool)
+            self.assertIsInstance(finding.message, str)
+            self.assertTrue(finding.message)

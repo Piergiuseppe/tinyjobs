@@ -14,6 +14,7 @@ from ...deadlines import Deadline, final
 from ...models import (
     Execution,
     ExecutionError,
+    Finding,
     Job,
     Page,
     QueueStats,
@@ -21,11 +22,12 @@ from ...models import (
     Stats,
 )
 from ...retention import RetentionPolicy
-from ...exceptions import AppClosedError
+from ...exceptions import AppClosedError, ConfigurationError
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
 from ...sheltered import landing
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
+from .audit import audit
 from .claim import SUPPORTS_RETURNING, build_claim_strategy
 from .connection import CALLING, FORK_GATE, ConnectionPool, StepAside
 from .queries import (
@@ -82,6 +84,8 @@ T = TypeVar("T")
 
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
 
+SQLITE_OPTIONS = frozenset({"busy_timeout"})
+
 EXECUTOR_GONE_MESSAGE = (
     "this SQLite backend was closed or the interpreter is shutting down, so it "
     "takes no more calls"
@@ -117,6 +121,7 @@ LOCK_FREE_CALLS = frozenset(
         "_executions_sync",
         "_counts_by_status_sync",
         "_stats_sync",
+        "_audit_sync",
         "_schedules_sync",
         "_close_sync",
     }
@@ -315,6 +320,9 @@ class SQLiteBackend(BaseBackend):
     async def stats(self, now: float) -> Stats:
         return await self._call(self._stats_sync, now)
 
+    async def audit(self) -> list[Finding]:
+        return await self._call(self._audit_sync)
+
     async def schedules(self) -> list[ScheduleState]:
         return await self._call(self._schedules_sync)
 
@@ -336,6 +344,15 @@ class SQLiteBackend(BaseBackend):
     @property
     def database(self) -> str:
         return self._connections.database
+
+    @classmethod
+    def check_options(cls, url: str, /, **options: Any) -> None:
+        unknown = sorted(set(options) - SQLITE_OPTIONS)
+        if unknown:
+            raise ConfigurationError(
+                f"the sqlite backend takes no option named {', '.join(unknown)}; "
+                f"it takes busy_timeout only"
+            )
 
     @classmethod
     def from_url(cls, url: str, **options: Any) -> "SQLiteBackend":
@@ -663,6 +680,11 @@ class SQLiteBackend(BaseBackend):
     def _counts_by_status_sync(self) -> dict[str, int]:
         rows = self._connections.connection.execute(COUNT_BY_STATUS).fetchall()
         return {row["status"]: row["total"] for row in rows}
+
+    def _audit_sync(self) -> list[Finding]:
+        connection = self._connections.connection
+        database = connection.execute("PRAGMA database_list").fetchone()["file"]
+        return audit(connection, database, self._connections.uri)
 
     def _stats_sync(self, now: float) -> Stats:
         connection = self._connections.connection

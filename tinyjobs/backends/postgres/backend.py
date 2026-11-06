@@ -53,6 +53,7 @@ from ...exceptions import ConfigurationError, UnsupportedCapabilityError
 from ...models import (
     Execution,
     ExecutionError,
+    Finding,
     Job,
     Page,
     QueueStats,
@@ -64,6 +65,8 @@ from ...runtime import spared_until_close
 from ...sheltered import sheltered
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
+from .audit import SETTINGS
+from .audit import audit as audit_settings
 from ..batching import AGAIN, Batches, Entry
 from .queries import NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
 from .records import (
@@ -1449,6 +1452,18 @@ class PostgresBackend(BaseBackend):
             queued_tasks={row["task"]: row["total"] for row in queued},
         )
 
+    async def audit(self) -> list[Finding]:
+        commit, fsync, standby, neon = await _again(self._settings_row)
+        return audit_settings(commit, fsync, standby, neon)
+
+    async def _settings_row(self) -> tuple[str | None, str | None, bool, bool]:
+        async with self._connection() as connection:
+            row = await (await connection.execute(SETTINGS)).fetchone()
+        return (
+            _setting(row["commit"]), _setting(row["fsync"]), bool(row["standby"]),
+            bool(row["neon"]),
+        )
+
     async def _counted(self, now: float) -> list[list[dict[str, Any]]]:
         queries = self._queries
         async with self._connection() as connection:
@@ -2179,6 +2194,10 @@ def _alive(connection: psycopg.AsyncConnection) -> bool:
     except psycopg.OperationalError:
         return False
     return True
+
+
+def _setting(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 async def _again(call: Callable[[], Awaitable[T]]) -> T:
