@@ -448,7 +448,8 @@ worker takes them at once; what a second Ctrl-C does and why the timeout must st
 orchestrator's grace period are in [FastAPI](#fastapi). A worker killed outright leaves its jobs to
 their leases, 60 s by default (`--lease`), before the reaper returns them to the queue.
 
-**Watch.** Alert on `tinyjobs check` exiting 1, or on `tinyjobs_store_expired_leases` above zero:
+**Watch.** Alert on `tinyjobs check` exiting 1, which a store configured against the
+[guarantees](#guarantees) does too, or on `tinyjobs_store_expired_leases` above zero:
 any value means a worker died, and the next worker's reaper returns its jobs within
 `--reap-interval` (30 s); no worker left at all shows as the scrape target going down. A rising
 `tinyjobs_store_oldest_due_seconds` is a backlog: more workers, or a queue of its own for the slow
@@ -460,6 +461,67 @@ a running one cooperatively. A cron job that keeps failing is `schedules pause`,
 on its queued retry, until the fix ships, then `schedules run` for the missed one and
 `schedules resume`. Queued jobs for a task the app no longer registers are a missing `--import` on
 the worker, or `jobs cancel` when the task is gone for good.
+
+## Guarantees
+
+What tinyjobs promises, on every backend, and how to see that it holds on yours.
+
+- A job that `enqueue` acknowledged runs until it succeeds or uses its attempts: a worker killed
+  outright leaves it to its lease, and the reaper returns it to the queue.
+- A job finishing while its worker dies may run again, never be lost. The second run shows as a
+  second execution, so an idempotent task makes the whole thing effectively once.
+- Cron fires once per due time from any number of workers, a deduplication key refuses a second
+  job while one is pending or running, and on Postgres a job enqueued in a transaction that rolls
+  back never exists.
+
+They hold when the store keeps what it acknowledged, so `tinyjobs check` audits its configuration
+and fails on what would break them: a Redis without `appendonly`, whose last append-only write or
+snapshot failed, with an `allkeys` eviction policy, nearly full, or a replica; a SQLite file not in
+WAL mode, with `synchronous` off, on a network filesystem, on `tmpfs` or a container's overlay
+layer, itself a mount point or on a disk with under 64 MB free; a Postgres with
+`synchronous_commit` or `fsync` off, Neon's `fsync` off excepted, or a standby. Each failure
+names the setting and its remedy, and a setting the server will not reveal is reported as not
+checked.
+
+`tinyjobs verify` proves them on your own setup, on a store that holds no other jobs:
+
+```bash
+tinyjobs verify redis://localhost:6379/9
+```
+
+It starts three workers on a queue of its own, sends 50 jobs a second for 30 seconds, stops a
+worker every five seconds, `SIGTERM` and `SIGKILL` in turn, and starts another in its place,
+then waits for the store to settle and reports:
+
+```
+sent 1,500 jobs: 1,500 succeeded, 0 failed, 0 cancelled, 0 unfinished, 0 lost
+workers stopped 5 times, 3 by SIGTERM and 2 by SIGKILL, 0 unexpected deaths
+4 jobs ran more than once, after the kills; every job applied its side effect once
+end-to-end p50 69 ms, p95 108 ms, kills included
+0 enqueue failures; the store is left as it was found
+ok
+```
+
+The side effect is a row per job in a ledger the workers share, written with `INSERT OR IGNORE`,
+which is the idempotency the contract asks of your tasks: a job that ran twice still counts once.
+It exits 1 on a job lost, failed, cancelled or unfinished, a side effect missing or a ledger it
+cannot read, a worker dying on its own or not stopping cleanly on `SIGTERM`, an enqueue failing,
+a store that does not settle or fails mid-run, a run cut short, a run too short to kill anyone,
+or a job left in the store unless other jobs appeared, so it can gate a deploy; a store refused
+or unreachable, or settings that make no sense, exit 2 before anything runs. Jobs are matched by
+number, so a loss cannot hide behind a send that failed after the store had taken it, and a job
+enqueued twice is caught. `--duration`, `--rate`, `--workers`, `--slots`, `--kill-every`,
+`--lease` and `--settle` set the load, with `--settle` above `--lease` plus the 1 s reap interval
+since a killed job comes back when its lease ends, and sized to twice the lease when only
+`--lease` is raised, `--prefix` the namespace on Redis and Postgres, and `--keep` leaves the
+finished jobs in the store for `tinyjobs jobs` and the dashboard instead of purging them. It
+refuses an in-memory store, since the workers could not share it, and a store that holds other
+jobs, and purges its own at the end, leaving only the store's schema rows behind, unless other
+jobs appeared during the run, in which case it purges nothing and says so. A verifier killed
+outright leaves its workers to stop themselves, and its temporary directory and its jobs in the
+store behind, which a new file, a flushed Redis database or dropped Postgres tables clear. The
+URL is printed with its password masked. What it does not do, stopping the store or skewing
+clocks, is in [Measured](#measured).
 
 ## Dashboard
 
@@ -656,6 +718,7 @@ ones. To run the rest of the queue, call `app.drain()`.
 | Observability | job fields on every log record, `--log-format json`, Prometheus metrics on `--metrics-port` |
 | Operations | schedules paused, resumed and run by hand, results capped per app and expired per task |
 | Dashboard | `tinyjobs dashboard`, dependency-free, with retry, cancel, pause, resume and run; mountable in WSGI and ASGI apps |
+| Guarantees | at-least-once with its window named, `tinyjobs check` auditing the store for it, `tinyjobs verify` proving it on yours |
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 | FastAPI | `lifespan()`, with an optional worker inside the server process |
 | Django | a `django.tasks` backend and `manage.py tinyjobs` |
@@ -769,7 +832,7 @@ cannot wake them: right after a claim that found work, then backing off from 5 m
 Expect low thousands of jobs per second on a local SSD, bounded by `fsync` rather than by Python:
 four processes of eight slots drain 5,200 no-op jobs a second from one file, and three workers held
 25 jobs per second for ten hours of restarts and kills without losing one. Keep the file on a local
-disk: SQLite's locking over NFS and SMB is unreliable, and nothing detects a network mount for you.
+disk: SQLite's locking over NFS and SMB is unreliable, and `tinyjobs check` fails on one on Linux.
 Pruning keeps the file at a plateau instead of shrinking it; see [retention](#keeping-the-database-from-growing-forever).
 A job cannot join your own database's transaction yet. The queue is a plain database, so the
 `sqlite3` shell reads it, as [How it works](#how-it-works) shows, and `memory://` is the same
@@ -1067,6 +1130,7 @@ v0.12.0. Working and measured, but young. What's in:
 - the job fields on every log record and `--log-format json`
 - a Prometheus exporter on `tinyjobs worker --metrics-port`
 - `tinyjobs dashboard`, and `wsgi(app)` / `asgi(app)` to mount its pages in an existing app
+- `tinyjobs verify`, and the store audit in `tinyjobs check`
 
 What's not in yet:
 
