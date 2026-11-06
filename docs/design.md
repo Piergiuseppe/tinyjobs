@@ -62,6 +62,185 @@ Where we *can* help:
 
 ---
 
+## Guarantees
+
+The numbers in the README's "Measured" section came from harnesses written for each run and thrown
+away, so a reader had to take them on trust, and a store configured against the guarantees, a
+Redis on snapshots or a SQLite file on NFS, broke them silently. The point of a small queue is that
+it can be trusted, so the guarantees are declared in one place, checked against the store that is
+actually configured, and provable on the reader's own machines with a harness that ships in the
+package. What tinyjobs promises, on every backend:
+
+- A job acknowledged by `enqueue` runs, at least once, until it succeeds or uses its attempts: a
+  worker killed outright leaves it to its lease, and the reaper returns it.
+- A job finishing while its worker dies may run again, never be lost; the second run is visible as a
+  second execution, so idempotent tasks make the whole thing effectively once.
+- A cron schedule fires once per due time, from any number of workers, without a leader.
+- A deduplication key refuses a second job while one is pending or running.
+- On Postgres, a job enqueued in a transaction that rolls back never exists.
+
+What the store must provide for those to hold is the store's own durability and the clock
+discipline described under each backend. Both are now checked rather than assumed.
+
+### What the store must provide
+
+`tinyjobs check` asks the backend to audit its own configuration, through an `audit()` the
+backend may define, read like `claim_job` rather than required by the protocol, returning the
+same `Finding` rows as the health check, so a plugin without one is unaffected and the
+dashboard's overview shows the result beside the queues. The audit reads settings, never writes,
+and costs one call: a few pragmas, the mount table and the free space on SQLite, one `INFO` on
+Redis, one query of three settings and the recovery state on Postgres.
+
+- **SQLite.** The journal mode must be `wal` and `synchronous` at least `NORMAL`, which the
+  passing line says holds across process crashes, not power loss, since in WAL mode `NORMAL`
+  can roll back the last commits on a power cut, the one case this promise leaves to `FULL`
+  and its fsync per commit; the file must be
+  on a local filesystem that survives a reboot, read from `/proc/self/mountinfo` on Linux, where
+  the mount is the one whose point is the file itself if there is one, else the deepest one
+  containing the file among those on the file's device, by `st_dev` of the file, or of its
+  directory before the file exists, against the table's `major:minor`, so a mount hidden under
+  a later or a moved one is never taken, else, when no entry carries that device, as on a btrfs
+  subvolume, the deepest containing mount of any device; octal escapes are decoded and
+  undecodable bytes kept as the paths carry them. NFS, CIFS and SMB, 9p, Ceph, Gluster, Lustre,
+  GPFS, WebDAV and the FUSE mounts of object stores fail, since SQLite's locking is unreliable
+  there and WAL needs shared memory; `tmpfs` and `ramfs` fail, since a reboot empties them, and
+  so do `overlay`, `fuse-overlayfs` and `aufs`, a container's writable layer, gone with the
+  container; a file that is
+  itself a mount point, as a Docker bind mount of the one file makes it, fails too, since its
+  `-wal` and `-shm` files land outside the mount and vanish with the container; and the disk
+  holding the file must have room, 64 MB at least, since SQLite
+  refuses every write with "database or disk is full" when it runs out and a worker then fails
+  every outcome. The file audited is the one SQLite reports in `PRAGMA database_list`, not a
+  reading of the name given, so a URI's `mode=memory` or `vfs=memdb`, the last value when a
+  parameter repeats, counts as in memory and a name without `file:` is the literal filename it
+  is to SQLite. An in-memory database audits clean; a file opened through a `file:` URI, whose
+  pragmas tinyjobs leaves to the caller, is audited as the file it is and told to set WAL itself
+  when it has not.
+- **Redis.** `appendonly` must be on, since on snapshots alone a crash loses the queue since the
+  last one, which in testing was all of it, and the last snapshot, and the last append-only
+  write when `appendonly` is on, must have succeeded, since Redis refuses every write with
+  `MISCONF` after a failed snapshot while save points are configured, which is the default,
+  whether or not the append-only file is on; `maxmemory-policy` must
+  not be an `allkeys-*` policy whenever `maxmemory` is set, since those evict jobs under pressure
+  without a word, while `noeviction` and the `volatile-*` policies leave the jobs alone, as
+  tinyjobs sets no TTL on any key, and fail enqueues with `OOM` instead; `used_memory` must be
+  under 90% of `maxmemory`, since past it enqueues fail with `OOM`, or jobs are already being
+  evicted; and the server must be the primary, since a replica refuses writes. All of it comes
+  from `INFO`, which ACL-restricted users usually keep where `CONFIG` is taken away, and a field
+  missing or in an unexpected form, `role`, `aof_enabled`, the write and snapshot statuses,
+  `maxmemory`, `maxmemory_policy` or `used_memory`, is reported as not checked.
+- **Postgres.** `synchronous_commit` must not be `off`, since a crash then loses the last commits
+  and a job acknowledged to the caller vanishes, which is the one thing promised not to happen;
+  `fsync` must be on, since off it can lose or corrupt what was committed, except on Neon, told
+  by its `neon.timeline_id` setting, which runs every compute with `fsync` off and keeps
+  durability in its storage layer; and the connection must not be in recovery, since a standby
+  refuses every write. The settings are read with
+  `current_setting(name, true)`, so a server that lacks one answers NULL, reported as not checked,
+  rather than an error.
+
+Each problem is one failing finding naming the setting and its remedy, so `check` exits 1 and a
+probe or the dashboard shows it, and what passed, or could not be checked, is one line after the
+failures, the only line when nothing fails, saying what the store runs with. A setting the
+server will not reveal, a mount table or a disk that does not answer, is reported as not
+checked, not as a failure, since the guarantee may still hold.
+
+### Proving it on your own setup
+
+`tinyjobs verify URL` is the README's crash-recovery harness, shipped: it runs on a store that holds
+no other jobs, which it checks first and refuses otherwise, and leaves it as it found it but for
+the schema rows, so it can run against a fresh file, a spare Redis database or a scratch Postgres
+database, before a deploy or in a pipeline. The URL is required rather than taken from `--app`,
+since a quiet production store would pass the check and then receive the harness's jobs; an
+in-memory store is refused, since the workers could not share it.
+
+```
+tinyjobs verify redis://localhost:6379/9 --duration 30s --rate 50 --workers 3 --kill-every 5s
+```
+
+It starts the workers as subprocesses of `tinyjobs worker` on a tiny app of its own,
+`tinyjobs.verify:app`, whose one task sleeps 20 to 100 ms and records its own run in a ledger, a
+SQLite file in a temporary directory that the workers share, with `INSERT OR IGNORE` on the job's
+number: the ledger is the side effect, and inserting it that way is the idempotency the contract
+asks of every task. The URL and the ledger reach the workers through the environment, and each
+run sends on a queue named after a random token and consumes only that queue, so two runs on one
+store, or a worker of the application's own, never take each other's jobs. The workers run with a
+short lease and reap interval, 5 s and 1 s, so a kill costs seconds, not the minute of the
+defaults, with `--no-scheduler`, in a session of their own, so a Ctrl-C reaches the verifier
+alone, and with their stdin on a pipe from the verifier that they watch: when it closes, because
+the verifier was killed or died, each worker sends itself `SIGTERM`, so no run leaves workers
+behind, though a verifier killed outright leaves its temporary directory and its jobs in the
+store, which a new file, a flushed Redis database or dropped Postgres tables clear. The verifier
+sends
+jobs at the rate for the duration, numbering them by attempt so a send that failed after the
+store had committed cannot share a number with the next; every `--kill-every` it stops the
+oldest worker not yet signalled, alternating `SIGTERM` and `SIGKILL`, and starts another in its
+place. Only a worker that has run a job is stopped, which the ledger knows from a token each
+worker gets in its environment and records with its first run, a token rather than a pid since a
+pid can be reused by the replacement, since a `SIGTERM` to a worker still importing, before its
+handlers are installed, ends it with the signal's default and would look like a refusal to stop;
+a `SIGKILL` goes only to a worker holding a running job, read from the running jobs'
+`worker_id`, which carries the pid, so it lands on a job in flight unless the job ended in the
+milliseconds between the query and the signal, and the lease is exercised rather than left to
+chance, which is why `--settle` must exceed `--lease` plus the reap interval, since the
+cut-short job comes back only when its lease ends, and why the command sizes `--settle` to twice
+the lease when the lease is raised without it; a kill due while no worker is ready, or none
+holds a job for a `SIGKILL`, is tried again a quarter of a second later, and one due
+during a stall, a suspended verifier or a send the store held for seconds, is taken once, not
+made up for, so the stops stay a kill interval apart. A worker that exits on its own is an
+unexpected death; one that outlives the shutdown timeout after `SIGTERM` did not stop cleanly,
+whatever it was doing, and one that exits non-zero on `SIGTERM` did not stop cleanly if it had
+run a job. When the sending stops it waits up to `--settle` (60 s)
+for its own queue to show nothing queued or running, so an application's job on another queue
+cannot keep it waiting, stops the workers cleanly, then reads every job of its queue back and
+reports:
+
+```
+sent 1,500 jobs: 1,500 succeeded, 0 failed, 0 cancelled, 0 unfinished, 0 lost
+workers stopped 5 times, 3 by SIGTERM and 2 by SIGKILL, 0 unexpected deaths
+4 jobs ran more than once, after the kills; every job applied its side effect once
+end-to-end p50 69 ms, p95 108 ms, kills included
+0 enqueue failures; the store is left as it was found
+ok
+```
+
+Unfinished means still queued or running at the end, which a run cut short leaves behind. The
+jobs are matched by number, read from each job's arguments and from the ledger's rows, never by
+count, so a loss and a phantom cannot cancel out: lost means a number acknowledged by the store
+and not found in it; never acknowledged means a number found whose send had been reported as
+failed; enqueued more than once means two jobs carrying one number, which the ledger's `INSERT
+OR IGNORE` would otherwise hide; missing means a number sent whose side effect never happened.
+Ran more than once is the job's `claims` field, so no per-job query is needed, and the only
+place a second run shows, since the ledger's `INSERT OR IGNORE` records each number once
+however many times its job ran: applied once is the ledger's numbers against the numbers sent,
+every number applied at least once and none that was not sent. Latency is
+`finished_at - created_at` from the job rows. The verdict is `ok` and exit 0 only when nothing
+was lost, failed or left unfinished, every job marked the ledger once, every enqueue went
+through, no worker died unexpectedly or refused to stop, the store settled in time and answered
+throughout, the run went to its end, some worker ran a job and at least one was `SIGKILL`ed,
+since a run too short for that proves nothing about leases, no job was cancelled, which only
+someone else could have done, and nothing was left in the store;
+otherwise the failing reasons are the verdict and the exit status is 1, with the tail of the
+workers' log when one died or refused to stop, while a store refused, unreachable or settings
+that make no sense are a configuration error and exit 2 before anything runs. The header and
+the errors show the URL with its password masked. Afterwards the queued jobs of a cut-short run are
+cancelled, in every case, since nothing would ever consume a queue named after the run, and
+the run's finished jobs purged, unless `--keep` leaves them in the store, for `tinyjobs jobs`
+and the dashboard, or other jobs appeared during the run, of another task or of another run on
+the same store, in which case nothing is purged, the run's own finished jobs stay too and the
+report says so. A job still running at the end, which a settle that timed out leaves behind a
+`SIGKILL`, is cancelled with the queued ones, which is safe once every worker has been reaped,
+and counted as unfinished, so the verdict fails and the store is still clean for the next run;
+a run that failed before clearing says the store was not cleared. The workers' environment is
+the verifier's own without any `TINYJOBS_VERIFY_*` variable inherited from the shell, so a
+leftover prefix cannot send them to another namespace.
+
+What it does not do: stop the store, skew clocks or saturate the machine. Those runs are in the
+README, measured once by hand, and their value is the number, not the harness. The verifier
+answers the one question a reader has before trusting a queue: on my store, with my settings,
+does a killed worker lose a job. It needs a POSIX platform for the signals.
+
+---
+
 ## Core concepts
 
 Four entities. Keeping them distinct is what makes retries, cron and monitoring simple instead of
@@ -757,9 +936,9 @@ access, so it stays a manual command and never runs on its own.
 
 Expect **low thousands of jobs per second** for enqueue and claim on a local SSD, dominated by fsync
 rather than by Python. That covers most applications. It will not cover a high-volume ingestion
-pipeline, and it degrades on network filesystems. SQLite's locking over NFS is unreliable, and the
-backend does not detect a network mount, so the file belongs on a local disk. Both cases are the
-reason the backend seam exists.
+pipeline, and it degrades on network filesystems. SQLite's locking over NFS is unreliable, so the
+file belongs on a local disk, which the audit in `tinyjobs check` verifies on Linux. Both cases
+are the reason the backend seam exists.
 
 ---
 
@@ -2529,8 +2708,10 @@ that means workers are dying.
 probe or a cron alert. It fails when the app registers no tasks, when queued jobs name a task the app
 does not register (the usual sign of a missing `--import`), when a job is past its lease, when a due
 job has waited longer than `--max-wait`, and when a cron schedule is more than a minute overdue, which
-means nothing is firing it. Reaching the store and its schema version is checked by connecting at
-all. Clock skew is not: on one SQLite file there is no second clock to compare against.
+means nothing is firing it. It also fails when the store is configured against the
+[guarantees](#what-the-store-must-provide), through the backend's `audit()`. Reaching the store and
+its schema version is checked by connecting at all. Clock skew is not: on one SQLite file there is
+no second clock to compare against.
 
 ### Schema migrations
 
@@ -2676,6 +2857,11 @@ running it.
 A dependency-free dashboard on the stdlib server and the same service calls as the CLI: queues
 and health, jobs and their attempts, retry and cancel, schedules paused, resumed and run from the
 page, mountable in a WSGI or ASGI app.
+
+**v0.13, guarantees**
+The guarantees written down in one place, `tinyjobs check` auditing the store's configuration
+against them through the backend's `audit()`, and `tinyjobs verify` to prove them on any store:
+workers killed under steady load, nothing lost, every side effect applied once.
 
 **Next**
 Transactional enqueue on SQLite.
