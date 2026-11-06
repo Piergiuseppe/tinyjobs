@@ -45,6 +45,14 @@ def _ignore(number: int, frame: Any) -> None:
     return None
 
 
+def end_when_stdin_closes() -> None:
+    with suppress(OSError, ValueError):
+        descriptor = sys.stdin.fileno()
+        while os.read(descriptor, 4096):
+            pass
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
 def own_group() -> None:
     with suppress(OSError):
         os.setpgid(0, 0)
