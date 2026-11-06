@@ -191,3 +191,16 @@ class Stats:
 class Page:
     items: list[Job]
     cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Finding:
+    ok: bool
+    message: str
+
+
+def concluded(findings: list[Finding]) -> list[Finding]:
+    failures = [finding for finding in findings if not finding.ok]
+    passes = [finding.message for finding in findings if finding.ok]
+    summary = [Finding(True, "; ".join(passes))] if passes else []
+    return [*failures, *summary]

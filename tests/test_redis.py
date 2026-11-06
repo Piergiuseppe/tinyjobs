@@ -1456,9 +1456,41 @@ class RedisAppTests(unittest.IsolatedAsyncioTestCase):
         await self.app.asend("elsewhere.task")
         stats = await self.app.astats()
         self.assertEqual(stats.queues[0].counts, {"queued": 2})
-        failures = [f.message for f in await self.app.acheck() if not f.ok]
+        with mock.patch.object(self.app.backend, "audit", mock.AsyncMock(return_value=[])):
+            failures = [f.message for f in await self.app.acheck() if not f.ok]
         self.assertEqual(len(failures), 1)
         self.assertIn("elsewhere.task", failures[0])
+
+    async def test_the_audit_follows_the_server_settings(self):
+        from redis.exceptions import ResponseError
+
+        from tinyjobs.backends.redis.audit import audit
+
+        client = self.app.backend._client
+        info = await on_backend_loop(self.app, client.info())
+        self.assertIn("role", info)
+        self.assertIn("aof_enabled", info)
+        persisted = {
+            **info, "aof_enabled": 1, "aof_last_write_status": "ok",
+            "rdb_last_bgsave_status": "ok", "role": "master", "maxmemory": 0,
+            "used_memory": 1024,
+        }
+        live = await self.app.backend.audit()
+        self.assertTrue(live)
+        self.assertTrue(all(isinstance(finding.ok, bool) for finding in live))
+        self.assertFalse(any("replica" in finding.message for finding in live))
+        for answer in (info, persisted):
+            with mock.patch.object(client, "info", mock.AsyncMock(return_value=answer)):
+                self.assertEqual(await self.app.backend.audit(), audit(answer))
+        refused = ResponseError("NOPERM this user has no permissions to run the 'info' command")
+        with mock.patch.object(client, "info", mock.AsyncMock(side_effect=refused)):
+            [finding] = await self.app.backend.audit()
+        self.assertTrue(finding.ok)
+        self.assertIn("the server did not answer INFO", finding.message)
+        with mock.patch.object(client, "info", mock.AsyncMock(return_value=persisted)):
+            [finding] = await self.app.backend.audit()
+        self.assertTrue(finding.ok, finding.message)
+        self.assertIn("appendonly on", finding.message)
 
     async def test_a_burst_larger_than_the_pool_waits_instead_of_failing(self):
         small = TinyJobs(REDIS_URL, prefix=self.prefix, max_connections=4)

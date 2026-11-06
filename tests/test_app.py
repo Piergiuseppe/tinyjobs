@@ -424,6 +424,14 @@ class ConcurrentInitialisationTests(BackendTestCase):
 
 
 class FailedConnectionTests(BackendTestCase):
+    def test_an_option_sqlite_does_not_take_is_refused_before_connecting(self):
+        for url in ("sqlite://", f"sqlite:///{self.database}", "memory://"):
+            with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
+                TinyJobs(url, prefix="billing")
+            self.assertIn("takes no option named prefix", str(caught.exception))
+            self.assertIn("busy_timeout only", str(caught.exception))
+        TinyJobs(f"sqlite:///{self.database}", busy_timeout=1).close()
+
     def test_a_backend_whose_setup_fails_is_closed(self):
         closed: list[object] = []
         close = SQLiteBackend.close

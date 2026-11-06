@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from functools import partial
 from types import CodeType, FrameType
 from typing import Any, Callable, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from ...runtime import (
     _fork_marks,
@@ -695,6 +695,10 @@ class ConnectionPool:
     @property
     def database(self) -> str:
         return self._database
+
+    @property
+    def uri(self) -> bool:
+        return self._uri
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -1786,12 +1790,16 @@ def _shared_with(scope: _WriteScope, outer: _WriteScope, frame: FrameType) -> bo
     return True
 
 
+def _memory_uri(database: str) -> bool:
+    query = parse_qs(urlsplit(database).query)
+    return query.get("mode", [""])[-1] == "memory" or query.get("vfs", [""])[-1] == "memdb"
+
+
 def _file_of(database: str, uri: bool, pool: "ConnectionPool") -> object:
-    if uri:
-        parts = urlsplit(database)
-        if "mode=memory" in parts.query:
+    if uri and database.startswith("file:"):
+        if _memory_uri(database):
             return database
-        path = parts.path
+        path = unquote(urlsplit(database).path)
     else:
         path = database
     if path in ("", ":memory:"):

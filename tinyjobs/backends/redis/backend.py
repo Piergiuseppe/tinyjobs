@@ -27,6 +27,7 @@ from ...exceptions import AppClosedError, ConfigurationError
 from ...models import (
     Execution,
     ExecutionError,
+    Finding,
     Job,
     Page,
     QueueStats,
@@ -37,6 +38,7 @@ from ...retention import RetentionPolicy
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from ..batching import AGAIN, Batches, Entry
+from .audit import audit as audit_info
 from .keys import Keys
 from .records import (
     execution_from,
@@ -399,6 +401,14 @@ class RedisBackend(BaseBackend):
         for (_, status), count in (await self._counts()).items():
             totals[status] = totals.get(status, 0) + count
         return totals
+
+    async def audit(self) -> list[Finding]:
+        try:
+            info = await self._client.info()
+        except ResponseError as error:
+            logger.debug("INFO refused, so the audit is skipped: %s", error)
+            info = None
+        return audit_info(info)
 
     async def stats(self, now: float) -> Stats:
         counts: dict[str, dict[str, int]] = {}

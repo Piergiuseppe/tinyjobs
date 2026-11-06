@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable, Collection, Coroutine, Sequence
 
 from ..deadlines import Deadline, end_of_caller, final_left, under
 from ..exceptions import AppClosedError, EventLoopStoppedError
-from ..models import Execution, ExecutionError, Job, Page, ScheduleState, Stats
+from ..models import Execution, ExecutionError, Finding, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
 from ..runtime import (
     CLOSED_MESSAGE,
@@ -323,6 +323,17 @@ class ManagedBackend:
 
     async def stats(self, now: float) -> Stats:
         return await self._forward(self._inner.stats, now)
+
+    async def audit(self) -> list[Finding]:
+        method = getattr(self._inner, "audit", None)
+        if method is None:
+            return []
+
+        async def audit() -> Any:
+            answer = method()
+            return await answer if inspect.isawaitable(answer) else answer
+
+        return list(await self._forward(audit))
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return await self._forward(self._inner.purge, policy, now)

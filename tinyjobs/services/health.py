@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..backends.base import Backend
 from ..clock import Clock
 from ..duration import format_age
-from ..models import Stats
+from ..models import Finding, Stats
 from ..registry import TaskRegistry
 
 OVERDUE_TOLERANCE = 60.0
-
-
-@dataclass(frozen=True, slots=True)
-class Finding:
-    ok: bool
-    message: str
 
 
 class HealthService:
@@ -34,6 +26,7 @@ class HealthService:
             stats = await self._backend.stats(now)
         return [
             self._tasks(),
+            *await self._audit(),
             *self._unknown_tasks(stats),
             self._leases(stats),
             *self._waiting(stats, now, max_wait),
@@ -49,6 +42,12 @@ class HealthService:
             )
         cron = sum(1 for task in self._registry if task.schedule)
         return Finding(True, f"{len(self._registry)} task(s) registered, {cron} on cron")
+
+    async def _audit(self) -> list[Finding]:
+        audit = getattr(self._backend, "audit", None)
+        if audit is None:
+            return []
+        return list(await audit())
 
     def _unknown_tasks(self, stats: Stats) -> list[Finding]:
         return [
