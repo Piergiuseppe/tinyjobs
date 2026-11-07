@@ -54,11 +54,11 @@ Where we *can* help:
   submitting the same job three times.
 - **Attempt visibility.** Every attempt is recorded as an `Execution` row, so a duplicate run is
   visible after the fact rather than silent.
-- **Transactional enqueue.** On Postgres, `enqueue` joins your application's own transaction: if
-  the transaction rolls back, the job is never created. This removes the classic dual-write bug where
-  a job starts running against a row that was never committed. It is a genuine advantage of a
-  database-backed queue over a broker-backed one; see [Transactional enqueue](#transactional-enqueue)
-  for the API, and for why SQLite does not have it yet.
+- **Transactional enqueue.** On Postgres and SQLite, `enqueue` joins your application's own
+  transaction: if the transaction rolls back, the job is never created. This removes the classic
+  dual-write bug where a job starts running against a row that was never committed. It is a genuine
+  advantage of a database-backed queue over a broker-backed one; see
+  [Transactional enqueue](#transactional-enqueue) for the API and what each backend needs for it.
 
 ---
 
@@ -330,64 +330,93 @@ ordinary history, and ordinary cancellation, with no special-casing anywhere in 
 
 ## Data model
 
-Sketch of the SQLite schema. Other backends are free to store this differently, as long as the
-protocol contract holds.
+The SQLite schema as `schema.py` creates it, under the default prefix. Other backends are free to
+store this differently, as long as the protocol contract holds. `payload` holds the serialized
+`(args, kwargs)`, `codec` names its encoding, `hand_backs` counts hand-backs in a row, `claims`
+every claim ever and is never reset, `run_at` is the earliest execution time as unix seconds,
+`lease_expires_at` is set only while running, and `next_run_at` on a schedule is its
+compare-and-set column. `tinyjobs_install_lock` stays empty: a first enqueue inside a caller's
+transaction writes to it to take the file's write lock before it reads, as
+[Transactional enqueue](#transactional-enqueue) explains.
 
 ```sql
-CREATE TABLE jobs (
-    id              TEXT PRIMARY KEY,        -- UUIDv7: sortable by creation time
-    task            TEXT NOT NULL,           -- registered task name
-    args            BLOB NOT NULL,           -- serialized (args, kwargs)
-    codec           TEXT NOT NULL,           -- 'json' | 'pickle' | ...
-    queue           TEXT NOT NULL DEFAULT 'default',
-    priority        INTEGER NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL,
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    max_attempts    INTEGER NOT NULL DEFAULT 1,
-    hand_backs      INTEGER NOT NULL DEFAULT 0, -- hand-backs in a row
-    claims          INTEGER NOT NULL DEFAULT 0, -- every claim ever; never reset
-    run_at          REAL NOT NULL,           -- earliest execution time (unix)
-    created_at      REAL NOT NULL,
-    finished_at     REAL,
-    lease_expires_at REAL,                   -- NULL unless RUNNING
-    worker_id       TEXT,
-    dedup_key       TEXT,
-    result          BLOB,
-    last_error      TEXT
+CREATE TABLE IF NOT EXISTS tinyjobs_install_lock (
+    taken INTEGER
 );
 
--- The claim query is the hottest path in the system; this index defines it.
--- Partial, and in exactly the ORDER BY's column order. See the note below.
-CREATE INDEX idx_jobs_claim ON jobs (queue, priority DESC, run_at ASC)
+CREATE TABLE IF NOT EXISTS tinyjobs_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tinyjobs_jobs (
+    id               TEXT PRIMARY KEY,
+    task             TEXT NOT NULL,
+    payload          BLOB NOT NULL,
+    codec            TEXT NOT NULL,
+    queue            TEXT NOT NULL DEFAULT 'default',
+    status           TEXT NOT NULL,
+    priority         INTEGER NOT NULL DEFAULT 0,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    max_attempts     INTEGER NOT NULL DEFAULT 1,
+    hand_backs       INTEGER NOT NULL DEFAULT 0,
+    claims           INTEGER NOT NULL DEFAULT 0,
+    run_at           REAL NOT NULL,
+    created_at       REAL NOT NULL,
+    finished_at      REAL,
+    lease_expires_at REAL,
+    worker_id        TEXT,
+    dedup_key        TEXT,
+    result           BLOB,
+    last_error       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_claim
+    ON tinyjobs_jobs (queue, priority DESC, run_at ASC)
     WHERE status = 'queued';
-CREATE INDEX idx_jobs_lease ON jobs (status, lease_expires_at);
-CREATE UNIQUE INDEX idx_jobs_dedup ON jobs (dedup_key)
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_lease
+    ON tinyjobs_jobs (lease_expires_at)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_by_status
+    ON tinyjobs_jobs (status, id DESC);
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_by_queue
+    ON tinyjobs_jobs (queue, id DESC);
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_purge
+    ON tinyjobs_jobs (status, finished_at)
+    WHERE finished_at IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS tinyjobs_jobs_dedup
+    ON tinyjobs_jobs (dedup_key)
     WHERE dedup_key IS NOT NULL AND status IN ('queued', 'running');
 
-CREATE TABLE executions (
+CREATE TABLE IF NOT EXISTS tinyjobs_executions (
     id          INTEGER PRIMARY KEY,
-    job_id      TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    job_id      TEXT NOT NULL REFERENCES tinyjobs_jobs(id) ON DELETE CASCADE,
     attempt     INTEGER NOT NULL,
-    claim       INTEGER NOT NULL,            -- the jobs.claims value of this run
-    status      TEXT NOT NULL,               -- running | success | failed | timeout | lost | cancelled
+    claim       INTEGER NOT NULL,
+    status      TEXT NOT NULL,
     worker_id   TEXT NOT NULL,
     started_at  REAL NOT NULL,
     finished_at REAL,
     error_type  TEXT,
     traceback   TEXT
 );
-CREATE UNIQUE INDEX idx_executions_claim ON executions (job_id, claim);
 
-CREATE TABLE schedules (
-    name         TEXT PRIMARY KEY,           -- task name
-    cron         TEXT NOT NULL,
-    timezone     TEXT NOT NULL,
-    next_run_at  REAL NOT NULL,              -- the compare-and-set column
-    last_run_at  REAL,
-    last_job_id  TEXT
+CREATE UNIQUE INDEX IF NOT EXISTS tinyjobs_executions_claim
+    ON tinyjobs_executions (job_id, claim);
+
+CREATE TABLE IF NOT EXISTS tinyjobs_schedules (
+    name        TEXT PRIMARY KEY,
+    cron        TEXT NOT NULL,
+    timezone    TEXT NOT NULL,
+    next_run_at REAL NOT NULL,
+    last_run_at REAL,
+    last_job_id TEXT
 );
-
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);  -- schema_version, ...
 ```
 
 Notes on a few choices:
@@ -524,7 +553,7 @@ is what Celery originally did. It is still the wrong default, for four reasons t
    by itself when those backends shipped.
 
 2. **It throws away the main benefit of a database-backed queue.** With JSON, diagnosing a bad job is
-   `SELECT task, args FROM jobs WHERE status = 'failed'`. With pickle it is an opaque blob that only
+   `SELECT task, payload FROM tinyjobs_jobs WHERE status = 'failed'`. With pickle it is an opaque blob that only
    a Python process with the right modules importable can even read. No `sqlite3` shell, no `grep`,
    no dashboard, no support engineer looking at a customer's database.
 
@@ -819,18 +848,47 @@ Switching a fresh file to WAL needs an exclusive lock, and SQLite answers "datab
 once instead of honouring `busy_timeout`. Two workers starting together on a new file lost that race
 in 11 of 60 tries, so the switch is retried until `busy_timeout` runs out.
 
+### Tables and the prefix
+
+The four tables are `tinyjobs_jobs`, `tinyjobs_executions`, `tinyjobs_schedules` and
+`tinyjobs_meta`, with the empty `tinyjobs_install_lock` beside them, the indexes
+`tinyjobs_jobs_claim` and so on, and `prefix=` renames them all, as on
+Postgres and Redis, so several apps share one file and a file shared with an application's own
+tables, which a transactional enqueue needs, collides with nothing: `jobs` and `meta` are names an
+application is likely to have taken, and before 0.14 tinyjobs took them. The prefix follows the
+Postgres rule, lowercase letters, digits and underscores, forty characters at most.
+
+A file from before 0.14 holds the bare names. The first 0.14 process to open it with the default
+prefix renames the four tables in place, which SQLite does without copying and while rewriting the
+foreign key in `executions`, drops the old `idx_*` indexes for the DDL to create them under their
+new names, migrates whatever older schema version it finds, and leaves one thing behind: a bare
+`meta` table holding `schema_version` 4 and nothing else. A worker from 0.7 to 0.13 reads `meta`
+first and refuses a version newer than its own, so it stops with "upgrade the package" instead of
+creating its four bare tables beside the renamed ones and running a second queue in the same file;
+one from before 0.7 creates its bare tables, empty, and refuses right after, which leaves nothing
+in them, and a bare `meta` at version 4 or more is read as that stub, never as a queue to migrate.
+A legacy queue is recognised by its shape, not by its names alone: bare `meta`, `jobs` and
+`executions` with the columns tinyjobs gave them and a `schema_version` from 1 to 3. An
+application's own `jobs` and `meta` tables, names that are common, are left alone and the
+prefixed tables are created beside them.
+A file created by 0.14 has no such stub, since a `meta` table in an application's database is the
+collision the prefix exists to avoid; an older worker pointed at such a file would start a queue of
+its own, which is a downgrade, not an upgrade, and is not supported. A legacy queue is migrated
+into the default prefix only: opening such a file with another prefix is refused with the reason,
+since two apps with two prefixes could otherwise each claim the old tables for their own.
+
 ### The claim
 
 The heart of the system. On SQLite >= 3.35 it is one statement, atomic by definition:
 
 ```sql
-UPDATE jobs
+UPDATE tinyjobs_jobs
    SET status = 'running',
        worker_id = :worker,
        attempts = attempts + 1,
        lease_expires_at = :now + :lease
  WHERE id IN (
-       SELECT id FROM jobs
+       SELECT id FROM tinyjobs_jobs
         WHERE queue IN (:queues)
           AND status = 'queued'
           AND run_at <= :now
@@ -884,7 +942,7 @@ simply expires.
 Any worker can run the reaper; it is another single atomic statement:
 
 ```sql
-UPDATE jobs
+UPDATE tinyjobs_jobs
    SET status = CASE WHEN attempts < max_attempts THEN 'queued' ELSE 'failed' END,
        lease_expires_at = NULL, worker_id = NULL,
        run_at = :now
@@ -911,10 +969,10 @@ nothing or half a million finished jobs. Defaults:
 Set any of them to `0` to keep forever, or use `KEEP_EVERYTHING` to disable pruning entirely.
 
 The sweep is claimed the same way a schedule is fired, with one conditional `UPDATE` on a marker row
-in `meta`:
+in `tinyjobs_meta`:
 
 ```sql
-UPDATE meta SET value = :now
+UPDATE tinyjobs_meta SET value = :now
  WHERE key = 'last_purge_at'
    AND (CAST(value AS REAL) = 0 OR CAST(value AS REAL) <= :now - :interval)
 RETURNING key;
@@ -935,7 +993,7 @@ follow their job through `ON DELETE CASCADE`, which the connection enables with
 `PRAGMA foreign_keys = ON`.
 
 Two indexes make this cheap, and both follow the same rule as the claim index: match the query, or
-SQLite silently sorts. `idx_jobs_purge` is `(status, finished_at) WHERE finished_at IS NOT NULL`,
+SQLite silently sorts. `tinyjobs_jobs_purge` is `(status, finished_at) WHERE finished_at IS NOT NULL`,
 which matches the sweep exactly, and being partial it only holds terminal rows. Since a terminal job
 is never updated again, only deleted, that index costs one write per job and nothing on the claim
 path. Getting it wrong turns the sweep quadratic: measured on 100,000 expired jobs, with the index
@@ -1501,10 +1559,10 @@ is cheaper, because the store already gives us atomicity:
 
 ```sql
 BEGIN IMMEDIATE;
-UPDATE schedules SET next_run_at = :computed_next
+UPDATE tinyjobs_schedules SET next_run_at = :computed_next
  WHERE name = :name AND next_run_at = :expected;
 -- only if that matched one row:
-INSERT INTO jobs ...;
+INSERT INTO tinyjobs_jobs ...;
 COMMIT;
 ```
 
@@ -2573,22 +2631,108 @@ Postgres backend joins it is in
 `Capabilities.transactional_enqueue` is `False` raises `UnsupportedCapabilityError` at enqueue time,
 and so does eager mode.
 
-SQLite does not have it yet. The jobs table would have to live in the same file as your data:
-SQLite documents that transactions spanning `ATTACH`ed databases are not atomic when `journal_mode`
-is WAL, and WAL is not negotiable here, since it is what lets readers work while a worker writes.
+On SQLite it does the same thing, with one condition: the queue has to live in the same file as
+your data. SQLite documents that a transaction spanning `ATTACH`ed databases is not atomic in WAL
+mode, and WAL is not negotiable here, since it is what lets readers work while a worker writes. So
+the tinyjobs tables carry a prefix, `tinyjobs_jobs`, `tinyjobs_executions`, `tinyjobs_schedules`
+and `tinyjobs_meta`, plus the empty `tinyjobs_install_lock`, as they do on Postgres, and point the
+app at the file your application already uses:
 
-Until it does, a tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain)
-made while the same context holds an open `backend.transaction()` on the same database file is
-refused at once: it would run on another connection and wait for the write lock that transaction
-holds. Make the call after the block, or from `transaction.on_commit` in Django. An asyncio task
-started inside the block is not refused, since it can wait while the block goes on; a thread handed
-the context, as `asyncio.to_thread` does, is. The refusal sees only the context that opened the
-transaction; a FastAPI endpoint enqueueing while its dependency holds one runs in another context, so
-there the enqueue waits for the lock and fails after `busy_timeout`. Inside the block, `commit()`,
-`rollback()`, `executescript()`, `with connection:` and setting `isolation_level` or `autocommit`
-are refused because they would end the transaction early, and a
-transaction SQLite ends by itself, as `INSERT OR ROLLBACK` does, makes the block raise when it exits,
-since every statement after that point committed on its own.
+```python
+app = TinyJobs("sqlite:///app.db")
+
+connection = sqlite3.connect("app.db")
+with connection:
+    connection.execute("INSERT INTO documents (id, name) VALUES (?, ?)", (123, "contract.pdf"))
+    generate_pdf.with_options(tx=connection).enqueue(123)
+connection.close()
+```
+
+`tx=` takes a `sqlite3.Connection` or a `sqlite3.Cursor`. The insert runs on it, on the thread that
+holds it, inside whatever transaction it has open, and tinyjobs neither begins nor commits one:
+with the module's default transaction control the first insert opens the transaction, as psycopg
+does, and the caller's `commit()` ends it; a connection in autocommit mode commits at once, which is
+an ordinary enqueue. `aenqueue` runs the same insert inline on the event loop's thread, since a
+`sqlite3` connection is bound to the thread that opened it; the insert is a few hundred
+microseconds, and the one wait it can have, for the write lock, is bounded by the connection's own
+`timeout`; the first call of a cold backend costs more, since it also opens a short connection on
+that thread to read the schema version, and may run the install inline there. The connection
+must be open on the file the app uses, compared by real path from `PRAGMA database_list`, or the
+call raises `ConfigurationError` naming both files, since an insert
+into another file would commit with nothing; an in-memory store refuses `tx`, since workers could
+not share it anyway. The dedup key is enforced on the caller's connection by the same partial unique
+index, and the holder it finds is read in the caller's snapshot, so a job sent twice inside one
+transaction comes back once.
+
+The first tinyjobs call of a process can well be an enqueue inside a transaction, a Django request
+that writes an order and sends its receipt from the same `atomic()` block. By then the caller's
+connection holds the file's write lock, so a setup through tinyjobs's own connection would wait
+for it, in the same thread, until `busy_timeout` ran out. So a join needs no setup: when the app is
+not yet connected, `enqueue_in` takes a backend built cold, with no connection of its own, which
+reads the schema version once through a short connection of its own, outside the caller's
+transaction and with no wait at all, since the caller may hold the file's exclusive lock, in
+rollback-journal mode, once its transaction outgrew the page cache; a busy answer counts as not
+current. When the file lacks the schema, or the check could not read, the backend installs it
+through the caller's connection, the same DDL and migrations, where SQLite keeps DDL
+transactional. Python's `sqlite3` opens a transaction on its own only before an insert, update or
+delete, never before DDL, so the install runs in a savepoint when the caller's transaction is
+already open, and rolls back with it, and inside a `BEGIN IMMEDIATE` of its own otherwise, which
+waits for the write lock up to the connection's own `timeout`, so that it is one atomic,
+serialized unit whatever the connection's transaction mode. Inside the savepoint the first
+statement is a write, since an install that read first from a deferred transaction failed in 3
+of 4 first requests started together on a new file: `DELETE FROM tinyjobs_install_lock WHERE 0`,
+an empty table the schema carries for that one purpose, takes the write lock and changes nothing,
+and when the table is not there yet, creating it is the write. Creating and dropping a scratch
+table instead failed with "database table is locked" whenever the caller still had a cursor
+open, as a Django `iterator()` inside `atomic()` does, and a legacy migration inside such a
+transaction still fails that way on its `DROP INDEX`; rolling the savepoint back then ends the
+read in progress too, so that error is reworded to say to read the rows first, or to let an
+ordinary call migrate the file. The reworded errors keep SQLite's error code and name, for a
+caller that retries on them; the renames run with `legacy_alter_table` off, so the foreign key in `executions`
+follows the table whatever the connection has set. Because an install inside the caller's
+transaction can roll back with it, the backend takes the schema as known only once its own setup,
+or a check outside any transaction, found it current; until then each call checks again, and a
+"no such table" on the insert after that makes the backend check and install once more before
+giving up. A transaction that read the file before a worker installed the tables cannot see
+them, and the "no such table" SQLite then answers is reworded to say so; a transaction that read
+before its enqueue while another connection wrote gets SQLite's `SQLITE_BUSY_SNAPSHOT`, reworded
+to name `BEGIN IMMEDIATE`. The app connects as usual on its next ordinary call after the commit, and finds the schema
+there; before the commit its own setup would wait for the caller's write lock. Which backends join
+cold is a fact about the backend, held by the loader beside `loop_bound`; Postgres connects
+first, since its join needs the store's identity from setup.
+
+What the caller's transaction costs is the write lock: from its first write to its commit, every
+worker on the file waits for it, up to `busy_timeout`, so the block that enqueues should be as
+short as the one that writes the order. And a transaction that read before it writes meets WAL's
+one rule: SQLite refuses the upgrade at once, with "database is locked", when another connection
+wrote since the read began, and a worker writes every few milliseconds. tinyjobs's own pool opens
+every write with `BEGIN IMMEDIATE` for that reason, and the enqueue through a caller's connection
+writes before it reads: the insert is its first statement, and a dedup key is looked up only after
+the insert hit the unique index, so a plain `BEGIN` whose first statement is the enqueue never
+meets the rule. Before the enqueue wrote first, it read the schema version on the caller's
+connection, and 16 of 300 calls inside a deferred transaction failed that way while another
+connection committed every millisecond. A caller's transaction that reads before it enqueues
+should begin immediately, which under Django is `"transaction_mode": "IMMEDIATE"` in the database
+`OPTIONS`.
+
+Under Django, `"database": "default"` in `OPTIONS` now works on a SQLite alias as on Postgres:
+the backend enqueues through that alias's raw connection, inside `transaction.atomic()`, the
+alias's `NAME` must be the file in `url`, and an alias on another engine than the one in `url` is
+refused with both named. tinyjobs sets the file to WAL mode the first time its own pool opens it,
+or when a first enqueue outside any transaction installs the schema, which is persistent and which
+Django's connections read and write through without change; `tinyjobs check` audits it as any
+store, and switches it when it can.
+
+A tinyjobs call that writes (an enqueue, a send, a cancel, a retry, a purge or a drain) made while
+the same context holds an open `backend.transaction()`, tinyjobs's own write scope on the same
+file, is still refused at once: it would run on another connection and wait for the write lock that
+scope holds. An asyncio task started inside the block is not refused, since it can wait while the
+block goes on; a thread handed the context, as `asyncio.to_thread` does, is. The refusal sees only
+the context that opened the transaction. Inside the block, `commit()`, `rollback()`,
+`executescript()`, `with connection:` and setting `isolation_level` or `autocommit` are refused
+because they would end the transaction early, and a transaction SQLite ends by itself, as
+`INSERT OR ROLLBACK` does, makes the block raise when it exits, since every statement after that
+point committed on its own.
 
 ### Task discovery
 
@@ -2730,14 +2874,22 @@ no second clock to compare against.
 
 ### Schema migrations
 
-A `schema_version` row in `meta`, forward-only migrations applied at `setup()`. Workers refuse to
+A `schema_version` row in `tinyjobs_meta`, forward-only migrations applied at `setup()`. Workers refuse to
 start against a schema newer than they understand, so a partial rollback cannot corrupt a queue.
 Version 3 adds `jobs.hand_backs` and `jobs.claims`, and keys executions by claim. The migration
 numbers each job's existing executions in the order they started, and sets `claims` to the larger of
 `attempts` and that count, so a job retried under 0.6 keeps every row. On Redis the store moves to
 version 2: a job without `hand_backs` reads as zero, and a job without `claims` gets the same
 renumbering the first time a script touches it or it is read, so `get`, `list` and `executions`
-already show the adopted order and `claims`.
+already show the adopted order and `claims`. Version 4 moves the SQLite tables under the prefix,
+as [Tables and the prefix](#tables-and-the-prefix) describes: a file from before 0.14 is renamed in
+place, its indexes recreated under their new names, and a bare `meta` stub left behind for older
+processes to refuse.
+
+Upgrading to 0.14 is a stop-the-world step as well, for the application processes that enqueue
+too, since a 0.13 process left running works on tables that are no longer there, as
+[SQLite](sqlite.md) spells out; a 0.13 process started afterwards refuses the stub before running
+any DDL, so it leaves nothing behind.
 
 Upgrading from 0.6 is a stop-the-world step. A 0.6 worker writes executions by attempt, which no
 longer matches the layout, so stop every 0.6 process before the first 0.7 one starts. Once the store
@@ -2878,8 +3030,13 @@ The guarantees written down in one place, `tinyjobs check` auditing the store's 
 against them through the backend's `audit()`, and `tinyjobs verify` to prove them on any store:
 workers killed under steady load, nothing lost, every side effect applied once.
 
+**v0.14, the queue in your database**
+Transactional enqueue on SQLite: prefixed tables, so the queue lives in the application's own file,
+`tx=` taking a `sqlite3` connection, a cold join that installs the schema through the caller's
+connection, and Django's `"database"` option on SQLite aliases.
+
 **Next**
-Transactional enqueue on SQLite.
+Per-task concurrency and rate limits; jobs that run after another.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the

@@ -5,10 +5,12 @@ The runbook, in the order things come up.
 **Deploy.** There is nothing to run besides `tinyjobs worker --app tasks:app`: add processes to
 scale, and `--queues` to keep slow queues from starving fast ones. A new version of your tasks is a
 rolling restart, one worker at a time. A change to the store's schema, announced in
-[Status](status.md), is the one time to stop every worker first, since a running worker does not
-notice the migration; an older worker started later refuses a schema newer than itself, so a
-rollback fails loudly instead of corrupting the queue. Upgrading to 0.11 needs no migration; the
-upgrade order that pausing needs is under [Cron](cron.md).
+[Status](status.md), is the one time to stop every worker first, since a running worker keeps
+its old statements and runs them against the changed store. An older worker started later
+refuses a schema newer than itself, so a rollback fails loudly instead of corrupting the queue,
+except on a SQLite file that 0.14 created, where an older worker would start a queue of its own.
+[SQLite](sqlite.md) has the 0.14 steps and what a process left running does; the upgrade order
+that pausing needs is under [Cron](cron.md).
 
 **Stop.** `SIGTERM` stops claiming and exits within `--shutdown-timeout` (30 s): running jobs get
 most of it, and the async and isolated ones still running at the end are handed back so another

@@ -16,7 +16,7 @@ still the answer for RabbitMQ routing, workflows and large fleets.
 
 On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the closest: async, with cron,
 retries, `LISTEN`/`NOTIFY` and jobs deferred inside your own transaction, but Postgres only. tinyjobs
-does the same on Postgres and keeps SQLite and Redis behind one API. In Django,
+does the same on Postgres and on SQLite, and keeps Redis behind the same API. In Django,
 [django-tasks-db](https://github.com/RealOrangeOne/django-tasks-db) keeps `django.tasks` tasks in
 your database through the ORM, so an enqueue can share your transaction, and
 [django-q2](https://github.com/GDay/django-q2) can use the ORM as its broker and has cron schedules.

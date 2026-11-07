@@ -7,8 +7,8 @@ What tinyjobs promises, on every backend, and how to see that it holds on yours.
 - A job finishing while its worker dies may run again, never be lost. The second run shows as a
   second execution, so an idempotent task makes the whole thing effectively once.
 - Cron fires once per due time from any number of workers, a deduplication key refuses a second
-  job while one is pending or running, and on Postgres a job enqueued in a transaction that rolls
-  back never exists.
+  job while one is pending or running, and on Postgres and SQLite a job enqueued in a transaction
+  that rolls back never exists.
 
 They hold when the store keeps what it acknowledged, so `tinyjobs check` audits its configuration
 and fails on what would break them: a Redis without `appendonly`, whose last append-only write or
