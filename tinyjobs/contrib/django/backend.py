@@ -120,7 +120,7 @@ class TinyJobsBackend(BaseTaskBackend):
     def _transaction(self) -> Any:
         if self.database is None or self.app.eager:
             return nullcontext()
-        return joined_connection(self.database)
+        return joined_connection(self.database, self.app.url)
 
     def _options_for(self, task: Task) -> dict[str, Any]:
         return {

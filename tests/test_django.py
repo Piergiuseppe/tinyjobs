@@ -3,8 +3,10 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import uuid
+import sqlite3
 import tempfile
+import time
+import uuid
 import threading
 import unittest
 from datetime import timedelta
@@ -27,6 +29,9 @@ except ImportError:
     django = None
 
 
+LITE_DIRECTORY = tempfile.TemporaryDirectory()
+LITE_PATH = Path(LITE_DIRECTORY.name) / "lite.db"
+
 def setUpModule() -> None:
     if django is None:
         return
@@ -35,7 +40,12 @@ def setUpModule() -> None:
     if settings.configured:
         return
     databases = {
-        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+        "lite": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": str(LITE_PATH),
+            "OPTIONS": {"transaction_mode": "IMMEDIATE"},
+        },
     }
     if POSTGRES_URL and psycopg is not None:
         settings_of = conninfo_to_dict(POSTGRES_URL)
@@ -54,6 +64,10 @@ def setUpModule() -> None:
         TASKS={},
     )
     django.setup()
+
+
+def tearDownModule() -> None:
+    LITE_DIRECTORY.cleanup()
 
 
 @unittest.skipIf(django is None, "pip install django to run the django tests")
@@ -146,7 +160,6 @@ class EnqueueTests(DjangoTestCase):
         self.assertEqual(self.backend.get_result(result.id).status, "READY")
 
     def test_run_after_is_reported_on_the_clock_the_job_keeps(self):
-        import time
         from unittest import mock
 
         from django.utils import timezone
@@ -496,7 +509,6 @@ class CommandTests(DjangoTestCase):
         import signal
         import subprocess
         import sys
-        import time
 
         import tinyjobs
 
@@ -545,7 +557,6 @@ class CommandTests(DjangoTestCase):
         import signal
         import subprocess
         import sys
-        import time
 
         import tinyjobs
 
@@ -822,10 +833,224 @@ class TransactionTests(unittest.TestCase):
         self.assertIn("same thread", str(raised[0]))
         self.assertEqual(len(self.backend.app.jobs().items), 1)
 
-    def test_a_database_that_is_not_postgres_is_refused(self):
+    def test_a_database_of_another_engine_is_refused(self):
         backend = self.configured({"database": "default"})
-        with self.assertRaisesRegex(ConfigurationError, "not PostgreSQL"):
+        with self.assertRaisesRegex(ConfigurationError, "runs on sqlite and the app's url is on postgres"):
             self.tasks.double.using(backend=backend.alias).enqueue(1)
+
+
+@unittest.skipIf(django is None, "pip install django to run the django tests")
+class SQLiteTransactionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.prefix = f"t{uuid.uuid4().hex[:12]}"
+        overrides = override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+                    "QUEUES": ["default", "emails"],
+                    "OPTIONS": {
+                        "url": f"sqlite:///{LITE_PATH}",
+                        "prefix": self.prefix,
+                        "database": "lite",
+                    },
+                }
+            }
+        )
+        overrides.enable()
+        self.addCleanup(overrides.disable)
+        from django.db import connections
+        from django.tasks import default_task_backend
+
+        from tests.djangoapp import tasks
+
+        self.backend = default_task_backend
+        self.tasks = tasks
+        self.addCleanup(default_task_backend.app.close)
+        self.addCleanup(connections["lite"].close)
+
+    def stored(self, result):
+        return self.backend.app.get(result.id)
+
+    def test_a_task_enqueued_inside_atomic_appears_when_it_commits(self):
+        from django.db import transaction
+
+        self.backend.app.start()
+        with transaction.atomic(using="lite"):
+            result = self.tasks.double.enqueue(2)
+            self.assertIsNone(self.stored(result))
+        self.assertEqual(self.stored(result).task, "tests.djangoapp.tasks.double")
+        self.assertEqual(self.backend.app.drain(), 1)
+        self.assertEqual(self.backend.get_result(result.id).return_value, 4)
+
+    def test_a_task_enqueued_inside_a_rolled_back_atomic_is_never_stored(self):
+        from django.db import transaction
+
+        with self.assertRaises(ZeroDivisionError):
+            with transaction.atomic(using="lite"):
+                result = self.tasks.double.enqueue(2)
+                1 / 0
+        self.assertIsNone(self.stored(result))
+
+    def test_a_rolled_back_savepoint_takes_only_its_own_tasks(self):
+        from django.db import transaction
+
+        with transaction.atomic(using="lite"):
+            kept = self.tasks.double.enqueue(1)
+            with contextlib.suppress(ZeroDivisionError):
+                with transaction.atomic(using="lite"):
+                    dropped = self.tasks.double.enqueue(2)
+                    1 / 0
+        self.assertIsNotNone(self.stored(kept))
+        self.assertIsNone(self.stored(dropped))
+
+    def test_a_task_enqueued_outside_atomic_is_stored_at_once(self):
+        result = self.tasks.greet.enqueue("ada")
+        self.assertEqual(self.stored(result).queue, "emails")
+
+    def test_aenqueue_joins_the_transaction_of_the_calling_thread(self):
+        from asgiref.sync import async_to_sync
+        from django.db import transaction
+
+        self.backend.app.start()
+        with self.assertRaises(ZeroDivisionError):
+            with transaction.atomic(using="lite"):
+                result = async_to_sync(self.tasks.double.aenqueue)(5)
+                self.assertIsNone(self.stored(result))
+                1 / 0
+        self.assertIsNone(self.stored(result))
+
+    def test_the_first_enqueue_installs_the_queue_inside_atomic(self):
+
+        from django.db import connections, transaction
+
+        outside = sqlite3.connect(LITE_PATH)
+        self.addCleanup(outside.close)
+        with transaction.atomic(using="lite"):
+            connections["lite"].cursor().execute(
+                "CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY)"
+            )
+            connections["lite"].cursor().execute("INSERT INTO receipts DEFAULT VALUES")
+            result = self.tasks.double.enqueue(3)
+            names = {
+                row[0]
+                for row in connections["lite"].cursor().execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertIn(f"{self.prefix}_jobs", names)
+            self.assertIsNone(self.backend.app._backend)
+            seen = {
+                row[0]
+                for row in outside.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            self.assertNotIn(f"{self.prefix}_jobs", seen)
+        self.assertIsNotNone(self.stored(result))
+
+    def test_a_deferred_atomic_block_writes_before_it_reads(self):
+        from unittest import mock
+
+        from django.db import connections, transaction
+
+        connections["lite"].ensure_connection()
+        other = sqlite3.connect(LITE_PATH, isolation_level=None, timeout=5)
+        self.addCleanup(other.close)
+        other.execute("CREATE TABLE IF NOT EXISTS ticks (n INTEGER)")
+        traced: list[str] = []
+
+        def commit_elsewhere(statement: str) -> None:
+            if traced or statement.upper().startswith(("BEGIN", "SAVEPOINT", "PRAGMA")):
+                return
+            traced.append(statement)
+            other.execute("INSERT INTO ticks VALUES (1)")
+
+        raw = connections["lite"].connection
+        raw.set_trace_callback(commit_elsewhere)
+        self.addCleanup(raw.set_trace_callback, None)
+        with mock.patch.object(connections["lite"], "transaction_mode", None):
+            with transaction.atomic(using="lite"):
+                result = self.tasks.double.enqueue(1)
+        self.assertEqual(len(traced), 1)
+        self.assertTrue(traced[0].upper().startswith("CREATE TABLE"), traced)
+        self.assertEqual(self.stored(result).task, "tests.djangoapp.tasks.double")
+
+    def test_an_in_memory_test_database_is_refused_with_the_reason(self):
+        from unittest import mock
+
+        from django.db import connections, transaction
+
+        with mock.patch.object(connections["lite"], "is_in_memory_db", return_value=True):
+            with transaction.atomic(using="lite"):
+                with self.assertRaisesRegex(ConfigurationError, "test runner"):
+                    self.tasks.double.enqueue(1)
+
+    def test_aenqueue_joins_atomic_before_the_app_ever_connected(self):
+        from asgiref.sync import async_to_sync
+        from django.db import transaction
+
+        with self.assertRaises(ZeroDivisionError):
+            with transaction.atomic(using="lite"):
+                dropped = async_to_sync(self.tasks.double.aenqueue)(5)
+                self.assertIsNone(self.backend.app._backend)
+                1 / 0
+        with transaction.atomic(using="lite"):
+            kept = async_to_sync(self.tasks.double.aenqueue)(6)
+        self.assertIsNone(self.stored(dropped))
+        self.assertEqual(self.stored(kept).task, "tests.djangoapp.tasks.double")
+
+    def test_a_database_of_another_engine_is_refused(self):
+        from unittest import mock
+
+        from django.db import connections, transaction
+
+        with mock.patch.object(connections["lite"], "vendor", "oracle"):
+            with transaction.atomic(using="lite"):
+                with self.assertRaisesRegex(ConfigurationError, "runs on oracle and the app's url is on sqlite"):
+                    self.tasks.double.enqueue(1)
+
+    def test_a_store_without_transactions_refuses_the_database_option(self):
+        from django.db import transaction
+
+        overrides = override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+                    "QUEUES": ["default"],
+                    "OPTIONS": {"url": "memory://", "database": "lite"},
+                }
+            }
+        )
+        overrides.enable()
+        self.addCleanup(overrides.disable)
+        from django.tasks import default_task_backend
+
+        self.addCleanup(default_task_backend.app.close)
+        with transaction.atomic(using="lite"):
+            with self.assertRaisesRegex(ConfigurationError, "memory:// cannot join"):
+                self.tasks.double.enqueue(1)
+
+    def test_a_database_on_another_file_is_refused(self):
+        from django.db import transaction
+
+        overrides = override_settings(
+            TASKS={
+                "default": {
+                    "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+                    "QUEUES": ["default"],
+                    "OPTIONS": {
+                        "url": f"sqlite:///{LITE_PATH.with_name('elsewhere.db')}",
+                        "database": "lite",
+                    },
+                }
+            }
+        )
+        overrides.enable()
+        self.addCleanup(overrides.disable)
+        from django.tasks import default_task_backend
+
+        self.addCleanup(default_task_backend.app.close)
+        with transaction.atomic(using="lite"):
+            with self.assertRaisesRegex(ConfigurationError, "the queue's own file"):
+                self.tasks.double.enqueue(1)
 
 
 class ExceptionPathTests(unittest.TestCase):
