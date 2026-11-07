@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import re
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from ..exceptions import UnknownBackendError
+
+IN_MEMORY_JOIN_MESSAGE = (
+    "an in-memory store cannot take a job from your transaction, since no worker could share "
+    "it; give the app a file, as in sqlite:///app.db, to enqueue inside a transaction"
+)
 
 ENTRY_POINT_GROUP = "tinyjobs.backends"
 SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
@@ -11,6 +17,7 @@ SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*(?=:)")
 _BUILTIN_FACTORIES: dict[str, Callable[..., Any]] = {}
 _BUILTIN_CHECKS: dict[str, Callable[..., None]] = {}
 _LOOP_BOUND: set[str] = set()
+_COLD_JOINERS: dict[str, Callable[[str], bool]] = {}
 
 
 def register_builtin(
@@ -19,16 +26,29 @@ def register_builtin(
     check: Callable[..., None] | None = None,
     *,
     loop_bound: bool = False,
+    joins_cold: Callable[[str], bool] | None = None,
 ) -> None:
     _BUILTIN_FACTORIES[scheme] = factory
     if check is not None:
         _BUILTIN_CHECKS[scheme] = check
     if loop_bound:
         _LOOP_BOUND.add(scheme)
+    if joins_cold is not None:
+        _COLD_JOINERS[scheme] = joins_cold
 
 
 def loop_bound(url: str) -> bool:
     return _scheme(url) in _LOOP_BOUND
+
+
+def joins_cold(url: str) -> bool:
+    decide = _COLD_JOINERS.get(_scheme(url))
+    return decide is not None and decide(url)
+
+
+def in_memory(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme in ("memory", "sqlite") and parts.path[1:] in ("", ":memory:")
 
 
 def check_options(url: str, options: dict[str, Any]) -> None:

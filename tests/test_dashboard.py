@@ -246,7 +246,7 @@ class JobPageTests(DashboardCase):
         with contextlib.closing(
             __import__("sqlite3").connect(Path(self.directory.name) / "jobs.db")
         ) as connection:
-            connection.execute("UPDATE jobs SET payload = X'00ff' WHERE id = ?", (job.id,))
+            connection.execute("UPDATE tinyjobs_jobs SET payload = X'00ff' WHERE id = ?", (job.id,))
             connection.commit()
         page = self.html(f"/jobs/{job.id}")
         self.assertIn("the arguments could not be decoded", page)
@@ -276,7 +276,7 @@ class JobPageTests(DashboardCase):
         with contextlib.closing(
             __import__("sqlite3").connect(Path(self.directory.name) / "jobs.db")
         ) as connection:
-            connection.execute("UPDATE jobs SET result = X'00ff' WHERE id = ?", (job.id,))
+            connection.execute("UPDATE tinyjobs_jobs SET result = X'00ff' WHERE id = ?", (job.id,))
             connection.commit()
         page = self.html(f"/jobs/{job.id}")
         self.assertIn("the result could not be decoded", page)

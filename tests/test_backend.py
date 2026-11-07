@@ -46,7 +46,7 @@ class SQLiteContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await self.backend.fail(claimed, ERROR, None)
         with self.backend.transaction() as connection:
             connection.execute(
-                "UPDATE jobs SET status = 'queued', claims = 0, finished_at = NULL "
+                "UPDATE tinyjobs_jobs SET status = 'queued', claims = 0, finished_at = NULL "
                 "WHERE id = ?",
                 (claimed.id,),
             )

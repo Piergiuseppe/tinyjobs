@@ -675,6 +675,7 @@ class ConnectionPool:
         self._database = database
         self._uri = uri
         self._file = _file_of(database, uri, self)
+        self._memory = not (isinstance(self._file, str) and os.path.isabs(self._file))
         self._busy_timeout = busy_timeout
         self._patient = f"PRAGMA busy_timeout = {int(busy_timeout * 1000)}"
         self._sliced = f"PRAGMA busy_timeout = {int(min(busy_timeout, BUSY_SLICE_SECONDS) * 1000)}"
@@ -699,6 +700,14 @@ class ConnectionPool:
     @property
     def uri(self) -> bool:
         return self._uri
+
+    @property
+    def file(self) -> object:
+        return self._file
+
+    @property
+    def memory(self) -> bool:
+        return self._memory
 
     @property
     def connection(self) -> sqlite3.Connection:

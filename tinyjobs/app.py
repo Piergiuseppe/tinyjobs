@@ -15,7 +15,14 @@ from functools import partial
 from typing import Any, AsyncIterator, Callable, Coroutine, Sequence, TypeVar
 
 from .backends.base import Backend
-from .backends.loader import check_options, load_backend, loop_bound
+from .backends.loader import (
+    IN_MEMORY_JOIN_MESSAGE,
+    check_options,
+    in_memory,
+    joins_cold,
+    load_backend,
+    loop_bound,
+)
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .deadlines import Deadline, finishing
@@ -152,6 +159,7 @@ class TinyJobs:
         when_collected(self, self._runner.close_here)
         self._backend: ManagedBackend | None = None
         self._dispatch: DispatchService | None = None
+        self._cold: tuple[Backend, DispatchService] | None = None
         self._lifecycle: JobLifecycleService | None = None
         self._execution: ExecutionService | None = None
         self._scheduling: SchedulingService | None = None
@@ -415,6 +423,7 @@ class TinyJobs:
         )
         self._health = HealthService(backend, self._registry, self._clock)
         self._backend = backend
+        self._cold = None
         self._closes = 0
 
     def forget_inherited_connection(self) -> None:
@@ -550,9 +559,14 @@ class TinyJobs:
     async def aenqueue_in(
         self, tx: Any, name: str, payload: JobPayload, options: EnqueueOptions
     ) -> Job:
-        await self.ensure_connected()
-        job = self._joining(name, payload, options)
-        return self.bind((await self.backend.aenqueue_in(tx, [job]))[0])
+        self._refuse_eager_join()
+        parts = self._joined_parts()
+        if parts is None:
+            await self.ensure_connected()
+            parts = self.backend, self.dispatch
+        backend, dispatch = parts
+        job = self._joining(name, payload, options, backend, dispatch)
+        return self.bind((await backend.aenqueue_in(tx, [job]))[0])
 
     def enqueue_in(
         self,
@@ -563,21 +577,66 @@ class TinyJobs:
         *,
         call: str = "enqueue",
     ) -> Job:
-        self.run_sync(self.ensure_connected, name=call)
-        job = self._joining(name, payload, options)
-        return self.bind(self.backend.enqueue_in(tx, [job])[0])
+        self._refuse_eager_join()
+        parts = self._joined_parts()
+        if parts is None:
+            if self._closed:
+                raise AppClosedError(CLOSED_MESSAGE)
+            self._runner.run(self.ensure_connected, name=call)
+            parts = self.backend, self.dispatch
+        backend, dispatch = parts
+        job = self._joining(name, payload, options, backend, dispatch)
+        return self.bind(backend.enqueue_in(tx, [job])[0])
 
-    def _joining(self, name: str, payload: JobPayload, options: EnqueueOptions) -> Job:
+    def _refuse_eager_join(self) -> None:
         if self._eager:
             raise UnsupportedCapabilityError(
                 "eager mode runs each job as it is sent, before any transaction "
                 "could commit; tx is not available with eager=True"
             )
-        if not self.backend.capabilities.transactional_enqueue:
+        if in_memory(self._url):
+            raise UnsupportedCapabilityError(IN_MEMORY_JOIN_MESSAGE)
+
+    def _joined_parts(self) -> tuple[Backend, DispatchService] | None:
+        if self._dispatch is not None:
+            return self.backend, self.dispatch
+        return self._cold_parts()
+
+    def _cold_parts(self) -> tuple[Backend, DispatchService] | None:
+        if not joins_cold(self._url):
+            return None
+        with self._lock_guard:
+            if self._dispatch is not None:
+                return None
+            if self._closed:
+                raise AppClosedError(CLOSED_MESSAGE)
+            if self._cold is None:
+                backend = load_backend(
+                    self._url, clock=self._clock, **self._backend_options
+                )
+                dispatch = DispatchService(
+                    backend,
+                    self._serialization,
+                    self._clock,
+                    self._default_queue,
+                    self._registry,
+                )
+                self._cold = (backend, dispatch)
+            return self._cold
+
+    def _joining(
+        self,
+        name: str,
+        payload: JobPayload,
+        options: EnqueueOptions,
+        backend: Backend,
+        dispatch: DispatchService,
+    ) -> Job:
+        if not backend.capabilities.transactional_enqueue:
             raise UnsupportedCapabilityError(
                 "this backend does not support enqueueing inside a transaction"
             )
-        return self.dispatch.prepare(name, payload, options)
+        return dispatch.prepare(name, payload, options)
 
     async def aget(self, job_id: str) -> Job | None:
         await self.ensure_connected()
@@ -850,6 +909,7 @@ class TinyJobs:
     async def _shutdown(self) -> None:
         with self._lock_guard:
             backend, self._backend = self._backend, None
+            self._cold = None
             self._dispatch = None
             self._lifecycle = None
             self._execution = None
@@ -887,6 +947,7 @@ class TinyJobs:
                 with self._lock_guard:
                     self._closed = True
                     self._shutting = True
+                    self._cold = None
                 self._runner.close_here()
 
     async def __aenter__(self) -> "TinyJobs":

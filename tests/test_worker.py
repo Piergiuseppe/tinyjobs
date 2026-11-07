@@ -467,7 +467,7 @@ class UndecodableJobTests(WorkerTestCase):
 
         outside = sqlite3.connect(self.app.backend.database, isolation_level=None)
         outside.execute(
-            "UPDATE jobs SET payload = ? WHERE id = ?",
+            "UPDATE tinyjobs_jobs SET payload = ? WHERE id = ?",
             (b'{"args":[{"$t":"gone","$v":1}],"kwargs":{}}', job.id),
         )
         outside.close()

@@ -23,7 +23,12 @@ def _postgres_options(url: str, **options):
     PostgresBackend.check_options(url, **options)
 
 
-register_builtin("sqlite", SQLiteBackend.from_url, SQLiteBackend.check_options)
+register_builtin(
+    "sqlite",
+    SQLiteBackend.from_url,
+    SQLiteBackend.check_options,
+    joins_cold=SQLiteBackend.joins_cold,
+)
 register_builtin("memory", SQLiteBackend.from_url, SQLiteBackend.check_options)
 register_builtin("redis", _redis, loop_bound=True)
 register_builtin("rediss", _redis, loop_bound=True)

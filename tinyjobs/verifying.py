@@ -16,6 +16,7 @@ from threading import Event
 from typing import IO, Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from .backends.loader import in_memory
 from .duration import is_finite_seconds
 from .exceptions import ConfigurationError
 from .retention import RetentionPolicy
@@ -596,11 +597,6 @@ def masked(url: str) -> str:
         host = f"[{host}]"
     netloc = f"{parts.username or ''}:***@{host}" + (f":{parts.port}" if parts.port else "")
     return parts._replace(netloc=netloc).geturl()
-
-
-def in_memory(url: str) -> bool:
-    parts = urlsplit(url)
-    return parts.scheme in ("memory", "sqlite") and parts.path[1:] in ("", ":memory:")
 
 
 def _ready(ledger: str) -> set[str]:
