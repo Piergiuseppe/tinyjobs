@@ -104,7 +104,7 @@ class RegistrationTests(SchedulingTestCase):
         await self.app.scheduling.register()
         await self.app.backend._call(
             lambda: self.app.backend._connections.connection.execute(
-                "DELETE FROM schedules"
+                "DELETE FROM tinyjobs_schedules"
             )
         )
         await self.tick()

@@ -94,8 +94,9 @@ send_receipt.enqueue(42)
 python manage.py tinyjobs worker
 ```
 
-Queues, priorities, `run_after`, async tasks and the signals all work, and on Postgres an enqueue
-inside `transaction.atomic()` commits or rolls back with it.
+Queues, priorities, `run_after`, async tasks and the signals all work, and with `"database"` in
+`OPTIONS` naming the alias the queue lives on, Postgres or SQLite, an enqueue inside
+`transaction.atomic()` commits or rolls back with it.
 [Django](https://tinyjobs.readthedocs.io/en/latest/django/) has the rest.
 
 ## Using FastAPI?
@@ -127,7 +128,7 @@ finish before it exits. Leave out `worker=True` to run the workers elsewhere.
 | Queues, priorities, delays | `queue=`, integer priorities, `delay=60` or `run_at=<datetime>` |
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
 | Crash recovery | leases and heartbeats, so a killed worker's jobs come back |
-| Transactional enqueue | on Postgres, a job commits or rolls back with your own transaction |
+| Transactional enqueue | on SQLite and Postgres, a job sent with your connection as `tx` commits or rolls back with your own transaction |
 | Attempt history | every attempt is a row, with its traceback and timings |
 | Retention | old jobs are pruned, so the database plateaus instead of growing |
 | Watching | hooks, job fields on every log line, `--log-format json`, Prometheus metrics, `tinyjobs check` for probes |
@@ -144,8 +145,8 @@ that are safe to run twice.
 
 - A job that `enqueue` acknowledged runs until it succeeds or uses its attempts.
 - A job finishing while its worker dies may run again, never be lost.
-- Cron fires once per due time, a deduplication key refuses a second job, and on Postgres a job
-  enqueued in a transaction that rolls back never exists.
+- Cron fires once per due time, a deduplication key refuses a second job, and on SQLite and
+  Postgres a job enqueued in a transaction that rolls back never exists.
 
 They hold when the store keeps what it acknowledged, so `tinyjobs check` fails on a store configured
 against them, a Redis without `appendonly`, a SQLite file on NFS or a container's layer, a

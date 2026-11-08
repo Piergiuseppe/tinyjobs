@@ -530,13 +530,17 @@ class DrainTests(unittest.TestCase):
         self.assertIs(job.refresh().status, JobStatus.SUCCESS)
 
     def test_a_drain_given_up_by_its_caller_renews_the_lease_until_its_thread_ends(self):
+        import threading
         import time
         from unittest import mock
 
         from tinyjobs.worker import drain
 
+        started = threading.Event()
+
         @self.app.task
         def slow():
+            started.set()
             time.sleep(0.6)
 
         job = slow.enqueue()
@@ -548,10 +552,17 @@ class DrainTests(unittest.TestCase):
             return await real(job_ids, lease_seconds, worker_id=worker_id)
 
         async def given_up():
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(self.app.adrain(), 0.1)
+            draining = asyncio.ensure_future(self.app.adrain())
+            deadline = time.monotonic() + 5
+            while not started.is_set():
+                self.assertLess(time.monotonic(), deadline)
+                await asyncio.sleep(0.005)
+            draining.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await draining
             left = time.monotonic()
             while (await job.arefresh()).status is not JobStatus.SUCCESS:
+                self.assertLess(time.monotonic(), deadline)
                 await asyncio.sleep(0.02)
             ended = time.monotonic()
             await asyncio.sleep(0.2)

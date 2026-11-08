@@ -260,7 +260,7 @@ class EnqueueTests(BackendTestCase):
     def test_a_write_inside_your_own_transaction_is_refused_at_once(self):
         started = time.monotonic()
         with self.app.backend.transaction() as connection:
-            connection.execute("UPDATE meta SET value = value")
+            connection.execute("UPDATE tinyjobs_meta SET value = value")
             with self.assertRaisesRegex(RuntimeError, "after the transaction ends"):
                 self.handler.enqueue(1)
             with self.assertRaisesRegex(RuntimeError, "after the transaction ends"):
@@ -272,7 +272,7 @@ class EnqueueTests(BackendTestCase):
     def test_an_aenqueue_inside_your_own_transaction_is_refused_at_once(self):
         async def enqueue_inside():
             with self.app.backend.transaction() as connection:
-                connection.execute("UPDATE meta SET value = value")
+                connection.execute("UPDATE tinyjobs_meta SET value = value")
                 with self.assertRaisesRegex(RuntimeError, "after the transaction ends"):
                     await self.handler.aenqueue(1)
             return await self.handler.aenqueue(2)
@@ -307,7 +307,7 @@ class EnqueueTests(BackendTestCase):
                 patches.enter_context(mock.patch.object(connection_module, name, interrupting(name)))
             with self.assertRaises(Interrupted):
                 with self.app.backend.transaction() as connection:
-                    connection.execute("UPDATE meta SET value = value")
+                    connection.execute("UPDATE tinyjobs_meta SET value = value")
                     armed.append(True)
                     raise ValueError
         gc.collect()
@@ -320,7 +320,7 @@ class EnqueueTests(BackendTestCase):
     def test_a_task_started_inside_your_own_transaction_enqueues_once_it_commits(self):
         async def fire_and_forget():
             with self.app.backend.transaction() as connection:
-                connection.execute("UPDATE meta SET value = value")
+                connection.execute("UPDATE tinyjobs_meta SET value = value")
                 later = asyncio.create_task(self.handler.aenqueue(1))
                 await asyncio.sleep(0.1)
                 self.assertFalse(later.done())
@@ -339,7 +339,7 @@ class EnqueueTests(BackendTestCase):
 
             started = time.monotonic()
             with self.app.backend.transaction() as connection:
-                connection.execute("UPDATE meta SET value = value")
+                connection.execute("UPDATE tinyjobs_meta SET value = value")
                 with self.assertRaisesRegex(RuntimeError, "after the transaction ends"):
                     ping.enqueue()
             self.assertLess(time.monotonic() - started, 2)
@@ -427,9 +427,9 @@ class FailedConnectionTests(BackendTestCase):
     def test_an_option_sqlite_does_not_take_is_refused_before_connecting(self):
         for url in ("sqlite://", f"sqlite:///{self.database}", "memory://"):
             with self.subTest(url=url), self.assertRaises(ConfigurationError) as caught:
-                TinyJobs(url, prefix="billing")
-            self.assertIn("takes no option named prefix", str(caught.exception))
-            self.assertIn("busy_timeout only", str(caught.exception))
+                TinyJobs(url, pool_size=4)
+            self.assertIn("takes no option named pool_size", str(caught.exception))
+            self.assertIn("busy_timeout and prefix only", str(caught.exception))
         TinyJobs(f"sqlite:///{self.database}", busy_timeout=1).close()
 
     def test_a_backend_whose_setup_fails_is_closed(self):
@@ -762,7 +762,7 @@ class RefreshTests(BackendTestCase):
         self.drive(
             self.app.backend._call(
                 lambda: self.app.backend._connections.connection.execute(
-                    "DELETE FROM jobs WHERE id = ?", (job.id,)
+                    "DELETE FROM tinyjobs_jobs WHERE id = ?", (job.id,)
                 )
             )
         )
@@ -1832,7 +1832,7 @@ class InterruptSweepTests(BackendTestCase):
         def write() -> None:
             with inner.transaction() as connection:
                 connection.execute(
-                    "INSERT INTO meta (key, value) VALUES (?, 'v')", (f"k{next(keys)}",)
+                    "INSERT INTO tinyjobs_meta (key, value) VALUES (?, 'v')", (f"k{next(keys)}",)
                 )
 
         def check(point: int) -> None:
@@ -1878,7 +1878,7 @@ class ForkTests(BackendTestCase):
 
         def write_slowly():
             with self.app.backend.transaction() as connection:
-                connection.execute("UPDATE meta SET value = value")
+                connection.execute("UPDATE tinyjobs_meta SET value = value")
                 holding.set()
                 time.sleep(0.5)
 
@@ -1976,7 +1976,7 @@ class ForkTests(BackendTestCase):
         try:
             with inner.transaction() as connection:
                 connection.execute(
-                    "INSERT INTO meta (key, value) VALUES ('marker', 'parent')"
+                    "INSERT INTO tinyjobs_meta (key, value) VALUES ('marker', 'parent')"
                 )
                 waiting.start()
                 time.sleep(0.2)
@@ -1987,7 +1987,7 @@ class ForkTests(BackendTestCase):
                 else:
                     forked_in = time.monotonic() - started
                     connection.execute(
-                        "UPDATE meta SET value = 'committed' WHERE key = 'marker'"
+                        "UPDATE tinyjobs_meta SET value = 'committed' WHERE key = 'marker'"
                     )
         except RuntimeError as error:
             if child == 0:
@@ -2000,7 +2000,7 @@ class ForkTests(BackendTestCase):
         self.assertLess(forked_in, 1.0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0)
         marker = inner._connections.connection.execute(
-            "SELECT value FROM meta WHERE key = 'marker'"
+            "SELECT value FROM tinyjobs_meta WHERE key = 'marker'"
         ).fetchone()[0]
         self.assertEqual(marker, "committed")
         self.assertEqual(self.app.counts()["queued"], 1)
@@ -2032,7 +2032,7 @@ class ForkTests(BackendTestCase):
         try:
             with inner.transaction() as connection:
                 connection.execute(
-                    "INSERT INTO meta (key, value) VALUES ('marker', 'parent')"
+                    "INSERT INTO tinyjobs_meta (key, value) VALUES ('marker', 'parent')"
                 )
                 child = self.fork_quietly()
                 if child == 0:
@@ -2049,7 +2049,7 @@ class ForkTests(BackendTestCase):
         _, status = os.waitpid(child, 0)
         self.assertEqual(os.waitstatus_to_exitcode(status), 0)
         marker = inner._connections.connection.execute(
-            "SELECT value FROM meta WHERE key = 'marker'"
+            "SELECT value FROM tinyjobs_meta WHERE key = 'marker'"
         ).fetchone()[0]
         self.assertEqual(marker, "parent")
 

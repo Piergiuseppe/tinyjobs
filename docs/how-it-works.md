@@ -1,12 +1,13 @@
 # How it works
 
-`jobs.db` holds two tables. `jobs` is the queue, `executions` is the history of attempts.
+`jobs.db` holds two tables that matter. `tinyjobs_jobs` is the queue, `tinyjobs_executions` is the
+history of attempts.
 
 A worker claims work with a single statement, which is what makes it safe to run as many workers as you like:
 
 ```sql
-UPDATE jobs SET status = 'running', worker_id = ?, attempts = attempts + 1, lease_expires_at = ?
- WHERE id IN (SELECT id FROM jobs
+UPDATE tinyjobs_jobs SET status = 'running', worker_id = ?, attempts = attempts + 1, lease_expires_at = ?
+ WHERE id IN (SELECT id FROM tinyjobs_jobs
                WHERE status = 'queued' AND run_at <= ? AND queue IN (?)
                ORDER BY priority DESC, run_at ASC LIMIT ?)
 RETURNING *;
@@ -25,7 +26,7 @@ having run rather than risk running twice. On SQLite older than
 Because it's just SQLite, you can read the queue with anything:
 
 ```bash
-sqlite3 jobs.db "SELECT task, status, attempts, payload FROM jobs WHERE status = 'failed';"
+sqlite3 jobs.db "SELECT task, status, attempts, payload FROM tinyjobs_jobs WHERE status = 'failed';"
 ```
 
 ```

@@ -1,17 +1,12 @@
 from __future__ import annotations
 
+import time
 import unittest
 
 from tinyjobs import TinyJobs
 from tinyjobs.exceptions import ConfigurationError
 from tinyjobs.retention import KEEP_EVERYTHING, RetentionPolicy
 from tinyjobs.status import JobStatus
-
-OLDER_RELEASE_INDEX = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_attempt "
-    "ON executions (job_id, attempt)"
-)
-
 
 class PolicyTests(unittest.TestCase):
     def test_defaults_keep_failures_longest(self):
@@ -163,7 +158,7 @@ class MigrationTests(unittest.TestCase):
             row[0]
             for row in handle.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND name LIKE 'idx%'"
+                "AND (name LIKE 'idx%' OR name LIKE 'tinyjobs%')"
             )
         )
         handle.close()
@@ -207,19 +202,39 @@ class MigrationTests(unittest.TestCase):
 
         handle = sqlite3.connect(path)
         version = handle.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'"
+            "SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'"
         ).fetchone()[0]
         purge_marker = handle.execute(
-            "SELECT count(*) FROM meta WHERE key = 'last_purge_at'"
+            "SELECT count(*) FROM tinyjobs_meta WHERE key = 'last_purge_at'"
         ).fetchone()[0]
+        stub = handle.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in handle.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
         handle.close()
 
         self.assertEqual(int(version), SCHEMA_VERSION)
         self.assertEqual(purge_marker, 1)
+        self.assertEqual(int(stub), SCHEMA_VERSION)
+        self.assertEqual(
+            tables,
+            {
+                "meta",
+                "tinyjobs_install_lock",
+                "tinyjobs_meta",
+                "tinyjobs_jobs",
+                "tinyjobs_executions",
+                "tinyjobs_schedules",
+            },
+        )
         names = self.indexes(path)
         self.assertNotIn("idx_jobs_listing", names)
-        self.assertIn("idx_jobs_by_status", names)
-        self.assertIn("idx_jobs_purge", names)
+        self.assertNotIn("idx_jobs_claim", names)
+        self.assertIn("tinyjobs_jobs_by_status", names)
+        self.assertIn("tinyjobs_jobs_purge", names)
 
     def test_history_written_before_claims_keeps_its_order_and_its_rows(self):
         import asyncio
@@ -261,7 +276,7 @@ class MigrationTests(unittest.TestCase):
             [(attempt, status) for attempt, status, _ in running],
             [(2, ExecutionStatus.FAILED), (1, ExecutionStatus.RUNNING)],
         )
-        self.assertIn("idx_executions_claim", self.indexes(path))
+        self.assertIn("tinyjobs_executions_claim", self.indexes(path))
         self.assertNotIn("idx_executions_attempt", self.unique_indexes(path))
 
     def test_executions_that_started_together_keep_the_order_they_were_written(self):
@@ -297,40 +312,81 @@ class MigrationTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(read()), [3, 1, 2])
 
-    def test_an_older_release_cannot_put_the_index_back_under_a_running_app(self):
+    def test_a_migrated_file_still_refuses_an_older_release(self):
         import asyncio
         import sqlite3
         import tempfile
         from pathlib import Path
 
         from tinyjobs import TinyJobs
-        from tinyjobs.models import ExecutionError
+        path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.build_v2(path)
 
-        path = Path(tempfile.mkdtemp()) / "live.db"
-
-        async def scenario() -> list[int]:
+        async def upgrade() -> None:
             app = TinyJobs(f"sqlite:///{path}")
             await app.ready()
+            await app.aclose()
+
+        asyncio.run(upgrade())
+        handle = sqlite3.connect(path)
+        stub = handle.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        handle.close()
+        self.assertEqual(int(stub), 4)
+        self.assertGreater(int(stub), 3)
+
+    def test_a_legacy_file_is_only_migrated_into_the_default_prefix(self):
+        import asyncio
+        import tempfile
+        from pathlib import Path
+
+        from tinyjobs import TinyJobs
+        from tinyjobs.exceptions import ConfigurationError
+
+        path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.build_v2(path)
+
+        async def open_with(prefix: str) -> None:
+            app = TinyJobs(f"sqlite:///{path}", prefix=prefix)
             try:
-                job = await app.asend("t")
-                backend = app.backend
-                first = await backend.claim(
-                    worker_id="w", queues=["default"], limit=1, lease_seconds=60
-                )
-                await backend.fail(first[0], ExecutionError("E", "boom", "tb"), None)
-                handle = sqlite3.connect(path, isolation_level=None)
-                handle.execute(OLDER_RELEASE_INDEX)
-                handle.close()
-                self.assertTrue(await backend.requeue(job.id))
-                again = await backend.claim(
-                    worker_id="w", queues=["default"], limit=1, lease_seconds=60
-                )
-                return [claimed.claims for claimed in first + again]
+                await app.ready()
             finally:
                 await app.aclose()
 
-        self.assertEqual(asyncio.run(scenario()), [1, 2])
-        self.assertNotIn("idx_executions_attempt", self.unique_indexes(path))
+        with self.assertRaisesRegex(ConfigurationError, "before 0.14"):
+            asyncio.run(open_with("other"))
+        asyncio.run(open_with("tinyjobs"))
+        asyncio.run(open_with("other"))
+
+    def test_the_renamed_tables_keep_their_foreign_key(self):
+        import asyncio
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        from tinyjobs import TinyJobs
+
+        path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.build_v2(path)
+
+        async def upgrade_and_purge() -> int:
+            app = TinyJobs(f"sqlite:///{path}")
+            await app.ready()
+            try:
+                job = await app.aget("retried")
+                await app.backend.cancel(job.id)
+                await app.backend.purge(RetentionPolicy(cancelled=1), time.time() + 60)
+            finally:
+                await app.aclose()
+            handle = sqlite3.connect(path)
+            left = handle.execute(
+                "SELECT count(*) FROM tinyjobs_executions WHERE job_id = 'retried'"
+            ).fetchone()[0]
+            handle.close()
+            return left
+
+        self.assertEqual(asyncio.run(upgrade_and_purge()), 0)
 
     def test_reopening_a_current_database_leaves_its_schema_alone(self):
         import asyncio
@@ -358,45 +414,6 @@ class MigrationTests(unittest.TestCase):
         asyncio.run(open_it())
         self.assertEqual(schema_version(), before)
 
-    def test_an_older_release_cannot_put_the_index_back(self):
-        import asyncio
-        import sqlite3
-        import tempfile
-        from pathlib import Path
-
-        from tinyjobs import TinyJobs
-
-        path = Path(tempfile.mkdtemp()) / "v2.db"
-        self.build_v2(path)
-
-        async def open_it() -> None:
-            app = TinyJobs(f"sqlite:///{path}")
-            await app.ready()
-            await app.aclose()
-
-        asyncio.run(open_it())
-        handle = sqlite3.connect(path, isolation_level=None)
-        handle.execute(OLDER_RELEASE_INDEX)
-        handle.close()
-
-        async def claim_twice() -> list[int]:
-            app = TinyJobs(f"sqlite:///{path}")
-            await app.ready()
-            try:
-                claims = []
-                for _ in range(2):
-                    claimed = await app.backend.claim(
-                        worker_id="new", queues=["default"], limit=1, lease_seconds=60
-                    )
-                    claims.append(claimed[0].claims)
-                    await app.backend.release(claimed[0])
-                return claims
-            finally:
-                await app.aclose()
-
-        self.assertEqual(asyncio.run(claim_twice()), [3, 4])
-        self.assertNotIn("idx_executions_attempt", self.unique_indexes(path))
-
     def test_a_newer_database_is_refused_before_anything_is_written(self):
         import asyncio
         import sqlite3
@@ -408,9 +425,12 @@ class MigrationTests(unittest.TestCase):
 
         path = Path(tempfile.mkdtemp()) / "newer.db"
         handle = sqlite3.connect(path, isolation_level=None)
-        handle.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         handle.execute(
-            "INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION + 1),)
+            "CREATE TABLE tinyjobs_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        handle.execute(
+            "INSERT INTO tinyjobs_meta VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION + 1),),
         )
         handle.close()
 
@@ -426,7 +446,7 @@ class MigrationTests(unittest.TestCase):
         handle = sqlite3.connect(path)
         tables = [row[0] for row in handle.execute("SELECT name FROM sqlite_master")]
         handle.close()
-        self.assertEqual(tables, ["meta", "sqlite_autoindex_meta_1"])
+        self.assertEqual(tables, ["tinyjobs_meta", "sqlite_autoindex_tinyjobs_meta_1"])
 
     def test_upgrading_twice_is_harmless(self):
         import asyncio
@@ -445,4 +465,4 @@ class MigrationTests(unittest.TestCase):
 
         asyncio.run(open_it())
         asyncio.run(open_it())
-        self.assertIn("idx_jobs_purge", self.indexes(path))
+        self.assertIn("tinyjobs_jobs_purge", self.indexes(path))

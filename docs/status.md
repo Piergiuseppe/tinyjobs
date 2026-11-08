@@ -16,7 +16,7 @@ v0.13.0. Working and measured, but young. What's in:
 - `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
 - a Redis backend, `pip install 'tinyjobs[redis]'`
 - a Postgres backend, `pip install 'tinyjobs[postgres]'`, with `LISTEN`/`NOTIFY` wake-ups
-- transactional enqueue on Postgres, also through Django's `transaction.atomic()`
+- transactional enqueue on Postgres and SQLite, also through Django's `transaction.atomic()`
 - the backend plugin seam and its contract suite
 - `app.lifespan()` and `app.serve()` for FastAPI and Starlette, with an embedded worker
 - a `django.tasks` backend and `manage.py tinyjobs`
@@ -32,10 +32,14 @@ v0.13.0. Working and measured, but young. What's in:
 - `tinyjobs verify`, and the store audit in `tinyjobs check`, with `--store-warnings` for a
   development store
 - `synchronous_commit` kept at least `on` on every Postgres connection
+- prefixed tables on SQLite, so the queue lives in the application's own file
 
 What's not in yet:
 
-- transactional enqueue on SQLite
+- per-task concurrency and rate limits
+- jobs that run after another
+
+Upgrading to 0.14 renames the SQLite tables, a stop-the-world step; [SQLite](sqlite.md) has it.
 
 Upgrading from 0.6: stop every 0.6 worker before starting 0.7. The first 0.7 process migrates the
 store, and from then on a 0.6 process refuses to start against it. 0.7 also needs Python 3.12 or

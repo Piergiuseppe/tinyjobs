@@ -132,7 +132,11 @@ class CapabilityTests(unittest.TestCase):
         def limited(url: str, **options):
             backend = SQLiteBackend(str(path), **options)
             backend.capabilities = replace(
-                SQLiteBackend.capabilities, dedup=False, priority=False, delayed=False
+                SQLiteBackend.capabilities,
+                dedup=False,
+                priority=False,
+                delayed=False,
+                transactional_enqueue=False,
             )
             return backend
 

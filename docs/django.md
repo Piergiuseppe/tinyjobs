@@ -45,7 +45,16 @@ the worker import code your project does not already trust, and enqueueing a tas
 raises `InvalidTask`. Django has no retries, so a failed task
 stays failed.
 
-On Postgres, `"database": "default"` in `OPTIONS` makes every enqueue join that database's
-transaction, so a task enqueued inside `transaction.atomic()` exists only if the block commits. On
-SQLite and Redis, enqueue from `transaction.on_commit`, or the worker may run before the row it needs
-is committed.
+`"database": "default"` in `OPTIONS` makes every enqueue join that database's transaction, so a
+task enqueued inside `transaction.atomic()` exists only if the block commits. It works on a
+Postgres alias and on a SQLite alias whose `NAME` is the file in `url`. On SQLite the enqueue
+writes before it reads, so it can open the block, but a block that reads before it enqueues meets
+"database is locked" when a worker committed in between: give the alias
+`"transaction_mode": "IMMEDIATE"` in its own `OPTIONS`, and keep the block short, since it holds
+the file's write lock until it commits. Django's test runner turns a SQLite alias into an
+in-memory database, which no worker could share, so an enqueue that joins it is refused there:
+give the test settings `"eager": True`, which runs each task inline and keeps test jobs out of
+your queue. An alias with a `TEST` `NAME` gets a file instead, but a `TestCase` holds that file's
+write lock inside its transaction, so the app's own calls wait on it; `"eager": True` is the
+setting for tests. On Redis, enqueue from
+`transaction.on_commit`, or the worker may run before the row it needs is committed.
