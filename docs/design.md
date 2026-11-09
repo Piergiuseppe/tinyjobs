@@ -17,6 +17,7 @@ Contents:
 - [The Postgres backend](#the-postgres-backend)
 - [The scheduler](#the-scheduler)
 - [Execution model](#execution-model)
+- [Limits](#limits)
 - [Retries](#retries)
 - [Results](#results)
 - [The dashboard](#the-dashboard)
@@ -391,7 +392,7 @@ CREATE INDEX IF NOT EXISTS tinyjobs_jobs_purge
 
 CREATE UNIQUE INDEX IF NOT EXISTS tinyjobs_jobs_dedup
     ON tinyjobs_jobs (dedup_key)
-    WHERE dedup_key IS NOT NULL AND status IN ('queued', 'running');
+    WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'running');
 
 CREATE TABLE IF NOT EXISTS tinyjobs_executions (
     id          INTEGER PRIMARY KEY,
@@ -417,7 +418,24 @@ CREATE TABLE IF NOT EXISTS tinyjobs_schedules (
     last_run_at REAL,
     last_job_id TEXT
 );
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_held
+    ON tinyjobs_jobs (task, queue, priority DESC, run_at ASC)
+    WHERE status = 'held';
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_running_by_task
+    ON tinyjobs_jobs (task)
+    WHERE status = 'running';
+
+CREATE TABLE IF NOT EXISTS tinyjobs_limits (
+    task    TEXT PRIMARY KEY,
+    last_at REAL NOT NULL DEFAULT 0
+);
 ```
+
+The last three serve [Limits](#limits): the held index is the per-task line a claim admits from,
+the running index answers how many of a task run right now, and `tinyjobs_limits` remembers when a
+rate-limited task last started.
 
 Notes on a few choices:
 
@@ -477,8 +495,13 @@ Notes on a few choices:
                                  │ FAILED │  terminal
                                  └────────┘
 
-  From QUEUED or RUNNING, an explicit request moves the job to CANCELLED (terminal).
+  From QUEUED, HELD or RUNNING, an explicit request moves the job to CANCELLED (terminal).
 ```
+
+One more state sits beside `QUEUED`: `HELD`. A claim that finds a due job of a task at its limit,
+as [Limits](#limits) explains, moves the job to `HELD` instead of taking it, and a later claim with
+room for that task moves it to `RUNNING`. A held job is still waiting, counts as such, and can be
+cancelled; it only stays out of the claim's way, so the claim never scans past jobs it cannot take.
 
 Terminal states: `SUCCESS`, `FAILED`, `CANCELLED`. Everything else is in flight.
 
@@ -652,7 +675,8 @@ class Backend(Protocol):
 
     # --- consumer side ---------------------------------------------------
     async def claim(self, *, worker_id: str, queues: Sequence[str],
-                    limit: int, lease_seconds: float) -> list[Job]: ...
+                    limit: int, lease_seconds: float,
+                    limits: Mapping[str, Limit] | None = None) -> list[Job]: ...
     async def claim_job(self, job_id: str, *, worker_id: str,
                         lease_seconds: float) -> Job | None: ...
     async def heartbeat(
@@ -663,6 +687,8 @@ class Backend(Protocol):
                    execution_status: ExecutionStatus = ExecutionStatus.FAILED) -> bool: ...
     async def release(self, job: Job, delay: float = 0.0) -> bool: ...
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
+    async def release_held(self, tasks: Collection[str],
+                           queues: Sequence[str] | None = None) -> int: ...
 
     # --- control ---------------------------------------------------------
     async def cancel(self, job_id: str) -> bool: ...
@@ -768,9 +794,14 @@ class Capabilities(NamedTuple):
     schedules: bool
     max_payload_bytes: int | None
     loop_bound: bool
+    result_ttl: bool
+    limits: bool
 ```
 
 Requesting an unsupported feature raises at *enqueue* time with a clear message, not silently later.
+`limits` says the store enforces a task's `concurrency=` and `rate=` at the claim, which then takes
+`limits=`, a mapping of task name to `Limit`; a worker or a drain whose app registers a limited task
+refuses a store without it at start, since enqueue is not where the limit would be lost.
 `loop_bound` is not a feature but a constraint: a backend whose connections belong to the event loop
 that opened them, as an asyncio Redis or Postgres client's do, sets it, and the app opens it on the
 facade's loop and routes every call there (see [Async core, sync facade](#async-core-sync-facade)).
@@ -850,8 +881,8 @@ in 11 of 60 tries, so the switch is retried until `busy_timeout` runs out.
 
 ### Tables and the prefix
 
-The four tables are `tinyjobs_jobs`, `tinyjobs_executions`, `tinyjobs_schedules` and
-`tinyjobs_meta`, with the empty `tinyjobs_install_lock` beside them, the indexes
+The five tables are `tinyjobs_jobs`, `tinyjobs_executions`, `tinyjobs_schedules`,
+`tinyjobs_meta` and `tinyjobs_limits`, with the empty `tinyjobs_install_lock` beside them, the indexes
 `tinyjobs_jobs_claim` and so on, and `prefix=` renames them all, as on
 Postgres and Redis, so several apps share one file and a file shared with an application's own
 tables, which a transactional enqueue needs, collides with nothing: `jobs` and `meta` are names an
@@ -1143,13 +1174,14 @@ when a `postgres://` or `postgresql://` URL is used. It runs on psycopg 3's asyn
 
 ### Tables
 
-Four tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
-`<prefix>_executions`, `<prefix>_schedules` and `<prefix>_meta`, with the same columns as SQLite.
+Five tables, named after the prefix and optionally inside a `schema=`: `<prefix>_jobs`,
+`<prefix>_executions`, `<prefix>_schedules`, `<prefix>_meta` and `<prefix>_limits`, with the same
+columns as SQLite except that `<prefix>_limits` also carries the `running` count of each task.
 Before `setup` reads any of them it finds them in the catalog, along the schemas the connection's
 `search_path` named when the pool opened, passing over a table of a tinyjobs name that a role it
 does not trust owns, or sits in a schema such a role owns, when a trusted one of that name comes later
 on the path, with a warning naming the schema, so a role allowed to create schemas cannot stop new
-processes by planting one earlier. It checks that all four sit in one schema and that the
+processes by planting one earlier. It checks that all five sit in one schema and that the
 tables and the schema belong to the connecting role or to a role that can become it (`SET` on
 Postgres 16 and later, membership before), and that no role inherits the privileges of without
 being able to become it too; a schema owned by `pg_database_owner` counts as the database owner's. Postgres runs a trigger, a policy or a view's function with the privileges of the
@@ -1619,7 +1651,7 @@ disagree by less than it between machines are never mistaken for a jump.
 
 ### Overlap
 
-By default a schedule will not create a new job while its previous one is still queued or running,
+By default a schedule will not create a new job while its previous one is still queued, held or running,
 implemented with the dedup key, so it needs no extra machinery. `overlap=True` opts out. A run that is
 waiting out its retry backoff is still queued, so it holds the key too: a failing hourly job does not
 pile up a second one behind it. `run_all` requires `overlap=True`, since its catch-up jobs would
@@ -1650,7 +1682,7 @@ not register the task, so it works from any process; firing by hand needs the ta
 job it creates is the task's.
 
 Running by hand is an ordinary enqueue carrying the schedule's dedup key, so with `overlap=False`
-a run that is already queued or running comes back instead of a second one, and the schedule's own
+a run that is already queued, held or running comes back instead of a second one, and the schedule's own
 next time is untouched: a job fired by hand at 10:40 does not move the 11:00 firing.
 
 ### Cron syntax
@@ -2138,6 +2170,189 @@ Where the limits are:
 
 ---
 
+## Limits
+
+```python
+@app.task(concurrency=2)
+async def rebuild_index(tenant_id: int): ...
+
+@app.task(rate="10/m")
+async def call_partner_api(order_id: int): ...
+```
+
+`concurrency=2` means at most two jobs of this task run at once, counted across every worker on
+the store. `rate="10/m"` means two starts of this task are at least six seconds apart, so no window
+of a minute holds more than ten. Both can be set on one task, and both are kept in the store, not
+in a worker: a worker's own `concurrency` says how many jobs one process runs, a task's says how
+many of that task the whole deployment runs. The limit is about the task, so `app.send(name)` from
+a process without the task's code is limited like any other job, and two tasks never share a limit.
+
+**Why a rate is spacing and not a bucket.** A token bucket lets an idle task start N jobs at once and
+then one per interval, which puts 2N - 1 starts in the first window; the quota it protects usually
+does not. Even spacing is the one reading of "ten a minute" that holds in every window, it needs one
+number per task, the time of the last start, and a backlog drains at the rate asked for. The
+cost is that a task idle for an hour does not catch up with a burst, which for a quota is the point.
+A burst allowance is a later option if usage asks for it, not a different design.
+
+**Enforced at the claim, through the store.** The only place that knows what runs everywhere is the
+store, so the worker passes the limits of the tasks it registers with every claim, and the claim
+decides. An app without limited tasks pays little: SQLite's claim is the single statement it was,
+Redis' script walks the ready sets as before, and Postgres' claim gains one step that raises the
+running count of any claimed task that has a `tinyjobs_limits` row, which with no limits ever
+declared is a join against an empty table; every exit from running on Postgres lowers that count
+the same way. A task that once had a limit keeps its row there, so its claims and exits keep
+locking that one row after the limit is gone, which on a no-op claim-and-complete loop measured
+about half the throughput of a task without a row; an operator who wants it back deletes the row
+once no process declares the limit, and a process that still does creates it again from the
+running jobs. With limits, a candidate job of a limited task is admitted when the task's running count,
+as the store keeps it, is under its `concurrency`, and, for a rate, when its last start is at least
+an interval ago and no other job of the task is admitted in the same claim. A rate admits one job of
+a task per claim, which is what spacing means.
+
+**A job the limit stops is held, not skipped.** Skipping would make every claim read past every due
+job of a saturated task, and a flood of one rate-limited task would put thousands of index entries
+in front of everything else. So the claim moves such a job to `HELD`, a status of its own outside
+the partial index the claim reads, and the index stays clean: each held job costs one write when it
+is held and one when it is admitted, however many claims pass in between. Held jobs form a line per
+task, ordered like the queue, by priority then `run_at`, and a claim with room for a task merges
+the line with the due jobs it reads in that same order, so the limit never changes the order the
+queue promised: a held job goes before a fresh one that is due later, and after a fresh one of a
+higher priority, which is then the one admitted while the held one keeps its place. The line
+respects the worker's queues: a held job in a queue the worker does not serve is left for one that
+does. Holding is only ever applied to jobs the claim reached, so a held job can be seen in
+`tinyjobs jobs`, in the dashboard and in `counts_by_status`, and cancelling it works as for a queued
+one. A hand-back or release returns a job to `QUEUED`, and the next claim decides again.
+
+**Who wakes a held job.** Nobody has to: the next claim with room does, and the worker knows when
+that is. A job of a concurrency-limited task finishing in a worker raises that worker's `room`
+flag, which ends its idle wait, so it claims again at once rather than after a poll; a worker whose
+own claim started a rate-limited job notes when that task's interval ends and bounds its idle wait
+to that moment, so the next start of a backlog comes an interval after the last and not an interval
+plus a poll. Both are hints a worker gives itself; room another worker opened is found by polling,
+so a worker that registers a rate-limited task also bounds its idle poll at the smallest interval
+among its tasks, never below 50 ms, where it would otherwise back off to half a second, and a worker
+on a store that wakes it, as Postgres does through `LISTEN`, bounds its wait the same way. A held job of a task
+whose limit was raised in a new deployment is admitted by the first claim that sees the room, since
+the claim admits as many from the line as the task has room for. A limit removed is the one case
+no claim covers, since a claim only reads the lines of the tasks it has limits for; so a worker or a
+drain, as it starts, returns to the queue the held jobs of the tasks it registers without a limit,
+through `release_held(tasks=..., queues=...)`, within the queues it serves, and they are claimed as
+the unlimited jobs they now are; the worker repeats the release on every reaper pass, since a worker
+on an older build that still has the limit holds them again on its next claim, and a release only at
+start would leave whatever it holds after that start held for good. A task not registered here is
+not touched, since its limit is someone else's to know, and a queue not served here is not touched
+either, so a service that registers a task only to send it, on queues of its own, leaves the
+service that runs it alone. While old and new builds overlap the two sides take turns, which is
+bounded churn and ends with the deployment. The release is best effort: any store error there is
+logged and the worker goes on, since the next pass tries again.
+
+**Held jobs are waiting jobs.** Every signal that counts due jobs counts held ones with them: the
+per-task waiting counts and the oldest due job of each queue behind `tinyjobs stats`, the
+dashboard's overview, the `tinyjobs_store_queued_jobs` and `tinyjobs_store_oldest_due_seconds`
+metrics and `tinyjobs check --max-wait`. A held job is due by definition, since the claim reached
+it, and a backlog stuck behind a saturated task is exactly what `--max-wait` exists to report.
+
+**The running count.** SQLite is a single writer, so the claim counts the task's running rows under
+the write lock, through a partial index on `(task) WHERE status = 'running'`, and nothing can drift.
+Redis keeps `running_tasks` beside `queued_tasks`, adjusted by the one pair of functions every
+transition goes through, so it is exact by construction. Postgres runs claims concurrently and reads
+under `READ COMMITTED`, where a count in a statement cannot see a claim that committed after the
+statement's snapshot, so there the count is a column on the task's row in `tinyjobs_limits`, locked
+`FOR UPDATE` by any claim that has a candidate of the task and read again after the lock, raised
+by the claim and lowered by every transition out of `RUNNING`, including the reaper and the sweep
+of lost claims. The reaper also writes the counts back from the running rows once per interval for
+the whole store, so a deployment that mixed a build without a task's limit with one that has it
+corrects itself within half a minute.
+The row is locked only when the task has a candidate, so claims of unlimited work never wait on
+it. A `pg_try_advisory_xact_lock` guards the claim as before; when it is not taken nothing is
+admitted, the counts are not raised, and holding still happens, which is correct either way.
+
+**The claim with limits, per store.**
+
+- *SQLite* runs the claim as a loop in one write transaction: it reads the task's running counts
+  and last starts once, then in each slice a batch of due jobs and, for each limited task with room,
+  the head of its held line, merges them in queue order, admits or holds each, and reads the next
+  slice after a slice held something, up to eight slices, so a saturated task's jobs leave the
+  index without starving the work behind them. The rows are taken with the `UPDATE ... WHERE id = ?
+  AND status = ?` of the pre-3.35 path, since a decision is made per row.
+- *Postgres* keeps one statement. The level walk picks due jobs as before; the tasks among them that
+  have a `tinyjobs_limits` row, and the limited tasks with a held job in the wanted queues, have their rows locked;
+  the held lines are read `FOR UPDATE SKIP LOCKED` up to each task's room; a window numbers the
+  candidates per task in queue order; the ones within the room are claimed, the others of limited
+  tasks are held, and the task rows are raised, all in data-modifying CTEs of the same statement.
+  The read of due jobs is bounded by the batch, so when it comes back full, a held job that sorts
+  after its last row waits for a later claim, and the line never jumps ahead of fresh work the queue
+  put before it. When a run holds jobs and still falls short of the batch, the backend runs the
+  claim again, up to eight times, each run a complete claim of its own with its own token, all
+  within the half lease one claim is given, so the jobs of the first run come back with lease time
+  left; the jobs it held have left the claim index, so each run reads the next due jobs. A claim without limits
+  still raises the running count of any task that has a row, so a worker that does not register a
+  task's limit, or hands such a job back as unknown, cannot drive the count below the jobs actually
+  running. The rate is checked and stamped against the same server-bounded time as the rest of the
+  claim, so two machines whose clocks disagree cannot start one task twice within an interval.
+  The claim locks, in task order, the limits row of every task among the jobs it read, whether or
+  not this worker limits it, and raises the count of each task it starts that has a row, so a worker
+  that limits other tasks still counts the running jobs of this one. Over several queues, the claim
+  reads each queue's jobs at a priority level before the next queue's, so a full read can leave
+  earlier due jobs of another queue unread; the claim finds the first unread due job of each wanted
+  queue at the last level it read, and a held job that sorts after the earliest of them waits for a
+  later claim. Held jobs form a line per task and queue, read through a partial index on
+  `(task, left(queue, 500), priority DESC, run_at ASC)` over held jobs, so a claim on one queue
+  never reads past the held jobs of another, and long queue names share the 500-character key the
+  claim index uses. A claim reads a further slice only when the previous one held jobs and its
+  read of due jobs came back full, since a short read means nothing else was due. A task's row in
+  the limits table is created the first time a process claims with the task's limit, starting from
+  the jobs of the task running at that moment; once the creation has committed, the process counts
+  again, locking the task's running jobs for share before the row, in the same order as every
+  transition out of running, which locks the job and then the row, so a completion under way
+  settles first instead of deadlocking with the count. Two narrow cases remain until the next reaper pass writes the count
+  back: a claim of the task that took its snapshot before the row existed and commits after the
+  recount began leaves the row one low, and a transition out of running that took its snapshot
+  before the row existed and reaches its job only after the recount locked the running jobs leaves
+  the row one high, which under `concurrency=1` stops the task until that pass. Once created, a row
+  is never deleted: a worker that registers the task without a limit returns the task's held jobs in
+  its own queues to the queue, in batches of 5,000 each its own statement so a large backlog never
+  runs into the statement timeout, and leaves the row with its running count and last start, so a
+  stub of the task in another service cannot reset the spacing of a rate; a process that finds a row
+  missing, as after an operator empties the table, creates it again from the running jobs and reads
+  the next slice. A rate stamp is not rolled back when its claim is swept as lost, so a lost claim
+  costs one interval. The reaper writes the running counts back from the jobs once per interval for
+  the whole store, not once per worker: each pass first tries to move a `last_recount_at` time in
+  the meta table by at least thirty seconds, forward or, after a clock step left the stored time
+  ahead, back, and only the pass that moves it locks the
+  limits rows and sets each from one grouped count of the running jobs, read through a partial
+  index on `(task)` over running jobs; the passes of the other workers skip it. The upgrade from
+  the first schema version runs without the statement timeout, so building its indexes on a large
+  table is not cancelled halfway.
+  Schema version 2 is reached in the setup transaction of the first 0.15 process: the DDL creates
+  the limits table and the held index, then the dedup index is recreated with `held` in its
+  predicate and the status `CHECK` constraint is swapped for one that allows `held`, named
+  `<prefix>_jobs_status_check` whatever the old one was called, validated on the spot, since every
+  row satisfied the stricter one. The pass holds the setup lock and blocks writes to the jobs table
+  while it scans it, which is the stop-the-world step the upgrade notes name.
+- *Redis* keeps one script. It reads `running_tasks` and `limit:<task>`, and a task's held jobs sit
+  in one sorted set per queue, `held:<length>:<task>:<queue>`, the task's byte length first so that
+  no two task and queue names share a key, with the ready set's order. The claim reads the head of
+  the line of each queue it serves, drops any entry whose job is gone or no longer held, and reads
+  on. `held_queues:<task>` names the queues with a line, which `release_held` reads when it is given
+  no queues. Each slice merges the fresh rows with those heads, and when a queue's read comes back
+  full, nothing that sorts after its last row is decided in that slice. The claim holds what it
+  cannot admit and reads a further slice only when a slice held something and a read came back
+  full, up to four slices. Held jobs count in `queued_tasks`, and `held_due:<queue>` gives their
+  oldest `run_at` to the stats. One reap pass a minute across the workers, gated by a store-wide
+  `running_recounted_at` time checked in the same script, and the move to schema 3 rebuild
+  `running_tasks` from the running index, so a count left wrong by a 0.14 process is corrected
+  within a minute while every other pass costs one read.
+
+**What the limits do not do.** Eager mode runs the task inline at the call and ignores limits, since
+there is no claim. `app.drain()` claims and so honours them, which means a drain returns with jobs
+held for a rate until the clock moves. A limit on a task the worker does not register is unknown to
+that worker, which claims the job as unlimited and hands it back as unknown, as before. A backend
+plugin that does not declare `limits` in its capabilities refuses to start a worker or a drain whose
+app registers a limited task, rather than run it unlimited.
+
+---
+
 ## Retries
 
 ```python
@@ -2266,7 +2481,7 @@ after, so the same handlers answer `/api/...` with JSON: that is what the tests 
 what a script that wants the numbers reads, with `curl`.
 
 The pages are what the runbook needs. The overview is `stats` and `check` on one screen: counts by
-queue and status, the oldest due job, leases past their time, queued jobs by task and every
+queue and status, the oldest due job, leases past their time, waiting jobs by task and every
 finding of the health check. The job list is the store's own `list`: newest first, by status and
 queue, fifty a page, with the cursor the backend returns, so it costs the same on a million rows
 as on ten, except status and queue together, which walk the status index and filter by queue; a filter by task would need an index no backend has, so a task is searched from the
@@ -2549,6 +2764,10 @@ def transcode(video_id: int) -> None:
 
 @app.task(cron="*/5 * * * *", timezone="Europe/Rome")
 async def refresh_cache() -> None:
+    ...
+
+@app.task(concurrency=2, rate="10/m")
+async def call_partner_api(order_id: int) -> None:
     ...
 ```
 
@@ -3035,8 +3254,13 @@ Transactional enqueue on SQLite: prefixed tables, so the queue lives in the appl
 `tx=` taking a `sqlite3` connection, a cold join that installs the schema through the caller's
 connection, and Django's `"database"` option on SQLite aliases.
 
+**v0.15, limits**
+`concurrency=` and `rate=` on a task, kept in the store and enforced at the claim across every
+worker: a job the limit stops is held out of the claim's way and admitted, in the order the queue
+promised, when the task has room again.
+
 **Next**
-Per-task concurrency and rate limits; jobs that run after another.
+Jobs that run after another.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the

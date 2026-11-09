@@ -33,11 +33,14 @@ v0.14.0. Working and measured, but young. What's in:
   development store
 - `synchronous_commit` kept at least `on` on every Postgres connection
 - prefixed tables on SQLite, so the queue lives in the application's own file
+- per-task limits: `concurrency=` and `rate=`, enforced by the store across every worker, with a
+  `held` status for the jobs a limit stops
 
 What's not in yet:
 
-- per-task concurrency and rate limits
 - jobs that run after another
+
+Upgrading to 0.15 adds a status and a limits table (keys, on Redis) to every store, a stop-the-world step; [Limits](limits.md) has it.
 
 Upgrading to 0.14 renames the SQLite tables, a stop-the-world step; [SQLite](sqlite.md) has it.
 

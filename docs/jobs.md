@@ -9,7 +9,7 @@ job = generate_pdf.enqueue(123)
 print(job.id)          # 01a061bf-c08a-738d-...
 
 job.refresh()          # updates this instance in place, and returns it
-job.status             # queued -> running -> success
+job.status             # queued -> running -> success, or held while a limit stops it
 job.attempts           # 3, if it took three tries
 job.last_error         # 'ConnectionError: refused', when it failed
 

@@ -12,7 +12,12 @@ the same pitch on SQLite.
 scheduler is still marked beta, and its retries take a fixed interval or a list of delays, with no
 built-in exponential backoff. arq is asyncio-only and in maintenance mode, with security fixes only.
 [Celery](https://docs.celeryq.dev) and [Dramatiq](https://dramatiq.io) need a broker; Celery is
-still the answer for RabbitMQ routing, workflows and large fleets.
+still the answer for RabbitMQ routing, workflows and large fleets. Celery's `rate_limit` is per
+worker instance, so two workers double it, and a cap on how many of a task run at once needs a
+dedicated queue or a lock of your own; Dramatiq's rate limiters span workers, through a Redis or
+Memcached backend of their own, and are taken inside the task, which still claims the message.
+tinyjobs keeps `concurrency=` and `rate=` in the store it already has and applies them at the claim,
+so a job the limit stops waits in the queue instead of occupying a worker.
 
 On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the closest: async, with cron,
 retries, `LISTEN`/`NOTIFY` and jobs deferred inside your own transaction, but Postgres only. tinyjobs
