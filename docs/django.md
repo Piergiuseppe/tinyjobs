@@ -42,8 +42,83 @@ until the job is first picked up.
 
 Tasks are found by their import path, and only inside your `INSTALLED_APPS`: a job can never make
 the worker import code your project does not already trust, and enqueueing a task defined elsewhere
-raises `InvalidTask`. Django has no retries, so a failed task
-stays failed.
+raises `InvalidTask`.
+
+## Timeouts, retries, limits and isolation
+
+`django.tasks` knows a priority and a queue. The rest of what tinyjobs does for a task goes on the
+same decorator, since Django, from 6.1, hands the keywords it does not know to the backend:
+
+```python
+from django.tasks import task  # on Django 6.0: from tinyjobs.contrib.django import task
+
+
+@task(timeout=30, max_attempts=3)
+def send_receipt(order_id: int) -> None: ...
+
+
+@task(rate="10/m", concurrency=2)
+def call_partner_api(order_id: int) -> None: ...
+
+
+@task(isolated=True, timeout=120)
+def render(document_id: int) -> None: ...
+```
+
+| option | what it does |
+| --- | --- |
+| `timeout` | seconds one attempt may take |
+| `max_attempts`, `retry_on`, `retry_backoff`, `retry_base`, `retry_max`, `retry_jitter` | [retries](jobs.md), off unless `max_attempts` is above 1 |
+| `concurrency`, `rate` | [limits](limits.md) counted across every worker |
+| `isolated` | a [job process](isolated-tasks.md) of its own, killed at the timeout |
+| `result_ttl` | seconds the result is kept after the job finishes |
+
+They mean what they mean on `@app.task`, and a value that cannot be, such as a malformed rate, is
+an `InvalidTask` where the task is declared. `retry_on` also takes dotted paths, which the
+settings need; they are imported when the task is first looked up.
+
+The same options can live in the settings, by import path, where they win over the decorator
+option by option:
+
+```python
+TASKS = {
+    "default": {
+        "BACKEND": "tinyjobs.contrib.django.TinyJobsBackend",
+        "OPTIONS": {
+            "url": "sqlite:///jobs.db",
+            "tasks": {
+                "newsletter.tasks.send_issue": {"rate": "30/m"},
+                "shop.tasks.send_receipt": {"max_attempts": 5, "retry_on": ["smtplib.SMTPException"]},
+            },
+        },
+    }
+}
+```
+
+That is the way to limit a task of an app you did not write, and the way to keep your own
+decorators plain when some environment runs another backend, such as Django's
+`ImmediateBackend`, which would refuse a keyword it does not know. A path that names no task of
+your `INSTALLED_APPS` stops `manage.py tinyjobs` with the path in the message.
+
+- **Retries.** A failed attempt that will run again reads as `READY`, with the attempt's error in
+  `errors`, and `task_finished` fires once, after the attempt that ends the task, a timeout
+  included.
+  `task_started` fires for every attempt and `context.attempt` counts them. `raise Retry(in_=60)`
+  and `raise Abandon("...")` from `tinyjobs` work inside a Django task.
+- **Limits.** A job a limit stops is `held` in `manage.py tinyjobs stats` and `READY` to Django.
+  Keep a limited task in its app's `tasks.py`, which `manage.py tinyjobs` imports before the
+  worker starts. A limited task defined elsewhere is unknown until its first job arrives; the
+  worker sends that job back to the queue once, to be claimed again under the limit.
+- **Isolated tasks** run inside the job process, with `django.setup()` done there first:
+  the task, its database connections and its `task_started` signal. The job process opens a
+  connection of its own to the queue to read the job's earlier attempts. `manage.py` must keep
+  its `if __name__ == "__main__":` guard, as the one Django generates does, since a job process
+  imports it.
+- **`task_finished`** fires in the worker, after the queue recorded how the task ended, with
+  the result `get_result()` would return, so it also reports a timeout and a job process that
+  died. Receivers run in a thread started for each finishing task, and one that raises is logged and
+  does not change the task. A job cancelled while it runs, and one failed because its worker
+  died, end without the signal.
 
 `"database": "default"` in `OPTIONS` makes every enqueue join that database's transaction, so a
 task enqueued inside `transaction.atomic()` exists only if the block commits. It works on a

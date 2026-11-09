@@ -35,10 +35,21 @@ v0.15.0. Working and measured, but young. What's in:
 - prefixed tables on SQLite, so the queue lives in the application's own file
 - per-task limits: `concurrency=` and `rate=`, enforced by the store across every worker, with a
   `held` status for the jobs a limit stops
+- the task options on `django.tasks`: timeout, retries, limits and `isolated` on Django's own
+  `@task`, or by import path in the settings
 
 What's not in yet:
 
 - jobs that run after another
+
+Upgrading to 0.16 needs no stop. On Django, `task_finished` now fires after the queue recorded
+the outcome, from a thread of the worker, with a result read back from the queue rather than the
+object the task's context holds; a receiver that raises no longer fails the task; a timeout now
+fires it, and a job cancelled while it runs no longer does. `@app.task` now refuses options it used to accept in silence:
+a `max_attempts` below 1, a `timeout`, `retry_base` or `retry_max` that is not a finite number of
+seconds (`timeout` above zero), a `retry_backoff` other than `"exponential"`, `"fixed"` or a
+function, a `retry_jitter` that is not a bool, and a `retry_on` holding anything but exception
+classes.
 
 Upgrading to 0.15 adds a status and a limits table (keys, on Redis) to every store, a stop-the-world step; [Limits](limits.md) has it.
 

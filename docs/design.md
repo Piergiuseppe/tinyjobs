@@ -3007,12 +3007,91 @@ The mapping to `TaskResult` follows what tinyjobs already stores. Executions giv
 because the execution keeps only the class name. Cancelled reads as `FAILED`, since Django has no
 such status, and so does a task whose worker died. Neither raised anything, so each gets a
 `JobCancelled` or `WorkerLost` error from `tinyjobs.contrib.django.exceptions`, and `errors[-1]`
-always exists on a failed result. Django tasks are not retried, so every job gets one attempt.
+always exists on a failed result. A Django task gets one attempt unless it asks for more, below.
 
 `takes_context` needs the running job inside the task. The execution service puts it in a context
 variable, and the thread executor copies the context into the thread that runs a `def` task.
 Signals fire as Django's own backend fires them; in eager mode `task_enqueued` arrives last, because
 the task has already run by the time `enqueue()` returns.
+
+**Task options.** `django.tasks` knows a priority and a queue, and nothing of a timeout, retries,
+a job process or a limit. Django leaves the door open for exactly this: `@task` hands every keyword
+it does not know to the backend's `task_class`, from 6.1 on, so the backend's own class,
+`tinyjobs.contrib.django.Task`, is Django's task with the tinyjobs options as fields: `timeout`,
+`max_attempts` and the `retry_*` family, `isolated`, `concurrency`, `rate` and `result_ttl`, with
+the names, defaults and meanings of `@app.task`. They are declared where the task is,
+`@task(concurrency=2, rate="10/m")`, validated by `validate_task` with the rest, so a malformed
+rate is an `InvalidTask` at import, and carried through `using()` like any field. Django 6.0's
+`@task` takes no other keyword, so `tinyjobs.contrib.django.task` is the same decorator with the
+keywords passed on, for 6.0 and for whoever prefers the import to say where the options come
+from. Two things the
+decorator cannot reach get a second way in, `"tasks"` in the backend's `OPTIONS`, a mapping from
+import path to options that wins over the decorator field by field: a task of a third-party app,
+and a project that keeps another backend, such as Django's immediate one, for some environment,
+where an unknown keyword on `@task` would be a `TypeError`. A path there that names no task of the
+installed apps is a `ConfigurationError` when `manage.py tinyjobs` starts, since a typo would
+otherwise leave a task quietly unlimited. `retry_on` takes exception classes or their dotted
+paths, which is what a settings file wants, where importing project code is awkward; a path is
+checked for its shape where it is declared and imported when the task is
+resolved, not when the backend is built, which happens inside the import of the first module that
+declares a task and would find the project half imported. There is no `store_result`, which
+`get_result()` needs and stays on, and no `cron`, since a Django task has no schedule.
+
+The adapter builds the tinyjobs task from those options, so everything downstream is the code
+`@app.task` already runs: the limit reaches the claim through the registry, which is why
+`manage.py tinyjobs` resolves every discovered task before the worker starts, and the retry policy
+decides in the lifecycle service. A task outside its app's `tasks` module is resolved only when its
+first job is claimed, by a claim that could not carry its limit; a worker or a drain that finds a
+limit on a task its claim did not name hands the job back and lets the next claim, which reads the
+registry again, decide it. A task the resolver finds but cannot build, a dotted `retry_on` that
+does not import in this process, is left queued with the unknown task's backoff and an error in
+the log, and a drain raises. `@app.task` now refuses at declaration what it used to accept in
+silence, a `max_attempts` below one, a timeout that is not a positive number, an unknown backoff,
+since the same check has to answer for values that arrive from a settings file.
+
+What changes is what Django sees of an attempt's end. `task_finished` used to fire from the
+wrapper around the task, which knows only what the function did. It does not know a timeout, which
+the executor decides outside it while an `async def` task is cancelled and a `def` task keeps its
+thread and may return long after its job was failed; nor a result too large to store; nor a job
+process that died; nor, now, whether a failure will be retried. Asking the wrapper to guess, and a
+ledger to reconcile its guess with the lifecycle's decision, left a window in every ordering. So
+`task_finished` now fires from the app's own success and failure hooks, in the worker, after the
+outcome is recorded and only when no attempt is left, with the result read back from the store:
+the status and errors `get_result()` would give at that moment. A failed attempt that will run
+again has not finished, so the task reads `READY` with the attempt's error in `errors`.
+`task_started` still fires from the wrapper, for every attempt, with `context.attempt` counting
+them, on the thread that runs a `def` task.
+
+What the hook sends from the worker's loop, it sends from a thread started for that one
+delivery, which closes the database connections its receivers opened before it ends, whatever
+their `CONN_MAX_AGE`, since nothing would use them again, and with the task's error raised around
+the send for a failure, because Django's own receiver logs the traceback it finds in flight. Neither a pool nor `asend` would do. The
+loop's default pool is bounded and shared with what tinyjobs itself needs, the pipe to a job
+process among it, so slow receivers would starve the worker, and in eager mode a chain of
+receivers each enqueueing the next task would block once it was as deep as the pool. And under
+`asend` asgiref runs sync receivers of a loop without
+an outer sync context on one thread for the whole process, which made four receivers of 0.4 s
+take 1.6 s on a worker of four and deadlocked an eager enqueue called from such a thread, and
+Django itself connects a sync receiver, its logger, to every signal. The price of reading the
+result back is two point reads for each job that ends, while it still holds its slot. If they
+fail, the signal still fires, built from the job as it was claimed and the error in hand. Two ends
+have no signal, because no worker is there to see them: a job cancelled while it runs, and a job
+the reaper fails after its worker died; `get_result()` reports both as `FAILED`. A receiver that
+raises is logged and no longer fails the task, since the task had already ended.
+
+**Isolated Django tasks.** A job process finds an isolated task by importing its module and
+looking for the tinyjobs task among the module's names, and a Django task module holds none. So a
+task may carry a locator, a module-level function with its arguments, which the job process calls
+for the task instead of searching; the Django backend's locator takes the alias and the path and
+asks that alias's registry, the same resolver and the same trust boundary as the worker's. The job
+process also receives the job and sets the context variable the thread executor would have copied,
+which `takes_context` and the signals need; that holds for every isolated task, not only Django's.
+The Django wrapper runs whole inside the job process, so `task_started` fires there, where the
+task's own code and its database connections live, and it reads the job's earlier attempts
+through a store connection of its own, one per job process. `task_finished` fires in the worker
+like any other task's, which is the only place that knows a process killed at its timeout or dead
+of a crash ended the task. `async def` tasks cannot be isolated,
+as anywhere else.
 
 ---
 
@@ -3258,6 +3337,11 @@ connection, and Django's `"database"` option on SQLite aliases.
 `concurrency=` and `rate=` on a task, kept in the store and enforced at the claim across every
 worker: a job the limit stops is held out of the claim's way and admitted, in the order the queue
 promised, when the task has room again.
+
+**v0.16, Django task options**
+The tinyjobs options on a `django.tasks` task: timeout, retries, `isolated`, `concurrency` and
+`rate`, through the backend's task class or the `"tasks"` option, with isolated tasks located by
+the backend in the job process.
 
 **Next**
 Jobs that run after another.

@@ -96,7 +96,8 @@ python manage.py tinyjobs worker
 
 Queues, priorities, `run_after`, async tasks and the signals all work, and with `"database"` in
 `OPTIONS` naming the alias the queue lives on, Postgres or SQLite, an enqueue inside
-`transaction.atomic()` commits or rolls back with it.
+`transaction.atomic()` commits or rolls back with it. `@task(timeout=30, max_attempts=3,
+rate="10/m", isolated=True)` gives a Django task the tinyjobs options.
 [Django](https://tinyjobs.readthedocs.io/en/latest/django/) has the rest.
 
 ## Using FastAPI?
