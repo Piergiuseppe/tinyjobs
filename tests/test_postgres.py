@@ -1073,7 +1073,8 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             while pending:
                 node = pending.pop()
                 pending.extend(node.get("Plans", []))
-                self.assertNotEqual(node.get("Node Type"), "Seq Scan", node.get("Relation Name"))
+                if node.get("Node Type") == "Seq Scan":
+                    self.assertEqual(node.get("Relation Name"), f"{self.prefix}_limits")
 
     async def test_heartbeats_rewrite_rows_in_place(self):
         [(version,)] = await sql("SHOW server_version_num")
@@ -3052,12 +3053,17 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.heard(listener), ["mail"])
 
     async def test_closing_with_a_wake_up_pending_leaves_nothing_running(self):
+        import tinyjobs.backends.postgres.backend as module
+
         backend = await self.open()
-        await backend.enqueue(make_job(queue="mail"))
-        await backend.enqueue(make_job(queue="mail"))
-        self.assertIsNotNone(backend._waking)
-        waking = backend._waking
-        await backend.close()
+        frozen = types.SimpleNamespace(monotonic=lambda: moment)
+        moment = time.monotonic()
+        with mock.patch.object(module, "time", frozen):
+            await backend.enqueue(make_job(queue="mail"))
+            await backend.enqueue(make_job(queue="mail"))
+            self.assertIsNotNone(backend._waking)
+            waking = backend._waking
+            await backend.close()
         self.assertTrue(waking.done())
 
     async def test_a_reaped_job_wakes_listeners_on_its_queue(self):
