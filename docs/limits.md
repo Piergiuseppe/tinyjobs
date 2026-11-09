@@ -59,6 +59,8 @@ task is reported like any other.
   room applies; remove it and a worker that registers the task without a limit returns the task's
   held jobs on its queues to the queue, at start and on every reaper pass, so a rolling deployment
   that mixes old and new builds settles as soon as the old ones are gone.
+- On a `django.tasks` task the two go on Django's own decorator, `@task(concurrency=2)`, or in
+  the settings by import path; [Django](django.md) has both.
 - `app.send("module.task")` from a process without the task's code is limited like any other job,
   because the limit belongs to the task name, which the worker knows.
 - A worker that does not register a task knows no limit for it; such jobs are handed back as

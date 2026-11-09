@@ -100,8 +100,8 @@ Django was measured with a real project under uvicorn `--workers 2` and under `r
 requests split between sync and async views, each enqueuing a task that writes a row, with two
 `manage.py tinyjobs worker` processes on SQLite and then on Redis. Every task ran exactly once.
 Enqueueing through `django.tasks` costs about what a direct `send` does, 6,000 a second against
-6,600. A worker `SIGKILL`ed mid-task leaves that task `FAILED` once its lease expires, since Django
-tasks are not retried.
+6,600. A worker `SIGKILL`ed mid-task leaves that task `FAILED` once its lease expires, since a
+Django task has one attempt unless it sets `max_attempts`.
 
 Throughput was measured on the same four-core ARM VPS against one Redis 7.4 capped at one CPU, the
 workers capped at three, 128 slots per loop or process, draining 80,000 no-op jobs; jobs a second
