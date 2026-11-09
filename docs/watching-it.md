@@ -22,17 +22,17 @@ tinyjobs check --app tasks:app --max-wait 5m      # exits 1 on any problem
 ```
 
 ```
-QUEUE    QUEUED  RUNNING  SUCCESS  FAILED  CANCELLED  OLDEST DUE
--------  ------  -------  -------  ------  ---------  ----------
-default  2       2        0        0       0          16s
-mail     1       0        0        0       0          16s
+QUEUE    QUEUED  HELD  RUNNING  SUCCESS  FAILED  CANCELLED  OLDEST DUE
+-------  ------  ----  -------  -------  ------  ---------  ----------
+default  2       0     2        0        0       0          16s
+mail     1       0     0        0        0       0          16s
 
 running past their lease: 2
 ```
 
 A job past its lease means the worker holding it stopped reporting, usually because it died. `check`
-fails on that, on an app that registers no tasks, on queued jobs for a task the app doesn't register
-(a missing `--import`), on a due job waiting longer than `--max-wait`, and on a cron schedule more
+fails on that, on an app that registers no tasks, on waiting jobs for a task the app doesn't register
+(a missing `--import`), on a due job, queued or [held](limits.md), waiting longer than `--max-wait`, and on a cron schedule more
 than a minute overdue, which means no worker or scheduler is running. Both are `app.stats()` and
 `app.check()` in code.
 

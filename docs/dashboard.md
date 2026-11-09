@@ -5,7 +5,7 @@ tinyjobs dashboard --app tasks:app
 ```
 
 serves [the runbook](operating-it.md) as pages on `http://127.0.0.1:8070/`: an overview with the counts by
-queue and status, the health findings and the queued jobs by task; the jobs, newest first, by
+queue and status, the health findings and the waiting jobs by task, held ones included; the jobs, newest first, by
 status and queue, with every attempt and its traceback on a job's page; and the schedules. Retry,
 cancel, pause, resume and run are buttons that do what the CLI commands do. The pages refresh
 every five seconds, and `/api/overview`, `/api/jobs`, `/api/jobs/<id>` and `/api/schedules` give

@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/tinyjobs)](https://pypi.org/project/tinyjobs/)
 [![Python](https://img.shields.io/pypi/pyversions/tinyjobs)](https://pypi.org/project/tinyjobs/)
 [![License](https://img.shields.io/pypi/l/tinyjobs)](LICENSE)
-[![Docs](https://app.readthedocs.org/projects/tinyjobs/badge/?version=latest)](https://tinyjobs.readthedocs.io/)
+[![Docs](https://img.shields.io/readthedocs/tinyjobs)](https://tinyjobs.readthedocs.io/)
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/tinyjobs?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/tinyjobs)
 
 **No broker, no result backend, no daemon. The queue is a file.**
@@ -127,6 +127,7 @@ finish before it exits. Leave out `worker=True` to run the workers elsewhere.
 | Cron | timezones and DST, misfire and overlap policies, fired from every worker with no leader |
 | Queues, priorities, delays | `queue=`, integer priorities, `delay=60` or `run_at=<datetime>` |
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
+| Limits | `concurrency=2` caps a task at two running jobs across every worker, `rate="10/m"` spaces its starts, both kept in the store |
 | Crash recovery | leases and heartbeats, so a killed worker's jobs come back |
 | Transactional enqueue | on SQLite and Postgres, a job sent with your connection as `tx` commits or rolls back with your own transaction |
 | Attempt history | every attempt is a row, with its traceback and timings |
@@ -169,7 +170,7 @@ Celery, Dramatiq, RQ and arq need a broker before the first job runs; tinyjobs r
 file and moves to Postgres or Redis by changing a URL. Huey is the closest relative, also on SQLite:
 tinyjobs adds native `async def` tasks, the worker inside FastAPI's lifespan and leader-free cron on
 every backend. On the same Redis, three tinyjobs workers drained 7,260 no-op jobs a second where
-Celery's prefork pool did 800; Celery keeps the canvas, rate limits and RabbitMQ.
+Celery's prefork pool did 800; Celery keeps the canvas and RabbitMQ.
 [How it compares](https://tinyjobs.readthedocs.io/en/latest/how-it-compares/) goes project by
 project.
 
@@ -180,6 +181,7 @@ Everything else is at https://tinyjobs.readthedocs.io/:
 - Get started: [Jobs](https://tinyjobs.readthedocs.io/en/latest/jobs/),
   [Retention](https://tinyjobs.readthedocs.io/en/latest/keeping-the-database-from-growing-forever/),
   [Cron](https://tinyjobs.readthedocs.io/en/latest/cron/),
+  [Limits](https://tinyjobs.readthedocs.io/en/latest/limits/),
   [Isolated tasks](https://tinyjobs.readthedocs.io/en/latest/isolated-tasks/),
   [Free-threaded Python](https://tinyjobs.readthedocs.io/en/latest/free-threaded-python/),
   [Watching it](https://tinyjobs.readthedocs.io/en/latest/watching-it/),

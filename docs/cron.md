@@ -53,7 +53,7 @@ back, while an older `tinyjobs schedules` fails to list one: upgrade them all be
 anything.
 
 `run` enqueues one ordinary job with the schedule's dedup key, so while the previous run is still
-queued or running you get that job back instead of a new one, unless `overlap=True`; the next
+queued, held or running you get that job back instead of a new one, unless `overlap=True`; the next
 scheduled firing stays where it was.
 
 When nothing was running at the moment a schedule was due, `misfire` decides what happens on restart:
@@ -65,7 +65,7 @@ When nothing was running at the moment a schedule was due, `misfire` decides wha
 ```
 
 A firing only counts as missed when it is more than a minute late (`--misfire-grace`). A schedule
-won't start a run while the previous one is still queued or running, unless `overlap=True`.
+won't start a run while the previous one is still queued, held or running, unless `overlap=True`.
 
 A malformed expression, an unknown timezone, `0 0 30 2 *` (which never fires) or a cron task that
 needs arguments all raise at import, not at 2 a.m.

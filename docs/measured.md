@@ -142,7 +142,7 @@ prefetch of 32 move it by a few percent: its ceiling is its own consumer process
 message apart and hands it to the children while Redis sits at 9%. On 3.14t one tinyjobs process
 with three loops does the work of the three processes, 7,100 and 1,010. So the gap is what each
 library adds to a job: it counts when jobs are many and small, and fades behind jobs that do real
-work. Celery still has the canvas, rate limits and RabbitMQ that tinyjobs does not.
+work. Celery still has the canvas and RabbitMQ that tinyjobs does not.
 
 Two caveats worth stating. The tasks are synthetic, with `sleep` standing in for real I/O. And 25
 jobs per second was chosen as a comfortable rate to hold for ten hours, not as a ceiling.

@@ -31,3 +31,8 @@ earlier comes back as it is, possibly `running`. A job not yet due comes back `q
 
 Earlier releases ran every due job on each eager call and returned the sent job after the older
 ones. To run the rest of the queue, call `app.drain()`.
+
+[Limits](limits.md) follow the same split. An eager call runs the job inline and ignores them. A
+drain claims, so it honours them: with `rate="10/m"` and three jobs sent, the first drain runs one
+and holds two, and each `clock.advance(6)` lets the next drain run one more. A drain runs the jobs of
+a `concurrency=` task one after another anyway, since it runs one job at a time.

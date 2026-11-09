@@ -20,6 +20,7 @@ nav:
       - Jobs: jobs.md
       - Retention: keeping-the-database-from-growing-forever.md
       - Cron: cron.md
+      - Limits: limits.md
       - Isolated tasks: isolated-tasks.md
       - Free-threaded Python: free-threaded-python.md
       - Watching it: watching-it.md
