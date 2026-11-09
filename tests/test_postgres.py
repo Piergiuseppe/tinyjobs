@@ -22,6 +22,7 @@ from tinyjobs import deadlines
 from tinyjobs.services import lifecycle
 from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
+from tinyjobs.limits import Limit
 from tinyjobs.runtime import run_on
 from tinyjobs.testing import BackendContract
 from tinyjobs.models import ExecutionError
@@ -292,7 +293,7 @@ async def sql(query: str, parameters: dict | None = None) -> list[tuple]:
 
 async def drop(prefix: str, schema: str | None = None) -> None:
     qualify = f'"{schema}".' if schema else ""
-    for table in ("executions", "jobs", "schedules", "meta", "ran"):
+    for table in ("executions", "jobs", "schedules", "meta", "limits", "ran"):
         await sql(f'DROP TABLE IF EXISTS {qualify}"{prefix}_{table}" CASCADE')
     if schema:
         await sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -346,6 +347,360 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"
         )
         self.assertEqual(stored, [(newer,)])
+
+    async def test_a_version_one_store_is_upgraded_in_place(self):
+        jobs = f'"{self.prefix}_jobs"'
+        kept = await self.enqueue(dedup_key="invoice:1")
+        await sql(f'DROP TABLE "{self.prefix}_limits"')
+        await sql(f'DROP INDEX "{self.prefix}_jobs_held"')
+        await sql(f'DROP INDEX "{self.prefix}_jobs_running_by_task"')
+        await sql(f'DROP INDEX "{self.prefix}_jobs_dedup"')
+        await sql(
+            f'CREATE UNIQUE INDEX "{self.prefix}_jobs_dedup" ON {jobs} (dedup_digest) '
+            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'running')"
+        )
+        await sql(
+            f'ALTER TABLE {jobs} DROP CONSTRAINT "{self.prefix}_jobs_status_check", '
+            "ADD CONSTRAINT legacy_status CHECK "
+            "(status IN ('queued', 'running', 'success', 'failed', 'cancelled'))"
+        )
+        await sql(f"UPDATE \"{self.prefix}_meta\" SET value = '1' WHERE key = 'schema_version'")
+        upgraded = await self.open()
+        self.assertEqual(
+            await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
+            [("2",)],
+        )
+        self.assertEqual(
+            await sql(
+                "SELECT pg_get_constraintdef(oid) LIKE '%%held%%' FROM pg_constraint "
+                "WHERE conrelid = %(jobs)s::regclass AND contype = 'c'",
+                {"jobs": jobs},
+            ),
+            [(True,)],
+        )
+        self.assertEqual(
+            await sql(
+                "SELECT indexrelid::regclass::text, pg_get_expr(indpred, indrelid) "
+                "FROM pg_index WHERE indrelid = %(jobs)s::regclass AND indpred IS NOT NULL "
+                "AND indexrelid::regclass::text IN (%(dedup)s, %(held)s, %(running)s) ORDER BY 1",
+                {
+                    "jobs": jobs,
+                    "dedup": f"{self.prefix}_jobs_dedup",
+                    "held": f"{self.prefix}_jobs_held",
+                    "running": f"{self.prefix}_jobs_running_by_task",
+                },
+            ),
+            [
+                (
+                    f"{self.prefix}_jobs_dedup",
+                    "((dedup_digest IS NOT NULL) AND (status = ANY "
+                    "(ARRAY['queued'::text, 'held'::text, 'running'::text])))",
+                ),
+                (f"{self.prefix}_jobs_held", "(status = 'held'::text)"),
+                (f"{self.prefix}_jobs_running_by_task", "(status = 'running'::text)"),
+            ],
+        )
+        self.assertEqual(
+            await sql("SELECT to_regclass(%(limits)s) IS NOT NULL", {"limits": f"{self.prefix}_limits"}),
+            [(True,)],
+        )
+        await upgraded.enqueue(make_job(run_at=1.0))
+        claimed = await upgraded.claim(
+            worker_id="w", queues=["default"], limit=10, lease_seconds=60,
+            limits={"tests.noop": Limit(concurrency=1)},
+        )
+        self.assertEqual([job.id for job in claimed], [kept.id])
+        self.assertEqual((await upgraded.counts_by_status())["held"], 1)
+
+    async def test_the_reaper_writes_the_running_counts_back_from_the_running_jobs(self):
+        for index in range(2):
+            await self.enqueue(run_at=float(index))
+        await self.limited(**{"tests.noop": Limit(concurrency=5)})
+        limits = f'"{self.prefix}_limits"'
+        await sql(f"INSERT INTO {limits} (task, running) VALUES ('tests.idle', 7)")
+        await sql(f"UPDATE {limits} SET running = 9 WHERE task = 'tests.noop'")
+        await self.backend.reap_expired()
+        self.assertEqual(
+            await sql(f"SELECT task, running FROM {limits} ORDER BY task"),
+            [("tests.idle", 0), ("tests.noop", 2)],
+        )
+
+    async def test_a_claim_without_limits_takes_room_from_a_limited_task(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue()
+        [taken] = await self.limited(**limits)
+        second = await self.enqueue(run_at=1.0)
+        [unknown] = await self.claim()
+        running = f'SELECT running FROM "{self.prefix}_limits"'
+        self.assertEqual((taken.id, unknown.id), (first.id, second.id))
+        self.assertEqual(await sql(running), [(2,)])
+        await self.backend.hand_back(unknown, 0.0)
+        self.assertEqual(await sql(running), [(1,)])
+        self.assertEqual(await self.limited(**limits), [])
+        self.assertEqual(await self.statuses(second), [JobStatus.HELD])
+
+    async def test_a_worker_without_a_task_s_limit_still_counts_its_running_jobs(self):
+        running = f"SELECT running FROM \"{self.prefix}_limits\" WHERE task = 'tests.x'"
+        first = await self.enqueue(task="tests.x", run_at=0.0)
+        self.assertEqual(
+            [job.id for job in await self.limited(**{"tests.x": Limit(concurrency=1)})], [first.id]
+        )
+        second = await self.enqueue(task="tests.x", run_at=1.0)
+        other = await self.enqueue(task="tests.t", run_at=2.0)
+        elsewhere = await self.limited(worker="worker-b", **{"tests.t": Limit(concurrency=5)})
+        self.assertEqual(sorted(job.id for job in elsewhere), sorted([second.id, other.id]))
+        self.assertEqual(await sql(running), [(2,)])
+        await self.backend.hand_back(await self.stored(second), 0.0)
+        self.assertEqual(await sql(running), [(1,)])
+        self.assertEqual(await self.limited(**{"tests.x": Limit(concurrency=1)}), [])
+
+    async def test_a_held_job_waits_behind_due_work_another_queue_had_not_yet_read(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        busy = await self.enqueue(queue="b", run_at=0.0)
+        held = await self.enqueue(queue="b", run_at=4.0)
+        self.assertEqual([job.id for job in await self.limited(queues=("b",), **limits)], [busy.id])
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+        await self.backend.complete(await self.stored(busy), None)
+        a = [await self.enqueue(task="tests.mail", queue="a", run_at=at) for at in (1.0, 5.0, 6.0)]
+        b = [await self.enqueue(task="tests.mail", queue="b", run_at=at) for at in (2.0, 3.0)]
+        claimed = await self.limited(limit=3, queues=("a", "b"), **limits)
+        self.assertNotIn(held.id, [job.id for job in claimed])
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+        self.assertEqual([job.id for job in claimed], [job.id for job in a])
+        claimed = await self.limited(limit=3, queues=("a", "b"), **limits)
+        self.assertEqual([job.id for job in claimed], [b[0].id, b[1].id, held.id])
+
+    async def test_a_limits_row_deleted_behind_the_backend_is_made_again(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue(run_at=0.0)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [first.id])
+        await self.backend.complete(await self.stored(first), None)
+        await sql(f'DELETE FROM "{self.prefix}_limits"')
+        second = await self.enqueue(run_at=1.0)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [second.id])
+        self.assertEqual(
+            await sql(f'SELECT task, running FROM "{self.prefix}_limits"'), [("tests.noop", 1)]
+        )
+
+    async def test_releasing_the_held_jobs_of_a_task_keeps_its_limits_row(self):
+        limits = {"tests.noop": Limit(concurrency=1, interval=60.0)}
+        rows = f'SELECT task, running, last_at FROM "{self.prefix}_limits"'
+        first = await self.enqueue(run_at=0.0)
+        held = await self.enqueue(run_at=1.0)
+        await self.limited(**limits)
+        self.assertEqual(await self.backend.release_held(["tests.noop"]), 1)
+        self.assertEqual(await sql(rows), [("tests.noop", 1, self.clock.now())])
+        self.assertEqual(await self.statuses(first, held), [JobStatus.RUNNING, JobStatus.QUEUED])
+        self.assertEqual(await self.limited(**limits), [])
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+
+    async def test_the_held_line_is_read_through_the_held_index_per_queue(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(queue="default")
+        await self.limited(**limits)
+        await self.backend.enqueue_many(
+            [make_job(queue="elsewhere", run_at=float(index)) for index in range(3000)]
+        )
+        await self.limited(queues=("elsewhere",), limit=1000, **limits)
+        await sql(f'ANALYZE "{self.prefix}_jobs"')
+        query, parameters = self.backend._claiming(
+            self.clock.now(), ["default", "mail"], "w", 10, 60.0, limits
+        )
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL, autocommit=True) as connection:
+            cursor = await connection.execute(f"EXPLAIN {query}", parameters)
+            plan = "\n".join(row[0] for row in await cursor.fetchall())
+        lines = plan.splitlines()
+        held_reads = [
+            (line, lines[place + 1])
+            for place, line in enumerate(lines)
+            if f"using {self.prefix}_jobs_held" in line
+        ]
+        self.assertEqual(len(held_reads), 2, plan)
+        for scan, condition in held_reads:
+            self.assertIn("Index Scan", scan, plan)
+            self.assertIn("(task = ", condition, plan)
+            self.assertIn('"left"(queue, 500) = "left"(wanted', condition, plan)
+
+    async def test_an_upgrade_is_not_cut_short_by_the_statement_timeout(self):
+        jobs = f'"{self.prefix}_jobs"'
+        await self.enqueue()
+        await sql(f'DROP TABLE "{self.prefix}_limits"')
+        await sql(f'DROP INDEX "{self.prefix}_jobs_held"')
+        await sql(f'DROP INDEX "{self.prefix}_jobs_running_by_task"')
+        await sql(f"UPDATE \"{self.prefix}_meta\" SET value = '1' WHERE key = 'schema_version'")
+        slow = PostgresBackend.from_url(
+            POSTGRES_URL, prefix=self.prefix, clock=self.clock, statement_timeout=0.5
+        )
+        self.addAsyncCleanup(slow.close)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as writer:
+            await writer.execute(f"UPDATE {jobs} SET priority = priority")
+            setting_up = asyncio.ensure_future(slow.setup())
+            await asyncio.sleep(1.5)
+            self.assertFalse(setting_up.done())
+            await writer.commit()
+        await asyncio.wait_for(setting_up, 10)
+        self.assertEqual(
+            await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
+            [("2",)],
+        )
+
+    async def test_a_short_read_holding_jobs_of_a_saturated_task_runs_one_statement(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        await self.limited(**limits)
+        for index in range(3):
+            await self.enqueue(run_at=1.0 + index)
+        real = self.backend._claimed
+        statements = []
+
+        async def counted(*args, **kwargs):
+            statements.append(args)
+            return await real(*args, **kwargs)
+
+        with mock.patch.object(self.backend, "_claimed", counted):
+            self.assertEqual(await self.limited(**limits), [])
+        self.assertEqual(len(statements), 1)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 3)
+
+    async def test_a_new_limits_row_waits_for_a_completion_in_flight_before_counting(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue(run_at=0.0)
+        [running] = await self.claim()
+        second = await self.enqueue(run_at=1.0)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as finishing:
+            await finishing.execute(
+                f"UPDATE \"{self.prefix}_jobs\" SET status = 'success' WHERE id = %(id)s",
+                {"id": running.id},
+            )
+            claiming = asyncio.ensure_future(self.limited(**limits))
+            await asyncio.sleep(0.5)
+            self.assertFalse(claiming.done())
+            await finishing.commit()
+        self.assertEqual(first.id, running.id)
+        self.assertEqual([job.id for job in await asyncio.wait_for(claiming, 10)], [second.id])
+        self.assertEqual(
+            await sql(f'SELECT task, running FROM "{self.prefix}_limits"'), [("tests.noop", 1)]
+        )
+
+    async def test_a_recount_and_a_completion_in_flight_never_deadlock(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue()
+        [running] = await self.limited(**limits)
+        prefix = self.prefix
+        await sql(f'CREATE SEQUENCE "{prefix}_slept"')
+        self.addAsyncCleanup(sql, f'DROP SEQUENCE IF EXISTS "{prefix}_slept"')
+        await sql(
+            f'CREATE FUNCTION "{prefix}_slow"() RETURNS trigger LANGUAGE plpgsql AS '
+            f"$$ BEGIN IF pg_catalog.nextval('public.\"{prefix}_slept\"') = 1 THEN "
+            "PERFORM pg_catalog.pg_sleep(1.5); END IF; RETURN NEW; END $$"
+        )
+        self.addAsyncCleanup(sql, f'DROP FUNCTION IF EXISTS "{prefix}_slow"() CASCADE')
+        await sql(
+            f'CREATE TRIGGER slow BEFORE UPDATE ON "{prefix}_jobs" '
+            f'FOR EACH ROW EXECUTE FUNCTION "{prefix}_slow"()'
+        )
+        with self.assertNoLogs("tinyjobs.postgres", "WARNING"):
+            completing = asyncio.ensure_future(self.backend.complete(running, None))
+            await asyncio.sleep(0.3)
+            await self.backend._recounted_from_running(["tests.noop"])
+            self.assertTrue(await asyncio.wait_for(completing, 10))
+        self.assertEqual(await sql(f'SELECT running FROM "{prefix}_limits"'), [(0,)])
+
+    async def test_one_reaper_pass_per_interval_recounts_the_whole_store(self):
+        await self.enqueue()
+        await self.limited(**{"tests.noop": Limit(concurrency=5)})
+        limits = f'"{self.prefix}_limits"'
+        other = await self.open()
+        await sql(f"UPDATE {limits} SET running = 9")
+        await self.backend.reap_expired()
+        self.assertEqual(await sql(f"SELECT running FROM {limits}"), [(1,)])
+        await sql(f"UPDATE {limits} SET running = 9")
+        await other.reap_expired()
+        await self.backend.reap_expired()
+        self.assertEqual(await sql(f"SELECT running FROM {limits}"), [(9,)])
+        self.clock.advance(postgres_backend.RECOUNT_SECONDS)
+        await other.reap_expired()
+        self.assertEqual(await sql(f"SELECT running FROM {limits}"), [(1,)])
+
+    async def test_a_recount_time_ahead_of_the_clock_does_not_stop_the_recounts(self):
+        await self.enqueue()
+        await self.limited(**{"tests.noop": Limit(concurrency=5)})
+        prefix = self.prefix
+        await sql(f'UPDATE "{prefix}_limits" SET running = 9')
+        await sql(
+            f"INSERT INTO \"{prefix}_meta\" (key, value) VALUES ('last_recount_at', %(at)s) "
+            "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            {"at": repr(self.clock.now() + 3600.0)},
+        )
+        await self.backend.reap_expired()
+        self.assertEqual(await sql(f'SELECT running FROM "{prefix}_limits"'), [(1,)])
+
+    async def test_held_jobs_are_released_in_batches(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        for index in range(5):
+            await self.enqueue(run_at=1.0 + index, queue=("default", "mail")[index % 2])
+        await self.limited(queues=("default", "mail"), **limits)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 5)
+        real = self.backend._retrying
+        batches = []
+
+        async def counted(query, parameters, **options):
+            if query in (self.backend._queries.release_held, self.backend._queries.release_held_in):
+                batches.append(query)
+            return await real(query, parameters, **options)
+
+        with (
+            mock.patch.object(postgres_backend, "RELEASE_BATCH", 2),
+            mock.patch.object(self.backend, "_retrying", counted),
+        ):
+            self.assertEqual(await self.backend.release_held(["tests.noop"], ["mail"]), 2)
+            self.assertEqual(len(batches), 2)
+            self.assertEqual(await self.backend.release_held(["tests.noop"]), 3)
+        self.assertEqual(len(batches), 4)
+        self.assertEqual((await self.backend.counts_by_status()).get("held", 0), 0)
+
+    async def test_the_reaper_lowers_the_running_count_of_the_jobs_it_takes_back(self):
+        limits = {"tests.noop": Limit(concurrency=2)}
+        for index in range(2):
+            await self.enqueue(run_at=float(index), max_attempts=2)
+        self.assertEqual(len(await self.limited(**limits)), 2)
+        running = f'SELECT running FROM "{self.prefix}_limits"'
+        self.assertEqual(await sql(running), [(2,)])
+        self.clock.advance(61)
+
+        async def untouched(*args):
+            return None
+
+        with mock.patch.object(self.backend, "_recounted", untouched):
+            self.assertEqual(await self.backend.reap_expired(), 2)
+        self.assertEqual(await sql(running), [(0,)])
+
+    async def test_a_drain_of_one_job_at_a_time_reaches_the_work_behind_a_saturated_task(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        await self.backend.enqueue_many(
+            [make_job(run_at=1.0 + index, priority=5) for index in range(30)]
+        )
+        other = await self.enqueue(task="tests.mail", run_at=100.0)
+        self.assertEqual(len(await self.limited(limit=1, **limits)), 1)
+        claims = 0
+        taken: list = []
+        while not taken and claims < 10:
+            claims += 1
+            taken = await self.limited(limit=1, **limits)
+        self.assertEqual([job.id for job in taken], [other.id])
+        self.assertLessEqual(claims, 4)
+
+    async def test_a_held_job_keeps_its_dedup_key(self):
+        await self.enqueue()
+        held = await self.enqueue(run_at=1.0, dedup_key="invoice:1")
+        await self.limited(**{"tests.noop": Limit(concurrency=1)})
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+        again = await self.enqueue(dedup_key="invoice:1")
+        [batched] = await self.backend.enqueue_many([make_job(dedup_key="invoice:1")])
+        self.assertEqual((again.id, batched.id), (held.id, held.id))
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 1, "held": 1})
 
     async def test_backends_setting_up_one_store_at_once_all_succeed(self):
         await drop(self.prefix)
@@ -3823,15 +4178,23 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             reap_interval=3600,
             handle_signals=False,
         )
-        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as holder:
-            await holder.execute(f'LOCK TABLE "{self.prefix}_jobs" IN ACCESS EXCLUSIVE MODE')
-            runner = asyncio.create_task(worker.start())
-            waited = time.monotonic() + 10
-            while time.monotonic() < waited and not await sql(
-                "SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND datname = current_database() AND query LIKE '%levels%'"
-            ):
-                await asyncio.sleep(0.05)
+        release_held = PostgresBackend.release_held
+
+        with psycopg.Connection.connect(POSTGRES_URL) as holder:
+
+            async def locking_after(backend, tasks, queues=None):
+                released = await release_held(backend, tasks, queues)
+                holder.execute(f'LOCK TABLE "{self.prefix}_jobs" IN ACCESS EXCLUSIVE MODE')
+                return released
+
+            with mock.patch.object(PostgresBackend, "release_held", locking_after):
+                runner = asyncio.create_task(worker.start())
+                waited = time.monotonic() + 10
+                while time.monotonic() < waited and not await sql(
+                    "SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                    "AND datname = current_database() AND query LIKE '%levels%'"
+                ):
+                    await asyncio.sleep(0.05)
             with self.assertLogs("tinyjobs.worker", "WARNING"):
                 worker.stop()
                 await asyncio.wait_for(runner, timeout=15)
@@ -4499,6 +4862,35 @@ class PostgresAppTests(unittest.IsolatedAsyncioTestCase):
             await backend._exorcise()
             self.assertEqual(backend._ghosts, {})
         [job] = await backend.claim(worker_id="w", queues=["default"], limit=1, lease_seconds=60)
+        self.assertEqual((job.id, job.attempts), (stored.id, 1))
+
+    async def test_a_ghost_of_a_limited_claim_gives_back_the_room_it_took(self):
+        prefix = new_prefix()
+        self.addAsyncCleanup(drop, prefix)
+        backend = PostgresBackend.from_url(POSTGRES_URL, prefix=prefix)
+        self.addAsyncCleanup(backend.close)
+        await backend.setup()
+        stored = await backend.enqueue(make_job())
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await backend._ensure_limits(limits)
+        running = f'SELECT running FROM "{prefix}_limits"'
+        async with await psycopg.AsyncConnection.connect(
+            POSTGRES_URL, autocommit=True, options="-c track_activities=off"
+        ) as lost:
+            query, parameters = backend._claiming(
+                await backend._now(), ["default"], "w", 1, 60.0, limits
+            )
+            backend._ghosts[parameters["token"]] = postgres_backend._Ghost(
+                "w", parameters["token"], await self.own_backend(lost), 60.0
+            )
+            self.assertEqual(len(await (await lost.execute(query, parameters)).fetchall()), 1)
+            self.assertEqual(await sql(running), [(1,)])
+            await backend._exorcise()
+            self.assertEqual(backend._ghosts, {})
+        self.assertEqual(await sql(running), [(0,)])
+        [job] = await backend.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60, limits=limits
+        )
         self.assertEqual((job.id, job.attempts), (stored.id, 1))
 
     async def test_a_ghost_landing_after_its_backend_moved_on_is_still_handed_back(self):
