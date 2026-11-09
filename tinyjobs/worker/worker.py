@@ -33,6 +33,8 @@ from ..executors import ExecutorResolver
 from ..executors.process import assert_process_setup
 from ..executors.thread import DaemonThreadPool
 from ..flag import Flag
+from ..limiting import limits_for, polling_under, release_held_elsewhere
+from ..limits import Limit
 from ..logs import failure_fields, job_fields
 from ..polling import AdaptiveInterval
 from ..services.execution import current_runner
@@ -172,6 +174,7 @@ class Worker:
         assert_retention_policy(retention)
         self._retention = retention or RetentionPolicy()
         self._misfire_grace = misfire_grace if scheduler else None
+        self._poll_minimum, self._poll_maximum = poll_minimum, poll_maximum
         self._interval = AdaptiveInterval(minimum=poll_minimum, maximum=poll_maximum)
         self._async_concurrency = async_concurrency
         self._id = worker_id or new_worker_id()
@@ -204,6 +207,9 @@ class Worker:
         self._forcing = False
         self._capacity = Flag()
         self._capacity.set()
+        self._room = Flag()
+        self._opening: dict[str, float] = {}
+        self._limits: dict[str, Limit] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._shutdown_timeout = self._configured_shutdown_timeout
         self._ending = Deadline()
@@ -369,6 +375,10 @@ class Worker:
         self._finished.clear()
         self._settle_by = Deadline()
         try:
+            self._interval = polling_under(
+                self._home.backend, self._app.registry, self._poll_minimum, self._poll_maximum
+            )
+            self._limits = limits_for(self._home.backend, self._app.registry).get("limits", {})
             self._app.attach(self)
         except BaseException:
             self._prepare_run()
@@ -378,8 +388,11 @@ class Worker:
             self._app.close_by(None)
         self._serving = True
         try:
-            self._open_lanes()
-            await self._serve()
+            if self._parent is None:
+                await self._released_held()
+            if not self._stopping.is_set():
+                self._open_lanes()
+                await self._serve()
         finally:
             lanes = self._lanes
             try:
@@ -450,6 +463,23 @@ class Worker:
         if self._parent is None:
             await self._app.reopen()
         await home.ready()
+
+    async def _released_held(self) -> None:
+        releasing = asyncio.ensure_future(
+            release_held_elsewhere(self._home.backend, self._app.registry, self._queues)
+        )
+        try:
+            await asyncio.wait(
+                {releasing, self._stopping.raised()}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            releasing.cancel()
+            raise
+        if releasing.done():
+            releasing.result()
+            return
+        releasing.cancel()
+        await asyncio.gather(releasing, return_exceptions=True)
 
     async def _readied(self) -> bool:
         ready = asyncio.ensure_future(self._ready_at_home())
@@ -553,13 +583,34 @@ class Worker:
                 self._capacity.clear()
                 await self._wait_for(self._capacity)
                 continue
+            self._room.clear()
+            claimed_at = time.monotonic()
             jobs = await self._claim(capacity)
             if not jobs:
-                await self._idle(self._interval.next())
+                await self._idle(self._until_room(self._interval.next(), claimed_at))
                 continue
             self._interval.reset()
             for job in jobs:
+                self._note_room(job)
                 self._launch(job)
+
+    def _note_room(self, job: Job) -> None:
+        limit = self._limits.get(job.task)
+        if limit is not None and limit.interval is not None:
+            self._opening[job.task] = time.monotonic() + limit.interval
+
+    def _until_room(self, seconds: float, claimed_at: float) -> float:
+        now = time.monotonic()
+        opened_meanwhile = False
+        for task, opens in list(self._opening.items()):
+            if opens <= now:
+                del self._opening[task]
+                opened_meanwhile = opened_meanwhile or opens > claimed_at
+        if opened_meanwhile:
+            return 0.0
+        if not self._opening:
+            return seconds
+        return min(seconds, max(min(self._opening.values()) - now, 0.0))
 
     async def _claim(self, capacity: int) -> list[Job]:
         try:
@@ -589,6 +640,7 @@ class Worker:
                     queues=self._queues,
                     limit=capacity,
                     lease_seconds=self._lease_seconds,
+                    **limits_for(self._home.backend, self._app.registry),
                 )
         except asyncio.CancelledError:
             if not self._gave_up or claiming is None or claiming.uncancel() > 0:
@@ -641,6 +693,9 @@ class Worker:
             self._inflight.pop(key, None)
             self._lost.discard(key)
             self._capacity.set()
+            limit = self._limits.get(job.task)
+            if limit is not None and limit.concurrency is not None:
+                self._room.set()
             settled = self._settling.pop(key, None)
             if key in self._abandoned:
                 self._abandoned.discard(key)
@@ -926,9 +981,16 @@ class Worker:
                 return
             except Exception:
                 logger.exception("reaper pass failed")
-                continue
+                reaped = 0
             if reaped:
                 logger.warning("reclaimed %d job(s) with an expired lease", reaped)
+            if self._parent is None:
+                try:
+                    await release_held_elsewhere(
+                        self._home.backend, self._app.registry, self._queues
+                    )
+                except AppClosedError:
+                    return
 
     async def _housekeeping_loop(self) -> None:
         capabilities = self._home.backend.capabilities
@@ -1140,14 +1202,19 @@ class Worker:
         except BackendNotReadyError:
             backend = None
         if not getattr(backend, "wakes_workers", False):
-            await self._pause(seconds)
+            await asyncio.wait(
+                {self._stopping.raised(), self._room.raised()},
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
             return
         waiting = asyncio.create_task(
             backend.wait_for_jobs(worker_id=self._id, queues=self._queues, timeout=seconds)
         )
         try:
             await asyncio.wait(
-                {waiting, self._stopping.raised()}, return_when=asyncio.FIRST_COMPLETED
+                {waiting, self._stopping.raised(), self._room.raised()},
+                return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
             waiting.cancel()

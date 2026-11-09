@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar
 from ..exceptions import AppClosedError, ExecutorClosedError, UnknownTaskError
 from ..executors import ExecutorResolver
 from ..flag import Flag
+from ..limiting import assert_limits_supported, limits_for, release_held_elsewhere
 from ..logs import job_fields
 from ..models import Job
 from ..runtime import CLOSED_MESSAGE, inside_running_loop
@@ -38,9 +39,11 @@ class Drain:
         queues: Sequence[str] | None = None,
         *,
         shutdown_timeout: float = DRAIN_SHUTDOWN_SECONDS,
+        limited: bool = True,
     ) -> None:
         self._app = app
         self._queues = tuple(queues) if queues else None
+        self._limited = limited
         self._shutdown_timeout = shutdown_timeout
         self._finished = threading.Event()
         self._renewal = _Renewal(app)
@@ -79,10 +82,14 @@ class Drain:
         return await self._attached(self._drain)
 
     async def run_job(self, job_id: str) -> bool:
+        self._limited = False
         return await self._attached(partial(self._run_job, job_id))
 
     async def _attached(self, running: Callable[[], Awaitable[T]]) -> T:
         await self._app.ensure_connected()
+        if self._limited:
+            assert_limits_supported(self._app.backend, self._app.registry)
+            await release_held_elsewhere(self._app.backend, self._app.registry, self._queues)
         self._app.attach(self)
         self._loop = asyncio.get_running_loop()
         self._finished.clear()
@@ -116,6 +123,7 @@ class Drain:
             queues=queues,
             limit=1,
             lease_seconds=DRAIN_LEASE_SECONDS,
+            **(limits_for(self._app.backend, self._app.registry) if self._limited else {}),
         )
         return jobs[0] if jobs else None
 

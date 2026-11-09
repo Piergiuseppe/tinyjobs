@@ -36,6 +36,7 @@ from .exceptions import (
     UnsupportedCapabilityError,
     described,
 )
+from .limits import declare_limit
 from .metrics import Metrics
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
@@ -273,7 +274,7 @@ class TinyJobs:
         if not self._eager:
             return bound
         if not getattr(self.backend, "claims_by_id", True):
-            await self.adrain()
+            await Drain(self, limited=False).run()
             if not inserted:
                 return await bound.arefresh()
         elif await Drain(self).run_job(bound.id) or not inserted:
@@ -457,6 +458,8 @@ class TinyJobs:
         store_result: bool = False,
         result_ttl: float | None = None,
         isolated: bool = False,
+        concurrency: int | None = None,
+        rate: str | None = None,
         max_attempts: int = 1,
         retry_on: tuple[type[BaseException], ...] = (Exception,),
         retry_backoff: Any = "exponential",
@@ -499,6 +502,7 @@ class TinyJobs:
                 ),
                 isolated=isolated,
                 registered_in=registered_in,
+                limit=declare_limit(task_name, concurrency, rate),
             )
             if isolated:
                 _assert_isolatable(resolved)
