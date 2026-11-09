@@ -33,7 +33,12 @@ from ..executors import ExecutorResolver
 from ..executors.process import assert_process_setup
 from ..executors.thread import DaemonThreadPool
 from ..flag import Flag
-from ..limiting import limits_for, polling_under, release_held_elsewhere
+from ..limiting import (
+    LIMITS_UNSUPPORTED_MESSAGE,
+    limits_for,
+    polling_under,
+    release_held_elsewhere,
+)
 from ..limits import Limit
 from ..logs import failure_fields, job_fields
 from ..polling import AdaptiveInterval
@@ -594,6 +599,14 @@ class Worker:
                 self._note_room(job)
                 self._launch(job)
 
+    def _carry(self, limits: dict[str, Limit]) -> None:
+        if limits == self._limits:
+            return
+        self._limits = limits
+        self._interval = polling_under(
+            self._home.backend, self._app.registry, self._poll_minimum, self._poll_maximum
+        )
+
     def _note_room(self, job: Job) -> None:
         limit = self._limits.get(job.task)
         if limit is not None and limit.interval is not None:
@@ -635,12 +648,14 @@ class Worker:
         self._claiming = claiming
         try:
             with under(Deadline(math.inf, self._admitting)):
+                carried = limits_for(self._home.backend, self._app.registry)
+                self._carry(carried.get("limits", {}))
                 return await self._home.backend.claim(
                     worker_id=self._id,
                     queues=self._queues,
                     limit=capacity,
                     lease_seconds=self._lease_seconds,
-                    **limits_for(self._home.backend, self._app.registry),
+                    **carried,
                 )
         except asyncio.CancelledError:
             if not self._gave_up or claiming is None or claiming.uncancel() > 0:
@@ -681,7 +696,9 @@ class Worker:
         context = contextvars.copy_context()
         context.run(run.enter)
         task = asyncio.create_task(
-            self._run_job(job, run), name=f"tinyjobs-{job.id}", context=context
+            self._run_job(job, run, job.task in self._limits),
+            name=f"tinyjobs-{job.id}",
+            context=context,
         )
         self._running[task] = run
         task.add_done_callback(self._finalize(job))
@@ -773,7 +790,7 @@ class Worker:
 
         return done
 
-    async def _run_job(self, job: Job, run: _Run) -> None:
+    async def _run_job(self, job: Job, run: _Run, limited: bool) -> None:
         if self._forcing:
             raise asyncio.CancelledError
         current_runner.set(self)
@@ -781,6 +798,12 @@ class Worker:
             task = self._app.registry.get(job.task)
         except UnknownTaskError:
             await self._release_unknown(job)
+            return
+        except ConfigurationError as error:
+            await self._release_unknown(job, str(error))
+            return
+        if task.limit is not None and not limited:
+            await self._decide_again(job)
             return
         try:
             attempt = await self._home.execution.execute(
@@ -852,12 +875,34 @@ class Worker:
                 extra=job_fields(job, worker_id=self._id),
             )
 
-    async def _release_unknown(self, job: Job) -> None:
+    async def _decide_again(self, job: Job) -> None:
+        if not self._home.backend.capabilities.limits:
+            delay = self._unknown_task_backoff.delay_for(job.hand_backs + 1)
+            logger.error(
+                "%s; leaving job %s queued and retrying it in %s",
+                LIMITS_UNSUPPORTED_MESSAGE.format(names=job.task),
+                job.id,
+                format_seconds(delay),
+                extra=job_fields(job, worker_id=self._id),
+            )
+        else:
+            delay = 0.0
+            logger.info(
+                "task %r was first seen with job %s and carries a limit the claim did not know; "
+                "the job goes back to the queue for the next claim to decide",
+                job.task,
+                job.id,
+                extra=job_fields(job, worker_id=self._id),
+            )
+        async with bounded(self._answer_by()):
+            await self._home.backend.hand_back(job, delay)
+
+    async def _release_unknown(self, job: Job, problem: str | None = None) -> None:
         delay = self._unknown_task_backoff.delay_for(job.hand_backs + 1)
         logger.error(
-            "task %r is not registered in this worker; leaving job %s queued "
-            "and retrying it in %s",
+            "task %r %s; leaving job %s queued and retrying it in %s",
             job.task,
+            "is not registered in this worker" if problem is None else f"cannot be used: {problem}",
             job.id,
             format_seconds(delay),
             extra=job_fields(job, worker_id=self._id),
