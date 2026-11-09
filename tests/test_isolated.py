@@ -28,6 +28,8 @@ def request_for(task, encoded: bytes) -> tuple:
         "json",
         task.store_result,
         None,
+        None,
+        None,
     )
 
 
@@ -72,6 +74,26 @@ class RunsElsewhereTests(IsolatedTestCase):
         await self.settle(self.make_worker(), [job])
         self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
         self.assertNotEqual(await self.result_of(job), os.getpid())
+
+    async def test_the_running_job_is_known_inside_the_job_process(self):
+        job = await self.send(isolated.current_attempts)
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(await self.result_of(job), [job.id, 2, isolated.current_attempts.name])
+
+    async def test_a_task_with_a_locator_is_found_through_it(self):
+        job = await self.send(isolated.LOCATED["found"])
+        await self.settle(self.make_worker(), [job])
+        self.assertIs(await self.status_of(job), JobStatus.SUCCESS)
+        self.assertNotEqual(await self.result_of(job), os.getpid())
+
+    async def test_a_locator_that_finds_nothing_or_another_task_fails_the_job(self):
+        jobs = [await self.send(isolated.LOCATED[key]) for key in ("missing", "other")]
+        await self.settle(self.make_worker(), jobs)
+        for job in jobs:
+            self.assertIs(await self.status_of(job), JobStatus.FAILED)
+            [execution] = await self.executions_of(job)
+            self.assertEqual(execution.error_type, "IsolatedTaskError")
+            self.assertIn("tests.isolated.locate", execution.traceback)
 
     async def test_arguments_and_results_cross_through_the_codec(self):
         value = {"a": [1, 2.5, "x"], "b": None}
@@ -621,7 +643,7 @@ import os
 from tinyjobs.executors.process import _Processes
 
 
-REQUEST = ("tests.isolated", "tests.isolated.sleep_then_pid", "tests.isolated", "sleep_then_pid", b'{"args": [30], "kwargs": {}}', "json", True, None)
+REQUEST = ("tests.isolated", "tests.isolated.sleep_then_pid", "tests.isolated", "sleep_then_pid", b'{"args": [30], "kwargs": {}}', "json", True, None, None, None)
 
 
 async def main() -> None:
@@ -643,7 +665,7 @@ import asyncio
 
 from tinyjobs.executors.process import _Processes
 
-REQUEST = ("tests.isolated", "tests.isolated.sleep_then_pid", "tests.isolated", "sleep_then_pid", b'{"args": [30], "kwargs": {}}', "json", True, None)
+REQUEST = ("tests.isolated", "tests.isolated.sleep_then_pid", "tests.isolated", "sleep_then_pid", b'{"args": [30], "kwargs": {}}', "json", True, None, None, None)
 
 
 async def main() -> None:

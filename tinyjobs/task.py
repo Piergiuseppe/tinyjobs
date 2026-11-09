@@ -13,6 +13,8 @@ from .schedules import Schedule
 if TYPE_CHECKING:
     from .app import TinyJobs
 
+Locator = tuple[str, str, tuple[Any, ...]]
+
 
 class Task:
     def __init__(
@@ -30,6 +32,7 @@ class Task:
         isolated: bool = False,
         registered_in: str | None = None,
         limit: Limit | None = None,
+        locator: Locator | None = None,
     ) -> None:
         self._app = app
         self._function = function
@@ -42,6 +45,7 @@ class Task:
         self._schedule = schedule
         self._isolated = isolated
         self._limit = limit
+        self._locator = locator
         self._registered_in = registered_in or function.__module__
         self._signature = inspect.signature(function)
         self._is_coroutine = inspect.iscoroutinefunction(function)
@@ -97,6 +101,10 @@ class Task:
     @property
     def limit(self) -> Limit | None:
         return self._limit
+
+    @property
+    def locator(self) -> Locator | None:
+        return self._locator
 
     def bind(self, args: tuple, kwargs: dict) -> JobPayload:
         bound = self._signature.bind(*args, **kwargs)

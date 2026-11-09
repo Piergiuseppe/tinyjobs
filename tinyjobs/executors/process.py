@@ -19,6 +19,7 @@ import time
 import traceback
 from collections import deque
 from contextlib import suppress
+from dataclasses import replace
 from typing import Any, Callable, TYPE_CHECKING
 
 from ..exceptions import (
@@ -40,6 +41,7 @@ from ..exiting import (
     signal_name,
     stop_signals_blocked,
 )
+from ..current import current_job
 from ..models import Job, JobPayload
 from .base import Executor
 
@@ -61,6 +63,9 @@ DIED_MESSAGE = "the process running {name} died {how} before it answered"
 IMPORT_MESSAGE = (
     "the job process could not find the task {name} in {module}; an isolated task must be kept "
     "at module level of the module that registered it, one the job process can import"
+)
+LOCATOR_MESSAGE = (
+    "the job process could not find the task {name} through {module}.{qualname}"
 )
 AMBIGUOUS_MESSAGE = (
     "the job process found more than one isolated task named {name} over the same function in "
@@ -156,6 +161,8 @@ class ProcessExecutor(Executor):
             codec,
             task.store_result,
             self._setup,
+            task.locator,
+            None if job is None else replace(job, _app=None, payload=b""),
         )
         for last in (False, True):
             child = await self._pool.acquire()
@@ -717,7 +724,9 @@ def _watch_parent(parent: int) -> None:
 
 
 def _run(conn: Any, request: tuple, state: _State) -> None:
-    module, name, function_module, qualname, encoded, codec, store_result, setup = request
+    (
+        module, name, function_module, qualname, encoded, codec, store_result, setup, locator, job
+    ) = request
     try:
         if not state.prepared:
             _prepare()
@@ -727,7 +736,11 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
             state.setups.add(setup)
         task = state.tasks.get((module, name))
         if task is None:
-            task = _resolve(module, name, function_module, qualname)
+            task = (
+                _resolve(module, name, function_module, qualname)
+                if locator is None
+                else _located(name, *locator)
+            )
             state.tasks[(module, name)] = task
         serialization = task.app.serialization
         raw = serialization.codecs.decode(encoded, codec)
@@ -735,6 +748,7 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
         _reply(conn, _failure(error))
         return
     conn.send(("started",))
+    token = None if job is None else current_job.set(replace(job, payload=encoded))
     try:
         result = task.function(*raw["args"], **raw["kwargs"])
     except Retry as error:
@@ -748,6 +762,9 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
             answer = ("ok", serialization.encode_result(result, codec))
         except Exception as error:
             answer = ("unencodable", *_failure(error)[1:]) if store_result else ("ok", None)
+    finally:
+        if token is not None:
+            current_job.reset(token)
     _reply(conn, answer)
 
 
@@ -821,6 +838,22 @@ def _resolve(module: str, name: str, function_module: str, qualname: str) -> Any
     if found:
         return next(iter(found.values()))
     raise IsolatedTaskError(IMPORT_MESSAGE.format(module=module, name=name) + problem)
+
+
+def _located(name: str, module: str, qualname: str, arguments: tuple) -> Any:
+    from ..task import Task
+
+    try:
+        task = _attribute(module, qualname)(*arguments)
+    except Exception as error:
+        raise IsolatedTaskError(
+            LOCATOR_MESSAGE.format(name=name, module=module, qualname=qualname) + f": {error!r}"
+        ) from error
+    if not isinstance(task, Task) or task.name != name:
+        raise IsolatedTaskError(
+            LOCATOR_MESSAGE.format(name=name, module=module, qualname=qualname)
+        )
+    return task
 
 
 def _spawned(module: str) -> str:
