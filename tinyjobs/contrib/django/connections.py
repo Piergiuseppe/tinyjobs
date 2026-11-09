@@ -14,9 +14,13 @@ _apps: dict[tuple[str, str], TinyJobs] = {}
 
 
 def shared_app(
-    alias: str, options: dict[str, Any], prepare: Callable[[TinyJobs], None]
+    alias: str,
+    options: dict[str, Any],
+    prepare: Callable[[TinyJobs], None],
+    *,
+    distinct: str = "",
 ) -> TinyJobs:
-    key = (alias, repr(sorted(options.items())))
+    key = (alias, repr(sorted(options.items())) + distinct)
     app = _apps.get(key)
     if app is None:
         app = TinyJobs(**options)
