@@ -8,7 +8,12 @@ from contextlib import suppress
 from functools import partial
 from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar
 
-from ..exceptions import AppClosedError, ExecutorClosedError, UnknownTaskError
+from ..exceptions import (
+    AppClosedError,
+    ConfigurationError,
+    ExecutorClosedError,
+    UnknownTaskError,
+)
 from ..executors import ExecutorResolver
 from ..flag import Flag
 from ..limiting import assert_limits_supported, limits_for, release_held_elsewhere
@@ -44,6 +49,7 @@ class Drain:
         self._app = app
         self._queues = tuple(queues) if queues else None
         self._limited = limited
+        self._carried: dict = {}
         self._shutdown_timeout = shutdown_timeout
         self._finished = threading.Event()
         self._renewal = _Renewal(app)
@@ -118,12 +124,14 @@ class Drain:
         return ran
 
     async def _claim(self, queues: Sequence[str]) -> Job | None:
+        carried = limits_for(self._app.backend, self._app.registry) if self._limited else {}
+        self._carried = carried.get("limits", {})
         jobs = await self._app.backend.claim(
             worker_id=DRAIN_WORKER_ID,
             queues=queues,
             limit=1,
             lease_seconds=DRAIN_LEASE_SECONDS,
-            **(limits_for(self._app.backend, self._app.registry) if self._limited else {}),
+            **carried,
         )
         return jobs[0] if jobs else None
 
@@ -144,9 +152,13 @@ class Drain:
     async def _run(self, job: Job) -> bool:
         try:
             task = self._app.registry.get(job.task)
-        except UnknownTaskError:
+        except (UnknownTaskError, ConfigurationError):
             await self._app.backend.hand_back(job)
             raise
+        if self._limited and task.limit is not None and job.task not in self._carried:
+            await self._app.backend.hand_back(job)
+            assert_limits_supported(self._app.backend, self._app.registry)
+            return False
         running = asyncio.ensure_future(self._attempt(job, task))
         self._renewal.hold(job)
         try:
