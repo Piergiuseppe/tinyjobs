@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
 from ..clock import Clock
+from ..current import current_job
 from ..exceptions import ExecutorClosedError, ForcedInterrupt, ResultError
 from ..executors import ExecutorResolver
 from ..models import Job
@@ -16,7 +17,6 @@ from .serialization import SerializationService
 if TYPE_CHECKING:
     from ..task import Task
 
-current_job: ContextVar[Job] = ContextVar("tinyjobs_current_job")
 current_runner: ContextVar[object] = ContextVar("tinyjobs_current_runner")
 
 

@@ -207,7 +207,47 @@ def was_prepared() -> bool:
     return prepared
 
 
+@app.task(isolated=True, store_result=True, max_attempts=2, retry_base=0, retry_jitter=False)
+def current_attempts() -> list:
+    from tinyjobs.current import current_job
+
+    job = current_job.get()
+    if job.attempts == 1:
+        raise ValueError("once more")
+    return [job.id, job.attempts, job.task]
+
+
+def _kept_out_of_sight() -> int:
+    return os.getpid()
+
+
+def _build(name: str, locator: tuple):
+    from tinyjobs.declaring import declared_task
+
+    return declared_task(
+        app,
+        _kept_out_of_sight,
+        name=name,
+        isolated=True,
+        store_result=True,
+        locator=locator,
+    )
+
+
+LOCATED = {
+    "found": _build("tests.isolated.found", ("tests.isolated", "locate", ("found",))),
+    "missing": _build("tests.isolated.missing", ("tests.isolated", "locate", ("nothing",))),
+    "other": _build("tests.isolated.other", ("tests.isolated", "locate", ("found",))),
+}
+
+
+def locate(key: str):
+    return LOCATED.get(key)
+
+
 TASKS = [
+    current_attempts,
+    *LOCATED.values(),
     hang_with_subprocess,
     registered_pid,
     via_helper,
