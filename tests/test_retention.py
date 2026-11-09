@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import shutil
 import unittest
 
 from tinyjobs import TinyJobs
@@ -188,6 +189,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs.backends.sqlite.schema import SCHEMA_VERSION
 
         path = Path(tempfile.mkdtemp()) / "old.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v1(path)
         self.assertIn("idx_jobs_listing", self.indexes(path))
 
@@ -228,6 +230,7 @@ class MigrationTests(unittest.TestCase):
                 "tinyjobs_jobs",
                 "tinyjobs_executions",
                 "tinyjobs_schedules",
+                "tinyjobs_limits",
             },
         )
         names = self.indexes(path)
@@ -245,6 +248,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs.status import ExecutionStatus
 
         path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v2(path)
 
         async def upgrade() -> tuple:
@@ -288,6 +292,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs import TinyJobs
 
         path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v2(path)
         handle = sqlite3.connect(path, isolation_level=None)
         handle.execute(
@@ -320,6 +325,7 @@ class MigrationTests(unittest.TestCase):
 
         from tinyjobs import TinyJobs
         path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v2(path)
 
         async def upgrade() -> None:
@@ -333,7 +339,7 @@ class MigrationTests(unittest.TestCase):
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()[0]
         handle.close()
-        self.assertEqual(int(stub), 4)
+        self.assertEqual(int(stub), 5)
         self.assertGreater(int(stub), 3)
 
     def test_a_legacy_file_is_only_migrated_into_the_default_prefix(self):
@@ -345,6 +351,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs.exceptions import ConfigurationError
 
         path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v2(path)
 
         async def open_with(prefix: str) -> None:
@@ -368,6 +375,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs import TinyJobs
 
         path = Path(tempfile.mkdtemp()) / "v2.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v2(path)
 
         async def upgrade_and_purge() -> int:
@@ -388,6 +396,71 @@ class MigrationTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(upgrade_and_purge()), 0)
 
+    def build_v4(self, path) -> None:
+        import sqlite3
+
+        from tinyjobs.backends.sqlite.schema import Tables, ddl
+
+        tables = Tables()
+        added = (tables.limits, tables.index("jobs_held"), tables.index("jobs_running_by_task"))
+        handle = sqlite3.connect(path, isolation_level=None)
+        handle.execute("PRAGMA journal_mode = WAL")
+        for statement in ddl(tables):
+            if any(name in statement for name in added):
+                continue
+            handle.execute(statement.replace("'queued', 'held', 'running'", "'queued', 'running'"))
+        handle.execute("INSERT INTO tinyjobs_meta VALUES ('schema_version', '4')")
+        handle.execute("INSERT INTO tinyjobs_meta VALUES ('last_purge_at', '0')")
+        handle.execute(
+            "INSERT INTO tinyjobs_jobs (id, task, payload, codec, status, run_at, created_at, "
+            "dedup_key) VALUES ('waiting', 't', x'7b7d', 'json', 'queued', 0, 0, 'key')"
+        )
+        handle.close()
+
+    def test_a_v4_database_gains_the_limits_in_place(self):
+        import asyncio
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        from tinyjobs import TinyJobs
+        from tinyjobs.limits import Limit
+        from tinyjobs.status import JobStatus
+        from tinyjobs.testing.contract import make_job
+
+        path = Path(tempfile.mkdtemp()) / "v4.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
+        self.build_v4(path)
+
+        async def upgrade() -> tuple:
+            app = TinyJobs(f"sqlite:///{path}")
+            await app.ready()
+            try:
+                backend = app.backend._inner
+                first = await backend.enqueue(make_job(task="t", run_at=-1.0))
+                claimed = await backend.claim(
+                    worker_id="w", queues=["default"], limit=10, lease_seconds=60,
+                    limits={"t": Limit(concurrency=1)},
+                )
+                twin = await backend.enqueue(make_job(task="t", dedup_key="key"))
+                held = await backend.get("waiting")
+                return [job.id for job in claimed] == [first.id], held.status, twin.id
+            finally:
+                await app.aclose()
+
+        self.assertEqual(asyncio.run(upgrade()), (True, JobStatus.HELD, "waiting"))
+        handle = sqlite3.connect(path)
+        version = handle.execute(
+            "SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        schema = dict(handle.execute("SELECT name, sql FROM sqlite_master WHERE name LIKE 'tinyjobs%'"))
+        handle.close()
+        self.assertEqual(int(version), 5)
+        self.assertIn("tinyjobs_limits", schema)
+        self.assertIn("WHERE status = 'held'", schema["tinyjobs_jobs_held"])
+        self.assertIn("WHERE status = 'running'", schema["tinyjobs_jobs_running_by_task"])
+        self.assertIn("status IN ('queued', 'held', 'running')", schema["tinyjobs_jobs_dedup"])
+
     def test_reopening_a_current_database_leaves_its_schema_alone(self):
         import asyncio
         import sqlite3
@@ -397,6 +470,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs import TinyJobs
 
         path = Path(tempfile.mkdtemp()) / "current.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
 
         async def open_it() -> None:
             app = TinyJobs(f"sqlite:///{path}")
@@ -424,6 +498,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs.backends.sqlite.schema import SCHEMA_VERSION
 
         path = Path(tempfile.mkdtemp()) / "newer.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         handle = sqlite3.connect(path, isolation_level=None)
         handle.execute(
             "CREATE TABLE tinyjobs_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -456,6 +531,7 @@ class MigrationTests(unittest.TestCase):
         from tinyjobs import TinyJobs
 
         path = Path(tempfile.mkdtemp()) / "old.db"
+        self.addCleanup(shutil.rmtree, path.parent, ignore_errors=True)
         self.build_v1(path)
 
         async def open_it() -> None:

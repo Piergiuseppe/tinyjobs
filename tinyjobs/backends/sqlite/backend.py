@@ -7,7 +7,7 @@ import uuid
 from contextlib import AbstractContextManager, suppress
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Sequence, TypeVar
+from typing import Any, Callable, Collection, Mapping, Sequence, TypeVar
 from urllib.parse import urlsplit
 
 from ...clock import Clock
@@ -24,13 +24,14 @@ from ...models import (
 )
 from ...retention import RetentionPolicy
 from ...exceptions import AppClosedError, ConfigurationError, UnsupportedCapabilityError
+from ...limits import Limit
 from ..loader import IN_MEMORY_JOIN_MESSAGE, in_memory
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
 from ...sheltered import landing
 from ...status import ExecutionStatus, JobStatus
 from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .audit import audit
-from .claim import SUPPORTS_RETURNING, build_claim_strategy
+from .claim import SUPPORTS_RETURNING, LimitedClaim, build_claim_strategy
 from .connection import CALLING, FORK_GATE, ConnectionPool, StepAside
 from .queries import Queries
 from .records import (
@@ -41,8 +42,9 @@ from .records import (
 )
 from .schema import (
     DEFAULT_PREFIX,
-    KINDS,
+    LEGACY_KINDS,
     LEGACY_STUB,
+    PREFIXED_SINCE,
     SCHEMA_VERSION,
     TABLES_OF,
     Tables,
@@ -56,6 +58,8 @@ T = TypeVar("T")
 MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
 
 SQLITE_OPTIONS = frozenset({"busy_timeout", "prefix"})
+
+RELEASE_BATCH = 1000
 
 LEGACY_PREFIX_MESSAGE = (
     "this file holds a queue from a tinyjobs before 0.14, whose tables had no prefix, and "
@@ -151,6 +155,7 @@ class SQLiteBackend(BaseBackend):
         schedules=True,
         max_payload_bytes=None,
         result_ttl=True,
+        limits=True,
     )
 
     def __init__(
@@ -171,6 +176,7 @@ class SQLiteBackend(BaseBackend):
             database, uri=uri, busy_timeout=busy_timeout
         )
         self._claim_strategy = build_claim_strategy(self._queries)
+        self._limited_claim = LimitedClaim(self._queries)
         self._executor = _executor()
         self._busy_timeout = busy_timeout
         self._ready = False
@@ -248,9 +254,15 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> list[Job]:
         return await self._call(
-            self._claim_sync, worker_id, tuple(queues), limit, lease_seconds
+            self._claim_sync,
+            worker_id,
+            tuple(queues),
+            limit,
+            lease_seconds,
+            dict(limits) if limits else None,
         )
 
     async def claim_job(
@@ -292,6 +304,13 @@ class SQLiteBackend(BaseBackend):
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool:
         return await self._call(self._hand_back_sync, job, delay)
+
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int:
+        if not tasks or queues is not None and not queues:
+            return 0
+        return await self._call(self._release_held_sync, tuple(tasks), queues)
 
     async def cancel(self, job_id: str) -> bool:
         return await self._call(self._cancel_sync, job_id)
@@ -463,14 +482,14 @@ class SQLiteBackend(BaseBackend):
         if self._tables.meta in present:
             row = connection.execute(self._queries.schema_version).fetchone()
             return (int(row[0]) if row else None), ()
-        legacy = tuple(kind for kind in KINDS if kind in present)
+        legacy = tuple(kind for kind in LEGACY_KINDS if kind in present)
         if not _legacy_queue(connection, present):
             return None, ()
         row = connection.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
         version = str(row[0]) if row else ""
-        if not version.isdigit() or not 1 <= int(version) < SCHEMA_VERSION:
+        if not version.isdigit() or not 1 <= int(version) < PREFIXED_SINCE:
             return None, ()
         if self._tables.prefix != DEFAULT_PREFIX:
             raise ConfigurationError(LEGACY_PREFIX_MESSAGE)
@@ -609,12 +628,16 @@ class SQLiteBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None,
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
         now = self._clock.now()
+        strategy = self._claim_strategy.claim
+        if limits:
+            strategy = partial(self._limited_claim.claim, limits=limits)
         with self._connections.write() as connection:
-            rows = self._claim_strategy.claim(
+            rows = strategy(
                 connection,
                 worker_id=worker_id,
                 queues=tuple(queues),
@@ -737,6 +760,20 @@ class SQLiteBackend(BaseBackend):
                 return False
             connection.execute(self._queries.delete_execution, (job.id, job.claims))
         return True
+
+    def _release_held_sync(self, tasks: Sequence[str], queues: Sequence[str] | None) -> int:
+        marks = ", ".join("?" for _ in tasks)
+        within = "" if queues is None else " AND queue IN (" + ", ".join("?" for _ in queues) + ")"
+        statement = self._queries.release_held.format(tasks=marks, queues=within)
+        released = 0
+        while True:
+            with self._connections.write() as connection:
+                batch = connection.execute(
+                    statement, (*tasks, *(queues or ()), RELEASE_BATCH)
+                ).rowcount
+            released += batch
+            if batch < RELEASE_BATCH:
+                return released
 
     def _cancel_sync(self, job_id: str) -> bool:
         now = self._clock.now()

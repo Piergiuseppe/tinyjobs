@@ -413,7 +413,7 @@ class ColdSQLiteTransactionTests(unittest.TestCase):
                     self.connect()
                     .execute("SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'")
                     .fetchone(),
-                    ("4",),
+                    ("5",),
                 )
                 if mode == "legacy":
                     self.assertIsNone(app.get(job.id))
@@ -613,7 +613,7 @@ class ColdSQLiteTransactionTests(unittest.TestCase):
         self.assertTrue(traced[0].startswith("DELETE FROM tinyjobs_install_lock"), traced)
         self.assertEqual(
             self.connect().execute("SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'").fetchone(),
-            ("4",),
+            ("5",),
         )
         self.assertIsNotNone(app.get(job.id))
 
@@ -787,7 +787,7 @@ class PrefixTests(unittest.TestCase):
         self.assertEqual(
             names,
             {f"{prefix}_{kind}" for prefix in ("shop", "mail")
-             for kind in ("jobs", "executions", "schedules", "meta", "install_lock")},
+             for kind in ("jobs", "executions", "schedules", "meta", "limits", "install_lock")},
         )
 
     def test_a_transaction_lands_in_the_prefix_of_its_app(self):

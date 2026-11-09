@@ -8,7 +8,7 @@ TEMPLATES = {
     "select_job": f"SELECT {JOB_COLUMN_LIST} FROM {{jobs}} WHERE id = ?",
     "select_active_by_dedup": f"""
         SELECT {JOB_COLUMN_LIST} FROM {{jobs}}
-         WHERE dedup_key = ? AND status IN ('queued', 'running')
+         WHERE dedup_key = ? AND status IN ('queued', 'held', 'running')
     """,
     "select_claimable_ids": """
         SELECT id FROM {jobs}
@@ -47,7 +47,51 @@ TEMPLATES = {
                attempts = attempts + 1,
                claims = claims + 1,
                lease_expires_at = ?
-         WHERE id = ? AND status = 'queued' AND run_at <= ?
+         WHERE id = ? AND status IN ('queued', 'held') AND run_at <= ?
+    """,
+    "select_due_candidates": """
+        SELECT id, task, priority, run_at, status FROM {jobs}
+         WHERE status = 'queued' AND run_at <= ? AND queue IN ({{queues}})
+         ORDER BY priority DESC, run_at ASC
+         LIMIT ?
+    """,
+    "select_held_line": """
+        SELECT id, task, priority, run_at, status FROM {jobs}
+         WHERE status = 'held' AND task = ? AND queue IN ({{queues}})
+         ORDER BY priority DESC, run_at ASC
+         LIMIT ?
+    """,
+    "running_by_task": """
+        SELECT task, count(*) AS total FROM {jobs}
+         WHERE status = 'running' AND task IN ({{tasks}})
+         GROUP BY task
+    """,
+    "select_last_starts": """
+        SELECT task, last_at FROM {limits} WHERE task IN ({{tasks}})
+    """,
+    "record_start": """
+        INSERT INTO {limits} (task, last_at) VALUES (?, ?)
+        ON CONFLICT (task) DO UPDATE SET last_at = excluded.last_at
+    """,
+    "admit_one": """
+        UPDATE {jobs}
+           SET status = 'running',
+               worker_id = ?,
+               attempts = attempts + 1,
+               claims = claims + 1,
+               lease_expires_at = ?
+         WHERE id = ? AND status = ?
+    """,
+    "release_held": """
+        UPDATE {jobs} SET status = 'queued'
+         WHERE id IN (
+            SELECT id FROM {jobs}
+             WHERE status = 'held' AND task IN ({{tasks}}){{queues}}
+             LIMIT ?
+         )
+    """,
+    "hold_one": """
+        UPDATE {jobs} SET status = 'held' WHERE id = ? AND status = 'queued'
     """,
     "heartbeat": """
         UPDATE {jobs} SET lease_expires_at = ?
@@ -100,7 +144,7 @@ TEMPLATES = {
         UPDATE {jobs}
            SET status = 'cancelled', finished_at = ?, lease_expires_at = NULL,
                hand_backs = 0
-         WHERE id = ? AND status IN ('queued', 'running')
+         WHERE id = ? AND status IN ('queued', 'held', 'running')
     """,
     "requeue_job": """
         UPDATE {jobs}
@@ -112,7 +156,7 @@ TEMPLATES = {
            AND NOT EXISTS (
                SELECT 1 FROM {jobs} AS holder
                 WHERE holder.dedup_key = {jobs}.dedup_key
-                  AND holder.status IN ('queued', 'running')
+                  AND holder.status IN ('queued', 'held', 'running')
            )
     """,
     "reap_expired": """
@@ -166,7 +210,7 @@ TEMPLATES = {
     """,
     "oldest_due_by_queue": """
         SELECT queue, min(run_at) AS oldest FROM {jobs}
-         WHERE status = 'queued' AND run_at <= ?
+         WHERE (status = 'queued' AND run_at <= ?) OR status = 'held'
          GROUP BY queue
     """,
     "count_expired_leases": """
@@ -174,7 +218,8 @@ TEMPLATES = {
          WHERE status = 'running' AND lease_expires_at < ?
     """,
     "queued_by_task": """
-        SELECT task, count(*) AS total FROM {jobs} WHERE status = 'queued' GROUP BY task
+        SELECT task, count(*) AS total FROM {jobs}
+         WHERE status IN ('queued', 'held') GROUP BY task
     """,
     "claim_housekeeping": """
         UPDATE {meta} SET value = ?
