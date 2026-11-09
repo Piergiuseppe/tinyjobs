@@ -5,6 +5,7 @@ from typing import Callable, Iterator, TYPE_CHECKING
 from .exceptions import TaskAlreadyRegisteredError, UnknownTaskError
 
 if TYPE_CHECKING:
+    from .limits import Limit
     from .task import Task
 
 Resolver = Callable[[str], "Task | None"]
@@ -40,6 +41,11 @@ class TaskRegistry:
 
     def names(self) -> list[str]:
         return sorted(self._tasks)
+
+    def limits(self) -> dict[str, "Limit"]:
+        return {
+            task.name: task.limit for task in self._tasks.values() if task.limit is not None
+        }
 
     def _resolve(self, name: str) -> "Task | None":
         for resolver in self._resolvers:

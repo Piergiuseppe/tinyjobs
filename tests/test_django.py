@@ -103,6 +103,15 @@ class DjangoTestCase(unittest.TestCase):
 
 
 class EnqueueTests(DjangoTestCase):
+    def test_a_held_job_reads_as_ready(self):
+        from django.tasks import TaskResultStatus
+
+        from tinyjobs.contrib.django.results import STATUSES
+        from tinyjobs.status import JobStatus
+
+        self.assertIs(STATUSES[JobStatus.HELD], TaskResultStatus.READY)
+        self.assertEqual(set(STATUSES), set(JobStatus))
+
     def test_enqueue_returns_a_ready_result_with_the_task_settings(self):
         result = self.tasks.greet.enqueue("ada")
         self.assertEqual(result.status, "READY")

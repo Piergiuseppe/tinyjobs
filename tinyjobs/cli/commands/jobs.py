@@ -38,7 +38,7 @@ class JobsCommand(Command):
         retry.add_argument("job_id")
 
         cancel = actions.add_parser(
-            "cancel", help="cancel a queued or running job", parents=[shared]
+            "cancel", help="cancel a queued, held or running job", parents=[shared]
         )
         cancel.add_argument("job_id")
 
@@ -108,7 +108,7 @@ class JobsCommand(Command):
 
     def _cancel(self, app, args: argparse.Namespace) -> int:
         if not app.cancel(args.job_id):
-            print(f"job {args.job_id} is not queued or running")
+            print(f"job {args.job_id} is not queued, held or running")
             return 1
         print(f"job {args.job_id} cancelled")
         return 0

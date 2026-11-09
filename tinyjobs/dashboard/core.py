@@ -34,7 +34,7 @@ SCHEDULE_ACTIONS = {
     "run": "run_schedule",
 }
 RETRYABLE = frozenset({JobStatus.FAILED, JobStatus.CANCELLED})
-CANCELLABLE = frozenset({JobStatus.QUEUED, JobStatus.RUNNING})
+CANCELLABLE = frozenset({JobStatus.QUEUED, JobStatus.HELD, JobStatus.RUNNING})
 
 
 class Dashboard:

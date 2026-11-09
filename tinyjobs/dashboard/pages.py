@@ -12,7 +12,7 @@ from ..status import JobStatus
 STATUSES = tuple(status.value for status in JobStatus)
 NOTICES = {
     "retried": "the job is queued again",
-    "retry-refused": "the job was not retried: it is not failed or cancelled, or another queued or running job holds its dedup key",
+    "retry-refused": "the job was not retried: it is not failed or cancelled, or another queued, held or running job holds its dedup key",
     "cancelled": "the job is cancelled, or will be when it next checks",
     "cancel-refused": "the job was not cancelled: it had already finished",
     "paused": "the schedule is paused",
@@ -48,9 +48,9 @@ def overview(data: dict[str, Any], root: str, notice: str) -> str:
         [escape(task), str(count)] for task, count in data["queued_tasks"].items()
     ]
     queued_tasks = (
-        table(("Task", "Queued"), tasks, numbers=(1,))
+        table(("Task", "Waiting"), tasks, numbers=(1,))
         if tasks
-        else '<p class="empty">nothing queued</p>'
+        else '<p class="empty">nothing waiting</p>'
     )
     body = f"""<h1>Overview</h1>
 {notice}
@@ -59,7 +59,7 @@ def overview(data: dict[str, Any], root: str, notice: str) -> str:
 <h2>Queues</h2>
 {queues}
 <p>running past their lease: <strong>{data["expired_leases"]}</strong></p>
-<h2>Queued by task</h2>
+<h2>Waiting by task</h2>
 {queued_tasks}"""
     return layout("Overview", "", body, root)
 

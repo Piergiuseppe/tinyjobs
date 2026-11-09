@@ -6,10 +6,11 @@ import inspect
 import logging
 import time
 from functools import partial
-from typing import Any, Awaitable, Callable, Collection, Coroutine, Sequence
+from typing import Any, Awaitable, Callable, Collection, Coroutine, Mapping, Sequence
 
 from ..deadlines import Deadline, end_of_caller, final_left, under
 from ..exceptions import AppClosedError, EventLoopStoppedError
+from ..limits import Limit
 from ..models import Execution, ExecutionError, Finding, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
 from ..runtime import (
@@ -85,6 +86,7 @@ class ManagedBackend:
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> list[Job]:
         return await self._claimed(
             partial(
@@ -93,6 +95,7 @@ class ManagedBackend:
                 queues=queues,
                 limit=limit,
                 lease_seconds=lease_seconds,
+                **({"limits": limits} if limits else {}),
             )
         )
 
@@ -317,6 +320,11 @@ class ManagedBackend:
 
     async def reap_expired(self) -> int:
         return await self._forward(self._inner.reap_expired)
+
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int:
+        return await self._forward(self._inner.release_held, tasks, queues)
 
     async def counts_by_status(self) -> dict[str, int]:
         return await self._forward(self._inner.counts_by_status)
