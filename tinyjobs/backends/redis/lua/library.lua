@@ -9,7 +9,7 @@ if FOLLOWING then
   local time = redis.call('TIME')
   SERVER = tonumber(time[1]) + tonumber(time[2]) / 1000000
 end
-local ACTIVE = { queued = true, running = true }
+local ACTIVE = { queued = true, held = true, running = true }
 local TERMINAL = { success = true, failed = true, cancelled = true }
 
 local function moment(value)
@@ -94,6 +94,14 @@ local function ready_member(job)
   return string.format('%020.6f', tonumber(job.run_at)) .. '|' .. job.id
 end
 
+local function member_id(member)
+  return string.match(member, '|(.+)$')
+end
+
+local function held_line(task, queue)
+  return key('held', #task .. ':' .. task .. ':' .. queue)
+end
+
 local function adjust(hash, field, delta)
   if redis.call('HINCRBY', hash, field, delta) <= 0 then
     redis.call('HDEL', hash, field)
@@ -138,7 +146,13 @@ local function enter(job)
     else
       redis.call('ZADD', key('waiting', job.queue), job.run_at, job.id)
     end
+  elseif status == 'held' then
+    adjust(key('queued_tasks'), job.task, 1)
+    redis.call('ZADD', held_line(job.task, job.queue), -tonumber(job.priority), ready_member(job))
+    redis.call('SADD', key('held_queues', job.task), job.queue)
+    redis.call('ZADD', key('held_due', job.queue), job.run_at, job.id)
   elseif status == 'running' then
+    adjust(key('running_tasks'), job.task, 1)
     redis.call('ZADD', key('leases'), job.lease_expires_at, job.id)
   elseif TERMINAL[status] then
     redis.call('ZADD', key('finished', status), job.finished_at, job.id)
@@ -155,7 +169,15 @@ local function leave(job)
     redis.call('ZREM', key('queued', job.queue), job.id)
     redis.call('ZREM', key('waiting', job.queue), job.id)
     redis.call('ZREM', key('ready', job.queue), ready_member(job))
+  elseif status == 'held' then
+    adjust(key('queued_tasks'), job.task, -1)
+    redis.call('ZREM', held_line(job.task, job.queue), ready_member(job))
+    redis.call('ZREM', key('held_due', job.queue), job.id)
+    if redis.call('ZCARD', held_line(job.task, job.queue)) == 0 then
+      redis.call('SREM', key('held_queues', job.task), job.queue)
+    end
   elseif status == 'running' then
+    adjust(key('running_tasks'), job.task, -1)
     redis.call('ZREM', key('leases'), job.id)
     if job.claim_token then
       redis.call('ZREM', key('claim_tokens'), job.claim_token .. '|' .. job.id)
@@ -268,6 +290,51 @@ local function take(job, worker, lease_expires_at, token)
   })
   start_execution(job)
   redis.call('ZADD', key('claim_tokens'), 0, token .. '|' .. job.id)
+end
+
+local function held_entry(task, queue, member)
+  local line = held_line(task, queue)
+  local id = member_id(member)
+  local job = load(id)
+  if job and job.status == 'held' and job.task == task and job.queue == queue then
+    return job
+  end
+  redis.call('ZREM', line, member)
+  if not job or job.status ~= 'held' then
+    redis.call('ZREM', key('held_due', queue), id)
+  end
+  if redis.call('ZCARD', line) == 0 then
+    redis.call('SREM', key('held_queues', task), queue)
+  end
+  return nil
+end
+
+local function held_jobs(task, queue, count)
+  local line = held_line(task, queue)
+  local found = {}
+  while #found < count do
+    local rows = redis.call('ZRANGE', line, #found, count - 1, 'WITHSCORES')
+    if #rows == 0 then
+      break
+    end
+    for position = 1, #rows, 2 do
+      local job = held_entry(task, queue, rows[position])
+      if job then
+        found[#found + 1] = { score = tonumber(rows[position + 1]), member = rows[position], job = job }
+      end
+    end
+  end
+  return found
+end
+
+local function recount_running_tasks()
+  redis.call('DEL', key('running_tasks'))
+  for _, id in ipairs(redis.call('ZRANGE', key('index', 'status', 'running'), 0, -1)) do
+    local job = redis.call('HMGET', job_key(id), 'task', 'status')
+    if job[1] and job[2] == 'running' then
+      redis.call('HINCRBY', key('running_tasks'), job[1], 1)
+    end
+  end
 end
 
 local function close_running_execution(job, status)
