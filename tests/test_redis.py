@@ -15,6 +15,7 @@ from unittest import mock
 import tinyjobs.clock
 from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import AppClosedError, ConfigurationError
+from tinyjobs.limits import Limit
 from tinyjobs.runtime import run_on
 from tinyjobs.status import ExecutionStatus
 from tinyjobs.testing import BackendContract
@@ -101,7 +102,7 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await self.enqueue(run_at=START - 1)
         now = await self.backend._now()
         [blob] = await self.backend._scripts.run(
-            "claim", now, "worker", str(now + 60), 1, "a-token", "default"
+            "claim", now, "worker", str(now + 60), 1, "a-token", 1, "default"
         )
         names = [item.partition(b"=")[0] for item in blob.partition(b"\n")[0].split(b",")]
         self.assertNotIn(b"claim_token", names)
@@ -210,10 +211,12 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.claim()), 1)
 
     async def test_a_store_written_by_0_6_is_moved_past_what_0_6_accepts(self):
+        from tinyjobs.backends.redis.backend import SCHEMA_VERSION
+
         version = self.backend._keys("schema_version")
         await self.backend._client.set(version, 1)
         await self.backend.setup()
-        self.assertEqual(int(await self.backend._client.get(version)), 2)
+        self.assertEqual(int(await self.backend._client.get(version)), SCHEMA_VERSION)
 
     async def test_a_store_from_a_newer_release_is_refused_and_left_alone(self):
         from tinyjobs.backends.redis.backend import SCHEMA_VERSION
@@ -307,6 +310,382 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             history, [(2, ExecutionStatus.FAILED), (1, ExecutionStatus.LOST)]
         )
         self.assertEqual((await self.stored(claimed)).claims, 2)
+
+    async def a_store_holding_jobs(self, task: str = "tests.noop") -> dict:
+        client = self.backend._client
+        counts = await client.hgetall(self.backend._keys("counts"))
+        return {
+            "held": await self.held_lines(task),
+            "held_due": await client.zcard(self.backend._keys("held_due", "default")),
+            "index": await client.zcard(self.backend._keys("index", "status", "held")),
+            "counts": sorted(
+                field.decode() for field in counts if field.decode().endswith("\theld")
+            ),
+            "running_tasks": {
+                name.decode(): int(count)
+                for name, count in (
+                    await client.hgetall(self.backend._keys("running_tasks"))
+                ).items()
+            },
+        }
+
+    async def test_held_jobs_leave_no_index_behind_once_admitted_and_finished(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        jobs = [await self.enqueue(run_at=float(index)) for index in range(3)]
+        [running] = await self.limited(**limits)
+        self.assertEqual(
+            await self.a_store_holding_jobs(),
+            {
+                "held": {"default": 2},
+                "held_due": 2,
+                "index": 2,
+                "counts": ["default\theld"],
+                "running_tasks": {"tests.noop": 1},
+            },
+        )
+        finished = []
+        for _ in jobs:
+            self.assertTrue(await self.backend.complete(running, None))
+            finished.append(running.id)
+            admitted = await self.limited(**limits)
+            running = admitted[0] if admitted else running
+        self.assertEqual(finished, [job.id for job in jobs])
+        self.assertEqual(
+            await self.a_store_holding_jobs(),
+            {"held": {}, "held_due": 0, "index": 0, "counts": [], "running_tasks": {}},
+        )
+        self.assertEqual((await self.backend.stats(self.clock.now())).queued_tasks, {})
+
+    async def test_a_held_job_keeps_its_dedup_key_until_it_finishes(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue()
+        held = await self.enqueue(run_at=1.0, dedup_key="invoice:1")
+        await self.limited(**limits)
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+        self.assertEqual((await self.enqueue(dedup_key="invoice:1")).id, held.id)
+        taken = await self.backend.claim_job(held.id, worker_id="worker-b", lease_seconds=60.0)
+        self.assertEqual(taken.id, held.id)
+        self.assertEqual(
+            await self.a_store_holding_jobs(),
+            {
+                "held": {},
+                "held_due": 0,
+                "index": 0,
+                "counts": [],
+                "running_tasks": {"tests.noop": 2},
+            },
+        )
+        self.assertTrue(await self.backend.complete(taken, None))
+        self.assertNotEqual((await self.enqueue(dedup_key="invoice:1")).id, held.id)
+
+    async def keyspace(self) -> dict:
+        client = self.backend._client
+        stored = {}
+        async for name in client.scan_iter(match=self.backend._keys("*"), count=10_000):
+            kind = (await client.type(name)).decode()
+            if kind == "hash":
+                value = await client.hgetall(name)
+            elif kind == "zset":
+                value = await client.zrange(name, 0, -1, withscores=True)
+            elif kind == "set":
+                value = await client.smembers(name)
+            else:
+                value = await client.get(name)
+            stored[name.decode().split(":", 1)[1]] = value
+        return stored
+
+    async def test_a_claim_without_limits_is_the_claim_it_always_was(self):
+        jobs = [
+            make_job(task=f"tests.task{index % 3}", queue=("default", "mail")[index % 2],
+                     priority=index % 4, run_at=float(index))
+            for index in range(10)
+        ]
+        delayed = make_job(task="tests.task0", priority=3, run_at=START + 5)
+        await self.backend.enqueue_many([*jobs, delayed])
+        self.clock.advance(10)
+        before = await self.keyspace()
+        claimed = await self.claim(limit=5, queues=("default", "mail"))
+        after = await self.keyspace()
+        order = sorted([*jobs, delayed], key=lambda job: (-job.priority, job.run_at, job.id))
+        taken, left = order[:5], order[5:]
+        self.assertEqual([job.id for job in claimed], [job.id for job in taken])
+        self.assertEqual({job.status for job in claimed}, {JobStatus.RUNNING})
+        touched = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+        self.assertEqual(
+            touched,
+            {f"job:{job.id}" for job in taken}
+            | {f"executions:{job.id}" for job in taken}
+            | {
+                "ready:default", "ready:mail", "waiting:default", "queued:default",
+                "queued:mail", "leases", "claim_tokens", "index:status:queued",
+                "index:status:running", "counts", "queued_tasks", "running_tasks",
+            },
+        )
+        self.assertFalse(
+            [name for name in after if name.split(":", 1)[0] in ("held", "held_queues", "held_due", "limit")]
+        )
+        for queue in ("default", "mail"):
+            self.assertEqual(
+                [member.decode().split("|", 1)[1] for member, _ in after[f"ready:{queue}"]],
+                [job.id for job in left if job.queue == queue],
+            )
+        self.assertNotIn("waiting:default", after)
+        self.assertEqual(
+            {member.decode() for member, _ in after["index:status:running"]},
+            {job.id for job in taken},
+        )
+
+        def tally(group, field):
+            counted = {}
+            for job in group:
+                name = field(job)
+                counted[name] = counted.get(name, 0) + 1
+            return {name.encode(): str(count).encode() for name, count in counted.items()}
+
+        self.assertEqual(
+            after["counts"],
+            tally(left, lambda job: f"{job.queue}\tqueued") | tally(taken, lambda job: f"{job.queue}\trunning"),
+        )
+        self.assertEqual(after["queued_tasks"], tally(left, lambda job: job.task))
+        self.assertEqual(after["running_tasks"], tally(taken, lambda job: job.task))
+
+    async def test_names_holding_a_separator_keep_their_held_lines_apart(self):
+        for first, first_queue, second, second_queue in (
+            ("tests.a:b", "c", "tests.a", "b:c"),
+            ("tests.t\tb", "e", "tests.t", "b\te"),
+        ):
+            with self.subTest(first=first, second_queue=second_queue):
+                await self.held_apart(first, first_queue, second, second_queue)
+
+    async def held_apart(self, first, first_queue, second, second_queue):
+        limits = {first: Limit(concurrency=1), second: Limit(concurrency=1)}
+        for task, queue in ((first, first_queue), (second, second_queue)):
+            await self.enqueue(task=task, queue=queue, run_at=0.0)
+            await self.enqueue(task=task, queue=queue, run_at=1.0)
+        running = await self.limited(queues=(first_queue, second_queue), **limits)
+        self.assertEqual(sorted(job.task for job in running), sorted([first, second]))
+        self.assertEqual(await self.held_lines(first), {first_queue: 1})
+        self.assertEqual(await self.held_lines(second), {second_queue: 1})
+        self.assertTrue(await self.backend.complete(next(job for job in running if job.task == second), None))
+        self.assertEqual(await self.limited(queues=(first_queue,), **limits), [])
+        [admitted] = await self.limited(queues=(second_queue,), **limits)
+        self.assertEqual((admitted.task, admitted.queue), (second, second_queue))
+        self.assertEqual(await self.backend.release_held(tasks=(second,)), 0)
+        self.assertEqual(await self.held_lines(first), {first_queue: 1})
+        self.assertEqual(await self.backend.release_held(tasks=(first,)), 1)
+        self.assertEqual(await self.held_lines(first), {})
+
+    async def zrange_calls(self) -> int:
+        stats = await self.backend._client.info("commandstats")
+        return stats.get("cmdstat_zrange", {}).get("calls", 0)
+
+    async def test_a_short_read_that_held_jobs_makes_one_slice(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        await self.limited(**limits)
+        for index in range(3):
+            await self.enqueue(run_at=1.0 + index)
+        before = await self.zrange_calls()
+        self.assertEqual(await self.limited(limit=10, **limits), [])
+        self.assertEqual(await self.zrange_calls() - before, 1)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 3)
+
+    async def test_a_stale_head_of_a_held_line_is_dropped_and_the_line_read_on(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        running = await self.enqueue(run_at=0.0)
+        held = await self.enqueue(run_at=1.0)
+        await self.limited(**limits)
+        client = self.backend._client
+        line = self.held_line("tests.noop", "default")
+        gone, moved = make_job(), await self.enqueue(task="tests.other", run_at=0.5)
+        await client.zadd(line, {f"{0:020.6f}|{gone.id}": -9, f"{0.5:020.6f}|{moved.id}": -8})
+        await client.zadd(self.backend._keys("held_due", "default"), {gone.id: 0.0})
+        self.assertTrue(await self.backend.complete(await self.stored(running), None))
+        self.assertEqual([job.id for job in await self.limited(**limits)], [moved.id, held.id])
+        self.assertEqual(await client.zrange(line, 0, -1), [])
+        self.assertEqual(await self.held_lines("tests.noop"), {})
+        self.assertEqual(
+            await client.zrange(self.backend._keys("held_due", "default"), 0, -1), []
+        )
+        self.assertEqual(await self.statuses(moved), [JobStatus.RUNNING])
+
+    async def test_one_reap_pass_a_minute_writes_running_tasks_back_from_the_running_jobs(self):
+        await self.backend.enqueue_many([make_job(task=("tests.a", "tests.b")[index % 2]) for index in range(3)])
+        await self.claim(limit=3, lease_seconds=3600.0)
+        counter = self.backend._keys("running_tasks")
+        exact = {"tests.a": 2, "tests.b": 1}
+
+        async def corrupt():
+            await self.backend._client.delete(counter)
+            await self.backend._client.hset(counter, mapping={"tests.a": 5, "tests.gone": 2})
+
+        await corrupt()
+        self.assertEqual(await self.backend.reap_expired(), 0)
+        self.assertEqual((await self.a_store_holding_jobs())["running_tasks"], exact)
+        await corrupt()
+        self.clock.advance(59)
+        self.assertEqual(await (await self.open()).reap_expired(), 0)
+        self.assertEqual(
+            (await self.a_store_holding_jobs())["running_tasks"], {"tests.a": 5, "tests.gone": 2}
+        )
+        self.clock.advance(1)
+        self.assertEqual(await self.backend.reap_expired(), 0)
+        self.assertEqual((await self.a_store_holding_jobs())["running_tasks"], exact)
+
+    async def test_one_claim_reads_four_slices_past_the_jobs_it_holds(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        running = await self.enqueue(run_at=0.0)
+        await self.limited(limit=4, **limits)
+        flood = [await self.enqueue(run_at=1.0 + index, priority=5) for index in range(12)]
+        other = await self.enqueue(task="tests.mail", run_at=100.0)
+        later = await self.enqueue(task="tests.mail", run_at=101.0)
+        claimed = await self.limited(limit=4, **limits)
+        self.assertEqual([job.id for job in claimed], [other.id, later.id])
+        self.assertEqual(await self.statuses(*flood), [JobStatus.HELD] * len(flood))
+        self.assertEqual(await self.statuses(running), [JobStatus.RUNNING])
+
+    def held_line(self, task: str, queue: str) -> str:
+        return self.backend._keys("held", f"{len(task.encode())}:{task}:{queue}")
+
+    async def held_lines(self, task: str) -> dict[str, int]:
+        client = self.backend._client
+        queues = await client.smembers(self.backend._keys("held_queues", task))
+        return {
+            queue.decode(): await client.zcard(self.held_line(task, queue.decode()))
+            for queue in queues
+        }
+
+    async def test_releasing_held_jobs_empties_their_lines_in_batches_and_keeps_the_rest(self):
+        from tinyjobs.backends.redis.backend import RELEASE_BATCH
+
+        limits = {"tests.noop": Limit(concurrency=1), "tests.mail": Limit(concurrency=1)}
+        await self.backend.enqueue_many(
+            [make_job(run_at=float(index)) for index in range(RELEASE_BATCH + 6)]
+        )
+        kept = [await self.enqueue(task="tests.mail", run_at=float(index)) for index in range(3)]
+        await self.limited(limit=RELEASE_BATCH, **limits)
+        stale = make_job(task="tests.noop")
+        await self.backend._client.zadd(
+            self.held_line("tests.noop", "default"), {f"{0:020.6f}|{stale.id}": -9}
+        )
+        self.assertEqual((await self.backend.counts_by_status())["held"], RELEASE_BATCH + 7)
+        self.assertEqual(await self.held_lines("tests.noop"), {"default": RELEASE_BATCH + 6})
+        self.assertEqual(await self.backend.release_held(tasks=()), 0)
+        released = await self.backend.release_held(tasks=("tests.noop", "tests.other"))
+        self.assertEqual(released, RELEASE_BATCH + 5)
+        self.assertEqual(await self.held_lines("tests.noop"), {})
+        self.assertEqual(await self.held_lines("tests.mail"), {"default": 2})
+        self.assertEqual(await self.statuses(*kept[1:]), [JobStatus.HELD, JobStatus.HELD])
+        self.assertEqual(
+            (await self.backend.stats(self.clock.now())).queued_tasks,
+            {"tests.noop": RELEASE_BATCH + 5, "tests.mail": 2},
+        )
+        claimed = await self.claim(limit=3)
+        self.assertEqual([job.run_at for job in claimed], [1.0, 2.0, 3.0])
+        self.assertEqual(await self.backend.release_held(tasks=("tests.mail",)), 2)
+        holding = await self.a_store_holding_jobs("tests.mail")
+        self.assertEqual((holding["held"], holding["held_due"], holding["index"]), ({}, 0, 0))
+
+    async def test_a_released_held_job_keeps_its_dedup_key(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue()
+        held = await self.enqueue(run_at=1.0, dedup_key="invoice:1")
+        await self.limited(**limits)
+        self.assertEqual(await self.backend.release_held(tasks=("tests.noop",)), 1)
+        self.assertEqual(await self.statuses(held), [JobStatus.QUEUED])
+        self.assertEqual((await self.enqueue(dedup_key="invoice:1")).id, held.id)
+
+    async def test_a_held_job_of_one_queue_is_not_hidden_by_the_held_jobs_of_another(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        running = await self.enqueue(queue="a", run_at=0.0)
+        await self.backend.enqueue_many(
+            [make_job(queue="a", run_at=1.0 + index) for index in range(60)]
+        )
+        late = await self.enqueue(queue="b", run_at=100.0)
+        [first] = await self.limited(queues=("a",), limit=100, **limits)
+        self.assertEqual(first.id, running.id)
+        self.assertEqual(await self.limited(queues=("b",), **limits), [])
+        self.assertEqual(await self.held_lines("tests.noop"), {"a": 60, "b": 1})
+        self.assertTrue(await self.backend.complete(first, None))
+        fresh = await self.enqueue(queue="b", run_at=200.0)
+        self.assertEqual([job.id for job in await self.limited(queues=("b",), **limits)], [late.id])
+        self.assertEqual(await self.statuses(fresh), [JobStatus.HELD])
+
+    async def test_a_held_job_passed_over_in_one_slice_is_read_again_in_the_next(self):
+        limits = {"tests.noop": Limit(concurrency=1), "tests.video": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        await self.enqueue(task="tests.video", run_at=0.0)
+        video = await self.enqueue(task="tests.video", run_at=1.0)
+        running = await self.limited(**limits)
+        self.assertEqual(await self.statuses(video), [JobStatus.HELD])
+        await self.backend.complete(next(job for job in running if job.task == "tests.video"), None)
+        flood = [await self.enqueue(run_at=2.0 + index, priority=9) for index in range(2)]
+        self.assertEqual([job.id for job in await self.limited(limit=2, **limits)], [video.id])
+        self.assertEqual(await self.statuses(*flood), [JobStatus.HELD, JobStatus.HELD])
+
+    async def test_a_rate_limit_stamps_the_start_with_the_claim_time(self):
+        await self.enqueue()
+        self.clock.advance(5)
+        await self.limited(**{"tests.noop": Limit(interval=10.0)})
+        last_at = await self.backend._client.hget(self.backend._keys("limit", "tests.noop"), "last_at")
+        self.assertEqual(float(last_at), START + 5)
+
+    async def test_running_tasks_follows_a_cancel_a_reap_and_the_sweep_of_a_lost_claim(self):
+        limits = {"tests.noop": Limit(concurrency=2)}
+        real = self.backend._scripts.run
+
+        async def lost(name, *arguments, **options):
+            await real(name, *arguments, **options)
+            raise RedisConnectionError("the answer was lost")
+
+        async def cancel(job):
+            [running] = await self.limited(**limits)
+            self.assertTrue(await self.backend.cancel(running.id))
+
+        async def reap(job):
+            await self.limited(**limits)
+            self.assertEqual(await self.reap_after_the_lease(), 1)
+
+        async def sweep(job):
+            with mock.patch.object(self.backend._scripts, "run", lost):
+                with self.assertRaises(RedisConnectionError):
+                    await self.limited(**limits)
+            self.assertIs((await self.stored(job)).status, JobStatus.RUNNING)
+            self.assertEqual(
+                (await self.a_store_holding_jobs())["running_tasks"], {"tests.noop": 1}
+            )
+            self.backend._swept = -math.inf
+            await self.backend._laid()
+            self.assertIs((await self.stored(job)).status, JobStatus.QUEUED)
+
+        for way in (cancel, reap, sweep):
+            with self.subTest(way=way.__name__):
+                job = await self.enqueue(run_at=START - 1)
+                await way(job)
+                self.assertEqual((await self.a_store_holding_jobs())["running_tasks"], {})
+                await self.backend.cancel(job.id)
+
+    async def test_a_store_written_by_0_14_is_moved_to_the_version_that_knows_held(self):
+        jobs = [make_job(task=("tests.noop", "tests.mail")[index % 3 == 0]) for index in range(6)]
+        await self.backend.enqueue_many(jobs)
+        running = await self.claim(limit=4)
+        client = self.backend._client
+        counter = self.backend._keys("running_tasks")
+        await client.delete(counter)
+        await client.hset(counter, "tests.gone", 7)
+        version = self.backend._keys("schema_version")
+        await client.set(version, 2)
+        await self.backend.setup()
+        self.assertEqual(int(await client.get(version)), 3)
+        tasks = [job.task for job in running]
+        self.assertEqual(
+            (await self.a_store_holding_jobs())["running_tasks"],
+            {task: tasks.count(task) for task in set(tasks)},
+        )
+        await self.backend.setup()
+        for job in running:
+            self.assertTrue(await self.backend.complete(job, None))
+        self.assertEqual((await self.a_store_holding_jobs())["running_tasks"], {})
 
 
 SKEWED_HOST = """

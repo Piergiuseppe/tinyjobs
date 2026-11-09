@@ -17,6 +17,7 @@ NAMES = (
     "release",
     "release_many",
     "hand_back",
+    "release_held",
     "cancel",
     "requeue",
     "heartbeat",

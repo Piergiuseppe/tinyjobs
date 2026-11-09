@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
-from typing import Any, Awaitable, Callable, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Collection, Mapping, Sequence, TypeVar
 from urllib.parse import unquote, urlsplit
 
 from redis.asyncio import BlockingConnectionPool, ConnectionPool, Redis
@@ -24,6 +24,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
 from ...exceptions import AppClosedError, ConfigurationError
+from ...limits import Limit
 from ...models import (
     Execution,
     ExecutionError,
@@ -54,12 +55,13 @@ from .tokens import claim_token
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MAX_CONNECTIONS = 100
 DEFAULT_POOL_TIMEOUT = 20.0
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
 CLOCK_SECONDS = 5.0
 SPARE_CONNECTIONS = 2
 SETTLE_BATCH = 100
+RELEASE_BATCH = 100
 CLOSED_MESSAGE = "the redis backend was closed"
 CLOSE_SECONDS = 0.5
 GHOST_SWEEP_SECONDS = 1.0
@@ -85,6 +87,7 @@ class RedisBackend(BaseBackend):
         max_payload_bytes=None,
         result_ttl=True,
         loop_bound=True,
+        limits=True,
     )
 
     def __init__(
@@ -214,6 +217,7 @@ class RedisBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
@@ -223,7 +227,17 @@ class RedisBackend(BaseBackend):
         claimed = await self._haunting(
             token,
             lease_seconds,
-            self._script("claim", now, worker_id, number(now + lease_seconds), limit, token, *queues),
+            self._script(
+                "claim",
+                now,
+                worker_id,
+                number(now + lease_seconds),
+                limit,
+                token,
+                len(queues),
+                *queues,
+                *_limit_arguments(limits),
+            ),
         )
         return [job_from_packed(blob) for blob in claimed]
 
@@ -351,6 +365,19 @@ class RedisBackend(BaseBackend):
             )
         )
 
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int:
+        if not tasks or (queues is not None and not queues):
+            return 0
+        lines = [-1] if queues is None else [len(queues), *queues]
+        released = 0
+        while True:
+            moved, examined = await self._run("release_held", RELEASE_BATCH, *lines, *tasks)
+            released += int(moved)
+            if int(examined) < RELEASE_BATCH:
+                return released
+
     async def cancel(self, job_id: str) -> bool:
         return bool(await self._run("cancel", job_id))
 
@@ -418,13 +445,15 @@ class RedisBackend(BaseBackend):
         pipeline = self._client.pipeline(transaction=False)
         for queue in queues:
             pipeline.zrange(self._keys("queued", queue), 0, 0, withscores=True)
+            pipeline.zrange(self._keys("held_due", queue), 0, 0, withscores=True)
         pipeline.zcount(self._keys("leases"), "-inf", f"({number(now)}")
         pipeline.hgetall(self._keys("queued_tasks"))
-        *oldest, expired, tasks = await pipeline.execute()
+        *firsts, expired, tasks = await pipeline.execute()
+        heads = [queued + held for queued, held in zip(firsts[::2], firsts[1::2])]
         return Stats(
             queues=[
-                QueueStats(queue, counts[queue], _due(first, now))
-                for queue, first in zip(queues, oldest)
+                QueueStats(queue, counts[queue], _due(head, now))
+                for queue, head in zip(queues, heads)
             ],
             expired_leases=expired,
             queued_tasks={task.decode(): int(count) for task, count in tasks.items()},
@@ -906,7 +935,21 @@ async def _opened(pool: Any, opening: dict[asyncio.Future, Any]) -> None:
         await pool.release(connection)
 
 
-def _due(first: list[tuple[bytes, float]], now: float) -> float | None:
-    if not first or first[0][1] > now:
+def _due(heads: list[tuple[bytes, float]], now: float) -> float | None:
+    oldest = min((score for _, score in heads), default=None)
+    if oldest is None or oldest > now:
         return None
-    return first[0][1]
+    return oldest
+
+
+def _limit_arguments(limits: Mapping[str, Limit] | None) -> list[str]:
+    arguments: list[str] = []
+    for task, rule in (limits or {}).items():
+        arguments.extend(
+            (
+                task,
+                "" if rule.concurrency is None else str(rule.concurrency),
+                "" if rule.interval is None else number(rule.interval),
+            )
+        )
+    return arguments
