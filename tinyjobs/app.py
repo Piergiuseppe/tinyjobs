@@ -26,9 +26,9 @@ from .backends.loader import (
 from .backends.managed import ManagedBackend
 from .clock import Clock, FollowingClock
 from .deadlines import Deadline, finishing
-from .duration import is_finite_seconds
 from .codecs import CodecRegistry
-from .executors.process import MAIN_MODULE, assert_process_setup, main_spawn_problem
+from .declaring import declared_task
+from .executors.process import assert_process_setup
 from .exceptions import (
     AppClosedError,
     BackendNotReadyError,
@@ -36,13 +36,11 @@ from .exceptions import (
     UnsupportedCapabilityError,
     described,
 )
-from .limits import declare_limit
 from .metrics import Metrics
 from .models import Job, JobPayload, Page, ScheduleState, Stats
 from .options import EnqueueOptions
 from .registry import TaskRegistry
 from .retention import RetentionPolicy, assert_retention_policy
-from .retry import RetryPolicy
 from .runtime import (
     CLOSED_MESSAGE,
     LOOP_POLL_SECONDS,
@@ -90,26 +88,11 @@ EMBEDDED_SIGNALS_MESSAGE = (
     "leaving serve() or the lifespan is what stops the worker"
 )
 
-ISOLATED_ASYNC_MESSAGE = (
-    "isolated=True runs a task in a job process of its own, which takes a def function; "
-    "{name} is async def"
-)
-ISOLATED_MAIN_MESSAGE = (
-    "isolated=True runs {name} in a job process that imports the module it was registered in, "
-    "and a job process cannot import __main__ when the worker runs from {how}; register the task "
-    "in a module of its own"
-)
 EMBEDDED_LOOPS_MESSAGE = (
     "an embedded worker runs on the server's event loop, so it takes no loops; "
     "run tinyjobs worker --loops or worker.run() for more loops"
 )
 
-RESULT_TTL_MESSAGE = (
-    "{name}: result_ttl only applies to a stored result; pass store_result=True as well"
-)
-RESULT_TTL_POSITIVE_MESSAGE = (
-    "{name}: result_ttl must be a finite number of seconds above zero, got {value}"
-)
 MAX_RESULT_BYTES_MESSAGE = "max_result_bytes must be a whole number of at least 1, got {value}"
 WRITING_CALLS = frozenset(
     {"enqueue", "send", "cancel", "retry", "purge", "drain",
@@ -475,37 +458,28 @@ class TinyJobs:
 
         def decorate(target: Callable[..., Any]) -> Task:
             task_name = name or f"{target.__module__}.{target.__qualname__}"
-            _assert_result_ttl(task_name, store_result, result_ttl)
-            resolved = Task(
+            resolved = declared_task(
                 self,
                 target,
                 name=task_name,
-                options=EnqueueOptions(
-                    queue=queue,
-                    priority=priority,
-                    max_attempts=max_attempts,
-                    codec=codec,
-                ),
-                retry_policy=RetryPolicy(
-                    max_attempts=max_attempts,
-                    retry_on=retry_on,
-                    backoff=retry_backoff,
-                    base=retry_base,
-                    maximum=retry_max,
-                    jitter=retry_jitter,
-                ),
+                registered_in=registered_in,
+                queue=queue,
+                priority=priority,
+                codec=codec,
                 timeout=timeout,
                 store_result=store_result,
                 result_ttl=result_ttl,
-                schedule=_declare_schedule(
-                    task_name, cron, timezone, misfire, overlap
-                ),
                 isolated=isolated,
-                registered_in=registered_in,
-                limit=declare_limit(task_name, concurrency, rate),
+                concurrency=concurrency,
+                rate=rate,
+                max_attempts=max_attempts,
+                retry_on=retry_on,
+                retry_backoff=retry_backoff,
+                retry_base=retry_base,
+                retry_max=retry_max,
+                retry_jitter=retry_jitter,
+                schedule=_declare_schedule(task_name, cron, timezone, misfire, overlap),
             )
-            if isolated:
-                _assert_isolatable(resolved)
             if cron is not None:
                 _assert_callable_without_arguments(resolved)
             self._registry.register(resolved)
@@ -1010,26 +984,6 @@ def _assert_max_result_bytes(value: int | None) -> None:
         return
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ConfigurationError(MAX_RESULT_BYTES_MESSAGE.format(value=described(value)))
-
-
-def _assert_result_ttl(name: str, store_result: bool, ttl: float | None) -> None:
-    if ttl is None:
-        return
-    if not store_result:
-        raise ConfigurationError(RESULT_TTL_MESSAGE.format(name=name))
-    if not is_finite_seconds(ttl) or ttl <= 0:
-        raise ConfigurationError(
-            RESULT_TTL_POSITIVE_MESSAGE.format(name=name, value=described(ttl))
-        )
-
-
-def _assert_isolatable(task: Task) -> None:
-    if task.is_coroutine:
-        raise ConfigurationError(ISOLATED_ASYNC_MESSAGE.format(name=task.name))
-    if task.registered_in == MAIN_MODULE:
-        how = main_spawn_problem()
-        if how is not None:
-            raise ConfigurationError(ISOLATED_MAIN_MESSAGE.format(name=task.name, how=how))
 
 
 def _assert_callable_without_arguments(task: Task) -> None:

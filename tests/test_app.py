@@ -54,6 +54,39 @@ class TaskDeclarationTests(BackendTestCase):
         self.assertIn(handler.name, self.app.registry)
         self.assertIs(self.app.registry.get(handler.name), handler)
 
+    def test_options_that_cannot_be_are_refused_where_the_task_is_declared(self):
+        refused = {
+            "max_attempts": (0, -1, 1.5, True, "3"),
+            "timeout": (0, -1, float("inf"), float("nan"), "30", True),
+            "retry_on": ((KeyError, "ValueError"), (int,), "KeyError", 5),
+            "retry_backoff": ("quadratic", 2, None),
+            "retry_base": (-1, float("inf"), "1"),
+            "retry_max": (-1, float("nan"), None),
+            "retry_jitter": (1, "yes", None),
+        }
+        for option, values in refused.items():
+            for value in values:
+                with self.subTest(option=option, value=value):
+                    with self.assertRaisesRegex(ConfigurationError, option):
+                        self.app.task(name=f"refused.{option}", **{option: value})(print)
+                    self.assertNotIn(f"refused.{option}", self.app.registry)
+
+    def test_the_edges_of_what_an_option_may_be_are_accepted(self):
+        accepted = self.app.task(
+            name="accepted",
+            max_attempts=1,
+            timeout=0.001,
+            retry_on=(),
+            retry_backoff=lambda attempt: attempt,
+            retry_base=0,
+            retry_max=0,
+            retry_jitter=False,
+        )(print)
+        self.assertEqual(accepted.retry_policy.retry_on, ())
+        for given in (KeyError, [KeyError], (KeyError,)):
+            task = self.app.task(name=f"one.{given!r}", retry_on=given)(print)
+            self.assertEqual(task.retry_policy.retry_on, (KeyError,))
+
     def test_a_result_ttl_needs_a_stored_result_and_a_positive_duration(self):
         with self.assertRaises(ConfigurationError) as caught:
             @self.app.task(result_ttl=60)
