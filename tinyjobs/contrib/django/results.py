@@ -62,24 +62,12 @@ def build_result(
     return result
 
 
-def record_failure(
-    result: TaskResult, error: BaseException, traceback: str, finished: float
-) -> None:
+def raised(error: BaseException) -> TaskError:
     kind = type(error)
-    result.errors.append(
-        TaskError(
-            exception_class_path=f"{kind.__module__}.{kind.__qualname__}",
-            traceback=traceback,
-        )
+    return TaskError(
+        exception_class_path=f"{kind.__module__}.{kind.__qualname__}",
+        traceback="".join(tracebacks.format_exception(error)),
     )
-    object.__setattr__(result, "status", TaskResultStatus.FAILED)
-    object.__setattr__(result, "finished_at", moment(finished))
-
-
-def record_success(result: TaskResult, value: Any, finished: float) -> None:
-    object.__setattr__(result, "_return_value", value)
-    object.__setattr__(result, "status", TaskResultStatus.SUCCESSFUL)
-    object.__setattr__(result, "finished_at", moment(finished))
 
 
 def errors_of(job: Job, executions: Sequence[Execution]) -> list[TaskError]:
