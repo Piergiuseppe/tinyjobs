@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 import zlib
+from typing import Sequence
 
 from ...exceptions import ConfigurationError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+UPGRADABLE_VERSION = 1
 
 QUEUE_KEY_CHARACTERS = 500
 
@@ -19,12 +22,16 @@ INDEXES = (
     ("jobs_by_queue", "jobs", False),
     ("jobs_purge", "jobs", False),
     ("jobs_dedup", "jobs", True),
+    ("jobs_held", "jobs", False),
+    ("jobs_running_by_task", "jobs", False),
     ("executions_claim", "executions", True),
 )
 
 STATISTICS = (("jobs_queue", "jobs"),)
 
 ARBITERS = frozenset({"executions_claim"})
+
+STATUSES = "status IN ('queued', 'held', 'running', 'success', 'failed', 'cancelled')"
 
 
 class Tables:
@@ -44,6 +51,8 @@ class Tables:
         self.executions = f'{qualify}"{prefix}_executions"'
         self.schedules = f'{qualify}"{prefix}_schedules"'
         self.meta = f'{qualify}"{prefix}_meta"'
+        self.limits = f'{qualify}"{prefix}_limits"'
+        self.status_check = f'"{prefix}_jobs_status_check"'
         self.lock = zlib.crc32(f"tinyjobs:{schema or ''}:{prefix}".encode())
 
     def within(self, schema: str) -> "Tables":
@@ -55,6 +64,7 @@ class Tables:
         placed.executions = f'{qualify}"{self.prefix}_executions"'
         placed.schedules = f'{qualify}"{self.prefix}_schedules"'
         placed.meta = f'{qualify}"{self.prefix}_meta"'
+        placed.limits = f'{qualify}"{self.prefix}_limits"'
         return placed
 
     def instance(self) -> str:
@@ -101,7 +111,17 @@ class Tables:
             "jobs_dedup": f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("jobs_dedup")}
                 ON {jobs} (dedup_digest)
-                WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'running')
+                WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'held', 'running')
+            """,
+            "jobs_held": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_held")}
+                ON {jobs} (task, ({QUEUE_KEY}), priority DESC, run_at ASC)
+                WHERE status = 'held'
+            """,
+            "jobs_running_by_task": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_running_by_task")}
+                ON {jobs} (task)
+                WHERE status = 'running'
             """,
             "executions_claim": f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
@@ -110,9 +130,7 @@ class Tables:
         }
 
     def statistics(self) -> dict[str, str]:
-        qualify = (
-            ('"' + self.schema.replace('"', '""') + '".').replace("%", "%%") if self.schema else ""
-        )
+        qualify = self._qualifier()
         return {
             "jobs_queue": f"""
             CREATE STATISTICS IF NOT EXISTS {qualify}"{self.prefix}_jobs_queue" (dependencies)
@@ -140,9 +158,8 @@ class Tables:
                 payload          bytea NOT NULL,
                 codec            text NOT NULL,
                 queue            text COLLATE "C" NOT NULL DEFAULT 'default',
-                status           text COLLATE "C" NOT NULL CHECK (
-                                     status IN ('queued', 'running', 'success', 'failed', 'cancelled')
-                                 ),
+                status           text COLLATE "C" NOT NULL
+                                 CONSTRAINT {self.status_check} CHECK ({STATUSES}),
                 priority         integer NOT NULL DEFAULT 0,
                 attempts         integer NOT NULL DEFAULT 0,
                 max_attempts     integer NOT NULL DEFAULT 1,
@@ -172,6 +189,8 @@ class Tables:
             indexes["jobs_by_queue"],
             indexes["jobs_purge"],
             indexes["jobs_dedup"],
+            indexes["jobs_held"],
+            indexes["jobs_running_by_task"],
             self.statistics()["jobs_queue"],
             f"""
             CREATE TABLE IF NOT EXISTS {executions} (
@@ -198,8 +217,30 @@ class Tables:
                 last_job_id text
             )
             """,
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.limits} (
+                task    text COLLATE "C" PRIMARY KEY,
+                running integer NOT NULL DEFAULT 0,
+                last_at double precision NOT NULL DEFAULT 0
+            )
+            """,
         ]
         return tuple(statements)
+
+    def upgrade(self, checks: Sequence[str]) -> tuple[str, ...]:
+        dropped = "".join(f"DROP CONSTRAINT IF EXISTS {_quoted(check)}, " for check in checks)
+        return (
+            f"DROP INDEX IF EXISTS {self._qualifier()}{self.index('jobs_dedup')}",
+            self.indexes()["jobs_dedup"],
+            f"""
+            ALTER TABLE {self.jobs}
+                {dropped}ADD CONSTRAINT {self.status_check} CHECK ({STATUSES})
+            """,
+            f"UPDATE {self.meta} SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version'",
+        )
+
+    def _qualifier(self) -> str:
+        return ('"' + self.schema.replace('"', '""') + '".').replace("%", "%%") if self.schema else ""
 
     def seeds(self) -> tuple[str, ...]:
         return (
@@ -213,3 +254,7 @@ class Tables:
             """,
             self.instance(),
         )
+
+
+def _quoted(name: str) -> str:
+    return ('"' + name.replace('"', '""') + '"').replace("%", "%%")

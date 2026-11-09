@@ -27,9 +27,11 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Generator,
     Iterable,
     Iterator,
+    Mapping,
     Sequence,
     TypeVar,
 )
@@ -50,6 +52,7 @@ from ...deadlines import final_left
 from ...deadlines import left as _left
 from ...deadlines import until
 from ...exceptions import ConfigurationError, UnsupportedCapabilityError
+from ...limits import Limit
 from ...models import (
     Execution,
     ExecutionError,
@@ -77,7 +80,7 @@ from .records import (
     job_from_row,
     schedule_from_row,
 )
-from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, Tables
+from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, UPGRADABLE_VERSION, Tables
 
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MIN_CONNECTIONS = 1
@@ -88,7 +91,7 @@ DEFAULT_STATEMENT_TIMEOUT = 30.0
 SHORTEST_STATEMENT_SECONDS = 0.001
 LONGEST_STATEMENT_SECONDS = (2**31 - 1) / 1000
 SAFE_SEARCH_PATH = "pg_catalog, pg_temp"
-TABLE_KINDS = ("jobs", "executions", "schedules", "meta")
+TABLE_KINDS = ("jobs", "executions", "schedules", "meta", "limits")
 IDLE_IN_TRANSACTION_SECONDS = 60
 SETUP_LOCK_SECONDS = 5
 SETUP_WAIT_SECONDS = 60.0
@@ -302,6 +305,10 @@ ENQUEUE_BATCH_BYTES = 64 * 2**20
 INSERT_ROUNDS = 50
 RETRIED_ERRORS = (errors.DeadlockDetected, errors.SerializationFailure, errors.IdleSessionTimeout)
 RETRIES = 3
+LIMITED_SLICES = 8
+RECOUNT_SECONDS = 30.0
+RELEASE_BATCH = 5000
+UNTIMED_UPGRADE = "SELECT pg_catalog.set_config('statement_timeout', '0', true)"
 SETTLE_BATCH = 100
 READS_TO_SEE_A_CLOSE = 2
 PSYCOPG_OPTIONS = frozenset({"prepare_threshold", "context"})
@@ -341,6 +348,7 @@ class PostgresBackend(BaseBackend):
         max_payload_bytes=None,
         result_ttl=True,
         loop_bound=True,
+        limits=True,
     )
 
     def __init__(
@@ -384,6 +392,7 @@ class PostgresBackend(BaseBackend):
         self._hearing = 0
         self._marks: dict[str, int] = {}
         self._ghosts: dict[str, _Ghost] = {}
+        self._limited: set[str] = set()
         self._probing: asyncio.Lock | None = None
         self._probe: psycopg.AsyncConnection | None = None
         self._probers = 0
@@ -527,6 +536,7 @@ class PostgresBackend(BaseBackend):
         self._identity = _identity_of(rows[0], cluster[0].get("cluster"))
         self._channel = f"tinyjobs_{hashlib.sha256(rows[0]['instance'].encode()).hexdigest()[:24]}"
         self._queries = queries
+        self._limited.clear()
         await self._now()
 
     def _trusted_placement(self, found: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -778,7 +788,7 @@ class PostgresBackend(BaseBackend):
             )
         cursor = await connection.execute(
             f"SELECT pg_catalog.string_agg(id, ', ' ORDER BY id) AS ids FROM {jobs} "
-            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'running') "
+            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'held', 'running') "
             "GROUP BY dedup_digest HAVING pg_catalog.count(*) > 1 LIMIT 5",
             {},
         )
@@ -816,6 +826,8 @@ class PostgresBackend(BaseBackend):
                 )
             if stored == SCHEMA_VERSION:
                 return
+            if stored == UPGRADABLE_VERSION:
+                await connection.execute(UNTIMED_UPGRADE)
             for statement in placed.within.ddl(schema_missing=placed.schema_missing):
                 await connection.execute(statement, {})
             created = await self._placed(connection)
@@ -824,6 +836,14 @@ class PostgresBackend(BaseBackend):
                     f"the tinyjobs tables for prefix {self._tables.prefix!r} changed while "
                     "setup created them; run setup again"
                 )
+            if stored == UPGRADABLE_VERSION:
+                checks = await _fetch(
+                    connection,
+                    self._unplaced.status_checks,
+                    {"schema": created.within.schema, "table": f"{self._tables.prefix}_jobs"},
+                )
+                for statement in created.within.upgrade([row["name"] for row in checks]):
+                    await connection.execute(statement, {})
             for statement in created.within.seeds():
                 await connection.execute(statement, {})
 
@@ -1037,35 +1057,87 @@ class PostgresBackend(BaseBackend):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> list[Job]:
         if limit <= 0 or not queues:
             return []
         self._marks[worker_id] = self._hearing
         self._listened.update(_noticed(queue) for queue in queues)
         wanted = list(dict.fromkeys(queues))
-        return await self._claimed(
-            worker_id,
-            lease_seconds,
-            partial(self._claiming, wanted=wanted, worker_id=worker_id, limit=limit),
+        if not limits:
+            rows, _ = await self._claimed(
+                worker_id,
+                lease_seconds,
+                partial(self._claiming, wanted=wanted, worker_id=worker_id, limit=limit),
+            )
+            return [job_from_row(row) for row in rows]
+        await self._ensure_limits(limits)
+        claimed: list[Job] = []
+        tokens: list[str] = []
+        try:
+            with until(time.monotonic() + lease_seconds / 2):
+                for _ in range(LIMITED_SLICES):
+                    asked = limit - len(claimed)
+                    rows, token = await self._claimed(
+                        worker_id,
+                        lease_seconds,
+                        partial(
+                            self._claiming,
+                            wanted=wanted,
+                            worker_id=worker_id,
+                            limit=asked,
+                            limits=limits,
+                        ),
+                    )
+                    tokens.append(token)
+                    claimed += [job_from_row(row) for row in rows if row["id"] is not None]
+                    missing = rows[0]["missing"]
+                    if missing:
+                        self._limited.difference_update(missing)
+                        await self._ensure_limits(limits)
+                    full = rows[0]["fresh_total"] == asked
+                    if len(claimed) >= limit or not (missing or (rows[0]["held_total"] and full)):
+                        break
+        except BaseException:
+            for token in tokens:
+                self._ghosts[token] = _Ghost(worker_id, token, None, lease_seconds)
+            if tokens:
+                self._swept = -math.inf
+            raise
+        return claimed
+
+    async def _ensure_limits(self, limits: Mapping[str, Limit]) -> None:
+        missing = sorted(task for task in limits if task not in self._limited)
+        if not missing:
+            return
+        inserted = await self._retrying(self._queries.ensure_limits, {"tasks": missing})
+        if inserted:
+            await self._recounted_from_running(sorted(row["task"] for row in inserted))
+        self._limited.update(missing)
+
+    async def _recounted_from_running(self, tasks: list[str]) -> None:
+        queries = self._queries
+        await self._recounted(
+            (queries.settle_running, queries.lock_tasks), queries.recount_tasks, {"tasks": tasks}
         )
 
     async def claim_job(
         self, job_id: str, *, worker_id: str, lease_seconds: float
     ) -> Job | None:
         self._marks[worker_id] = self._hearing
-        jobs = await self._claimed(
+        rows, _ = await self._claimed(
             worker_id,
             lease_seconds,
             partial(self._claiming_one, job_id=job_id, worker_id=worker_id),
         )
-        return jobs[0] if jobs else None
+        return job_from_row(rows[0]) if rows else None
 
     async def _claimed(
         self,
         worker_id: str,
         lease_seconds: float,
         claiming: Callable[..., tuple[str, dict[str, Any]]],
-    ) -> list[Job]:
+    ) -> tuple[list[dict[str, Any]], str]:
         with until(time.monotonic() + lease_seconds / 2):
             if self._ghosts or self._orphans:
                 await self._swept_within()
@@ -1080,7 +1152,7 @@ class PostgresBackend(BaseBackend):
                     self._ghosts[token] = _Ghost(worker_id, token, _LEFT.get(), lease_seconds)
                     self._swept = -math.inf
                 raise
-        return [job_from_row(row) for row in rows]
+        return rows, parameters["token"]
 
     async def _swept_within(self) -> None:
         with until(time.monotonic() + max(0.0, _left()) / 2):
@@ -1231,14 +1303,10 @@ class PostgresBackend(BaseBackend):
         worker_id: str,
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        query = (
-            self._queries.claim_one_queue
-            if len(wanted) == 1
-            else self._queries.claim_many_queues
-        )
         token = secrets.token_hex(16)
-        return query, self._at(
+        parameters = self._at(
             now,
             queues=wanted,
             queue=wanted[0],
@@ -1249,6 +1317,21 @@ class PostgresBackend(BaseBackend):
             token=token,
             key=_claim_key(token),
         )
+        queries = self._queries
+        if not limits:
+            query = queries.claim_one_queue if len(wanted) == 1 else queries.claim_many_queues
+            return query, parameters
+        query = (
+            queries.claim_one_queue_limited
+            if len(wanted) == 1
+            else queries.claim_many_queues_limited
+        )
+        return query, {
+            **parameters,
+            "tasks": list(limits),
+            "concurrencies": [rule.concurrency for rule in limits.values()],
+            "intervals": [rule.interval for rule in limits.values()],
+        }
 
     def _claiming_one(
         self, *, now: float, job_id: str, worker_id: str, lease_seconds: float
@@ -1378,6 +1461,28 @@ class PostgresBackend(BaseBackend):
             await self._wake({job.queue})
         return changed
 
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int:
+        if not tasks or (queues is not None and not queues):
+            return 0
+        parameters: dict[str, Any] = {"tasks": sorted(tasks), "batch": RELEASE_BATCH}
+        query = self._queries.release_held
+        if queues is not None:
+            query = self._queries.release_held_in
+            parameters["queues"] = list(dict.fromkeys(queues))
+        released = 0
+        woken: set[str] = set()
+        while True:
+            rows = await self._retrying(query, parameters)
+            batch = sum(row["total"] for row in rows)
+            released += batch
+            woken.update(row["queue"] for row in rows)
+            if batch < RELEASE_BATCH:
+                break
+        await self._wake(woken)
+        return released
+
     async def cancel(self, job_id: str) -> bool:
         now = await self._now()
         return await self._changed(self._queries.cancel, self._at(now, id=job_id))
@@ -1432,7 +1537,33 @@ class PostgresBackend(BaseBackend):
             self._queries.reap, self._at(now, message=LEASE_EXPIRED_MESSAGE)
         )
         await self._wake(set(rows[0]["queues"]))
+        if await self._rows(
+            self._queries.claim_recount,
+            {
+                "now": repr(float(now)),
+                "cutoff": now - RECOUNT_SECONDS,
+                "ahead": now + RECOUNT_SECONDS,
+            },
+        ):
+            await self._recounted(
+                (self._queries.lock_limits,), self._queries.recount_limits, {}
+            )
         return rows[0]["reaped"]
+
+    async def _recounted(
+        self, locks: tuple[str, ...], recount: str, parameters: dict[str, Any]
+    ) -> None:
+        for attempt in range(RETRIES):
+            try:
+                async with self._transaction() as connection:
+                    for lock in locks:
+                        await connection.execute(lock, parameters)
+                    await connection.execute(recount, parameters)
+                return
+            except RETRIED_ERRORS as error:
+                if attempt == RETRIES - 1:
+                    raise
+                logger.warning("retrying a postgres statement after %s", error)
 
     async def counts_by_status(self) -> dict[str, int]:
         rows = await self._lookup(self._queries.count_by_status, {})
