@@ -25,10 +25,13 @@ from unittest import mock
 from tinyjobs import runtime
 from tinyjobs.backends import SQLiteBackend, load_backend
 from tinyjobs.backends.sqlite import connection as connection_module
+from tinyjobs.backends.sqlite.claim import SUPPORTS_RETURNING
 from tinyjobs.backends.sqlite.connection import ConnectionPool
-from tinyjobs.status import ExecutionStatus
+from tinyjobs.clock import FrozenClock
+from tinyjobs.limits import Limit
+from tinyjobs.status import ExecutionStatus, JobStatus
 from tinyjobs.testing import BackendContract
-from tinyjobs.testing.contract import ERROR, START
+from tinyjobs.testing.contract import ERROR, START, make_job
 
 from tests.support import interrupt_repeatedly
 
@@ -76,6 +79,114 @@ class SQLiteWithoutReturningContractTests(SQLiteContractTests):
             )
             patcher.start()
             self.addCleanup(patcher.stop)
+
+
+class SQLiteLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.backend = SQLiteBackend(str(Path(directory.name) / "jobs.db"), clock=FrozenClock(START))
+        await self.backend.setup()
+        self.traced: list[str] = []
+
+    async def asyncTearDown(self) -> None:
+        await self.backend.close()
+
+    async def trace(self) -> None:
+        def trace_sync() -> None:
+            self.backend._connections.connection.set_trace_callback(self.traced.append)
+
+        await self.backend._call(trace_sync)
+
+    async def claim(self, limit=10, limits=None):
+        return await self.backend.claim(
+            worker_id="worker-a", queues=("default",), limit=limit, lease_seconds=60.0, limits=limits
+        )
+
+    def touching(self, table: str) -> list[str]:
+        return [statement.strip() for statement in self.traced if table in statement]
+
+    async def test_a_held_job_keeps_its_dedup_key(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        running = await self.backend.enqueue(make_job(dedup_key="first"))
+        held = await self.backend.enqueue(make_job(dedup_key="second", run_at=1.0))
+        self.assertEqual([job.id for job in await self.claim(limits=limits)], [running.id])
+        self.assertIs((await self.backend.get(held.id)).status, JobStatus.HELD)
+        duplicate = await self.backend.enqueue(make_job(dedup_key="second"))
+        self.assertEqual(duplicate.id, held.id)
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 1, "held": 1})
+
+    async def test_a_held_job_keeps_a_failed_twin_from_being_requeued(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        failed = await self.backend.enqueue(make_job(dedup_key="key"))
+        [claimed] = await self.claim()
+        await self.backend.fail(claimed, ERROR, None)
+        await self.backend.enqueue(make_job())
+        held = await self.backend.enqueue(make_job(dedup_key="key", run_at=1.0))
+        await self.claim(limits=limits)
+        self.assertIs((await self.backend.get(held.id)).status, JobStatus.HELD)
+        self.assertFalse(await self.backend.requeue(failed.id))
+
+    async def test_a_claim_without_limits_is_the_one_update_returning(self):
+        if not SUPPORTS_RETURNING:
+            raise unittest.SkipTest("this SQLite has no RETURNING")
+        await self.backend.enqueue(make_job())
+        await self.trace()
+        self.assertEqual(len(await self.claim()), 1)
+        [statement] = self.touching("tinyjobs_jobs")
+        self.assertTrue(statement.startswith("UPDATE tinyjobs_jobs"), statement)
+        self.assertIn("RETURNING", statement)
+        self.assertEqual(self.touching("tinyjobs_limits"), [])
+
+    async def test_limits_of_a_task_without_jobs_write_nothing_for_it(self):
+        jobs = [await self.backend.enqueue(make_job(run_at=float(index))) for index in range(2)]
+        await self.trace()
+        claimed = await self.claim(limits={"tests.other": Limit(concurrency=1, interval=5.0)})
+        self.assertEqual([job.id for job in claimed], [job.id for job in jobs])
+        self.assertEqual([s for s in self.traced if "'held'" in s and s.lstrip().startswith("UPDATE")], [])
+        self.assertEqual(
+            [s for s in self.touching("tinyjobs_limits") if not s.startswith("SELECT")], []
+        )
+
+    async def test_a_rate_admission_records_its_start(self):
+        await self.backend.enqueue(make_job())
+        await self.claim(limits={"tests.noop": Limit(interval=5.0)})
+        with self.backend.transaction() as connection:
+            rows = connection.execute("SELECT task, last_at FROM tinyjobs_limits").fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("tests.noop", START)])
+
+    async def test_a_claim_by_id_takes_a_held_job_past_its_limit(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.backend.enqueue(make_job())
+        held = await self.backend.enqueue(make_job(run_at=1.0))
+        await self.claim(limits=limits)
+        taken = await self.backend.claim_job(held.id, worker_id="worker-b", lease_seconds=60.0)
+        self.assertEqual((taken.id, taken.status), (held.id, JobStatus.RUNNING))
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 2})
+
+    async def test_released_held_jobs_are_the_only_rows_written(self):
+        limits = {"tests.noop": Limit(concurrency=1), "tests.mail": Limit(concurrency=1)}
+        for task in ("tests.noop", "tests.mail"):
+            for index in range(2):
+                await self.backend.enqueue(make_job(task=task, run_at=float(index)))
+        await self.claim(limits=limits)
+        await self.trace()
+        self.assertEqual(await self.backend.release_held(tasks=["tests.mail"]), 1)
+        self.assertEqual(
+            [s.strip().split()[0] for s in self.touching("tinyjobs_jobs")], ["UPDATE"]
+        )
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 2, "held": 1, "queued": 1})
+        held = (await self.backend.list(status=JobStatus.HELD, limit=10)).items
+        self.assertEqual([job.task for job in held], ["tests.noop"])
+
+    async def test_a_saturated_flood_leaves_the_index_in_one_claim(self):
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.backend.enqueue_many([make_job(run_at=float(index)) for index in range(20)])
+        other = await self.backend.enqueue(make_job(task="tests.mail", run_at=100.0))
+        claimed = await self.claim(limit=4, limits=limits)
+        self.assertEqual(sorted(job.task for job in claimed), ["tests.mail", "tests.noop"])
+        self.assertIn(other.id, [job.id for job in claimed])
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 2, "held": 19})
 
 
 def timed_fork_hold() -> float:

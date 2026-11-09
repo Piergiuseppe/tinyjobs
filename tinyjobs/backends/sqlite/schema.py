@@ -4,13 +4,17 @@ import re
 
 from ...exceptions import ConfigurationError
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+PREFIXED_SINCE = 4
 
 DEFAULT_PREFIX = "tinyjobs"
 
 NAME = re.compile(r"^[a-z_][a-z0-9_]{0,39}$")
 
-KINDS = ("jobs", "executions", "schedules", "meta")
+LEGACY_KINDS = ("jobs", "executions", "schedules", "meta")
+
+KINDS = (*LEGACY_KINDS, "limits")
 
 LEGACY_INDEXES = (
     "idx_jobs_claim",
@@ -44,6 +48,7 @@ class Tables:
         self.executions = f"{prefix}_executions"
         self.schedules = f"{prefix}_schedules"
         self.meta = f"{prefix}_meta"
+        self.limits = f"{prefix}_limits"
         self.lock = f"{prefix}_install_lock"
 
     def names(self) -> dict[str, str]:
@@ -112,11 +117,7 @@ def ddl(tables: Tables) -> tuple[str, ...]:
             ON {tables.jobs} (status, finished_at)
             WHERE finished_at IS NOT NULL
         """,
-        f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS {tables.index("jobs_dedup")}
-            ON {tables.jobs} (dedup_key)
-            WHERE dedup_key IS NOT NULL AND status IN ('queued', 'running')
-        """,
+        dedup_index(tables),
         f"""
         CREATE TABLE IF NOT EXISTS {tables.executions} (
             id          INTEGER PRIMARY KEY,
@@ -143,6 +144,36 @@ def ddl(tables: Tables) -> tuple[str, ...]:
             next_run_at REAL NOT NULL,
             last_run_at REAL,
             last_job_id TEXT
+        )
+        """,
+        *limit_statements(tables),
+    )
+
+
+def dedup_index(tables: Tables) -> str:
+    return f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {tables.index("jobs_dedup")}
+            ON {tables.jobs} (dedup_key)
+            WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'running')
+        """
+
+
+def limit_statements(tables: Tables) -> tuple[str, ...]:
+    return (
+        f"""
+        CREATE INDEX IF NOT EXISTS {tables.index("jobs_held")}
+            ON {tables.jobs} (task, queue, priority DESC, run_at ASC)
+            WHERE status = 'held'
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {tables.index("jobs_running_by_task")}
+            ON {tables.jobs} (task)
+            WHERE status = 'running'
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {tables.limits} (
+            task    TEXT PRIMARY KEY,
+            last_at REAL NOT NULL DEFAULT 0
         )
         """,
     )
@@ -175,6 +206,11 @@ def migrations(tables: Tables) -> dict[int, tuple[str, ...]]:
             f"WHERE {tables.executions}.job_id = {tables.jobs}.id))",
         ),
         4: tuple(f"DROP INDEX IF EXISTS {name}" for name in LEGACY_INDEXES),
+        5: (
+            *limit_statements(tables),
+            f"DROP INDEX IF EXISTS {tables.index('jobs_dedup')}",
+            dedup_index(tables),
+        ),
     }
 
 
