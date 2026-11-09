@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Collection, Protocol, Sequence, runtime_checkable
+from typing import Collection, Mapping, Protocol, Sequence, runtime_checkable
 
+from ..limits import Limit
 from ..models import Execution, ExecutionError, Job, Page, ScheduleState, Stats
 from ..retention import RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
@@ -26,6 +27,7 @@ class Capabilities:
     max_payload_bytes: int | None = None
     loop_bound: bool = False
     result_ttl: bool = False
+    limits: bool = False
 
 
 @runtime_checkable
@@ -47,6 +49,7 @@ class Backend(Protocol):
         queues: Sequence[str],
         limit: int,
         lease_seconds: float,
+        limits: Mapping[str, Limit] | None = None,
     ) -> list[Job]: ...
 
     async def heartbeat(
@@ -71,6 +74,10 @@ class Backend(Protocol):
     async def release_many(self, jobs: Sequence[Job]) -> int: ...
 
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
+
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int: ...
 
     async def cancel(self, job_id: str) -> bool: ...
 
@@ -141,6 +148,11 @@ class BaseBackend(ABC):
     async def release_many(self, jobs: Sequence[Job]) -> int:
         released = await asyncio.gather(*(self.release(job) for job in jobs))
         return sum(map(bool, released))
+
+    async def release_held(
+        self, tasks: Collection[str], queues: Sequence[str] | None = None
+    ) -> int:
+        return 0
 
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None:
         return None

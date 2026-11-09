@@ -16,6 +16,7 @@ from .exceptions import JobCancelled, WorkerLost
 
 STATUSES = {
     JobStatus.QUEUED: TaskResultStatus.READY,
+    JobStatus.HELD: TaskResultStatus.READY,
     JobStatus.RUNNING: TaskResultStatus.RUNNING,
     JobStatus.SUCCESS: TaskResultStatus.SUCCESSFUL,
     JobStatus.FAILED: TaskResultStatus.FAILED,

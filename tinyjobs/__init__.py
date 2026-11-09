@@ -18,6 +18,7 @@ __version__ = "0.14.0"
 
 from .app import TinyJobs
 from .clock import FrozenClock
+from .limits import Limit
 from .exceptions import (
     Abandon,
     ConfigurationError,
@@ -54,6 +55,7 @@ __all__ = [
     "Job",
     "JobPayload",
     "JobStatus",
+    "Limit",
     "MisfirePolicy",
     "ProcessDied",
     "ResultError",

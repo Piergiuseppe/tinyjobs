@@ -97,7 +97,7 @@ class Scheduler:
             )
         for name in tick.skipped:
             logger.warning(
-                "schedule %s skipped a run: the previous one is still queued or running",
+                "schedule %s skipped a run: the previous one is still queued, held or running",
                 name,
                 extra={"schedule": name},
             )

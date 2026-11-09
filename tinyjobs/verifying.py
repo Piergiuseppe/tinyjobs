@@ -59,7 +59,7 @@ PURGE_POLICY = RetentionPolicy(
 
 LOG_TAIL = 20
 
-PENDING = (JobStatus.QUEUED, JobStatus.RUNNING)
+PENDING = (JobStatus.QUEUED, JobStatus.HELD, JobStatus.RUNNING)
 
 QUEUE_PREFIX = "tinyjobs-verify-"
 

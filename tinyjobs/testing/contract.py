@@ -8,6 +8,7 @@ from dataclasses import replace
 from ..backends.base import Backend
 from ..clock import Clock, FrozenClock
 from ..ids import new_job_id
+from ..limits import Limit
 from ..models import NEVER, ExecutionError, Job, ScheduleState
 from ..retention import KEEP_EVERYTHING, RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
@@ -802,3 +803,320 @@ class BackendContract:
             self.assertIsInstance(finding.ok, bool)
             self.assertIsInstance(finding.message, str)
             self.assertTrue(finding.message)
+
+    async def limited(self, limit=10, worker="worker-a", queues=("default",), **limits) -> list[Job]:
+        return await self.backend.claim(
+            worker_id=worker,
+            queues=queues,
+            limit=limit,
+            lease_seconds=60.0,
+            limits={name: value for name, value in limits.items()},
+        )
+
+    async def statuses(self, *jobs: Job) -> list[JobStatus]:
+        return [(await self.stored(job)).status for job in jobs]
+
+    async def test_a_concurrency_limit_caps_the_running_jobs_of_a_task_across_claims(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=2)}
+        first, second, third = [await self.enqueue(run_at=float(index)) for index in range(3)]
+        mail = await self.enqueue(task="tests.mail")
+        claimed = await self.limited(**limits)
+        self.assertEqual(
+            sorted(job.id for job in claimed), sorted([first.id, second.id, mail.id])
+        )
+        self.assertEqual(await self.statuses(third), [JobStatus.HELD])
+        self.assertEqual(await self.limited(**limits), [])
+        await self.backend.complete(await self.stored(first), None)
+        admitted = await self.limited(**limits)
+        self.assertEqual(
+            [(job.id, job.status, job.claims) for job in admitted],
+            [(third.id, JobStatus.RUNNING, 1)],
+        )
+        self.assertEqual(await self.limited(**limits), [])
+
+    async def test_a_rate_limit_spaces_the_starts_of_a_task(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(interval=10.0)}
+        jobs = [await self.enqueue(run_at=float(index)) for index in range(3)]
+        self.assertEqual([job.id for job in await self.limited(**limits)], [jobs[0].id])
+        self.assertEqual(await self.statuses(*jobs[1:]), [JobStatus.HELD, JobStatus.HELD])
+        self.assertEqual(await self.limited(**limits), [])
+        self.clock.advance(9.9)
+        self.assertEqual(await self.limited(**limits), [])
+        self.clock.advance(0.1)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [jobs[1].id])
+        self.clock.advance(10)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [jobs[2].id])
+        self.assertEqual(await self.statuses(*jobs), [JobStatus.RUNNING] * 3)
+
+    async def test_a_rate_limit_admits_one_job_of_a_task_per_claim_however_much_room(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=5, interval=1.0)}
+        for index in range(3):
+            await self.enqueue(run_at=float(index))
+        self.clock.advance(100)
+        self.assertEqual(len(await self.limited(**limits)), 1)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 2)
+
+    async def test_held_jobs_are_admitted_in_the_order_the_queue_promised(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue(run_at=0.0)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [first.id])
+        second = await self.enqueue(run_at=1.0)
+        self.assertEqual(await self.limited(**limits), [])
+        self.assertEqual(await self.statuses(second), [JobStatus.HELD])
+        urgent = await self.enqueue(run_at=2.0, priority=5)
+        await self.backend.complete(await self.stored(first), None)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [urgent.id])
+        self.assertEqual(await self.statuses(second), [JobStatus.HELD])
+        await self.backend.complete((await self.stored(urgent)), None)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [second.id])
+
+    async def test_a_held_job_waits_for_a_worker_on_its_queue(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue()
+        mail = await self.enqueue(queue="mail")
+        self.assertEqual([job.id for job in await self.limited(**limits)], [first.id])
+        self.assertEqual(await self.limited(queues=("mail",), **limits), [])
+        self.assertEqual(await self.statuses(mail), [JobStatus.HELD])
+        await self.backend.complete(await self.stored(first), None)
+        self.assertEqual(await self.limited(queues=("default",), **limits), [])
+        self.assertEqual(await self.statuses(mail), [JobStatus.HELD])
+        self.assertEqual([job.id for job in await self.limited(queues=("mail",), **limits)], [mail.id])
+
+    async def test_a_held_job_counts_as_held_and_can_be_cancelled(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        running = await self.enqueue()
+        held = await self.enqueue(run_at=1.0)
+        await self.limited(**limits)
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 1, "held": 1})
+        stats = await self.backend.stats(self.clock.now())
+        self.assertEqual(stats.queues[0].counts, {"running": 1, "held": 1})
+        self.assertEqual(stats.queues[0].oldest_due_at, 1.0)
+        listed = await self.backend.list(status=JobStatus.HELD, limit=10)
+        self.assertEqual([job.id for job in listed.items], [held.id])
+        self.assertTrue(await self.backend.cancel(held.id))
+        self.assertEqual(await self.statuses(held), [JobStatus.CANCELLED])
+        await self.backend.complete(running, None)
+        self.assertEqual(await self.limited(**limits), [])
+
+    async def test_every_way_out_of_running_frees_the_room_of_a_task(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+
+        async def complete(job):
+            await self.backend.complete(job, None)
+
+        async def fail(job):
+            await self.backend.fail(job, ERROR, None)
+
+        async def retry(job):
+            await self.backend.fail(job, ERROR, self.clock.now() + 3600)
+
+        async def release(job):
+            await self.backend.release(job)
+
+        async def release_many(job):
+            await self.backend.release_many([job])
+
+        async def hand_back(job):
+            await self.backend.hand_back(job, 3600)
+
+        async def cancel(job):
+            await self.backend.cancel(job.id)
+
+        async def reap(job):
+            self.clock.advance(61)
+            await self.backend.reap_expired()
+
+        for way in (complete, fail, retry, release, release_many, hand_back, cancel, reap):
+            with self.subTest(way=way.__name__):
+                running = await self.enqueue(max_attempts=2, run_at=0.0)
+                waiting = await self.enqueue(run_at=1.0)
+                self.assertEqual([job.id for job in await self.limited(**limits)], [running.id])
+                self.assertEqual(await self.limited(**limits), [])
+                await way(await self.stored(running))
+                self.clock.advance(1)
+                admitted = await self.limited(**limits)
+                self.assertEqual([job.id for job in admitted], [waiting.id], way.__name__)
+                for job in admitted:
+                    await self.backend.complete(job, None)
+                for status in (JobStatus.QUEUED, JobStatus.HELD):
+                    for leftover in (await self.backend.list(status=status, limit=10)).items:
+                        await self.backend.cancel(leftover.id)
+
+    async def test_a_claim_by_id_takes_room_from_the_task(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue()
+        second = await self.enqueue(run_at=1.0)
+        taken = await self.backend.claim_job(first.id, worker_id="worker-a", lease_seconds=60.0)
+        self.assertEqual(taken.id, first.id)
+        self.assertEqual(await self.limited(**limits), [])
+        self.assertEqual(await self.statuses(second), [JobStatus.HELD])
+        await self.backend.complete(taken, None)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [second.id])
+
+    async def test_a_raised_limit_admits_as_many_held_jobs_as_the_room_allows(self):
+        self.requires("limits")
+        jobs = [await self.enqueue(run_at=float(index)) for index in range(4)]
+        self.assertEqual(len(await self.limited(**{"tests.noop": Limit(concurrency=1)})), 1)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 3)
+        admitted = await self.limited(**{"tests.noop": Limit(concurrency=3)})
+        self.assertEqual([job.id for job in admitted], [jobs[1].id, jobs[2].id])
+        self.assertEqual(await self.statuses(jobs[3]), [JobStatus.HELD])
+
+    async def test_a_held_job_released_to_the_queue_is_decided_again(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        first = await self.enqueue(run_at=0.0)
+        second = await self.enqueue(run_at=1.0)
+        await self.limited(**limits)
+        await self.backend.hand_back(await self.stored(first), 0.0)
+        self.assertEqual(await self.statuses(first, second), [JobStatus.QUEUED, JobStatus.HELD])
+        admitted = await self.limited(**limits)
+        self.assertEqual([job.id for job in admitted], [second.id])
+        self.assertEqual(await self.statuses(first), [JobStatus.HELD])
+        await self.backend.complete(await self.stored(second), None)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [first.id])
+
+    async def test_jobs_of_a_saturated_task_do_not_hide_the_work_behind_them(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        flood = [await self.enqueue(run_at=1.0 + index, priority=5) for index in range(30)]
+        other = await self.enqueue(task="tests.mail", run_at=100.0)
+        self.assertEqual(len(await self.limited(limit=4, **limits)), 1)
+        claimed = []
+        for _ in range(12):
+            claimed += await self.limited(limit=4, **limits)
+            if any(job.id == other.id for job in claimed):
+                break
+        self.assertIn(other.id, [job.id for job in claimed])
+        self.assertEqual(len([job for job in claimed if job.task == "tests.noop"]), 0)
+        held = (await self.backend.counts_by_status())["held"]
+        self.assertGreaterEqual(held, 1)
+        self.assertLessEqual(held, len(flood))
+
+    async def test_concurrent_claims_never_exceed_a_concurrency_limit(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=3)}
+        await self.backend.enqueue_many(
+            [make_job(run_at=float(index)) for index in range(RACED_JOBS)]
+        )
+        racers = await self.racers()
+        results = await asyncio.gather(
+            *(
+                backend.claim(
+                    worker_id=f"w{index}", queues=("default",), limit=10,
+                    lease_seconds=60, limits=limits,
+                )
+                for index, backend in enumerate(racers)
+            )
+        )
+        taken = [job.id for batch in results for job in batch]
+        self.assertEqual(len(taken), 3)
+        self.assertEqual(len(set(taken)), 3)
+        self.assertEqual((await self.backend.counts_by_status())["running"], 3)
+
+    async def test_unlimited_tasks_pass_a_claim_with_limits_untouched(self):
+        self.requires("limits")
+        limits = {"tests.other": Limit(concurrency=1)}
+        jobs = [await self.enqueue(run_at=float(index)) for index in range(3)]
+        claimed = await self.limited(limit=2, **limits)
+        self.assertEqual([job.id for job in claimed], [jobs[0].id, jobs[1].id])
+        self.assertEqual(await self.statuses(jobs[2]), [JobStatus.QUEUED])
+
+    async def test_held_jobs_of_tasks_named_to_release_held_return_to_the_queue(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1), "tests.mail": Limit(concurrency=1)}
+        for task in ("tests.noop", "tests.mail"):
+            await self.enqueue(task=task, run_at=0.0)
+            await self.enqueue(task=task, run_at=1.0, priority=3)
+        self.assertEqual(len(await self.limited(**limits)), 2)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 2)
+        self.assertEqual(await self.backend.release_held(tasks=()), 0)
+        self.assertEqual(await self.backend.release_held(tasks=("tests.other",)), 0)
+        self.assertEqual(await self.backend.release_held(tasks=("tests.mail",)), 1)
+        held = (await self.backend.list(status=JobStatus.HELD, limit=10)).items
+        self.assertEqual([job.task for job in held], ["tests.noop"])
+        queued = (await self.backend.list(status=JobStatus.QUEUED, limit=10)).items
+        self.assertEqual([(job.task, job.run_at, job.priority) for job in queued], [("tests.mail", 0.0, 0)])
+        self.assertEqual(len(await self.limited(**limits)), 0)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 2)
+        self.assertEqual(await self.backend.release_held(tasks=("tests.noop", "tests.mail")), 2)
+        self.assertEqual((await self.backend.counts_by_status()).get("held", 0), 0)
+        self.assertEqual(sorted(job.task for job in await self.claim()), ["tests.mail", "tests.noop"])
+
+    async def test_release_held_stays_within_the_queues_it_is_given(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue(run_at=0.0)
+        in_default = await self.enqueue(run_at=1.0)
+        in_mail = await self.enqueue(run_at=2.0, queue="mail")
+        self.assertEqual(len(await self.limited(queues=("default", "mail"), **limits)), 1)
+        self.assertEqual(await self.statuses(in_default, in_mail), [JobStatus.HELD, JobStatus.HELD])
+        self.assertEqual(await self.backend.release_held(tasks=("tests.noop",), queues=("other",)), 0)
+        self.assertEqual(await self.backend.release_held(tasks=("tests.noop",), queues=("mail",)), 1)
+        self.assertEqual(await self.statuses(in_default, in_mail), [JobStatus.HELD, JobStatus.QUEUED])
+        self.assertEqual(await self.backend.release_held(tasks=("tests.noop",), queues=None), 1)
+        self.assertEqual(await self.statuses(in_default, in_mail), [JobStatus.QUEUED, JobStatus.QUEUED])
+
+    async def test_a_held_job_with_room_waits_behind_fresh_work_the_queue_put_before_it(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(concurrency=1), "tests.video": Limit(concurrency=1)}
+        first_noop = await self.enqueue(run_at=0.0)
+        first_video = await self.enqueue(task="tests.video", run_at=0.0)
+        second_video = await self.enqueue(task="tests.video", run_at=1.0)
+        claimed = await self.limited(limit=3, **limits)
+        self.assertEqual(sorted(job.id for job in claimed), sorted([first_noop.id, first_video.id]))
+        self.assertEqual(await self.statuses(second_video), [JobStatus.HELD])
+        await self.backend.complete(await self.stored(first_video), None)
+        second_noop = await self.enqueue(run_at=2.0, priority=9)
+        mail = await self.enqueue(task="tests.mail", run_at=2.0, priority=5)
+        self.assertEqual([job.id for job in await self.limited(limit=1, **limits)], [mail.id])
+        self.assertEqual(
+            await self.statuses(second_noop, second_video), [JobStatus.HELD, JobStatus.HELD]
+        )
+        self.assertEqual([job.id for job in await self.limited(limit=1, **limits)], [second_video.id])
+        await self.backend.complete(await self.stored(first_noop), None)
+        self.assertEqual([job.id for job in await self.limited(limit=1, **limits)], [second_noop.id])
+
+    async def test_held_jobs_count_as_waiting_in_the_stats(self):
+        self.requires("limits")
+        limits = {"tests.noop": Limit(interval=3600.0)}
+        await self.enqueue(run_at=0.0)
+        await self.enqueue(run_at=1.0)
+        await self.enqueue(run_at=2.0, queue="mail")
+        self.assertEqual(len(await self.limited(queues=("default", "mail"), **limits)), 1)
+        self.assertEqual((await self.backend.counts_by_status())["held"], 2)
+        stats = await self.backend.stats(self.clock.now())
+        by_queue = {queue.queue: queue for queue in stats.queues}
+        self.assertEqual(by_queue["default"].oldest_due_at, 1.0)
+        self.assertEqual(by_queue["mail"].oldest_due_at, 2.0)
+        self.assertEqual(stats.queued_tasks, {"tests.noop": 2})
+        await self.backend.cancel((await self.backend.list(status=JobStatus.HELD, queue="mail", limit=1)).items[0].id)
+        stats = await self.backend.stats(self.clock.now())
+        by_queue = {queue.queue: queue for queue in stats.queues}
+        self.assertIsNone(by_queue["mail"].oldest_due_at)
+        self.assertEqual(stats.queued_tasks, {"tests.noop": 1})
+
+    async def test_a_claim_counts_the_running_jobs_of_tasks_it_has_no_limit_for(self):
+        self.requires("limits")
+        first = await self.enqueue(run_at=0.0)
+        capped = {"tests.noop": Limit(concurrency=1)}
+        self.assertEqual([job.id for job in await self.limited(**capped)], [first.id])
+        second = await self.enqueue(run_at=1.0)
+        mail = await self.enqueue(task="tests.mail", run_at=2.0)
+        elsewhere = await self.limited(worker="worker-b", **{"tests.mail": Limit(concurrency=1)})
+        self.assertEqual(sorted(job.id for job in elsewhere), sorted([second.id, mail.id]))
+        self.assertTrue(await self.backend.hand_back(await self.stored(second)))
+        self.assertEqual(await self.limited(**capped), [])
+        self.assertEqual(await self.statuses(first, second), [JobStatus.RUNNING, JobStatus.HELD])
+        await self.backend.complete(await self.stored(first), None)
+        self.assertEqual([job.id for job in await self.limited(**capped)], [second.id])
+

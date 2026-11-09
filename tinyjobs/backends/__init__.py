@@ -1,4 +1,5 @@
 from .base import BaseBackend, Backend, Capabilities
+from ..limits import Limit
 from .loader import available_schemes, load_backend, register_builtin
 from .sqlite import SQLiteBackend
 
@@ -39,6 +40,7 @@ __all__ = [
     "Backend",
     "BaseBackend",
     "Capabilities",
+    "Limit",
     "SQLiteBackend",
     "available_schemes",
     "load_backend",
