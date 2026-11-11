@@ -90,7 +90,7 @@ STARTUP_SECONDS = 120.0
 SETUP_SECONDS = 600.0
 JOIN_SECONDS = 1.0
 KILL_SECONDS = 2.0
-EXIT_GRACE_SECONDS = 0.1
+EXIT_GRACE_SECONDS = 1.0
 WAIT_POLL_SECONDS = 0.01
 ALIVE_POLL_SECONDS = 0.5
 PARENT_POLL_SECONDS = 0.5
@@ -523,7 +523,7 @@ class _Child:
             return ProcessDied(DIED_LOST_MESSAGE.format(name=self._name))
         if code is None:
             self._kill_process()
-            how = "without answering"
+            how = "without leaving an exit status"
         elif code < 0:
             how = f"from {signal_name(-code)}"
         else:
