@@ -250,6 +250,7 @@ class TinyJobsBackend(BaseTaskBackend):
             "queue": task.queue_name,
             "priority": task.priority,
             "run_at": task.run_after.timestamp() if task.run_after else None,
+            "after": getattr(task, "follows", None),
         }
 
     def _find(self, job: Job | None, result_id: str) -> tuple[Job, Task]:

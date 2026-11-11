@@ -464,6 +464,123 @@ class OptionTests(DjangoTestCase):
             (7, "emails", True, "1/s"),
         )
 
+    def test_after_sends_a_task_to_run_once_another_has_succeeded(self):
+        first = self.tasks.double.enqueue(4)
+        child = self.tasks.double.after(first).using(priority=5).enqueue(8)
+        by_id = self.tasks.greet.using(queue_name="default").after(first.id).enqueue("ada")
+        job = self.backend.app.get(child.id)
+        self.assertEqual((job.after, job.status.value, job.priority), (first.id, "waiting", 5))
+        self.assertEqual((child.status, child.task.follows), ("READY", first.id))
+        self.assertIsNone(self.tasks.double.follows)
+        self.assertEqual(self.drain(), 3)
+        self.assertEqual(
+            [self.backend.get_result(result.id).return_value for result in (child, by_id)],
+            [16, "hello ada"],
+        )
+
+    def test_a_task_after_one_that_failed_reads_as_failed_and_never_runs(self):
+        failed = self.tasks.refuse.enqueue()
+        child = self.tasks.double.after(failed).enqueue(1)
+        self.assertEqual(self.drain(), 1)
+        cancelled = self.backend.get_result(child.id)
+        self.assertEqual(cancelled.status, "FAILED")
+        self.assertEqual(
+            cancelled.errors[-1].exception_class_path,
+            "tinyjobs.contrib.django.exceptions.JobCancelled",
+        )
+        late = self.tasks.double.after(failed).enqueue(2)
+        self.assertEqual(late.status, "FAILED")
+
+    def test_after_is_not_an_option_of_the_settings_or_the_decorator(self):
+        from tinyjobs.contrib.django import task
+        from tinyjobs.contrib.django.options import OPTIONS
+
+        self.assertNotIn("follows", OPTIONS)
+        self.assertIn("timeout", OPTIONS)
+        with self.assertRaisesRegex(TypeError, r"use \.after\(result\)"):
+            task(follows="some-job")(self.tasks.double.func)
+
+    def test_a_task_sent_after_another_still_copies_and_pickles(self):
+        import copy
+        import pickle
+
+        first = self.tasks.double.enqueue(1)
+        bound = self.tasks.double.after(first)
+        self.assertEqual(copy.deepcopy(bound).follows, first.id)
+        self.assertEqual(copy.copy(self.tasks.double), self.tasks.double)
+        self.assertEqual(bound.using(priority=3).follows, first.id)
+        self.assertEqual(self.tasks.double.using(priority=3).after(first).follows, first.id)
+        if django.VERSION >= (6, 1):
+            self.assertEqual(pickle.loads(pickle.dumps(bound)), bound)
+            result = bound.enqueue(2)
+            self.assertEqual(pickle.loads(pickle.dumps(result)).task.follows, first.id)
+
+    def test_the_async_calls_send_a_task_after_another(self):
+        import asyncio
+
+        async def send():
+            first = await self.tasks.double.aenqueue(1)
+            child = await self.tasks.double.after(first).aenqueue(2)
+            read = await self.backend.aget_result(child.id)
+            await child.arefresh()
+            return first, child, read
+
+        first, child, read = asyncio.run(send())
+        self.assertEqual((child.task.follows, read.task.follows), (first.id, first.id))
+        self.assertEqual(self.backend.app.get(child.id).status.value, "waiting")
+
+    def test_a_result_read_back_names_the_task_it_ran_after_and_why_it_was_cancelled(self):
+        failed = self.tasks.refuse.enqueue()
+        child = self.tasks.double.after(failed).enqueue(1)
+        self.assertEqual(self.backend.get_result(child.id).task.follows, failed.id)
+        self.assertIsNone(self.backend.get_result(failed.id).task.follows)
+        self.drain()
+        cancelled = self.backend.get_result(child.id)
+        self.assertIn("was to run after did not succeed", cancelled.errors[-1].traceback)
+        self.backend.app.retry(failed.id)
+        self.backend.app.retry(child.id)
+        for job_id in (child.id, self.tasks.double.enqueue(1).id):
+            self.backend.app.cancel(job_id)
+            self.assertIn(
+                "the job was cancelled", self.backend.get_result(job_id).errors[-1].traceback
+            )
+
+    def test_a_task_cancelled_with_the_one_before_it_finishes_without_the_signal(self):
+        from django.tasks.signals import task_finished
+
+        finished = []
+
+        def note(sender, task_result, **_):
+            finished.append(task_result.id)
+
+        task_finished.connect(note)
+        self.addCleanup(task_finished.disconnect, note)
+        failed = self.tasks.refuse.enqueue()
+        child = self.tasks.double.after(failed).enqueue(1)
+        self.drain()
+        last = self.tasks.double.enqueue(2)
+        self.drain()
+        deadline = time.monotonic() + 5
+        while len(finished) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(sorted(finished), sorted([failed.id, last.id]))
+        self.assertEqual(self.backend.get_result(child.id).status, "FAILED")
+
+    def test_a_task_released_by_the_one_before_it_reports_no_run_after(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        first = self.tasks.double.enqueue(1)
+        child = self.tasks.double.using(queue_name="emails").after(first).enqueue(2)
+        later = timezone.now() + timedelta(hours=1)
+        delayed = self.tasks.double.using(run_after=later).after(first).enqueue(3)
+        self.assertIsNone(child.task.run_after)
+        self.assertEqual(self.backend.get_result(delayed.id).task.run_after, later)
+        self.assertEqual(self.backend.app.drain(["default"]), 1)
+        self.assertIsNone(self.backend.get_result(child.id).task.run_after)
+        self.assertEqual(self.backend.app.get(child.id).status.value, "queued")
+
     def test_using_keeps_the_options(self):
         moved = self.tasks.capped.using(queue_name="emails", priority=5)
         self.assertEqual((moved.concurrency, moved.timeout, moved.queue_name), (2, 5, "emails"))
