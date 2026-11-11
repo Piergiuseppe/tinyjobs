@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, Callable, Mapping
 
 from django.tasks import DEFAULT_TASK_BACKEND_ALIAS, Task as DjangoTask, task_backends
@@ -23,10 +23,16 @@ class Task(DjangoTask):
     concurrency: int | None = None
     rate: str | None = None
     result_ttl: float | None = None
+    follows: str | None = None
+
+    def after(self, result: Any) -> "Task":
+        return replace(self, follows=getattr(result, "id", result))
 
 
 OPTIONS = tuple(
-    field.name for field in fields(Task) if field.name not in {f.name for f in fields(DjangoTask)}
+    field.name
+    for field in fields(Task)
+    if field.name not in {"follows", *(f.name for f in fields(DjangoTask))}
 )
 
 TASKS_MESSAGE = (
@@ -39,6 +45,9 @@ UNKNOWN_OPTION_MESSAGE = (
 )
 RUN_AFTER_MESSAGE = (
     "run_after cannot be set on the decorator; use .using(run_after=...) when the task is sent"
+)
+FOLLOWS_MESSAGE = (
+    "the job a task runs after is chosen when it is sent; use .after(result) on the task"
 )
 RETRY_ON_PATH_MESSAGE = (
     "{path} on TASKS[{alias!r}] has a retry_on that names {value}, which is not an exception "
@@ -116,6 +125,8 @@ def task(
 ) -> Any:
     if "run_after" in options:
         raise TypeError(RUN_AFTER_MESSAGE)
+    if "follows" in options:
+        raise TypeError(FOLLOWS_MESSAGE)
 
     def declare(target: Callable[..., Any]) -> DjangoTask:
         return task_backends[backend].task_class(
