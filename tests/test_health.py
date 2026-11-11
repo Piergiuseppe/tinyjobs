@@ -104,7 +104,7 @@ class CheckTests(HealthTestCase):
         self.app.send("elsewhere.task")
         self.app.send("elsewhere.task")
         self.assertEqual(len(self.failures()), 1)
-        self.assertIn("2 waiting job(s) for elsewhere.task", self.failures()[0])
+        self.assertIn("2 queued job(s) for elsewhere.task", self.failures()[0])
 
     def test_store_warnings_report_the_audit_without_failing_on_it(self):
         audited = [Finding(False, "the file is on tmpfs"), Finding(True, "journal mode WAL")]

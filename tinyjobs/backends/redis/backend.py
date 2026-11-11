@@ -23,7 +23,8 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...exceptions import AppClosedError, ConfigurationError
+from ...exceptions import AppClosedError, ConfigurationError, JobNotFoundError
+from ...following import PARENT_MISSING_MESSAGE, refuse_parents_among
 from ...limits import Limit
 from ...models import (
     Execution,
@@ -55,7 +56,8 @@ from .tokens import claim_token
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MAX_CONNECTIONS = 100
 DEFAULT_POOL_TIMEOUT = 20.0
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+COMPATIBLE_SINCE = 4
 ENQUEUE_BATCH = 100
 LIST_CHUNK = 200
 CLOCK_SECONDS = 5.0
@@ -88,6 +90,7 @@ class RedisBackend(BaseBackend):
         result_ttl=True,
         loop_bound=True,
         limits=True,
+        after=True,
     )
 
     def __init__(
@@ -150,8 +153,8 @@ class RedisBackend(BaseBackend):
         return backend
 
     async def setup(self) -> None:
-        stored = int(await self._run("schema", SCHEMA_VERSION))
-        if stored > SCHEMA_VERSION:
+        stored, since = map(int, await self._run("schema", SCHEMA_VERSION, COMPATIBLE_SINCE))
+        if stored > SCHEMA_VERSION and since > SCHEMA_VERSION:
             raise RuntimeError(
                 f"redis schema version {stored} is newer than this tinyjobs "
                 f"build understands ({SCHEMA_VERSION}); upgrade the package"
@@ -204,10 +207,15 @@ class RedisBackend(BaseBackend):
 
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         stored: list[Job] = []
+        refuse_parents_among(jobs)
+        if len(jobs) > ENQUEUE_BATCH:
+            await self._assert_parents(jobs)
         for start in range(0, len(jobs), ENQUEUE_BATCH):
             batch = jobs[start : start + ENQUEUE_BATCH]
-            ids = await self._run("enqueue", *jobs_to_arguments(batch))
-            stored.extend(await self._resolve(batch, ids))
+            ids, placed = await self._run("enqueue", *jobs_to_arguments(batch))
+            if ids is None:
+                raise JobNotFoundError(PARENT_MISSING_MESSAGE.format(after=placed.decode()))
+            stored.extend(await self._resolve(batch, ids, placed))
         return stored
 
     async def claim(
@@ -685,12 +693,29 @@ class RedisBackend(BaseBackend):
         )
         return f"redis {place} db {settings.get('db', 0)}"
 
-    async def _resolve(self, jobs: Sequence[Job], ids: Sequence[bytes]) -> list[Job]:
-        resolved = []
-        for job, stored in zip(jobs, ids):
-            stored_id = stored.decode()
-            resolved.append(job if stored_id == job.id else await self.get(stored_id))
-        return resolved
+    async def _assert_parents(self, jobs: Sequence[Job]) -> None:
+        parents = list(dict.fromkeys(job.after for job in jobs if job.after is not None))
+        if not parents:
+            return
+        pipeline = self._client.pipeline(transaction=False)
+        for parent in parents:
+            pipeline.exists(self._keys("job", parent))
+        for parent, found in zip(parents, await pipeline.execute()):
+            if not found:
+                raise JobNotFoundError(PARENT_MISSING_MESSAGE.format(after=parent))
+
+    async def _resolve(
+        self, jobs: Sequence[Job], ids: Sequence[bytes], placed: Sequence[bytes] = ()
+    ) -> list[Job]:
+        read = []
+        for index, (job, stored) in enumerate(zip(jobs, ids)):
+            status = placed[index].decode() if placed else str(job.status)
+            if stored.decode() != job.id or status == JobStatus.CANCELLED:
+                read.append(stored)
+            else:
+                job.status = JobStatus(status)
+        found = dict(zip(read, await self._load(read))) if read else {}
+        return [found.get(stored) or job for job, stored in zip(jobs, ids)]
 
     async def _load(self, ids: Sequence[bytes]) -> list[Job | None]:
         found = await self._fetch(ids)

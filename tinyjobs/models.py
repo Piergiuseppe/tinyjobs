@@ -47,6 +47,7 @@ class Job:
     last_error: str | None = None
     hand_backs: int = 0
     claims: int = 0
+    after: str | None = None
     _app: "TinyJobs | None" = field(default=None, compare=False, repr=False)
 
     @property

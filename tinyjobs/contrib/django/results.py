@@ -9,6 +9,7 @@ from django.tasks import Task, TaskResult, TaskResultStatus
 from django.tasks.base import TaskError
 from django.utils import timezone
 
+from ...following import PARENT_ENDED_MESSAGE, PARENT_GONE_MESSAGE
 from ...models import Execution, Job, JobPayload
 from ...status import ExecutionStatus, JobStatus
 from .discovery import stored
@@ -17,6 +18,7 @@ from .exceptions import JobCancelled, WorkerLost
 STATUSES = {
     JobStatus.QUEUED: TaskResultStatus.READY,
     JobStatus.HELD: TaskResultStatus.READY,
+    JobStatus.WAITING: TaskResultStatus.READY,
     JobStatus.RUNNING: TaskResultStatus.RUNNING,
     JobStatus.SUCCESS: TaskResultStatus.SUCCESSFUL,
     JobStatus.FAILED: TaskResultStatus.FAILED,
@@ -42,9 +44,12 @@ def build_result(
             queue_name=job.queue,
             run_after=(
                 moment(job.run_at)
-                if job.claims == 0 and job.run_at != job.created_at
+                if job.claims == 0
+                and job.run_at != job.created_at
+                and (job.after is None or job.status is JobStatus.WAITING)
                 else None
             ),
+            follows=job.after,
         ),
         id=job.id,
         status=STATUSES[job.status],
@@ -75,7 +80,8 @@ def errors_of(job: Job, executions: Sequence[Execution]) -> list[TaskError]:
     if errors or STATUSES[job.status] is not TaskResultStatus.FAILED:
         return errors
     if job.status is JobStatus.CANCELLED:
-        return [synthetic(JobCancelled("the job was cancelled"))]
+        followed = job.last_error in (PARENT_ENDED_MESSAGE, PARENT_GONE_MESSAGE)
+        return [synthetic(JobCancelled(job.last_error if followed else "the job was cancelled"))]
     return [synthetic(WorkerLost("the worker running the job was lost"))]
 
 

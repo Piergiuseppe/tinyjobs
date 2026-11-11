@@ -23,7 +23,17 @@ from ...models import (
     Stats,
 )
 from ...retention import RetentionPolicy
-from ...exceptions import AppClosedError, ConfigurationError, UnsupportedCapabilityError
+from ...exceptions import (
+    AppClosedError,
+    ConfigurationError,
+    JobNotFoundError,
+    UnsupportedCapabilityError,
+)
+from ...following import (
+    PARENT_ENDED_MESSAGE,
+    PARENT_MISSING_MESSAGE,
+    refuse_parents_among,
+)
 from ...limits import Limit
 from ..loader import IN_MEMORY_JOIN_MESSAGE, in_memory
 from ...runtime import CountingPool, pause_threads_at_fork, refuse_interrupted
@@ -35,12 +45,15 @@ from .claim import SUPPORTS_RETURNING, LimitedClaim, build_claim_strategy
 from .connection import CALLING, FORK_GATE, ConnectionPool, StepAside
 from .queries import Queries
 from .records import (
+    JOB_COLUMNS,
     execution_from_row,
     job_from_row,
     job_to_row,
     schedule_from_row,
 )
 from .schema import (
+    ADDED_COLUMNS,
+    COMPATIBLE_SINCE,
     DEFAULT_PREFIX,
     LEGACY_KINDS,
     LEGACY_STUB,
@@ -49,6 +62,7 @@ from .schema import (
     TABLES_OF,
     Tables,
     ddl,
+    meta_table,
     migrations,
     renames,
 )
@@ -60,6 +74,7 @@ MEMORY_TEMPLATE = "file:tinyjobs-{token}?mode=memory&cache=shared"
 SQLITE_OPTIONS = frozenset({"busy_timeout", "prefix"})
 
 RELEASE_BATCH = 1000
+ENDED_STATUSES = ("failed", "cancelled")
 
 LEGACY_PREFIX_MESSAGE = (
     "this file holds a queue from a tinyjobs before 0.14, whose tables had no prefix, and "
@@ -156,6 +171,7 @@ class SQLiteBackend(BaseBackend):
         max_payload_bytes=None,
         result_ttl=True,
         limits=True,
+        after=True,
     )
 
     def __init__(
@@ -409,13 +425,17 @@ class SQLiteBackend(BaseBackend):
 
     def _install_schema(self, connection: Any) -> None:
         stored, legacy = self._stored_version(connection)
+        if stored is None and _columns(connection, self._tables.jobs):
+            connection.execute(meta_table(self._tables))
+            stored = PREFIXED_SINCE
         if stored is not None:
-            _refuse_newer(stored)
+            self._refuse_newer(connection, stored)
             self._rename(connection, legacy)
             self._migrate(connection, stored)
         for statement in self._ddl:
             connection.execute(statement)
         connection.execute(self._queries.record_schema_version, (str(SCHEMA_VERSION),))
+        connection.execute(self._queries.record_compatible_since, (str(COMPATIBLE_SINCE),))
         connection.execute(self._queries.record_last_purge)
         if legacy:
             for statement in LEGACY_STUB:
@@ -496,15 +516,39 @@ class SQLiteBackend(BaseBackend):
         return int(version), legacy
 
     def _current(self, connection: Any) -> bool:
-        return self._stored_version(connection) == (SCHEMA_VERSION, ())
+        stored, legacy = self._stored_version(connection)
+        if stored is None or legacy or stored < SCHEMA_VERSION:
+            return False
+        return self._works_on(connection, stored)
+
+    def _works_on(self, connection: Any, stored: int) -> bool:
+        if stored <= SCHEMA_VERSION:
+            return True
+        row = connection.execute(self._queries.compatible_since).fetchone()
+        return row is not None and int(row[0]) <= SCHEMA_VERSION
+
+    def _refuse_newer(self, connection: Any, stored: int) -> None:
+        if not self._works_on(connection, stored):
+            raise RuntimeError(
+                f"database schema version {stored} is newer than this tinyjobs "
+                f"build understands ({SCHEMA_VERSION}); upgrade the package"
+            )
 
     def _migrate(self, connection: Any, current: int) -> None:
         if current >= SCHEMA_VERSION:
             return
         for version in range(current + 1, SCHEMA_VERSION + 1):
+            self._add_columns(connection, version)
             for statement in self._migrations.get(version, ()):
                 connection.execute(statement)
         connection.execute(self._queries.write_schema_version, (str(SCHEMA_VERSION),))
+
+    def _add_columns(self, connection: Any, version: int) -> None:
+        jobs = self._tables.jobs
+        present = _columns(connection, jobs)
+        for name, kind in ADDED_COLUMNS.get(version, ()):
+            if present and name not in present:
+                connection.execute(f"ALTER TABLE {jobs} ADD COLUMN {name} {kind}")
 
     def _close_sync(self) -> None:
         self._connections.close()
@@ -601,13 +645,16 @@ class SQLiteBackend(BaseBackend):
             return self._insert_all(connection, jobs)
 
     def _insert_all(self, connection: Any, jobs: Sequence[Job]) -> list[Job]:
-        if any(job.dedup_key is not None for job in jobs):
+        refuse_parents_among(jobs)
+        if any(job.dedup_key is not None or job.after is not None for job in jobs):
             return [self._insert(connection, job) for job in jobs]
         connection.executemany(self._queries.insert_job, [job_to_row(job) for job in jobs])
         return list(jobs)
 
     def _insert(self, connection: Any, job: Job) -> Job:
         try:
+            if job.after is not None:
+                return self._insert_child(connection, job)
             connection.execute(self._queries.insert_job, job_to_row(job))
         except sqlite3.IntegrityError:
             if job.dedup_key is None:
@@ -617,6 +664,21 @@ class SQLiteBackend(BaseBackend):
                 raise
             return existing
         return job
+
+    def _insert_child(self, connection: Any, job: Job) -> Job:
+        values = dict(zip(JOB_COLUMNS, job_to_row(job)))
+        values.update(now=self._clock.now(), ended=PARENT_ENDED_MESSAGE)
+        if connection.execute(self._queries.insert_child, values).rowcount != 1:
+            raise JobNotFoundError(PARENT_MISSING_MESSAGE.format(after=job.after))
+        return job_from_row(connection.execute(self._queries.select_job, (job.id,)).fetchone())
+
+    def _release_children(self, connection: Any, job_id: str, now: float) -> None:
+        connection.execute(self._queries.release_children, (now, job_id))
+
+    def _cancel_descendants(self, connection: Any, job_id: str, now: float) -> None:
+        connection.execute(
+            self._queries.cancel_descendants, (job_id, now, PARENT_ENDED_MESSAGE)
+        )
 
     def _active_duplicate(self, connection: Any, dedup_key: str) -> Job | None:
         row = connection.execute(self._queries.select_active_by_dedup, (dedup_key,)).fetchone()
@@ -699,6 +761,7 @@ class SQLiteBackend(BaseBackend):
             self._finish_execution(
                 connection, job, ExecutionStatus.SUCCESS, None, now
             )
+            self._release_children(connection, job.id, now)
         return True
 
     def _fail_sync(
@@ -722,6 +785,8 @@ class SQLiteBackend(BaseBackend):
             if cursor.rowcount != 1:
                 return False
             self._finish_execution(connection, job, execution_status, error, now)
+            if retry_at is None:
+                self._cancel_descendants(connection, job.id, now)
         return True
 
     def _release_sync(self, job: Job, delay: float) -> bool:
@@ -782,11 +847,18 @@ class SQLiteBackend(BaseBackend):
             if cursor.rowcount != 1:
                 return False
             connection.execute(self._queries.cancel_executions, (now, job_id))
+            self._cancel_descendants(connection, job_id, now)
         return True
 
     def _requeue_sync(self, job_id: str) -> bool:
         with self._connections.write() as connection:
-            cursor = connection.execute(self._queries.requeue_job, (self._clock.now(), job_id))
+            found = connection.execute(self._queries.select_requeued, (job_id,)).fetchone()
+            if found is None or found[0] in ENDED_STATUSES:
+                return False
+            status = "queued" if found[0] in (None, "success") else "waiting"
+            cursor = connection.execute(
+                self._queries.requeue_job, (status, status, self._clock.now(), job_id)
+            )
         return cursor.rowcount == 1
 
     def _get_sync(self, job_id: str) -> Job | None:
@@ -835,6 +907,9 @@ class SQLiteBackend(BaseBackend):
             connection.execute(
                 self._queries.mark_executions_lost.format(ids=placeholders), (now, *expired)
             )
+            for job_id, status in expired.items():
+                if status == "failed":
+                    self._cancel_descendants(connection, job_id, now)
         return len(expired)
 
     def _purge_sync(self, policy: RetentionPolicy, now: float) -> int | None:
@@ -928,24 +1003,26 @@ class SQLiteBackend(BaseBackend):
 
     def _select_expired(
         self, connection: sqlite3.Connection, now: float
-    ) -> list[str]:
+    ) -> dict[str, str]:
         if SUPPORTS_RETURNING:
             rows = connection.execute(self._queries.reap_expired, (now, now, now)).fetchall()
-            return [row["id"] for row in rows]
+            return {row["id"]: row["status"] for row in rows}
         rows = connection.execute(self._queries.select_expired_ids, (now,)).fetchall()
+        expired = {}
         for row in rows:
             exhausted = row["attempts"] >= row["max_attempts"]
+            expired[row["id"]] = "failed" if exhausted else "queued"
             connection.execute(
                 self._queries.expire_one,
                 (
-                    "failed" if exhausted else "queued",
+                    expired[row["id"]],
                     now,
                     now if exhausted else None,
                     LEASE_EXPIRED_MESSAGE,
                     row["id"],
                 ),
             )
-        return [row["id"] for row in rows]
+        return expired
 
     def _finish_execution(
         self,
@@ -968,16 +1045,9 @@ class SQLiteBackend(BaseBackend):
         )
 
     def _assert_schema_supported(self) -> None:
-        row = self._connections.connection.execute(self._queries.schema_version).fetchone()
-        _refuse_newer(int(row[0]) if row else SCHEMA_VERSION)
-
-
-def _refuse_newer(stored: int) -> None:
-    if stored > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"database schema version {stored} is newer than this tinyjobs "
-            f"build understands ({SCHEMA_VERSION}); upgrade the package"
-        )
+        connection = self._connections.connection
+        row = connection.execute(self._queries.schema_version).fetchone()
+        self._refuse_newer(connection, int(row[0]) if row else SCHEMA_VERSION)
 
 
 def _legacy_queue(connection: Any, present: set[str]) -> bool:

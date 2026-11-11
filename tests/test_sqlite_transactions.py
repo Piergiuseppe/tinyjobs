@@ -413,7 +413,7 @@ class ColdSQLiteTransactionTests(unittest.TestCase):
                     self.connect()
                     .execute("SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'")
                     .fetchone(),
-                    ("5",),
+                    ("6",),
                 )
                 if mode == "legacy":
                     self.assertIsNone(app.get(job.id))
@@ -613,7 +613,7 @@ class ColdSQLiteTransactionTests(unittest.TestCase):
         self.assertTrue(traced[0].startswith("DELETE FROM tinyjobs_install_lock"), traced)
         self.assertEqual(
             self.connect().execute("SELECT value FROM tinyjobs_meta WHERE key = 'schema_version'").fetchone(),
-            ("5",),
+            ("6",),
         )
         self.assertIsNotNone(app.get(job.id))
 

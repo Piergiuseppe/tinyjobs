@@ -9,7 +9,17 @@ from ...status import ExecutionStatus, JobStatus
 BINARY_FIELDS = ("payload", "result")
 INTEGER_FIELDS = ("priority", "attempts", "max_attempts", "hand_backs", "claims")
 TIME_FIELDS = ("run_at", "created_at", "finished_at", "lease_expires_at")
-TEXT_FIELDS = ("id", "task", "codec", "queue", "status", "worker_id", "dedup_key", "last_error")
+TEXT_FIELDS = (
+    "id",
+    "task",
+    "codec",
+    "queue",
+    "status",
+    "worker_id",
+    "dedup_key",
+    "last_error",
+    "after",
+)
 
 
 def number(value: float) -> str:
@@ -39,6 +49,7 @@ def job_to_arguments(job: Job) -> list[Any]:
         "dedup_key": job.dedup_key,
         "result": job.result_payload,
         "last_error": job.last_error,
+        "after": job.after,
     }
     flat: list[Any] = []
     for field, value in values.items():
@@ -97,6 +108,7 @@ def job_from_fields(raw: dict[bytes, bytes]) -> Job:
         dedup_key=text("dedup_key"),
         result_payload=fields.get("result"),
         last_error=text("last_error"),
+        after=text("after"),
     )
 
 

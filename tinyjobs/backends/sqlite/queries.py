@@ -1,14 +1,36 @@
 from __future__ import annotations
 
-from .records import JOB_COLUMN_LIST, JOB_PLACEHOLDERS
+from .records import JOB_COLUMN_LIST, JOB_COLUMNS, JOB_PLACEHOLDERS
 from .schema import Tables
+
+ENDED = "parent.status IN ('failed', 'cancelled')"
+
+CHILD_EXPRESSIONS = {
+    "status": (
+        "CASE WHEN parent.status = 'success' THEN 'queued' "
+        f"WHEN {ENDED} THEN 'cancelled' ELSE 'waiting' END"
+    ),
+    "finished_at": f"CASE WHEN {ENDED} THEN :now END",
+    "last_error": f"CASE WHEN {ENDED} THEN :ended END",
+}
+
+CHILD_VALUES = ", ".join(
+    CHILD_EXPRESSIONS.get(column, f":{column}") for column in JOB_COLUMNS
+)
 
 TEMPLATES = {
     "insert_job": f"INSERT INTO {{jobs}} ({JOB_COLUMN_LIST}) VALUES ({JOB_PLACEHOLDERS})",
+    "insert_child": f"""
+        INSERT INTO {{jobs}} ({JOB_COLUMN_LIST}, waiting_on)
+        SELECT {CHILD_VALUES},
+               CASE WHEN parent.status IN ('success', 'failed', 'cancelled') THEN NULL
+                    ELSE :runs_after END
+          FROM {{jobs}} AS parent WHERE parent.id = :runs_after
+    """,
     "select_job": f"SELECT {JOB_COLUMN_LIST} FROM {{jobs}} WHERE id = ?",
     "select_active_by_dedup": f"""
         SELECT {JOB_COLUMN_LIST} FROM {{jobs}}
-         WHERE dedup_key = ? AND status IN ('queued', 'held', 'running')
+         WHERE dedup_key = ? AND status IN ('queued', 'held', 'waiting', 'running')
     """,
     "select_claimable_ids": """
         SELECT id FROM {jobs}
@@ -143,12 +165,13 @@ TEMPLATES = {
     "cancel_job": """
         UPDATE {jobs}
            SET status = 'cancelled', finished_at = ?, lease_expires_at = NULL,
-               hand_backs = 0
-         WHERE id = ? AND status IN ('queued', 'held', 'running')
+               hand_backs = 0, waiting_on = NULL
+         WHERE id = ? AND status IN ('queued', 'held', 'waiting', 'running')
     """,
     "requeue_job": """
         UPDATE {jobs}
-           SET status = 'queued', run_at = CASE WHEN claims = 0 THEN created_at ELSE ? END,
+           SET status = ?, waiting_on = CASE WHEN ? = 'waiting' THEN runs_after END,
+               run_at = CASE WHEN claims = 0 THEN created_at ELSE ? END,
                attempts = 0,
                finished_at = NULL,
                lease_expires_at = NULL, worker_id = NULL, last_error = NULL
@@ -156,8 +179,28 @@ TEMPLATES = {
            AND NOT EXISTS (
                SELECT 1 FROM {jobs} AS holder
                 WHERE holder.dedup_key = {jobs}.dedup_key
-                  AND holder.status IN ('queued', 'held', 'running')
+                  AND holder.status IN ('queued', 'held', 'waiting', 'running')
            )
+    """,
+    "select_requeued": """
+        SELECT parent.status FROM {jobs} AS job
+          LEFT JOIN {jobs} AS parent ON parent.id = job.runs_after
+         WHERE job.id = ? AND job.status IN ('failed', 'cancelled')
+    """,
+    "release_children": """
+        UPDATE {jobs} SET status = 'queued', waiting_on = NULL, run_at = max(run_at, ?)
+         WHERE waiting_on = ?
+    """,
+    "cancel_descendants": """
+        WITH RECURSIVE descendants (id) AS (
+            SELECT id FROM {jobs} WHERE waiting_on = ?
+            UNION ALL
+            SELECT child.id FROM descendants
+             CROSS JOIN {jobs} AS child ON child.waiting_on = descendants.id
+        )
+        UPDATE {jobs}
+           SET status = 'cancelled', waiting_on = NULL, finished_at = ?, last_error = ?
+         WHERE id IN (SELECT id FROM descendants)
     """,
     "reap_expired": """
         UPDATE {jobs}
@@ -169,7 +212,7 @@ TEMPLATES = {
                hand_backs = 0,
                last_error = 'lease expired: the worker holding this job stopped reporting'
          WHERE status = 'running' AND lease_expires_at < ?
-        RETURNING id, attempts
+        RETURNING id, status
     """,
     "select_expired_ids": """
         SELECT id, attempts, max_attempts FROM {jobs}
@@ -232,6 +275,11 @@ TEMPLATES = {
     "record_schema_version": (
         "INSERT INTO {meta} (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT (key) DO NOTHING"
+    ),
+    "compatible_since": "SELECT value FROM {meta} WHERE key = 'compatible_since'",
+    "record_compatible_since": (
+        "INSERT INTO {meta} (key, value) VALUES ('compatible_since', ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value"
     ),
     "record_last_purge": (
         "INSERT INTO {meta} (key, value) VALUES ('last_purge_at', '0') "

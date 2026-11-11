@@ -4,7 +4,11 @@ import re
 
 from ...exceptions import ConfigurationError
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+COMPATIBLE_SINCE = 6
+
+ADDED_COLUMNS = {6: (("runs_after", "TEXT"), ("waiting_on", "TEXT"))}
 
 PREFIXED_SINCE = 4
 
@@ -65,12 +69,7 @@ def ddl(tables: Tables) -> tuple[str, ...]:
             taken INTEGER
         )
         """,
-        f"""
-        CREATE TABLE IF NOT EXISTS {tables.meta} (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """,
+        meta_table(tables),
         f"""
         CREATE TABLE IF NOT EXISTS {tables.jobs} (
             id               TEXT PRIMARY KEY,
@@ -91,7 +90,9 @@ def ddl(tables: Tables) -> tuple[str, ...]:
             worker_id        TEXT,
             dedup_key        TEXT,
             result           BLOB,
-            last_error       TEXT
+            last_error       TEXT,
+            runs_after       TEXT,
+            waiting_on       TEXT
         )
         """,
         f"""
@@ -147,14 +148,32 @@ def ddl(tables: Tables) -> tuple[str, ...]:
         )
         """,
         *limit_statements(tables),
+        waiting_index(tables),
     )
+
+
+def meta_table(tables: Tables) -> str:
+    return f"""
+        CREATE TABLE IF NOT EXISTS {tables.meta} (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+
+
+def waiting_index(tables: Tables) -> str:
+    return f"""
+        CREATE INDEX IF NOT EXISTS {tables.index("jobs_waiting")}
+            ON {tables.jobs} (waiting_on)
+            WHERE waiting_on IS NOT NULL
+        """
 
 
 def dedup_index(tables: Tables) -> str:
     return f"""
         CREATE UNIQUE INDEX IF NOT EXISTS {tables.index("jobs_dedup")}
             ON {tables.jobs} (dedup_key)
-            WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'running')
+            WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'waiting', 'running')
         """
 
 
@@ -208,6 +227,11 @@ def migrations(tables: Tables) -> dict[int, tuple[str, ...]]:
         4: tuple(f"DROP INDEX IF EXISTS {name}" for name in LEGACY_INDEXES),
         5: (
             *limit_statements(tables),
+            f"DROP INDEX IF EXISTS {tables.index('jobs_dedup')}",
+            dedup_index(tables),
+        ),
+        6: (
+            waiting_index(tables),
             f"DROP INDEX IF EXISTS {tables.index('jobs_dedup')}",
             dedup_index(tables),
         ),

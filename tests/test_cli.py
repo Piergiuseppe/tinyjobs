@@ -1172,7 +1172,7 @@ class HealthCommandTests(FixtureApp, unittest.TestCase):
         self.invoke("send", "--app", "fixture_app:app", "nobody.home")
         code, output = self.invoke("check", "--app", "fixture_app:app")
         self.assertEqual(code, 1)
-        self.assertIn("FAIL  1 waiting job(s) for nobody.home", output)
+        self.assertIn("FAIL  1 queued job(s) for nobody.home", output)
 
     def test_check_store_warnings_reports_the_store_without_failing_on_it(self):
         from unittest import mock

@@ -22,12 +22,13 @@ from tinyjobs import deadlines
 from tinyjobs.services import lifecycle
 from tinyjobs import JobStatus, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
+from tinyjobs.following import PARENT_ENDED_MESSAGE, PARENT_GONE_MESSAGE
 from tinyjobs.limits import Limit
 from tinyjobs.runtime import run_on
 from tinyjobs.testing import BackendContract
 from tinyjobs.models import ExecutionError
 from tinyjobs.status import ExecutionStatus
-from tinyjobs.testing.contract import ERROR, make_job
+from tinyjobs.testing.contract import ERROR, make_job, pruning
 from tests.support import (
     LoopBoundAppCases,
     Untouched,
@@ -314,6 +315,16 @@ async def _rows_of(connection, query: str, parameters: dict) -> list[tuple]:
     return await cursor.fetchall()
 
 
+async def quiet_snapshots(seconds: float = 20.0) -> None:
+    others = (
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+        "AND pid <> pg_backend_pid() AND backend_xmin IS NOT NULL"
+    )
+    deadline = time.monotonic() + seconds
+    while (await sql(others))[0][0] and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+
+
 def requires_postgres(case):
     case = unittest.skipUnless(POSTGRES_URL, "set TINYJOBS_POSTGRES_URL to run the postgres tests")(case)
     return unittest.skipIf(
@@ -338,15 +349,64 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
         newer = str(SCHEMA_VERSION + 1)
         await sql(
-            f"UPDATE \"{self.prefix}_meta\" SET value = %(v)s WHERE key = 'schema_version'",
+            f"UPDATE \"{self.prefix}_meta\" SET value = %(v)s "
+            "WHERE key IN ('schema_version', 'compatible_since')",
             {"v": newer},
         )
+        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+            await self.backend.setup()
+        await sql(f"DELETE FROM \"{self.prefix}_meta\" WHERE key = 'compatible_since'")
         with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
             await self.backend.setup()
         stored = await sql(
             f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"
         )
         self.assertEqual(stored, [(newer,)])
+
+    async def test_a_newer_store_that_says_this_release_works_on_it_is_used_as_it_is(self):
+        from tinyjobs.backends.postgres.schema import SCHEMA_VERSION
+
+        meta = f'SELECT key, value FROM "{self.prefix}_meta" WHERE key = ANY(%(keys)s) ORDER BY key'
+        keys = {"keys": ["compatible_since", "schema_version"]}
+        self.assertEqual(
+            await sql(meta, keys),
+            [("compatible_since", str(SCHEMA_VERSION)), ("schema_version", str(SCHEMA_VERSION))],
+        )
+        newer = str(SCHEMA_VERSION + 1)
+        await sql(
+            f"UPDATE \"{self.prefix}_meta\" SET value = %(v)s WHERE key = 'schema_version'",
+            {"v": newer},
+        )
+        beside = await self.open()
+        self.assertEqual(
+            await sql(meta, keys),
+            [("compatible_since", str(SCHEMA_VERSION)), ("schema_version", newer)],
+        )
+        job = await beside.enqueue(make_job())
+        self.assertEqual([claimed.id for claimed in await self.claim()], [job.id])
+        await sql(f'DROP INDEX "{self.prefix}_jobs_waiting"')
+        with self.assertRaisesRegex(ConfigurationError, "jobs_waiting"):
+            await self.open()
+        self.assertEqual(
+            await sql("SELECT to_regclass(%(index)s)", {"index": f"{self.prefix}_jobs_waiting"}),
+            [(None,)],
+        )
+
+    async def test_a_backend_keeps_following_the_server_clock_through_setup_and_children(self):
+        following = PostgresBackend.from_url(POSTGRES_URL, prefix=self.prefix)
+        self.opened.append(following)
+        await following.setup()
+        parent = await following.enqueue(make_job())
+        child = await following.enqueue(make_job(after=parent.id))
+        [claimed] = await following.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60
+        )
+        self.assertTrue(await following.complete(claimed, None))
+        await following.setup()
+        self.assertIn("statement_timestamp", following._queries.reap)
+        self.assertEqual((await following.get(child.id)).status, JobStatus.QUEUED)
+        frozen = await self.open()
+        self.assertNotIn("statement_timestamp", frozen._queries.reap)
 
     async def test_a_version_one_store_is_upgraded_in_place(self):
         jobs = f'"{self.prefix}_jobs"'
@@ -364,11 +424,12 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             "ADD CONSTRAINT legacy_status CHECK "
             "(status IN ('queued', 'running', 'success', 'failed', 'cancelled'))"
         )
+        await sql(f"ALTER TABLE {jobs} DROP COLUMN runs_after, DROP COLUMN waiting_on")
         await sql(f"UPDATE \"{self.prefix}_meta\" SET value = '1' WHERE key = 'schema_version'")
         upgraded = await self.open()
         self.assertEqual(
             await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
-            [("2",)],
+            [("3",)],
         )
         self.assertEqual(
             await sql(
@@ -394,7 +455,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 (
                     f"{self.prefix}_jobs_dedup",
                     "((dedup_digest IS NOT NULL) AND (status = ANY "
-                    "(ARRAY['queued'::text, 'held'::text, 'running'::text])))",
+                    "(ARRAY['queued'::text, 'held'::text, 'waiting'::text, 'running'::text])))",
                 ),
                 (f"{self.prefix}_jobs_held", "(status = 'held'::text)"),
                 (f"{self.prefix}_jobs_running_by_task", "(status = 'running'::text)"),
@@ -411,6 +472,283 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([job.id for job in claimed], [kept.id])
         self.assertEqual((await upgraded.counts_by_status())["held"], 1)
+
+    async def test_a_store_written_by_0_16_learns_to_keep_waiting_jobs(self):
+        jobs = f'"{self.prefix}_jobs"'
+        parent = await self.enqueue(dedup_key="invoice:1")
+        held = await self.enqueue(run_at=1.0)
+        await sql(f"UPDATE {jobs} SET status = 'held' WHERE id = %(id)s", {"id": held.id})
+        await sql(f"ALTER TABLE {jobs} DROP COLUMN runs_after, DROP COLUMN waiting_on")
+        await sql(f'DROP INDEX "{self.prefix}_jobs_dedup"')
+        await sql(
+            f'CREATE UNIQUE INDEX "{self.prefix}_jobs_dedup" ON {jobs} (dedup_digest) '
+            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'held', 'running')"
+        )
+        await sql(
+            f'ALTER TABLE {jobs} DROP CONSTRAINT "{self.prefix}_jobs_status_check", '
+            f'ADD CONSTRAINT "{self.prefix}_jobs_status_check" CHECK '
+            "(status IN ('queued', 'held', 'running', 'success', 'failed', 'cancelled'))"
+        )
+        await sql(f"UPDATE \"{self.prefix}_meta\" SET value = '2' WHERE key = 'schema_version'")
+        upgraded = await self.open()
+        self.assertEqual(
+            await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
+            [("3",)],
+        )
+        self.assertEqual(
+            await sql(
+                "SELECT pg_get_expr(indpred, indrelid) FROM pg_index "
+                "WHERE indexrelid = %(index)s::regclass",
+                {"index": f"{self.prefix}_jobs_waiting"},
+            ),
+            [("(waiting_on IS NOT NULL)",)],
+        )
+        self.assertEqual((await upgraded.get(held.id)).status, JobStatus.HELD)
+        child = await upgraded.enqueue(make_job(after=parent.id, dedup_key="report:1"))
+        again = await upgraded.enqueue(make_job(dedup_key="report:1"))
+        self.assertEqual((child.status, again.id), (JobStatus.WAITING, child.id))
+        [claimed] = await upgraded.claim(
+            worker_id="w", queues=["default"], limit=1, lease_seconds=60
+        )
+        self.assertTrue(await upgraded.complete(claimed, None))
+        self.assertEqual((await upgraded.get(child.id)).status, JobStatus.QUEUED)
+
+    async def test_a_store_pays_for_waiting_jobs_only_once_it_has_held_one(self):
+        flag = f"SELECT count(*) FROM \"{self.prefix}_meta\" WHERE key LIKE 'following:%%'"
+        await self.finish(await self.enqueue())
+        self.assertEqual((await sql(flag), self.backend._releasing), ([(0,)], False))
+        other = await self.open()
+        parent = await self.enqueue(run_at=1.0)
+        children = [await other.enqueue(make_job(after=parent.id)) for _ in range(2)]
+        self.assertEqual(await sql(flag), [(1,)])
+        self.assertFalse(self.backend._releasing)
+        await self.finish(parent)
+        self.assertTrue(self.backend._releasing)
+        self.assertEqual(await self.statuses(*children), [JobStatus.QUEUED] * 2)
+        line = [await self.enqueue(run_at=2.0)]
+        line.append(await self.child_of(line[0]))
+        with mock.patch.object(self.backend, "_release_children") as separate:
+            await self.finish(line[0])
+        separate.assert_not_called()
+        self.assertEqual(await self.statuses(*line), [JobStatus.SUCCESS, JobStatus.QUEUED])
+
+    async def test_children_a_failed_release_left_waiting_are_queued_by_the_reaper(self):
+        parent = await self.enqueue()
+        child = await self.child_of(parent)
+        broken = mock.patch.object(
+            self.backend._queries, "release_children", "SELECT 1 / 0 AS woken"
+        )
+        with broken, self.assertLogs("tinyjobs", level="WARNING") as logs:
+            await self.finish(parent)
+        self.assertIn("the next reaper pass", logs.output[0])
+        self.assertEqual(await self.statuses(parent, child), [JobStatus.SUCCESS, JobStatus.WAITING])
+        await self.backend.reap_expired()
+        self.assertEqual(await self.statuses(child), [JobStatus.QUEUED])
+
+    async def test_a_long_line_is_cancelled_by_index_whatever_else_waits(self):
+        jobs = f'"{self.prefix}_jobs"'
+        self.assertEqual(
+            await sql(
+                "SELECT attoptions FROM pg_attribute "
+                "WHERE attrelid = %(jobs)s::regclass AND attname = 'waiting_on'",
+                {"jobs": jobs},
+            ),
+            [(["n_distinct=-1"],)],
+        )
+        crowd = await self.enqueue(queue="crowd")
+        await sql(
+            f"INSERT INTO {jobs} (id, task, payload, codec, queue, status, run_at, created_at, "
+            "runs_after, waiting_on) SELECT 'crowd-' || n, 'tests.noop', '\\x7b7d'::bytea, 'json', "
+            "'crowd', 'waiting', 0, 0, %(parent)s, %(parent)s FROM generate_series(1, 20000) AS n",
+            {"parent": crowd.id},
+        )
+        head = await self.enqueue()
+        await sql(
+            f"INSERT INTO {jobs} (id, task, payload, codec, queue, status, run_at, created_at, "
+            "runs_after, waiting_on) SELECT 'line-' || lpad(n::text, 5, '0'), 'tests.noop', "
+            "'\\x7b7d'::bytea, 'json', 'default', 'waiting', 0, 0, before.id, before.id "
+            "FROM generate_series(1, 1000) AS n, LATERAL (SELECT CASE WHEN n = 1 THEN %(head)s "
+            "ELSE 'line-' || lpad((n - 1)::text, 5, '0') END AS id) AS before",
+            {"head": head.id},
+        )
+        await sql(f"ANALYZE {jobs}")
+        started = time.monotonic()
+        self.assertTrue(await self.backend.cancel(head.id))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(
+            await self.backend.counts_by_status(),
+            {"cancelled": 1001, "queued": 1, "waiting": 20000},
+        )
+
+    async def test_an_enqueue_looks_again_at_a_child_whose_parent_ended_under_it(self):
+        ended = {}
+        async def end_the_parent(jobs, now):
+            for parent, status in ended.items():
+                await sql(
+                    f'UPDATE "{self.prefix}_jobs" SET status = %(status)s WHERE id = %(id)s',
+                    {"status": status, "id": parent},
+                )
+            return await looking(jobs, now)
+
+        looking = self.backend._settle_sent
+        self.backend._settle_sent = end_the_parent
+        done, failed, running = [await self.enqueue() for _ in range(3)]
+        ended.update({done.id: "success", failed.id: "failed"})
+        self.clock.advance(3)
+        released = await self.child_of(done)
+        cancelled = await self.child_of(failed)
+        kept = await self.child_of(running)
+        self.assertEqual(
+            [(job.status, job.last_error) for job in (released, cancelled, kept)],
+            [
+                (JobStatus.QUEUED, None),
+                (JobStatus.CANCELLED, PARENT_ENDED_MESSAGE),
+                (JobStatus.WAITING, None),
+            ],
+        )
+        self.assertEqual((released.run_at, cancelled.finished_at), (self.clock.now(),) * 2)
+        self.assertEqual(
+            await self.statuses(released, cancelled, kept),
+            [JobStatus.QUEUED, JobStatus.CANCELLED, JobStatus.WAITING],
+        )
+        broken = mock.patch.object(self.backend._queries, "settle_sent", "SELECT 1 / 0")
+        with broken:
+            late = await self.child_of(running)
+        self.assertEqual(late.status, JobStatus.WAITING)
+
+    async def test_an_upgrade_tells_the_planner_the_new_column_is_empty(self):
+        jobs = f'"{self.prefix}_jobs"'
+        await self.backend.enqueue_many([make_job() for _ in range(300)])
+        await sql(f"ALTER TABLE {jobs} DROP COLUMN runs_after, DROP COLUMN waiting_on")
+        await sql(f"ANALYZE {jobs}")
+        await sql(f"UPDATE \"{self.prefix}_meta\" SET value = '2' WHERE key = 'schema_version'")
+        await self.open()
+        self.assertEqual(
+            await sql(
+                "SELECT null_frac FROM pg_stats WHERE tablename = %(jobs)s "
+                "AND attname = 'waiting_on'",
+                {"jobs": f"{self.prefix}_jobs"},
+            ),
+            [(1.0,)],
+        )
+
+    async def test_a_child_that_missed_its_parent_ending_is_settled_by_the_reaper(self):
+        jobs = f'"{self.prefix}_jobs"'
+        done, failed, gone = [await self.enqueue() for _ in range(3)]
+        late = [await self.child_of(parent) for parent in (done, failed, gone)]
+        below = await self.child_of(late[1])
+        waiting = await self.child_of(await self.enqueue())
+        await sql(f"UPDATE {jobs} SET status = 'success' WHERE id = %(id)s", {"id": done.id})
+        await sql(f"UPDATE {jobs} SET status = 'failed' WHERE id = %(id)s", {"id": failed.id})
+        await sql(f"DELETE FROM {jobs} WHERE id = %(id)s", {"id": gone.id})
+        self.clock.advance(7)
+        await self.backend.reap_expired()
+        self.assertEqual(
+            await self.statuses(*late, below, waiting),
+            [JobStatus.QUEUED, *[JobStatus.CANCELLED] * 3, JobStatus.WAITING],
+        )
+        self.assertEqual((await self.stored(late[0])).run_at, self.clock.now())
+        await self.assert_cancelled_with_the_parent(late[1], below)
+        gone = await self.stored(late[2])
+        self.assertEqual(
+            (gone.last_error, gone.finished_at), (PARENT_GONE_MESSAGE, self.clock.now())
+        )
+        self.assertTrue(await self.backend.requeue(gone.id))
+        self.assertEqual(await self.statuses(gone), [JobStatus.QUEUED])
+
+    async def test_purge_keeps_a_parent_a_child_still_waits_on(self):
+        jobs = f'"{self.prefix}_jobs"'
+        parent = await self.enqueue()
+        child = await self.child_of(parent)
+        await sql(
+            f"UPDATE {jobs} SET status = 'success', finished_at = 1 WHERE id = %(id)s",
+            {"id": parent.id},
+        )
+        everything = pruning(success=1e-9)
+        self.assertEqual(await self.backend.purge(everything, self.clock.now() + 10), 0)
+        await self.backend.reap_expired()
+        self.assertEqual(await self.statuses(child), [JobStatus.QUEUED])
+        self.assertEqual(await self.backend.purge(everything, self.clock.now() + 20), 1)
+
+    async def test_a_child_sent_in_an_open_transaction_holds_nothing_back(self):
+        flag = f"SELECT count(*) FROM \"{self.prefix}_meta\" WHERE key LIKE 'following:%%'"
+        parent, other = await self.enqueue(), await self.enqueue(run_at=1.0)
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as sender:
+            [child] = await self.backend.aenqueue_in(sender, [make_job(after=parent.id)])
+            self.assertEqual(child.status, JobStatus.WAITING)
+            second = await asyncio.wait_for(
+                self.backend.enqueue(make_job(after=other.id)), timeout=5
+            )
+            self.assertEqual(second.status, JobStatus.WAITING)
+            claimed = await self.claim()
+            self.assertEqual(sorted(job.id for job in claimed), sorted([parent.id, other.id]))
+            for job in claimed:
+                self.assertTrue(await self.backend.complete(job, None))
+            self.assertEqual(await asyncio.wait_for(self.backend.reap_expired(), timeout=5), 0)
+            self.assertEqual(await self.statuses(second), [JobStatus.QUEUED])
+            await sender.rollback()
+        self.assertEqual(await sql(flag), [(1,)])
+        self.assertIsNone(await self.stored(child))
+        third = await self.child_of(await self.enqueue(run_at=2.0))
+        await sql(f"DELETE FROM \"{self.prefix}_meta\" WHERE key LIKE 'following:%%'")
+        await self.backend.reap_expired()
+        self.assertEqual(await sql(flag), [(1,)])
+        self.assertEqual(await self.statuses(third), [JobStatus.WAITING])
+
+    async def test_a_child_sent_under_repeatable_read_survives_the_first_child_elsewhere(self):
+        parent = await self.enqueue()
+        async with await psycopg.AsyncConnection.connect(POSTGRES_URL) as sender:
+            await sender.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            await sender.execute("SELECT 1")
+            first = await self.child_of(parent)
+            [second] = await self.backend.aenqueue_in(sender, [make_job(after=parent.id)])
+            await sender.commit()
+        self.assertEqual(await self.statuses(first, second), [JobStatus.WAITING] * 2)
+        await self.finish(parent)
+        self.assertEqual(await self.statuses(first, second), [JobStatus.QUEUED] * 2)
+
+    async def test_a_reaper_pass_that_cannot_settle_still_reaps_and_recounts(self):
+        claimed = await self.claimed_one()
+        broken = mock.patch.object(self.backend._queries, "settle_waiting", "SELECT 1 / 0")
+        with broken, self.assertLogs("tinyjobs", level="WARNING") as logs:
+            self.assertEqual(await self.reap_after_the_lease(), 1)
+        self.assertIn("the next one tries again", logs.output[0])
+        self.assertEqual(await self.statuses(claimed), [JobStatus.FAILED])
+
+    async def test_a_store_that_lost_its_version_row_is_brought_up_like_an_old_one(self):
+        jobs = f'"{self.prefix}_jobs"'
+        await sql(f"ALTER TABLE {jobs} DROP COLUMN runs_after, DROP COLUMN waiting_on")
+        await sql(
+            f'ALTER TABLE {jobs} DROP CONSTRAINT "{self.prefix}_jobs_status_check", '
+            f'ADD CONSTRAINT "{self.prefix}_jobs_status_check" CHECK '
+            "(status IN ('queued', 'held', 'running', 'success', 'failed', 'cancelled'))"
+        )
+        await sql(f"DELETE FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'")
+        restored = await self.open()
+        parent = await restored.enqueue(make_job())
+        child = await restored.enqueue(make_job(after=parent.id))
+        self.assertEqual(child.status, JobStatus.WAITING)
+        self.assertEqual(
+            await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
+            [("3",)],
+        )
+
+    async def test_children_sent_while_their_parents_finish_are_never_left_waiting(self):
+        parents = [await self.enqueue(run_at=float(index)) for index in range(40)]
+        claimed = await self.claim(limit=40)
+
+        async def send(parent):
+            return await self.backend.enqueue(make_job(after=parent.id))
+
+        async def finish(job):
+            await self.backend.complete(job, None)
+
+        outcomes = await asyncio.gather(
+            *(send(parent) for parent in parents), *(finish(job) for job in claimed)
+        )
+        children = outcomes[: len(parents)]
+        await self.backend.reap_expired()
+        self.assertEqual(await self.statuses(*children), [JobStatus.QUEUED] * len(children))
 
     async def test_the_reaper_writes_the_running_counts_back_from_the_running_jobs(self):
         for index in range(2):
@@ -541,7 +879,7 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(setting_up, 10)
         self.assertEqual(
             await sql(f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"),
-            [("2",)],
+            [("3",)],
         )
 
     async def test_a_short_read_holding_jobs_of_a_saturated_task_runs_one_statement(self):
@@ -1096,13 +1434,19 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
                 rows = await _rows_of(connection, query, {"name": f"{self.prefix}_jobs"})
             return rows[0]
 
-        before = await counted()
-        for _ in range(10):
-            self.clock.advance(1)
-            await self.backend.heartbeat([job.id for job in claimed], 60.0, worker_id="worker-a")
-        after = await counted()
-        updated, hot = after[0] - before[0], after[1] - before[1]
-        self.assertEqual(updated, 200)
+        for _ in range(3):
+            await quiet_snapshots()
+            before = await counted()
+            for _ in range(10):
+                self.clock.advance(1)
+                await self.backend.heartbeat(
+                    [job.id for job in claimed], 60.0, worker_id="worker-a"
+                )
+            after = await counted()
+            updated, hot = after[0] - before[0], after[1] - before[1]
+            self.assertEqual(updated, 200)
+            if hot >= 150:
+                break
         self.assertGreaterEqual(hot, 150)
 
     async def test_bulk_enqueues_take_dedup_keys_in_one_order(self):

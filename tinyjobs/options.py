@@ -15,6 +15,7 @@ class EnqueueOptions:
     max_attempts: int | None = None
     key: str | None = None
     codec: str | None = None
+    after: object = None
 
     def merged_with(self, **overrides: object) -> "EnqueueOptions":
         provided = {k: v for k, v in overrides.items() if v is not None}

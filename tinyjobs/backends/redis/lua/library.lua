@@ -9,8 +9,9 @@ if FOLLOWING then
   local time = redis.call('TIME')
   SERVER = tonumber(time[1]) + tonumber(time[2]) / 1000000
 end
-local ACTIVE = { queued = true, held = true, running = true }
+local ACTIVE = { queued = true, held = true, waiting = true, running = true }
 local TERMINAL = { success = true, failed = true, cancelled = true }
+local PARENT_ENDED = 'the job this one was to run after did not succeed'
 
 local function moment(value)
   return string.format('%.6f', value)
@@ -151,6 +152,8 @@ local function enter(job)
     redis.call('ZADD', held_line(job.task, job.queue), -tonumber(job.priority), ready_member(job))
     redis.call('SADD', key('held_queues', job.task), job.queue)
     redis.call('ZADD', key('held_due', job.queue), job.run_at, job.id)
+  elseif status == 'waiting' then
+    redis.call('SADD', key('children', job.after), job.id)
   elseif status == 'running' then
     adjust(key('running_tasks'), job.task, 1)
     redis.call('ZADD', key('leases'), job.lease_expires_at, job.id)
@@ -176,6 +179,8 @@ local function leave(job)
     if redis.call('ZCARD', held_line(job.task, job.queue)) == 0 then
       redis.call('SREM', key('held_queues', job.task), job.queue)
     end
+  elseif status == 'waiting' then
+    redis.call('SREM', key('children', job.after), job.id)
   elseif status == 'running' then
     adjust(key('running_tasks'), job.task, -1)
     redis.call('ZREM', key('leases'), job.id)
@@ -187,7 +192,7 @@ local function leave(job)
   end
 end
 
-local function transition(job, status, changes, removals)
+local function shift(job, status, changes, removals)
   if job.status == 'running' and job.claim_token then
     removals = removals or {}
     removals[#removals + 1] = 'claim_token'
@@ -207,8 +212,65 @@ local function transition(job, status, changes, removals)
   enter(job)
 end
 
+local function settle_children(parent)
+  local pending = { parent }
+  while #pending > 0 do
+    local ended = table.remove(pending)
+    for _, id in ipairs(redis.call('SMEMBERS', key('children', ended.id))) do
+      local child = load(id)
+      if ended.status == 'success' then
+        local run_at = child.run_at
+        if tonumber(run_at) < tonumber(HORIZON) then
+          run_at = HORIZON
+        end
+        shift(child, 'queued', { run_at = run_at })
+      else
+        shift(child, 'cancelled', { finished_at = HORIZON, last_error = PARENT_ENDED })
+        pending[#pending + 1] = child
+      end
+    end
+  end
+end
+
+local function transition(job, status, changes, removals)
+  shift(job, status, changes, removals)
+  if TERMINAL[status] then
+    settle_children(job)
+  end
+end
+
+local function placed_after(status)
+  if status == 'success' then
+    return 'queued'
+  end
+  if status == 'failed' or status == 'cancelled' then
+    return 'cancelled'
+  end
+  return 'waiting'
+end
+
+local function parent_status(job)
+  return redis.call('HGET', job_key(job.after), 'status')
+end
+
+local function orphan(jobs)
+  for _, job in ipairs(jobs) do
+    if job.after and not parent_status(job) then
+      return job.after
+    end
+  end
+  return nil
+end
+
 local function insert(job)
-  local holder = dedup_holder(job)
+  if job.after then
+    job.status = placed_after(parent_status(job))
+    if job.status == 'cancelled' then
+      job.finished_at = HORIZON
+      job.last_error = PARENT_ENDED
+    end
+  end
+  local holder = ACTIVE[job.status] and dedup_holder(job)
   if holder then
     return holder
   end
