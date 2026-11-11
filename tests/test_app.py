@@ -617,6 +617,40 @@ class FailedConnectionTests(BackendTestCase):
             fresh.close()
         self.assertEqual(unexpected, [])
 
+    def test_opening_again_does_not_inherit_the_refusal_of_a_connection_the_close_beat(self):
+        fresh = TinyJobs(f"sqlite:///{self.database}")
+        handler = fresh.task(name="handler")(lambda: None)
+
+        async def open_beside_a_refused_connection() -> None:
+            beaten: concurrent.futures.Future = concurrent.futures.Future()
+            fresh._connecting = (beaten, asyncio.get_running_loop())
+            opening = asyncio.ensure_future(fresh.ready())
+            await asyncio.sleep(0.05)
+            self.assertFalse(opening.done())
+            fresh._settle(beaten, AppClosedError("closed while it connected"))
+            await opening
+            await handler.aenqueue()
+            self.assertEqual((await fresh.acounts())["queued"], 1)
+            await fresh.aclose()
+
+        asyncio.run(open_beside_a_refused_connection())
+
+    def test_a_closed_app_still_refuses_beside_a_refused_connection(self):
+        fresh = TinyJobs(f"sqlite:///{self.database}")
+
+        async def wait_beside_a_refused_connection() -> None:
+            await fresh.ready()
+            await fresh.aclose()
+            beaten: concurrent.futures.Future = concurrent.futures.Future()
+            fresh._connecting = (beaten, asyncio.get_running_loop())
+            waiting = asyncio.ensure_future(fresh._connect())
+            await asyncio.sleep(0.05)
+            fresh._settle(beaten, AppClosedError("closed while it connected"))
+            with self.assertRaises(AppClosedError):
+                await waiting
+
+        asyncio.run(wait_beside_a_refused_connection())
+
     def test_sync_and_async_callers_racing_start_and_close_leave_nothing_behind(self):
         race_open_and_close(self, TinyJobs(f"sqlite:///{self.database}"))
 

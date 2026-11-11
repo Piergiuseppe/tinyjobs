@@ -320,8 +320,8 @@ PROCESS_EXIT_SECONDS = 0.6
 
 async def quiet_snapshots(seconds: float = 20.0) -> None:
     others = (
-        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-        "AND pid <> pg_backend_pid() AND backend_xmin IS NOT NULL"
+        "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() "
+        "AND (backend_xmin IS NOT NULL OR backend_xid IS NOT NULL)"
     )
     deadline = time.monotonic() + seconds
     while (await sql(others))[0][0] and time.monotonic() < deadline:
