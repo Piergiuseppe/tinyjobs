@@ -108,7 +108,8 @@ class OverviewTests(DashboardCase):
 
     def test_the_overview_is_also_served_as_json(self):
         self.add.enqueue(1, 2)
-        data = self.data("/api/overview")
+        with mock.patch("tinyjobs.backends.sqlite.audit._mounts", return_value=[]):
+            data = self.data("/api/overview")
         self.assertEqual(data["queues"][0]["queue"], "default")
         self.assertEqual(data["queues"][0]["counts"]["queued"], 1)
         self.assertEqual(data["queued_tasks"], {"math.add": 1})

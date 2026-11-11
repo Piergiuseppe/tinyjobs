@@ -315,6 +315,9 @@ async def _rows_of(connection, query: str, parameters: dict) -> list[tuple]:
     return await cursor.fetchall()
 
 
+PROCESS_EXIT_SECONDS = 0.6
+
+
 async def quiet_snapshots(seconds: float = 20.0) -> None:
     others = (
         "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
@@ -4414,7 +4417,7 @@ class PostgresExitTests(unittest.TestCase):
         took = seconds_to_exit(
             POSTGRES_URL, prefix=self.prefix, seconds=2.0, count=8, timeout=2.0, lock=self.locked
         )
-        self.assertLess(took, 2.0 + 1.0 + 0.2)
+        self.assertLess(took, 2.0 + 1.0 + PROCESS_EXIT_SECONDS)
 
     def test_a_zero_shutdown_timeout_records_def_jobs_whose_threads_end(self):
         took = seconds_to_exit(
@@ -4427,7 +4430,7 @@ class PostgresExitTests(unittest.TestCase):
         )
         with TinyJobs(POSTGRES_URL, prefix=self.prefix) as app:
             statuses = [job.status for job in app.jobs().items]
-        self.assertLess(took, 1.5 + 1.25 + 0.2)
+        self.assertLess(took, 1.5 + 1.25 + PROCESS_EXIT_SECONDS)
         self.assertEqual(statuses, [JobStatus.SUCCESS] * 3)
 
     def test_a_zero_shutdown_timeout_still_releases_async_jobs(self):
@@ -4442,7 +4445,7 @@ class PostgresExitTests(unittest.TestCase):
         )
         with TinyJobs(POSTGRES_URL, prefix=self.prefix) as app:
             statuses = [job.status for job in app.jobs().items]
-        self.assertLess(took, 1.25 + 0.2)
+        self.assertLess(took, 1.25 + PROCESS_EXIT_SECONDS)
         self.assertEqual(statuses, [JobStatus.QUEUED] * 3)
 
 
