@@ -68,6 +68,14 @@ none run twice; 88 came back through an expired lease. Postgres stopped three ti
 jobs, once cleanly and twice with `-m immediate`, down three seconds each: the workers carried on,
 and nothing was lost or ran twice.
 
+Sending one job after another on Postgres takes 0.65 ms where a plain job takes 0.16, since the
+store looks at the parent twice. A job after another starts 3 to 7 ms after its parent finishes on Postgres, where the release
+wakes the listeners, and within the poll interval on SQLite and Redis, 4 to 56 ms in a line of
+eight jobs over two workers. On Postgres, claiming and completing 20,000 no-op jobs straight
+through the backend ran at 6,100 a second against 6,500 before the release existed, and at 5,100
+on a store that has held a waiting job; the other two stores settle children inside the
+transaction or script they already ran, for 1 to 2% of the same loop.
+
 Two machines sharing one Redis were measured too: a laptop and a Linux VPS 52 ms apart, two workers
 of eight slots on each, a `SIGKILL` on one of them every 25 to 30 seconds, 3,000 jobs a run. With the
 laptop's clock set five minutes behind and the VPS's fifteen minutes ahead, all 3,000 succeeded and

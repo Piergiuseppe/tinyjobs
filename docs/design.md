@@ -335,7 +335,9 @@ The SQLite schema as `schema.py` creates it, under the default prefix. Other bac
 store this differently, as long as the protocol contract holds. `payload` holds the serialized
 `(args, kwargs)`, `codec` names its encoding, `hand_backs` counts hand-backs in a row, `claims`
 every claim ever and is never reset, `run_at` is the earliest execution time as unix seconds,
-`lease_expires_at` is set only while running, and `next_run_at` on a schedule is its
+`lease_expires_at` is set only while running, `runs_after` is the job a job was sent after, `waiting_on` the same id for as long as it waits
+and null otherwise, and
+`next_run_at` on a schedule is its
 compare-and-set column. `tinyjobs_install_lock` stays empty: a first enqueue inside a caller's
 transaction writes to it to take the file's write lock before it reads, as
 [Transactional enqueue](#transactional-enqueue) explains.
@@ -369,7 +371,9 @@ CREATE TABLE IF NOT EXISTS tinyjobs_jobs (
     worker_id        TEXT,
     dedup_key        TEXT,
     result           BLOB,
-    last_error       TEXT
+    last_error       TEXT,
+    runs_after       TEXT,
+    waiting_on       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS tinyjobs_jobs_claim
@@ -392,7 +396,11 @@ CREATE INDEX IF NOT EXISTS tinyjobs_jobs_purge
 
 CREATE UNIQUE INDEX IF NOT EXISTS tinyjobs_jobs_dedup
     ON tinyjobs_jobs (dedup_key)
-    WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'running');
+    WHERE dedup_key IS NOT NULL AND status IN ('queued', 'held', 'waiting', 'running');
+
+CREATE INDEX IF NOT EXISTS tinyjobs_jobs_waiting
+    ON tinyjobs_jobs (waiting_on)
+    WHERE waiting_on IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS tinyjobs_executions (
     id          INTEGER PRIMARY KEY,
@@ -467,7 +475,7 @@ Notes on a few choices:
 
 ```
                           ┌─────────┐
-                          │ CREATED │   transient: the row is written as QUEUED
+                          │ CREATED │   transient: the row is written as QUEUED (or WAITING)
                           └────┬────┘
                                ↓
                           ┌─────────┐
@@ -495,13 +503,18 @@ Notes on a few choices:
                                  │ FAILED │  terminal
                                  └────────┘
 
-  From QUEUED, HELD or RUNNING, an explicit request moves the job to CANCELLED (terminal).
+  From QUEUED, HELD, WAITING or RUNNING, an explicit request moves the job to CANCELLED (terminal).
 ```
 
 One more state sits beside `QUEUED`: `HELD`. A claim that finds a due job of a task at its limit,
 as [Limits](#limits) explains, moves the job to `HELD` instead of taking it, and a later claim with
-room for that task moves it to `RUNNING`. A held job is still waiting, counts as such, and can be
+room for that task moves it to `RUNNING`. A held job is still in the queue, counts as queued, and can be
 cancelled; it only stays out of the claim's way, so the claim never scans past jobs it cannot take.
+
+`WAITING` sits before `QUEUED`: a job sent with `after=` is written as `WAITING` and moves to
+`QUEUED` when the job it names succeeds, or to `CANCELLED` when that one fails for good or is
+cancelled, as [Jobs after another](#jobs-after-another) explains. A waiting job is not due, so no
+claim considers it and no backlog figure counts it.
 
 Terminal states: `SUCCESS`, `FAILED`, `CANCELLED`. Everything else is in flight.
 
@@ -796,12 +809,15 @@ class Capabilities(NamedTuple):
     loop_bound: bool
     result_ttl: bool
     limits: bool
+    after: bool
 ```
 
 Requesting an unsupported feature raises at *enqueue* time with a clear message, not silently later.
 `limits` says the store enforces a task's `concurrency=` and `rate=` at the claim, which then takes
 `limits=`, a mapping of task name to `Limit`; a worker or a drain whose app registers a limited task
 refuses a store without it at start, since enqueue is not where the limit would be lost.
+`after` says the store keeps a job sent with `after=` waiting and settles it when its parent ends;
+without it the enqueue raises.
 `loop_bound` is not a feature but a constraint: a backend whose connections belong to the event loop
 that opened them, as an asyncio Redis or Postgres client's do, sets it, and the app opens it on the
 facade's loop and routes every call there (see [Async core, sync facade](#async-core-sync-facade)).
@@ -1096,12 +1112,13 @@ All keys sit under `{prefix}`, which by default is `{tinyjobs}`:
 | `job:<id>` | hash | the job's fields, the same columns as the SQLite table |
 | `executions:<id>` | hash | attempt number to a JSON record |
 | `ready:<queue>` | sorted set | due jobs, score `-priority`, member `run_at\|id`, so order is priority then age |
-| `waiting:<queue>` | sorted set | jobs not due yet, by `run_at`; a claim promotes the due ones first |
+| `waiting:<queue>` | sorted set | queued jobs not due yet, by `run_at`; a claim promotes the due ones first (the name predates the `waiting` status and has nothing to do with it) |
 | `queued:<queue>` | sorted set | every queued job by `run_at`, for the oldest-due figure |
 | `leases` | sorted set | running jobs by lease expiry, for the reaper |
 | `finished:<status>` | sorted set | terminal jobs by `finished_at`, for retention |
 | `index:all`, `index:status:<s>`, `index:queue:<q>` | sorted sets | ids for listing; UUIDv7 ids sort by creation |
 | `dedup:<key>` | string | the active job holding a dedup key |
+| `children:<id>` | set | the jobs waiting on a job, settled when it ends |
 | `counts`, `queued_tasks` | hashes | counters kept by `enter` and `leave`, so `stats` is O(queues) |
 | `schedule:<name>`, `schedules` | hash, set | cron state; firing compares `next_run_at` and swaps it |
 
@@ -1151,6 +1168,8 @@ apps on two servers whose times differ by more than a second raises instead of m
 - **Script length bounds latency.** Redis serves nobody else while a script runs. Enqueues go in
   batches of 100 and a claim promotes at most 100 due delayed jobs, which kept the slowest call at
   18 ms when 100,000 delayed jobs fell due at once. Claiming stays at 0.7 ms with 200,000 queued.
+  The one script without a bound is the one that settles the jobs waiting on a job that ends:
+  cancelling a parent with 20,000 jobs waiting on it took 0.27 seconds, 13 microseconds a child.
 - **Polling, not blocking.** Workers poll with the same adaptive interval as on SQLite. A blocking
   pop would save the idle round trips but cannot express priorities across queues.
 - **No transactional enqueue, ever.** Redis shares no transaction with your database, so the
@@ -1539,6 +1558,11 @@ child opens its own.
   is configured once when opened, and the listener needs a session of its own. Transaction pooling
   would lose both, and without the reset a backend could reach another client still holding our
   lock and our last statement, which is what marks it as ours.
+- **Every reaper pass looks at every waiting job.** Each worker's pass reads the jobs waiting on
+  another and looks up the parent of each, to settle the ones whose parent ended unseen. A few
+  thousand waiting jobs cost nothing to speak of, fifty thousand about a tenth of a second a pass,
+  and a million of them under fifty workers more than a million lookups a second for as long as
+  they wait; the answer there is a longer `--reap-interval` on most of the workers.
 - **A held snapshot stops the cleanup.** A transaction left open anywhere on the server, or a
   replication slot that stopped advancing, keeps autovacuum from removing finished job rows, and the
   jobs table bloats until it ends.
@@ -2246,8 +2270,8 @@ service that runs it alone. While old and new builds overlap the two sides take 
 bounded churn and ends with the deployment. The release is best effort: any store error there is
 logged and the worker goes on, since the next pass tries again.
 
-**Held jobs are waiting jobs.** Every signal that counts due jobs counts held ones with them: the
-per-task waiting counts and the oldest due job of each queue behind `tinyjobs stats`, the
+**Held jobs count as queued.** Every signal that counts due jobs counts held ones with them: the
+per-task queued counts and the oldest due job of each queue behind `tinyjobs stats`, the
 dashboard's overview, the `tinyjobs_store_queued_jobs` and `tinyjobs_store_oldest_due_seconds`
 metrics and `tinyjobs check --max-wait`. A held job is due by definition, since the claim reached
 it, and a backlog stuck behind a saturated task is exactly what `--max-wait` exists to report.
@@ -2352,6 +2376,120 @@ plugin that does not declare `limits` in its capabilities refuses to start a wor
 app registers a limited task, rather than run it unlimited.
 
 ---
+
+## Jobs after another
+
+```python
+report = build_report.enqueue(42)
+email_report.with_options(after=report).enqueue(42)
+```
+
+The second job runs only once the first has succeeded. This is the one piece of workflow most
+applications ask a queue for, and it is kept as one piece on purpose: a job names at most one
+parent, a parent can have any number of children, and nothing else exists. No "after all of these",
+no group, no chord, no result passed down the line. Those are where a queue starts needing a
+scheduler of its own, with state to join and partial failures to define, and a tree of single
+parents needs none of it: every job's fate depends on one row.
+
+**A status, not a flag.** A child is written as `WAITING` with its parent's id on the row
+(`runs_after`; `after` on a `Job`). A status of its own keeps it out of the claim's partial index,
+so claims never scan past waiting jobs however many there are, and out of the backlog figures,
+since a job that waits on another is not late. `HELD` could not be reused: workers hand held jobs
+of tasks they know no limit for back to the queue, which would start a child early.
+
+**And a column that is only set while it waits.** `runs_after` stays on the row for good, for
+`jobs show` and for a retry to ask the parent again. The lookups that settle children go through
+a second column, `waiting_on`, which holds the same id while the job waits and is null from the
+moment it is released or cancelled, with a partial index on it where it is not null. The first
+version looked children up by `runs_after` and `status = 'waiting'`, and that predicate gave both
+SQL planners a choice: the index of jobs by status serves it too, and with statistics taken
+before the waiting jobs arrived, after an upgrade or a burst, or with the sampled ones
+`PRAGMA optimize` leaves, they took it, reading every waiting job once per descendant. A lookup by
+`waiting_on` alone has one index that can serve it, whatever the statistics say.
+
+**Settled where the parent ends.** Every path that ends a job also settles what waits on it, in
+the same atomic step, with the exceptions Postgres makes below: `complete` queues the children; a final `fail`, `cancel` and the reaper
+failing a job out of attempts cancel every descendant, since a waiting child's own children can
+only be waiting too. A released child keeps its `run_at` unless that has passed, in which case it
+becomes due now, so the oldest-due figure measures how long it waited for a worker and not for its
+parent. A cancelled child gets `last_error` "the job this one was to run after did not succeed",
+no execution row, and no hooks, as with any job cancelled before it ran. An attempt that failed
+and will be retried ends nothing, so nothing moves.
+
+On SQLite the settling is two statements in the write transaction that records the outcome, a
+plain `UPDATE` by parent for a success and a recursive one for a failure, both on the partial
+index of waiting jobs by parent. On Redis it is a loop inside the same script, over the set
+`children:<parent>` that `enter` and `leave` keep. Neither has a window: the store's single writer
+orders the child's insert and the parent's end.
+
+**Postgres has a window, and closes it twice.** There the outcome statement gains a CTE that
+releases or cancels the children it can see. The walk down the line is a lateral lookup and
+`waiting_on` is declared all-distinct to the planner, because left to the statistics of a few
+parents with thousands of children each it chose joins that reread every waiting job at every
+step. What it can
+see is every child committed before the statement began. A child whose insert commits after that, because the enqueue raced the parent's end or sat
+in the application's transaction while the parent finished, was placed by a snapshot in which the
+parent still ran, and is seen by nobody. Taking a lock on the parent at insert would close the
+window and let an application transaction block the workers from claiming the parent or recording
+its outcome, which is the wrong side to make wait. So the insert locks nothing, and the reaper
+pass settles stragglers: every waiting job whose parent is terminal is released or cancelled by
+the same rules, at most `reap_interval` late. The pass reads the waiting jobs through their
+partial index, so it costs nothing while none wait and one lookup of a parent per waiting job
+while some do; the upgrade analyzes the new column so that this holds from the first pass on a
+store that came from 0.16, and a new store reads its whole table in the pass, 12 ms at 100,000
+jobs, only until autovacuum has analyzed it once. Retention plays along: a purge skips a parent that still has a waiting child, so a straggler
+finds its parent's outcome. What is left is a child whose insert was still uncommitted when
+retention removed its parent, which takes a transaction held open for longer than the retention
+horizon: the pass cannot know how that parent ended, so it cancels the child with a `last_error`
+that says the parent is gone, and a retry runs it. Released children wake their queue's
+listeners like an insert does.
+
+That window is not rare when children are sent right behind parents that finish fast: four
+senders against four workers doing nothing else left 51 and 60 of 2,400 children waiting for the
+pass. So an enqueue
+outside a caller's transaction looks once more at the children it has just stored as waiting,
+by id, after its insert has committed, and settles the ones whose parent ended in between. It is
+one more statement for a child sent that way, two when it finds something to settle, and none
+for any other job: a single child takes 0.65 ms to send where it took 0.32, against 0.16 for a
+plain job, and it left 4 and 9 of
+the same 2,400: what remains for the pass is a parent whose outcome statement was itself still
+running across both, or a child sent inside a transaction that commits later.
+
+The CTE is not free: Postgres plans every outcome statement, and a second look at the jobs table,
+with its partial indexes to prove, takes a completion from about 150 to about 195 microseconds
+whether or not anything waits. So a store pays for it only once it has held a waiting job. The
+first child ever sent leaves a `following:` row in the meta table, for good. It is an insert of a
+row of its own when it sees none, never an update of a shared one, so it waits for nobody, a
+`REPEATABLE READ` transaction that began before the first row committed adds its own instead of
+failing, and two that race leave two rows. Only two `SERIALIZABLE` transactions that both send the
+first child a store ever held are a write skew, and Postgres fails one of them as it would any
+other. The role that sends a child therefore needs `INSERT` on the meta table as well as on the
+jobs; the reaper
+pass leaves one if the store holds waiting jobs and none is there, as after a rollback. A
+completion looks for such a row, which costs a fifth as much, and a process that reads it set queues the children of the job it
+just completed with one more statement and uses the statement with the CTE from then on. If that
+one extra statement fails, the reaper pass does its work.
+
+**Placed at insert.** The parent has to be in the store when the child is sent; a missing one
+raises `JobNotFoundError` and the job is not written, nor is anything else of the call unless
+it joined a caller's transaction, where what the call had written is the caller's to roll back,
+or retention removed a parent between two of the hundred-job scripts of one large call on Redis. A parent that already succeeded
+gives a child that is `QUEUED` at once, one that already failed or was cancelled a child stored
+as `CANCELLED`, and the `Job` that `enqueue` returns says which. A waiting job holds its
+deduplication key like any job in flight.
+
+**Requeue asks the parent again.** `requeue` on a failed or cancelled job with a parent places it
+as the insert would: `QUEUED` if the parent succeeded or is no longer in the store; `WAITING` if the parent
+is in flight again; refused while the parent is failed or cancelled. A parent that is gone cannot
+say how it ended, and refusing there would leave a job that failed on its own impossible to retry
+once retention had removed its parent, so the request of whoever retries it is taken as the answer. Requeueing a parent does not
+bring back the children its failure cancelled: nothing records which cancelled jobs were cancelled
+by it rather than by hand, and a guess there would run jobs somebody stopped.
+
+**Eager mode** needs nothing of its own: a parent sent eagerly has usually ended before the child
+is sent, so the child is placed queued and runs at once, or is placed cancelled. A parent that is
+still queued, because it is delayed or has a retry ahead, leaves the child waiting like anywhere
+else, until a drain or a worker finds the parent due and runs both in order.
 
 ## Retries
 
@@ -2481,7 +2619,7 @@ after, so the same handlers answer `/api/...` with JSON: that is what the tests 
 what a script that wants the numbers reads, with `curl`.
 
 The pages are what the runbook needs. The overview is `stats` and `check` on one screen: counts by
-queue and status, the oldest due job, leases past their time, waiting jobs by task and every
+queue and status, the oldest due job, leases past their time, queued jobs by task and every
 finding of the health check. The job list is the store's own `list`: newest first, by status and
 queue, fifty a page, with the cursor the backend returns, so it costs the same on a million rows
 as on ten, except status and queue together, which walk the status index and filter by queue; a filter by task would need an index no backend has, so a task is searched from the
@@ -3079,6 +3217,17 @@ have no signal, because no worker is there to see them: a job cancelled while it
 the reaper fails after its worker died; `get_result()` reports both as `FAILED`. A receiver that
 raises is logged and no longer fails the task, since the task had already ended.
 
+**One task after another.** `task.after(result)` returns the task with `follows` set, the way
+`using` returns it with another queue, and the enqueue passes it on as `after=`. `follows` is an
+ordinary field of the task class because Django copies and pickles a task by its fields, a
+result included, and a field kept out of the constructor would break both; it is left out of the
+`"tasks"` settings and tinyjobs' decorator refuses it, since the job a task runs after exists
+only once something has been sent. A result read back carries it, a cancelled one says in its
+`JobCancelled` error that the task before it did not succeed, and a missing parent raises
+`JobNotFoundError` from `enqueue`. A task with `follows` reports a `run_after` only while it
+waits: once released its `run_at` is the moment it was released whenever the time asked for had
+passed, and the two cannot be told apart.
+
 **Isolated Django tasks.** A job process finds an isolated task by importing its module and
 looking for the tinyjobs task among the module's names, and a Django task module holds none. So a
 task may carry a locator, a module-level function with its arguments, which the job process calls
@@ -3183,6 +3332,24 @@ already show the adopted order and `claims`. Version 4 moves the SQLite tables u
 as [Tables and the prefix](#tables-and-the-prefix) describes: a file from before 0.14 is renamed in
 place, its indexes recreated under their new names, and a bare `meta` stub left behind for older
 processes to refuse.
+
+Version 6 on SQLite, 3 on Postgres and 4 on Redis add `runs_after` and `waiting_on` to the jobs, the partial index
+of waiting jobs by parent, and `waiting` to the statuses a dedup key is held in and, on Postgres,
+to the status check. Upgrading to 0.17 is a stop-the-world step: an older worker would end a
+parent and leave its children waiting.
+
+It is meant to be the last one. Beside `schema_version` every store now keeps `compatible_since`,
+the oldest schema version whose code works on the store as it is, written by whichever release
+installs or upgrades it. A process that finds a store newer than itself starts anyway when
+`compatible_since` is at or below its own version, runs no DDL and leaves both rows alone; it
+refuses, as before, when the row is higher or missing. The promise that goes with it: from 0.17
+a release that changes the store keeps the previous minor working beside it, so a rolling deploy
+from one minor to the next needs no stop, and a release that cannot keep the promise says so in
+its upgrade note and raises `compatible_since`, which makes older processes refuse to start;
+the ones already running are what the note's stop is for. Two minors apart is not covered: the store allows it only when every release between
+kept the row where it was. Keeping the promise includes keeping the tables, columns and indexes
+the previous minor checks at setup, since a process working beside a newer store creates nothing, and
+on Postgres verifies what it knows.
 
 Upgrading to 0.14 is a stop-the-world step as well, for the application processes that enqueue
 too, since a 0.13 process left running works on tables that are no longer there, as
@@ -3343,8 +3510,10 @@ The tinyjobs options on a `django.tasks` task: timeout, retries, `isolated`, `co
 `rate`, through the backend's task class or the `"tasks"` option, with isolated tasks located by
 the backend in the job process.
 
-**Next**
-Jobs that run after another.
+**v0.17, one job after another**
+`after=job`: a job waits, in a status of its own, until another has succeeded, and is cancelled
+with everything behind it when that one fails. The store settles it in the step that ends the
+parent. With it, `compatible_since`, so that later upgrades need no stop.
 
 **v1.0, commitment**
 Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
@@ -3353,5 +3522,5 @@ protocol is a compatibility promise.
 **Beyond**
 Joining a SQLAlchemy session's transaction, designed against a real application rather than against a
 guess. A `--workers N` that forks and supervises N workers, if running one per core under a
-supervisor turns out to be the friction people report. Chains and groups only if usage demands
+supervisor turns out to be the friction people report. Groups and chords only if usage demands
 them. They are where task queues usually go to become frameworks.

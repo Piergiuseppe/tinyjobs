@@ -17,7 +17,9 @@ worker instance, so two workers double it, and a cap on how many of a task run a
 dedicated queue or a lock of your own; Dramatiq's rate limiters span workers, through a Redis or
 Memcached backend of their own, and are taken inside the task, which still claims the message.
 tinyjobs keeps `concurrency=` and `rate=` in the store it already has and applies them at the claim,
-so a job the limit stops waits in the queue instead of occupying a worker.
+so a job the limit stops waits in the queue instead of occupying a worker. RQ's `depends_on`
+and Celery's chains run one job after another on their brokers; tinyjobs' `after=` does it in the
+store, on SQLite and Postgres inside your own transaction, and stops there: no groups, no chords.
 
 On Postgres, [Procrastinate](https://procrastinate.readthedocs.io) is the closest: async, with cron,
 retries, `LISTEN`/`NOTIFY` and jobs deferred inside your own transaction, but Postgres only. tinyjobs

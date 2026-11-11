@@ -27,7 +27,8 @@ dedup and retries as production. Delays and backoff are respected in eager mode 
 and drain. A failing task is recorded on the job, not raised, as it would be in a worker. An eager
 call runs only the job it sent, ahead of any older job, and returns it finished. If a drain or a
 worker claimed that job first, the call waits for it to finish. A dedup hit on a job sent
-earlier comes back as it is, possibly `running`. A job not yet due comes back `queued`.
+earlier comes back as it is, possibly `running`. A job not yet due comes back `queued`, and one sent
+`after` a job that has not finished comes back `waiting`; `app.drain()` runs them when their time comes.
 
 Earlier releases ran every due job on each eager call and returned the sent job after the older
 ones. To run the rest of the queue, call `app.drain()`.

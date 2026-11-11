@@ -22,18 +22,19 @@ tinyjobs check --app tasks:app --max-wait 5m      # exits 1 on any problem
 ```
 
 ```
-QUEUE    QUEUED  HELD  RUNNING  SUCCESS  FAILED  CANCELLED  OLDEST DUE
--------  ------  ----  -------  -------  ------  ---------  ----------
-default  2       0     2        0        0       0          16s
-mail     1       0     0        0        0       0          16s
+QUEUE    QUEUED  HELD  WAITING  RUNNING  SUCCESS  FAILED  CANCELLED  OLDEST DUE
+-------  ------  ----  -------  -------  -------  ------  ---------  ----------
+default  2       0     0        2        0        0       0          16s
+mail     1       0     0        0        0        0       0          16s
 
 running past their lease: 2
 ```
 
 A job past its lease means the worker holding it stopped reporting, usually because it died. `check`
-fails on that, on an app that registers no tasks, on waiting jobs for a task the app doesn't register
-(a missing `--import`), on a due job, queued or [held](limits.md), waiting longer than `--max-wait`, and on a cron schedule more
-than a minute overdue, which means no worker or scheduler is running. Both are `app.stats()` and
+fails on that, on an app that registers no tasks, on queued or held jobs for a task the app doesn't register
+(a missing `--import`), on a due job, queued or [held](limits.md), left longer than `--max-wait`, and on a cron schedule more
+than a minute overdue, which means no worker or scheduler is running. A job
+[waiting on another](jobs.md#one-job-after-another) is not due, so it never counts as a backlog. Both are `app.stats()` and
 `app.check()` in code.
 
 Every log record about a job carries the job as fields, so a log pipeline can filter on them without

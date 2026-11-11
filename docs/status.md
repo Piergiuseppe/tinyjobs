@@ -37,10 +37,35 @@ v0.16.0. Working and measured, but young. What's in:
   `held` status for the jobs a limit stops
 - the task options on `django.tasks`: timeout, retries, limits and `isolated` on Django's own
   `@task`, or by import path in the settings
+- jobs that run after another: `after=job`, with a `waiting` status, on every store and on
+  `django.tasks`
 
-What's not in yet:
+Upgrading to 0.17 adds the `waiting` status and a column (a field, on Redis) to every store. Stop
+every tinyjobs process on a store before starting the first 0.17 one: it upgrades the store on its
+first call, and an older process refuses to start against the upgraded store, since it would not
+release the jobs waiting on the ones it finishes. This is meant to be the last upgrade that needs a
+stop: from 0.17 a store records the oldest version of its layout whose code can work on it, and a release that changes
+the store keeps the previous minor working beside it unless its upgrade note says otherwise, so a
+rolling deploy from one minor to the next needs no stop. A release older than the store allows
+still refuses to start. That holds for 0.16 too once the store is upgraded, so going back to 0.16
+means restoring a backup taken before the upgrade.
 
-- jobs that run after another
+What changes for an application that never sends a job `after` another:
+
+- `JobStatus` has a new member, `waiting`. `tinyjobs stats` and the dashboard's table of queues
+  have a column for it between held and running, so whatever reads those tables by position reads
+  one column off, and `/api/overview` counts it in every queue.
+- The figures for queued and held jobs are called queued everywhere, now that waiting is a status:
+  the dashboard's "Queued by task", the `check` finding "N queued job(s) for X", which said
+  "waiting", and the help text of `tinyjobs_store_queued_jobs`. An alert matching the old words
+  needs the new ones.
+- `jobs retry` and `jobs cancel` word their refusals and help differently, and so do the
+  dashboard's notices after a retry. A job's page and every job in `/api/jobs` gain the job it
+  runs after, `/jobs?status=waiting` is a page and no longer a 400, and `tinyjobs_store_jobs`
+  can carry `status="waiting"`.
+- On Django every task of the backend has a `follows` field, `None` unless `.after()` set it.
+- On Postgres a completion reads one more row, which measured about 6% on a loop that only claims
+  and completes; [Measured](measured.md) has the numbers.
 
 Upgrading to 0.16 needs no stop. On Django, `task_finished` now fires after the queue recorded
 the outcome, from a thread of the worker, with a result read back from the queue rather than the

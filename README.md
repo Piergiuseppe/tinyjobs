@@ -60,7 +60,7 @@ tinyjobs worker --app tasks:app --concurrency 8
 ```
 
 Every worker also fires the cron schedules, once per due time however many workers run.
-[Jobs](https://tinyjobs.readthedocs.io/en/latest/jobs/) covers results, waiting and the `jobs`
+[Jobs](https://tinyjobs.readthedocs.io/en/latest/jobs/) covers results, `job.wait()`, jobs after another and the `jobs`
 commands, [Cron](https://tinyjobs.readthedocs.io/en/latest/cron/) the schedules.
 
 ## Using Django?
@@ -128,6 +128,7 @@ finish before it exits. Leave out `worker=True` to run the workers elsewhere.
 | Cron | timezones and DST, misfire and overlap policies, fired from every worker with no leader |
 | Queues, priorities, delays | `queue=`, integer priorities, `delay=60` or `run_at=<datetime>` |
 | Deduplication | `key="invoice:123"` collapses duplicate enqueues |
+| One job after another | `after=job` keeps a job waiting until another has succeeded, and cancels it if that one fails |
 | Limits | `concurrency=2` caps a task at two running jobs across every worker, `rate="10/m"` spaces its starts, both kept in the store |
 | Crash recovery | leases and heartbeats, so a killed worker's jobs come back |
 | Transactional enqueue | on SQLite and Postgres, a job sent with your connection as `tx` commits or rolls back with your own transaction |

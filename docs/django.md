@@ -73,7 +73,20 @@ def render(document_id: int) -> None: ...
 | `isolated` | a [job process](isolated-tasks.md) of its own, killed at the timeout |
 | `result_ttl` | seconds the result is kept after the job finishes |
 
-They mean what they mean on `@app.task`, and a value that cannot be, such as a malformed rate, is
+`after` sends a task to run once another has succeeded, as
+[it does on a tinyjobs task](jobs.md#one-job-after-another):
+
+```python
+report = build_report.enqueue(42)
+email_report.after(report).enqueue(42)
+```
+
+It takes the `TaskResult` or its id and chains with `using`. The result reads `READY` while it
+waits, and `FAILED` with a `JobCancelled` error if the task before it did not succeed. A result
+that is not in the queue raises `tinyjobs.JobNotFoundError`, and a task sent this way shows its
+`run_after` only while it waits.
+
+The options mean what they mean on `@app.task`, and a value that cannot be, such as a malformed rate, is
 an `InvalidTask` where the task is declared. `retry_on` also takes dotted paths, which the
 settings need; they are imported when the task is first looked up.
 
@@ -117,8 +130,9 @@ your `INSTALLED_APPS` stops `manage.py tinyjobs` with the path in the message.
 - **`task_finished`** fires in the worker, after the queue recorded how the task ended, with
   the result `get_result()` would return, so it also reports a timeout and a job process that
   died. Receivers run in a thread started for each finishing task, and one that raises is logged and
-  does not change the task. A job cancelled while it runs, and one failed because its worker
-  died, end without the signal.
+  does not change the task. A job cancelled while it runs, one failed because its worker
+  died, and one cancelled because the task it was to run `after` did not succeed, end without
+  the signal.
 
 `"database": "default"` in `OPTIONS` makes every enqueue join that database's transaction, so a
 task enqueued inside `transaction.atomic()` exists only if the block commits. It works on a

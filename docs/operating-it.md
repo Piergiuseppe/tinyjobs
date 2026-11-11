@@ -28,8 +28,8 @@ task, unless the `held` count is what rises, which means a task at its [limit](l
 workers do not help there, the limit does, or the backlog is the price of the quota. `tinyjobs_jobs_total` by `outcome` and the `--log-format json` fields tell which task is
 failing and why.
 
-**Fix.** `jobs retry` requeues a failed or cancelled job and `jobs cancel` stops a queued or held one, or
-a running one cooperatively. A cron job that keeps failing is `schedules pause`, and `jobs cancel`
+**Fix.** `jobs retry` requeues a failed or cancelled job and `jobs cancel` stops a queued, held or waiting one, or
+a running one cooperatively, and with it the jobs [waiting behind it](jobs.md#one-job-after-another). A cron job that keeps failing is `schedules pause`, and `jobs cancel`
 on its queued retry, until the fix ships, then `schedules run` for the missed one and
 `schedules resume`. Queued jobs for a task the app no longer registers are a missing `--import` on
 the worker, or `jobs cancel` when the task is gone for good.
