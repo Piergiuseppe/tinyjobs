@@ -93,7 +93,7 @@ class OverviewTests(DashboardCase):
         self.assertIn("<h1>Overview</h1>", page)
         self.assertIn("no jobs in the store yet", page)
         self.assertIn('class="ok"', page)
-        self.assertIn("nothing waiting", page)
+        self.assertIn("nothing queued", page)
 
     def test_queue_counts_link_to_the_filtered_job_list(self):
         self.add.enqueue(1, 2)
@@ -199,7 +199,7 @@ class JobListTests(DashboardCase):
     def test_an_unknown_status_is_a_400_that_names_the_choices(self):
         response = self.get("/jobs", status="done")
         self.assertEqual(response.status, 400)
-        self.assertIn(b"one of queued, held, running, success, failed, cancelled", response.body)
+        self.assertIn(b"one of queued, held, waiting, running, success, failed, cancelled", response.body)
         self.assertEqual(self.get("/api/jobs", status="done").status, 400)
 
 
@@ -346,7 +346,7 @@ class JobActionTests(DashboardCase):
         response = self.post(f"/jobs/{failed.id}/retry")
         self.assertEqual(dict(response.headers)["Location"], f"/jobs/{failed.id}?notice=retry-refused")
         page = self.html(f"/jobs/{failed.id}", notice="retry-refused")
-        self.assertIn("another queued, held or running job holds its dedup key", page)
+        self.assertIn("another job that has not finished holds its dedup key", page)
 
     def test_actions_need_post_and_pages_need_get(self):
         job = self.add.enqueue(1, 2)

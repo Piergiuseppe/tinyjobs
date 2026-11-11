@@ -6,6 +6,7 @@ from enum import StrEnum
 class JobStatus(StrEnum):
     QUEUED = "queued"
     HELD = "held"
+    WAITING = "waiting"
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"

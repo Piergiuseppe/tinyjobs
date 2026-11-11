@@ -339,7 +339,7 @@ class MigrationTests(unittest.TestCase):
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()[0]
         handle.close()
-        self.assertEqual(int(stub), 5)
+        self.assertEqual(int(stub), 6)
         self.assertGreater(int(stub), 3)
 
     def test_a_legacy_file_is_only_migrated_into_the_default_prefix(self):
@@ -455,11 +455,11 @@ class MigrationTests(unittest.TestCase):
         ).fetchone()[0]
         schema = dict(handle.execute("SELECT name, sql FROM sqlite_master WHERE name LIKE 'tinyjobs%'"))
         handle.close()
-        self.assertEqual(int(version), 5)
+        self.assertEqual(int(version), 6)
         self.assertIn("tinyjobs_limits", schema)
         self.assertIn("WHERE status = 'held'", schema["tinyjobs_jobs_held"])
         self.assertIn("WHERE status = 'running'", schema["tinyjobs_jobs_running_by_task"])
-        self.assertIn("status IN ('queued', 'held', 'running')", schema["tinyjobs_jobs_dedup"])
+        self.assertIn("status IN ('queued', 'held', 'waiting', 'running')", schema["tinyjobs_jobs_dedup"])
 
     def test_reopening_a_current_database_leaves_its_schema_alone(self):
         import asyncio

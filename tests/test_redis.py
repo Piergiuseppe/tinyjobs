@@ -222,12 +222,33 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         from tinyjobs.backends.redis.backend import SCHEMA_VERSION
 
         version = self.backend._keys("schema_version")
+        since = self.backend._keys("compatible_since")
         await self.backend._client.set(version, SCHEMA_VERSION + 1)
+        await self.backend._client.set(since, SCHEMA_VERSION + 1)
+        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+            await self.backend.setup()
+        await self.backend._client.delete(since)
         with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
             await self.backend.setup()
         self.assertEqual(
             int(await self.backend._client.get(version)), SCHEMA_VERSION + 1
         )
+
+    async def test_a_newer_store_that_says_this_release_works_on_it_is_used_as_it_is(self):
+        from tinyjobs.backends.redis.backend import SCHEMA_VERSION
+
+        client = self.backend._client
+        version = self.backend._keys("schema_version")
+        since = self.backend._keys("compatible_since")
+        self.assertEqual(int(await client.get(since)), SCHEMA_VERSION)
+        await client.set(version, SCHEMA_VERSION + 1)
+        beside = await self.open()
+        self.assertEqual(
+            (int(await client.get(version)), int(await client.get(since))),
+            (SCHEMA_VERSION + 1, SCHEMA_VERSION),
+        )
+        job = await beside.enqueue(make_job())
+        self.assertEqual([claimed.id for claimed in await self.claim()], [job.id])
 
     async def test_a_job_stored_before_claims_existed_keeps_its_history(self):
         claimed = await self.claimed_one()
@@ -676,7 +697,7 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         version = self.backend._keys("schema_version")
         await client.set(version, 2)
         await self.backend.setup()
-        self.assertEqual(int(await client.get(version)), 3)
+        self.assertEqual(int(await client.get(version)), 4)
         tasks = [job.task for job in running]
         self.assertEqual(
             (await self.a_store_holding_jobs())["running_tasks"],

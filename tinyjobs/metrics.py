@@ -127,7 +127,7 @@ def _store_lines(stats: Stats | None, now: float) -> Iterable[str]:
     for queue in stats.queues:
         for status, count in sorted(queue.counts.items()):
             yield f"tinyjobs_store_jobs{_labels(queue=queue.queue, status=status)} {count}"
-    yield "# HELP tinyjobs_store_queued_jobs Jobs waiting in the store, by task."
+    yield "# HELP tinyjobs_store_queued_jobs Jobs queued or held in the store, by task."
     yield "# TYPE tinyjobs_store_queued_jobs gauge"
     for task, count in sorted(stats.queued_tasks.items()):
         yield f"tinyjobs_store_queued_jobs{_labels(task=task)} {count}"

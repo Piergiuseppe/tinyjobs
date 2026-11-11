@@ -11,6 +11,7 @@
   --problem: #cf222e;
   --queued: #6e7781;
   --held: #8250df;
+  --waiting: #bf3989;
   --running: #0a5bd3;
   --success: #1a7f37;
   --failed: #cf222e;
@@ -30,6 +31,7 @@
     --problem: #f85149;
     --queued: #8b949e;
     --held: #a371f7;
+    --waiting: #f778ba;
     --running: #6ea8fe;
     --success: #3fb950;
     --failed: #f85149;
@@ -219,6 +221,10 @@ td.number {
 
 .status-held {
   background: var(--held);
+}
+
+.status-waiting {
+  background: var(--waiting);
 }
 
 .status-paused {

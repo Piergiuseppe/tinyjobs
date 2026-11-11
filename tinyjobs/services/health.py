@@ -63,8 +63,8 @@ class HealthService:
         return [
             Finding(
                 False,
-                f"{count} waiting job(s) for {task}, which this app does not "
-                f"register; workers started like this leave them waiting",
+                f"{count} queued job(s) for {task}, which this app does not "
+                f"register; workers started like this leave them queued",
             )
             for task, count in sorted(stats.queued_tasks.items())
             if task not in self._registry

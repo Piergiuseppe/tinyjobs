@@ -25,6 +25,7 @@ JOB_COLUMNS = (
     "dedup_key",
     "result",
     "last_error",
+    "runs_after",
 )
 
 JOB_COLUMN_LIST = ", ".join(JOB_COLUMNS)
@@ -52,6 +53,7 @@ def job_to_row(job: Job) -> tuple:
         job.dedup_key,
         job.result_payload,
         job.last_error,
+        job.after,
     )
 
 
@@ -76,6 +78,7 @@ def job_from_row(row: sqlite3.Row) -> Job:
         dedup_key=row["dedup_key"],
         result_payload=row["result"],
         last_error=row["last_error"],
+        after=row["runs_after"],
     )
 
 

@@ -34,7 +34,9 @@ SCHEDULE_ACTIONS = {
     "run": "run_schedule",
 }
 RETRYABLE = frozenset({JobStatus.FAILED, JobStatus.CANCELLED})
-CANCELLABLE = frozenset({JobStatus.QUEUED, JobStatus.HELD, JobStatus.RUNNING})
+CANCELLABLE = frozenset(
+    {JobStatus.QUEUED, JobStatus.HELD, JobStatus.WAITING, JobStatus.RUNNING}
+)
 
 
 class Dashboard:
@@ -246,6 +248,7 @@ def describe_job(job: Job) -> dict[str, Any]:
         "lease_expires_at": job.lease_expires_at,
         "worker_id": job.worker_id,
         "dedup_key": job.dedup_key,
+        "after": job.after,
         "last_error": job.last_error,
         "has_result": job.result_payload is not None,
     }

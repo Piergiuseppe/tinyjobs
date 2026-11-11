@@ -5,6 +5,7 @@ if stored < wanted then
     recount_running_tasks()
   end
   redis.call('SET', key('schema_version'), ARGV[2])
-  return wanted
+  redis.call('SET', key('compatible_since'), ARGV[3])
+  stored = wanted
 end
-return stored
+return { stored, tonumber(redis.call('GET', key('compatible_since')) or stored) }

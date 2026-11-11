@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
+from ...status import JobStatus
 from .base import Command
+
+
+def _job_id(value: str) -> str:
+    if not value:
+        raise argparse.ArgumentTypeError("the id of a job, not an empty value")
+    return value
 
 
 class SendCommand(Command):
@@ -21,6 +29,9 @@ class SendCommand(Command):
         parser.add_argument("--delay", type=float, default=None)
         parser.add_argument("--max-attempts", type=int, default=None)
         parser.add_argument("--key", default=None)
+        parser.add_argument(
+            "--after", default=None, type=_job_id, help="the id of a job this one runs after"
+        )
 
     def run(self, args: argparse.Namespace) -> int:
         app = self.resolve_app(args)
@@ -33,6 +44,9 @@ class SendCommand(Command):
             delay=args.delay,
             max_attempts=args.max_attempts,
             key=args.key,
+            after=args.after,
         )
         print(job.id)
+        if job.status is JobStatus.CANCELLED:
+            print(f"stored as cancelled: {job.last_error}", file=sys.stderr)
         return 0

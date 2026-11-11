@@ -38,7 +38,7 @@ class JobsCommand(Command):
         retry.add_argument("job_id")
 
         cancel = actions.add_parser(
-            "cancel", help="cancel a queued, held or running job", parents=[shared]
+            "cancel", help="cancel a job that has not finished", parents=[shared]
         )
         cancel.add_argument("job_id")
 
@@ -85,6 +85,8 @@ class JobsCommand(Command):
         print(f"created    {format_timestamp(job.created_at)}")
         print(f"run at     {format_timestamp(job.run_at)}")
         print(f"finished   {format_timestamp(job.finished_at)}")
+        if job.after:
+            print(f"after      {job.after}")
         if job.last_error:
             print(f"last error {job.last_error}")
         print("\nattempts")
@@ -99,16 +101,20 @@ class JobsCommand(Command):
     def _retry(self, app, args: argparse.Namespace) -> int:
         if not app.retry(args.job_id):
             print(
-                f"job {args.job_id} is not in a retryable state, or another active "
-                "job holds its dedup key"
+                f"job {args.job_id} is not failed or cancelled, the job it runs after did "
+                "not succeed, another active job holds its dedup key, or it is not in the store"
             )
             return 1
-        print(f"job {args.job_id} requeued")
+        job = app.get(args.job_id)
+        if job is not None and job.status is JobStatus.WAITING:
+            print(f"job {args.job_id} waits for job {job.after}")
+        else:
+            print(f"job {args.job_id} requeued")
         return 0
 
     def _cancel(self, app, args: argparse.Namespace) -> int:
         if not app.cancel(args.job_id):
-            print(f"job {args.job_id} is not queued, held or running")
+            print(f"job {args.job_id} has finished already, or is not in the store")
             return 1
         print(f"job {args.job_id} cancelled")
         return 0

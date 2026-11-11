@@ -28,6 +28,7 @@ class Capabilities:
     loop_bound: bool = False
     result_ttl: bool = False
     limits: bool = False
+    after: bool = False
 
 
 @runtime_checkable

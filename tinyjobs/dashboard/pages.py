@@ -11,8 +11,8 @@ from ..status import JobStatus
 
 STATUSES = tuple(status.value for status in JobStatus)
 NOTICES = {
-    "retried": "the job is queued again",
-    "retry-refused": "the job was not retried: it is not failed or cancelled, or another queued, held or running job holds its dedup key",
+    "retried": "the job is queued again, or waits for the job it runs after",
+    "retry-refused": "the job was not retried: it is not failed or cancelled, the job it runs after did not succeed, or another job that has not finished holds its dedup key",
     "cancelled": "the job is cancelled, or will be when it next checks",
     "cancel-refused": "the job was not cancelled: it had already finished",
     "paused": "the schedule is paused",
@@ -48,9 +48,9 @@ def overview(data: dict[str, Any], root: str, notice: str) -> str:
         [escape(task), str(count)] for task, count in data["queued_tasks"].items()
     ]
     queued_tasks = (
-        table(("Task", "Waiting"), tasks, numbers=(1,))
+        table(("Task", "Queued"), tasks, numbers=(1,))
         if tasks
-        else '<p class="empty">nothing waiting</p>'
+        else '<p class="empty">nothing queued</p>'
     )
     body = f"""<h1>Overview</h1>
 {notice}
@@ -59,7 +59,7 @@ def overview(data: dict[str, Any], root: str, notice: str) -> str:
 <h2>Queues</h2>
 {queues}
 <p>running past their lease: <strong>{data["expired_leases"]}</strong></p>
-<h2>Waiting by task</h2>
+<h2>Queued by task</h2>
 {queued_tasks}"""
     return layout("Overview", "", body, root)
 
@@ -123,6 +123,10 @@ def job(data: dict[str, Any], root: str, notice: str) -> str:
         ("Lease", when(data["lease_expires_at"], now)),
         ("Worker", escape(data["worker_id"] or "-")),
         ("Dedup key", escape(data["dedup_key"] or "-")),
+        (
+            "Runs after",
+            link(f"{root}/jobs/{segment(data['after'])}", data["after"]) if data["after"] else "-",
+        ),
     )
     details = "".join(f"<dt>{name}</dt><dd>{value}</dd>" for name, value in fields)
     actions = "".join(

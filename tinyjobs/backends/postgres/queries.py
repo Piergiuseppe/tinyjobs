@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ...following import PARENT_ENDED_MESSAGE, PARENT_GONE_MESSAGE
 from .records import JOB_COLUMNS, JOB_TYPES, job_columns
 from .schema import QUEUE_KEY, QUEUE_KEY_CHARACTERS, Tables
 
@@ -10,6 +11,8 @@ SERVER = "extract(epoch FROM pg_catalog.statement_timestamp())::double precision
 NOW = "%(now)s::double precision"
 
 NOTICE_CHARACTERS = 1000
+
+FOLLOWING = "following:"
 
 SPAN_LIMIT = 128
 
@@ -203,6 +206,74 @@ class Queries:
             SELECT id, queue, due FROM inserted
         """
 
+        ended = (
+            "parents.status OPERATOR(pg_catalog.=) "
+            "ANY(ARRAY['failed', 'cancelled']::pg_catalog.text[])"
+        )
+        placing = {
+            "status": (
+                "CASE WHEN incoming.runs_after IS NULL THEN incoming.status "
+                "WHEN parents.status OPERATOR(pg_catalog.=) 'success' THEN 'queued' "
+                f"WHEN {ended} THEN 'cancelled' ELSE 'waiting' END"
+            ),
+            "finished_at": (
+                "CASE WHEN incoming.runs_after IS NULL THEN incoming.finished_at "
+                f"WHEN {ended} THEN {horizon} END"
+            ),
+            "last_error": (
+                "CASE WHEN incoming.runs_after IS NULL THEN incoming.last_error "
+                f"WHEN {ended} THEN '{PARENT_ENDED_MESSAGE}' END"
+            ),
+        }
+        placed = ", ".join(placing.get(column, f"incoming.{column}") for column in JOB_COLUMNS)
+
+        self.insert_after = f"""
+            WITH incoming AS (
+                SELECT * FROM ROWS FROM ({arrays}) WITH ORDINALITY
+                    AS incoming ({columns}, position)
+            ),
+            parents AS (
+                SELECT parent.id, parent.status FROM {jobs} AS parent
+                 WHERE parent.id OPERATOR(pg_catalog.=) ANY(%(runs_after)b::pg_catalog.text[])
+            ),
+            marked AS (
+                INSERT INTO {meta} (key, value)
+                SELECT %(flag)s::pg_catalog.text, '1'
+                 WHERE NOT EXISTS (
+                       SELECT FROM {meta} AS flag
+                        WHERE flag.key OPERATOR(pg_catalog.~~) '{FOLLOWING}%%'
+                 )
+                ON CONFLICT DO NOTHING
+            ),
+            orphans AS (
+                SELECT incoming.runs_after FROM incoming
+                 WHERE incoming.runs_after IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT FROM parents
+                        WHERE parents.id OPERATOR(pg_catalog.=) incoming.runs_after
+                   )
+            ),
+            inserted AS (
+                INSERT INTO {jobs} ({columns}, waiting_on)
+                SELECT {placed},
+                       CASE WHEN parents.status OPERATOR(pg_catalog.=) 'success' OR {ended}
+                            THEN NULL ELSE incoming.runs_after END
+                  FROM incoming
+                  LEFT JOIN parents ON parents.id OPERATOR(pg_catalog.=) incoming.runs_after
+                 WHERE NOT EXISTS (SELECT FROM orphans)
+                 ORDER BY incoming.position
+                ON CONFLICT DO NOTHING
+                RETURNING id, queue, status, finished_at, last_error,
+                          status OPERATOR(pg_catalog.=) 'queued'
+                          AND run_at OPERATOR(pg_catalog.<=) {horizon} AS due
+            )
+            SELECT id, queue, due, status, finished_at, last_error,
+                   NULL::pg_catalog.text AS orphan
+              FROM inserted
+             UNION ALL
+            SELECT NULL, NULL, false, NULL, NULL, NULL, runs_after FROM orphans
+        """
+
         self.by_ids = (
             f"SELECT {columns} FROM {jobs} "
             "WHERE id OPERATOR(pg_catalog.=) ANY(%(ids)b::pg_catalog.text[])"
@@ -212,7 +283,7 @@ class Queries:
             SELECT {columns} FROM {jobs}
              WHERE dedup_digest OPERATOR(pg_catalog.=) ANY(%(digests)b::pg_catalog.bytea[])
                AND status OPERATOR(pg_catalog.=) ANY(
-                   ARRAY['queued', 'held', 'running']::pg_catalog.text[])
+                   ARRAY['queued', 'held', 'waiting', 'running']::pg_catalog.text[])
         """
 
         def lowering(source: str) -> str:
@@ -234,6 +305,54 @@ class Queries:
                  WHERE allowance.task = counted.task
             )
             """
+
+        releasing_children = f"""
+            released AS (
+                UPDATE {jobs} AS child
+                   SET status = 'queued', waiting_on = NULL,
+                       run_at = greatest(child.run_at, {horizon})
+                 WHERE child.waiting_on = ANY(ARRAY(SELECT id FROM changed))
+                RETURNING child.queue, child.run_at <= {horizon} AS due
+            )
+        """
+
+        woken = (
+            "(SELECT coalesce(json_agg(DISTINCT queue) FILTER (WHERE due), '[]')::text "
+            "FROM released) AS woken"
+        )
+
+        def cancelling(first: str, reason: str = f"'{PARENT_ENDED_MESSAGE}'") -> str:
+            return f"""
+            descendants AS (
+                {first}
+                 UNION ALL
+                SELECT child.id FROM descendants
+                 CROSS JOIN LATERAL (
+                       SELECT waiting.id FROM {jobs} AS waiting
+                        WHERE waiting.waiting_on = descendants.id
+                       OFFSET 0
+                 ) AS child
+            ),
+            doomed AS (
+                SELECT child.id, child.waiting_on FROM {jobs} AS child
+                 WHERE child.id = ANY(ARRAY(SELECT id FROM descendants))
+                 ORDER BY child.id
+                   FOR UPDATE OF child
+            ),
+            dropped AS (
+                UPDATE {jobs} AS child
+                   SET status = 'cancelled', waiting_on = NULL, finished_at = {horizon},
+                       last_error = {reason}
+                 WHERE child.id = ANY(ARRAY(
+                       SELECT id FROM doomed WHERE waiting_on IS NOT NULL
+                 ))
+            )
+            """
+
+        def children_of(source: str) -> str:
+            return f"""
+                SELECT child.id FROM {jobs} AS child
+                 WHERE child.waiting_on = ANY(ARRAY(SELECT id FROM {source}))"""
 
         raising = f"""
             started AS (
@@ -640,7 +759,7 @@ class Queries:
             )
         """
 
-        self.complete = f"""
+        completed = f"""
             WITH changed AS (
                 UPDATE {jobs}
                    SET status = 'success', finished_at = %(now)s, result = %(result)s,
@@ -649,12 +768,29 @@ class Queries:
                 RETURNING id, claims, task
             ),
             {close_execution},
-            {lowering("changed")}
-            SELECT count(*) AS changed FROM changed
+            {lowering("changed")}"""
+
+        self.complete = f"""{completed}
+            SELECT count(*) AS changed,
+                   (SELECT '1' FROM {meta} WHERE key LIKE '{FOLLOWING}%%' LIMIT 1) AS following
+              FROM changed
+        """
+
+        self.complete_releasing = f"""{completed},
+            {releasing_children}
+            SELECT count(*) AS changed, {woken} FROM changed
+        """
+
+        self.release_children = f"""
+            WITH changed AS (
+                SELECT id FROM {jobs} WHERE id = %(id)s AND status = 'success'
+            ),
+            {releasing_children}
+            SELECT {woken}
         """
 
         self.fail = f"""
-            WITH changed AS (
+            WITH RECURSIVE changed AS (
                 UPDATE {jobs}
                    SET status = 'failed', finished_at = %(now)s, last_error = %(summary)s,
                        lease_expires_at = NULL, hand_backs = 0
@@ -662,7 +798,8 @@ class Queries:
                 RETURNING id, claims, task
             ),
             {close_execution},
-            {lowering("changed")}
+            {lowering("changed")},
+            {cancelling(children_of("changed"))}
             SELECT count(*) AS changed FROM changed
         """
 
@@ -752,15 +889,15 @@ class Queries:
         """
 
         self.cancel = f"""
-            WITH target AS (
+            WITH RECURSIVE target AS (
                 SELECT id, status FROM {jobs}
-                 WHERE id = %(id)s AND status IN ('queued', 'held', 'running')
+                 WHERE id = %(id)s AND status IN ('queued', 'held', 'waiting', 'running')
                  FOR UPDATE
             ),
             changed AS (
                 UPDATE {jobs} AS job
                    SET status = 'cancelled', finished_at = %(now)s, lease_expires_at = NULL,
-                       hand_backs = 0
+                       hand_backs = 0, waiting_on = NULL
                   FROM target
                  WHERE job.id = target.id
                 RETURNING job.id, job.task, target.status AS was
@@ -769,7 +906,8 @@ class Queries:
                 UPDATE {executions} SET status = 'cancelled', finished_at = %(now)s
                  WHERE status = 'running' AND job_id IN (SELECT id FROM changed)
             ),
-            {lowering("changed WHERE was = 'running'")}
+            {lowering("changed WHERE was = 'running'")},
+            {cancelling(children_of("changed"))}
             SELECT count(*) AS changed FROM changed
         """
 
@@ -800,18 +938,32 @@ class Queries:
                    AND queue = ANY(%(queues)s::text[])""")
 
         self.requeue = f"""
+            WITH wanted AS (
+                SELECT job.id, parent.status AS parent
+                  FROM {jobs} AS job
+                  LEFT JOIN {jobs} AS parent ON parent.id = job.runs_after
+                 WHERE job.id = %(id)s AND job.status IN ('failed', 'cancelled')
+                   FOR UPDATE OF job
+            )
             UPDATE {jobs} AS target
-               SET status = 'queued',
-                   run_at = CASE WHEN claims = 0 THEN created_at ELSE %(now)s END,
+               SET status = CASE WHEN wanted.parent IS NULL OR wanted.parent = 'success'
+                                 THEN 'queued' ELSE 'waiting' END,
+                   waiting_on = CASE WHEN wanted.parent IS NULL OR wanted.parent = 'success'
+                                     THEN NULL ELSE target.runs_after END,
+                   run_at = CASE WHEN target.claims = 0 THEN target.created_at
+                                 ELSE %(now)s END,
                    attempts = 0, finished_at = NULL, lease_expires_at = NULL,
                    worker_id = NULL, last_error = NULL
-             WHERE id = %(id)s AND status IN ('failed', 'cancelled')
+              FROM wanted
+             WHERE target.id = wanted.id
+               AND (wanted.parent IS NULL OR wanted.parent NOT IN ('failed', 'cancelled'))
                AND NOT EXISTS (
                    SELECT 1 FROM {jobs} AS holder
                     WHERE holder.dedup_digest = target.dedup_digest
-                      AND holder.status IN ('queued', 'held', 'running')
+                      AND holder.status IN ('queued', 'held', 'waiting', 'running')
                )
-            RETURNING id, queue, run_at <= {horizon} AS due
+            RETURNING target.id, target.queue,
+                      target.status = 'queued' AND target.run_at <= {horizon} AS due
         """
 
         self.notify = (
@@ -820,8 +972,57 @@ class Queries:
             "FROM pg_catalog.unnest(%(queues)b::pg_catalog.text[]) AS woken (queue)"
         )
 
+        gone = f"""CASE WHEN child.id IN (SELECT id FROM late WHERE parent IS NULL)
+                                 THEN '{PARENT_GONE_MESSAGE}'
+                                 ELSE '{PARENT_ENDED_MESSAGE}' END"""
+
+        def settling(children: str, marking: str = "") -> str:
+            return f"""
+            WITH RECURSIVE late AS (
+                SELECT child.id, parent.status AS parent
+                  FROM {jobs} AS child
+                  LEFT JOIN LATERAL (
+                       SELECT found.status FROM {jobs} AS found
+                        WHERE found.id = child.waiting_on
+                       OFFSET 0
+                  ) AS parent ON true
+                 WHERE {children}
+                   AND (parent.status IS NULL
+                        OR parent.status IN ('success', 'failed', 'cancelled'))
+                   FOR UPDATE OF child SKIP LOCKED
+            ),
+            released AS (
+                UPDATE {jobs} AS child
+                   SET status = 'queued', waiting_on = NULL,
+                       run_at = greatest(child.run_at, {horizon})
+                 WHERE child.id = ANY(ARRAY(SELECT id FROM late WHERE parent = 'success'))
+                RETURNING child.queue, child.run_at <= {horizon} AS due
+            ),{marking}
+            {cancelling(
+                "SELECT late.id FROM late WHERE late.parent IS DISTINCT FROM 'success'",
+                gone,
+            )}
+            SELECT (SELECT count(*) FROM late) AS settled, {woken}
+            """
+
+        self.settle_waiting = settling(
+            "child.waiting_on IS NOT NULL",
+            f"""
+            marked AS (
+                INSERT INTO {meta} (key, value)
+                SELECT '{FOLLOWING}reaper', '1'
+                 WHERE NOT EXISTS (SELECT FROM {meta} WHERE key LIKE '{FOLLOWING}%%')
+                   AND EXISTS (SELECT FROM {jobs} WHERE waiting_on IS NOT NULL)
+                ON CONFLICT DO NOTHING
+            ),""",
+        )
+
+        self.settle_sent = settling(
+            "child.id = ANY(%(ids)s::text[]) AND coalesce(child.waiting_on, '') <> ''"
+        )
+
         self.reap = f"""
-            WITH expired AS (
+            WITH RECURSIVE expired AS (
                 SELECT id FROM {jobs}
                  WHERE status = 'running' AND lease_expires_at < {horizon}
                  FOR UPDATE SKIP LOCKED
@@ -845,7 +1046,8 @@ class Queries:
                   FROM reaped
                  WHERE execution.job_id = reaped.id AND execution.status = 'running'
             ),
-            {lowering("reaped")}
+            {lowering("reaped")},
+            {cancelling(children_of("reaped WHERE status = 'failed'"))}
             SELECT count(*) AS reaped,
                    coalesce(array_agg(DISTINCT queue) FILTER (WHERE status = 'queued'), '{{}}')
                        AS queues
@@ -918,6 +1120,10 @@ class Queries:
                        SELECT id FROM {jobs}
                         WHERE status = %(status)s AND finished_at IS NOT NULL
                           AND finished_at < %(cutoff)s - ({NOW} - {horizon})
+                          AND NOT EXISTS (
+                              SELECT FROM {jobs} AS child
+                               WHERE child.waiting_on = {jobs}.id
+                          )
                         ORDER BY finished_at
                         LIMIT %(batch)s
                         FOR UPDATE SKIP LOCKED
@@ -953,9 +1159,11 @@ class Queries:
              WHERE name = %(name)s
         """
 
-        self.schema_version = (
-            f"SELECT value FROM {meta} WHERE key = 'schema_version'"
-        )
+        self.schema_version = f"""
+            SELECT value,
+                   (SELECT value FROM {meta} WHERE key = 'compatible_since') AS compatible_since
+              FROM {meta} WHERE key = 'schema_version'
+        """
 
         self.identity = f"""
             SELECT stored.value AS instance, here.oid::pg_catalog.text AS database

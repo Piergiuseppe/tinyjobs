@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import unittest
 from dataclasses import replace
 
 from ..backends.base import Backend
 from ..clock import Clock, FrozenClock
+from ..exceptions import JobNotFoundError
+from ..following import PARENT_ENDED_MESSAGE
 from ..ids import new_job_id
 from ..limits import Limit
 from ..models import NEVER, ExecutionError, Job, ScheduleState
@@ -43,6 +46,7 @@ def pruning(**horizons: float) -> RetentionPolicy:
 
 class BackendContract:
     independent_clients = True
+    wide_cancel_seconds = 1.0
 
     async def make_backend(self, clock: Clock) -> Backend:
         raise NotImplementedError
@@ -1086,7 +1090,7 @@ class BackendContract:
         await self.backend.complete(await self.stored(first_noop), None)
         self.assertEqual([job.id for job in await self.limited(limit=1, **limits)], [second_noop.id])
 
-    async def test_held_jobs_count_as_waiting_in_the_stats(self):
+    async def test_held_jobs_count_as_queued_in_the_stats(self):
         self.requires("limits")
         limits = {"tests.noop": Limit(interval=3600.0)}
         await self.enqueue(run_at=0.0)
@@ -1120,3 +1124,280 @@ class BackendContract:
         await self.backend.complete(await self.stored(first), None)
         self.assertEqual([job.id for job in await self.limited(**capped)], [second.id])
 
+
+    async def child_of(self, parent: Job, **overrides) -> Job:
+        return await self.enqueue(after=parent.id, **overrides)
+
+    async def finish(self, job: Job) -> None:
+        [claimed] = [found for found in await self.claim() if found.id == job.id]
+        self.assertTrue(await self.backend.complete(claimed, None))
+
+    async def test_a_job_after_another_waits_out_of_the_claims_way(self):
+        self.requires("after")
+        parent = await self.enqueue()
+        child = await self.child_of(parent)
+        self.assertEqual((child.status, child.after), (JobStatus.WAITING, parent.id))
+        stored = await self.stored(child)
+        self.assertEqual((stored.status, stored.after), (JobStatus.WAITING, parent.id))
+        self.assertEqual([job.id for job in await self.claim()], [parent.id])
+        self.assertEqual(await self.claim(), [])
+        self.assertIsNone(
+            await self.backend.claim_job(child.id, worker_id="worker-b", lease_seconds=60.0)
+        )
+        self.assertEqual((await self.backend.counts_by_status())["waiting"], 1)
+        listed = await self.backend.list(status=JobStatus.WAITING)
+        self.assertEqual([job.id for job in listed.items], [child.id])
+
+    async def test_a_waiting_job_is_queued_when_the_job_before_it_succeeds(self):
+        self.requires("after")
+        parent = await self.enqueue()
+        children = [await self.child_of(parent, run_at=0.0) for _ in range(3)]
+        later = await self.child_of(parent, run_at=START + 500)
+        other = await self.child_of(await self.enqueue(queue="mail"))
+        self.clock.advance(10)
+        await self.finish(parent)
+        self.assertEqual(await self.statuses(*children), [JobStatus.QUEUED] * 3)
+        self.assertEqual(
+            [(await self.stored(child)).run_at for child in children], [START + 10] * 3
+        )
+        self.assertEqual((await self.stored(later)).run_at, START + 500)
+        self.assertEqual(await self.statuses(other), [JobStatus.WAITING])
+        self.assertEqual(
+            sorted(job.id for job in await self.claim()), sorted(child.id for child in children)
+        )
+
+    async def test_a_waiting_job_keeps_waiting_while_the_job_before_it_retries(self):
+        self.requires("after")
+        parent = await self.enqueue(max_attempts=2)
+        child = await self.child_of(parent)
+        [claimed] = await self.claim()
+        self.assertTrue(await self.backend.fail(claimed, ERROR, retry_at=self.clock.now()))
+        self.assertEqual(await self.statuses(child), [JobStatus.WAITING])
+        [claimed] = await self.claim()
+        self.assertTrue(await self.backend.release(claimed))
+        self.assertEqual(await self.statuses(child), [JobStatus.WAITING])
+        [claimed] = await self.claim()
+        self.assertTrue(await self.backend.hand_back(claimed))
+        self.assertEqual(await self.statuses(child), [JobStatus.WAITING])
+        await self.finish(parent)
+        self.assertEqual(await self.statuses(child), [JobStatus.QUEUED])
+
+    async def chain(self, length: int = 3) -> list[Job]:
+        jobs = [await self.enqueue()]
+        for _ in range(length):
+            jobs.append(await self.child_of(jobs[-1]))
+        return jobs
+
+    async def assert_cancelled_with_the_parent(self, *jobs: Job) -> None:
+        for job in jobs:
+            stored = await self.stored(job)
+            self.assertEqual(
+                (stored.status, stored.last_error, stored.finished_at),
+                (JobStatus.CANCELLED, PARENT_ENDED_MESSAGE, self.clock.now()),
+            )
+        self.assertEqual(await self.backend.executions(jobs[-1].id), [])
+
+    async def test_a_failure_cancels_every_job_waiting_down_the_line(self):
+        self.requires("after")
+        parent, *descendants = await self.chain()
+        aside = await self.child_of(parent)
+        [claimed] = await self.claim()
+        self.clock.advance(5)
+        self.assertTrue(await self.backend.fail(claimed, ERROR, retry_at=None))
+        await self.assert_cancelled_with_the_parent(*descendants, aside)
+        self.assertEqual(await self.claim(), [])
+        self.assertNotIn("waiting", await self.backend.counts_by_status())
+
+    async def test_cancelling_a_job_cancels_every_job_waiting_down_the_line(self):
+        self.requires("after")
+        for cancelled in range(3):
+            jobs = await self.chain()
+            self.clock.advance(5)
+            self.assertTrue(await self.backend.cancel(jobs[cancelled].id))
+            self.assertEqual(await self.statuses(*jobs[:cancelled]), [
+                JobStatus.QUEUED, *[JobStatus.WAITING] * 3
+            ][:cancelled])
+            self.assertEqual(await self.statuses(jobs[cancelled]), [JobStatus.CANCELLED])
+            await self.assert_cancelled_with_the_parent(*jobs[cancelled + 1 :])
+            await self.backend.cancel(jobs[0].id)
+
+    async def test_cancelling_a_running_job_cancels_the_jobs_waiting_on_it(self):
+        self.requires("after")
+        parent, *descendants = await self.chain(2)
+        await self.claim()
+        self.assertTrue(await self.backend.cancel(parent.id))
+        await self.assert_cancelled_with_the_parent(*descendants)
+
+    async def test_a_job_lost_for_good_cancels_the_jobs_waiting_on_it(self):
+        self.requires("after")
+        lost, *descendants = await self.chain(2)
+        kept = await self.enqueue(max_attempts=2)
+        waiting = await self.child_of(kept)
+        self.assertEqual(len(await self.claim()), 2)
+        self.assertEqual(await self.reap_after_the_lease(), 2)
+        self.assertEqual(
+            await self.statuses(lost, kept, waiting),
+            [JobStatus.FAILED, JobStatus.QUEUED, JobStatus.WAITING],
+        )
+        await self.assert_cancelled_with_the_parent(*descendants)
+
+    async def test_a_job_sent_after_one_that_ended_is_placed_by_how_it_ended(self):
+        self.requires("after")
+        done = await self.enqueue()
+        await self.finish(done)
+        failed = await self.claimed_one()
+        await self.backend.fail(failed, ERROR, retry_at=None)
+        cancelled = await self.enqueue()
+        await self.backend.cancel(cancelled.id)
+        self.clock.advance(5)
+        ready = await self.child_of(done)
+        self.assertEqual((ready.status, ready.finished_at), (JobStatus.QUEUED, None))
+        self.assertEqual([job.id for job in await self.claim()], [ready.id])
+        for ended in (failed, cancelled):
+            child = await self.child_of(ended)
+            self.assertEqual(
+                (child.status, child.last_error, child.finished_at),
+                (JobStatus.CANCELLED, PARENT_ENDED_MESSAGE, self.clock.now()),
+            )
+            await self.assert_cancelled_with_the_parent(child)
+        self.assertEqual(await self.claim(), [])
+
+    async def test_a_job_cannot_be_sent_after_one_the_store_does_not_hold(self):
+        self.requires("after")
+        before = await self.backend.counts_by_status()
+        with self.assertRaises(JobNotFoundError) as raised:
+            await self.backend.enqueue_many(
+                [make_job(), make_job(after="no-such-job"), make_job()]
+            )
+        self.assertIn("no-such-job", str(raised.exception))
+        self.assertEqual(await self.backend.counts_by_status(), before)
+
+    async def test_a_parent_sent_in_the_same_call_is_not_yet_in_the_store(self):
+        self.requires("after")
+        parent = make_job()
+        with self.assertRaises(JobNotFoundError):
+            await self.backend.enqueue_many([parent, make_job(after=parent.id)])
+        self.assertEqual(await self.backend.counts_by_status(), {})
+        many = [make_job() for _ in range(250)] + [make_job(after="no-such-job")]
+        with self.assertRaises(JobNotFoundError):
+            await self.backend.enqueue_many(many)
+        self.assertEqual(await self.backend.counts_by_status(), {})
+        first, last = make_job(), make_job()
+        fillers = [make_job() for _ in range(1100)]
+        for parent in (first, last):
+            with self.assertRaises(JobNotFoundError):
+                await self.backend.enqueue_many(
+                    [first, make_job(after=parent.id), *fillers, last]
+                )
+            self.assertEqual(await self.backend.counts_by_status(), {})
+
+    async def test_a_job_placed_cancelled_takes_no_dedup_key(self):
+        self.requires("after")
+        self.requires("dedup")
+        ended = await self.enqueue()
+        await self.backend.cancel(ended.id)
+        holder = await self.enqueue(dedup_key="report:1")
+        child = await self.child_of(ended, dedup_key="report:1")
+        self.assertNotEqual(child.id, holder.id)
+        self.assertEqual(child.status, JobStatus.CANCELLED)
+        self.assertEqual(
+            await self.backend.counts_by_status(), {"cancelled": 2, "queued": 1}
+        )
+        self.assertEqual((await self.enqueue(dedup_key="report:1")).id, holder.id)
+
+    async def test_a_waiting_job_holds_its_dedup_key(self):
+        self.requires("after")
+        self.requires("dedup")
+        parent = await self.enqueue()
+        child = await self.child_of(parent, dedup_key="report:1")
+        again = await self.child_of(parent, dedup_key="report:1")
+        plain = await self.enqueue(dedup_key="report:1")
+        self.assertEqual((again.id, plain.id), (child.id, child.id))
+        self.assertEqual(plain.status, JobStatus.WAITING)
+        await self.backend.cancel(child.id)
+        fresh = await self.enqueue(dedup_key="report:1")
+        self.assertNotEqual(fresh.id, child.id)
+        self.assertFalse(await self.backend.requeue(child.id))
+
+    async def test_requeue_places_a_job_by_the_state_of_the_job_before_it(self):
+        self.requires("after")
+        parent, child, grandchild = await self.chain(2)
+        [claimed] = await self.claim()
+        await self.backend.fail(claimed, ERROR, retry_at=None)
+        self.assertFalse(await self.backend.requeue(child.id))
+        self.assertTrue(await self.backend.requeue(parent.id))
+        self.assertEqual(
+            await self.statuses(child, grandchild), [JobStatus.CANCELLED] * 2
+        )
+        self.assertFalse(await self.backend.requeue(grandchild.id))
+        self.assertTrue(await self.backend.requeue(child.id))
+        self.assertTrue(await self.backend.requeue(grandchild.id))
+        self.assertEqual(await self.statuses(child, grandchild), [JobStatus.WAITING] * 2)
+        waiting = await self.stored(child)
+        self.assertEqual((waiting.finished_at, waiting.last_error), (None, None))
+        await self.finish(parent)
+        self.assertEqual(
+            await self.statuses(child, grandchild), [JobStatus.QUEUED, JobStatus.WAITING]
+        )
+        [claimed] = await self.claim()
+        await self.backend.fail(claimed, ERROR, retry_at=None)
+        self.assertTrue(await self.backend.requeue(child.id))
+        self.assertEqual(await self.statuses(child), [JobStatus.QUEUED])
+
+    async def test_requeue_runs_a_job_whose_parent_was_purged(self):
+        self.requires("after")
+        self.requires("retention")
+        parent = await self.enqueue()
+        child = await self.child_of(parent)
+        await self.finish(parent)
+        [claimed] = await self.claim()
+        await self.backend.fail(claimed, ERROR, retry_at=None)
+        self.assertEqual(
+            await self.backend.purge(pruning(success=1e-9), self.clock.now() + 10), 1
+        )
+        self.assertIsNone(await self.stored(parent))
+        self.assertTrue(await self.backend.requeue(child.id))
+        self.assertEqual(await self.statuses(child), [JobStatus.QUEUED])
+
+    async def test_waiting_jobs_stay_out_of_the_queue_figures(self):
+        self.requires("after")
+        parent = await self.enqueue(run_at=5.0)
+        await self.child_of(parent, run_at=1.0)
+        await self.child_of(parent, run_at=2.0, queue="mail")
+        stats = await self.backend.stats(self.clock.now())
+        by_queue = {queue.queue: queue for queue in stats.queues}
+        self.assertEqual(by_queue["default"].counts, {"queued": 1, "waiting": 1})
+        self.assertEqual(by_queue["default"].oldest_due_at, 5.0)
+        self.assertEqual(by_queue["mail"].counts, {"waiting": 1})
+        self.assertIsNone(by_queue["mail"].oldest_due_at)
+        self.assertEqual(stats.queued_tasks, {"tests.noop": 1})
+        await self.finish(parent)
+        stats = await self.backend.stats(self.clock.now())
+        by_queue = {queue.queue: queue for queue in stats.queues}
+        self.assertEqual(by_queue["mail"].counts, {"queued": 1})
+        self.assertEqual(by_queue["mail"].oldest_due_at, START)
+        self.assertEqual(stats.queued_tasks, {"tests.noop": 2})
+
+    async def test_a_wide_line_of_waiting_jobs_is_cancelled_without_rereading_them_for_each(self):
+        self.requires("after")
+        parent = await self.enqueue()
+        aside = await self.child_of(await self.enqueue(run_at=1.0))
+        for _ in range(40):
+            await self.backend.enqueue_many(
+                [make_job(after=parent.id) for _ in range(100)]
+            )
+        started = time.monotonic()
+        self.assertTrue(await self.backend.cancel(parent.id))
+        self.assertLess(time.monotonic() - started, self.wide_cancel_seconds)
+        self.assertEqual(
+            await self.backend.counts_by_status(),
+            {"cancelled": 4001, "queued": 1, "waiting": 1},
+        )
+        self.assertEqual(await self.statuses(aside), [JobStatus.WAITING])
+
+    async def test_a_long_line_of_waiting_jobs_is_cancelled_at_once(self):
+        self.requires("after")
+        parent, *descendants = await self.chain(300)
+        self.assertTrue(await self.backend.cancel(parent.id))
+        self.assertEqual(await self.backend.counts_by_status(), {"cancelled": 301})
+        self.assertEqual(await self.statuses(descendants[-1]), [JobStatus.CANCELLED])

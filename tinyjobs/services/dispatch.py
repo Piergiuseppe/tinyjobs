@@ -5,6 +5,7 @@ from dataclasses import fields
 from ..backends.base import Backend
 from ..clock import Clock, FollowingClock
 from ..exceptions import UnsupportedCapabilityError
+from ..following import parent_id
 from ..ids import JobIdGenerator
 from ..models import Job, JobPayload
 from ..options import EnqueueOptions
@@ -87,6 +88,7 @@ class DispatchService:
             ),
             created_at=now,
             dedup_key=options.key,
+            after=parent_id(options.after),
         )
 
     def _verify_capabilities(self, options: EnqueueOptions) -> None:
@@ -94,6 +96,10 @@ class DispatchService:
         if options.key is not None and not capabilities.dedup:
             raise UnsupportedCapabilityError(
                 "this backend does not support deduplication keys"
+            )
+        if options.after is not None and not capabilities.after:
+            raise UnsupportedCapabilityError(
+                "this backend cannot keep a job until another has succeeded"
             )
         if not capabilities.priority and options.priority:
             raise UnsupportedCapabilityError(

@@ -267,7 +267,7 @@ class DrainTests(unittest.TestCase):
         release.assert_not_called()
         self.assertEqual(self.ran, [1, 2])
 
-    def test_held_jobs_count_as_waiting_in_stats_metrics_and_the_check(self):
+    def test_held_jobs_count_as_queued_in_stats_metrics_and_the_check(self):
         @self.app.task(rate="1/h")
         def spaced():
             return None

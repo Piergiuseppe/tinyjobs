@@ -6,9 +6,11 @@ from typing import Sequence
 
 from ...exceptions import ConfigurationError
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-UPGRADABLE_VERSION = 1
+COMPATIBLE_SINCE = 3
+
+UPGRADABLE_VERSIONS = (1, 2)
 
 QUEUE_KEY_CHARACTERS = 500
 
@@ -24,6 +26,7 @@ INDEXES = (
     ("jobs_dedup", "jobs", True),
     ("jobs_held", "jobs", False),
     ("jobs_running_by_task", "jobs", False),
+    ("jobs_waiting", "jobs", False),
     ("executions_claim", "executions", True),
 )
 
@@ -31,7 +34,9 @@ STATISTICS = (("jobs_queue", "jobs"),)
 
 ARBITERS = frozenset({"executions_claim"})
 
-STATUSES = "status IN ('queued', 'held', 'running', 'success', 'failed', 'cancelled')"
+STATUSES = (
+    "status IN ('queued', 'held', 'waiting', 'running', 'success', 'failed', 'cancelled')"
+)
 
 
 class Tables:
@@ -111,7 +116,8 @@ class Tables:
             "jobs_dedup": f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("jobs_dedup")}
                 ON {jobs} (dedup_digest)
-                WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'held', 'running')
+                WHERE dedup_digest IS NOT NULL
+                  AND status IN ('queued', 'held', 'waiting', 'running')
             """,
             "jobs_held": f"""
             CREATE INDEX IF NOT EXISTS {self.index("jobs_held")}
@@ -122,6 +128,11 @@ class Tables:
             CREATE INDEX IF NOT EXISTS {self.index("jobs_running_by_task")}
                 ON {jobs} (task)
                 WHERE status = 'running'
+            """,
+            "jobs_waiting": f"""
+            CREATE INDEX IF NOT EXISTS {self.index("jobs_waiting")}
+                ON {jobs} (waiting_on)
+                WHERE waiting_on IS NOT NULL
             """,
             "executions_claim": f"""
             CREATE UNIQUE INDEX IF NOT EXISTS {self.index("executions_claim")}
@@ -174,7 +185,9 @@ class Tables:
                 dedup_digest     bytea,
                 result           bytea,
                 last_error       text,
-                claim_token      text
+                claim_token      text,
+                runs_after       text COLLATE "C",
+                waiting_on       text COLLATE "C"
             ) WITH (
                 fillfactor = 85,
                 autovacuum_vacuum_scale_factor = 0.01,
@@ -184,6 +197,9 @@ class Tables:
                 autovacuum_vacuum_cost_delay = 1
             )
             """,
+            f'ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS runs_after text COLLATE "C"',
+            f'ALTER TABLE {jobs} ADD COLUMN IF NOT EXISTS waiting_on text COLLATE "C"',
+            f"ALTER TABLE {jobs} ALTER COLUMN waiting_on SET (n_distinct = -1)",
             indexes["jobs_claim"],
             indexes["jobs_by_status"],
             indexes["jobs_by_queue"],
@@ -191,6 +207,7 @@ class Tables:
             indexes["jobs_dedup"],
             indexes["jobs_held"],
             indexes["jobs_running_by_task"],
+            indexes["jobs_waiting"],
             self.statistics()["jobs_queue"],
             f"""
             CREATE TABLE IF NOT EXISTS {executions} (
@@ -236,6 +253,7 @@ class Tables:
             ALTER TABLE {self.jobs}
                 {dropped}ADD CONSTRAINT {self.status_check} CHECK ({STATUSES})
             """,
+            f"ANALYZE {self.jobs} (waiting_on)",
             f"UPDATE {self.meta} SET value = '{SCHEMA_VERSION}' WHERE key = 'schema_version'",
         )
 
@@ -247,6 +265,11 @@ class Tables:
             f"""
             INSERT INTO {self.meta} (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
             ON CONFLICT (key) DO NOTHING
+            """,
+            f"""
+            INSERT INTO {self.meta} (key, value)
+            VALUES ('compatible_since', '{COMPATIBLE_SINCE}')
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value
             """,
             f"""
             INSERT INTO {self.meta} (key, value) VALUES ('last_purge_at', '0')

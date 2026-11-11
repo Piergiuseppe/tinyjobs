@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import hashlib
 import inspect
+import json
 import logging
 import math
 import re
@@ -51,7 +52,13 @@ from ...clock import Clock, FollowingClock, elapsed
 from ...deadlines import final_left
 from ...deadlines import left as _left
 from ...deadlines import until
-from ...exceptions import ConfigurationError, UnsupportedCapabilityError
+from ...exceptions import (
+    AppClosedError,
+    ConfigurationError,
+    JobNotFoundError,
+    UnsupportedCapabilityError,
+)
+from ...following import PARENT_MISSING_MESSAGE, refuse_parents_among
 from ...limits import Limit
 from ...models import (
     Execution,
@@ -71,7 +78,7 @@ from ..base import LEASE_EXPIRED_MESSAGE, BaseBackend, Capabilities
 from .audit import SETTINGS
 from .audit import audit as audit_settings
 from ..batching import AGAIN, Batches, Entry
-from .queries import NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
+from .queries import FOLLOWING, NOTICE_CHARACTERS, REFUSAL, Queries, queue_is
 from .records import (
     JOB_COLUMNS,
     dedup_digest,
@@ -80,7 +87,7 @@ from .records import (
     job_from_row,
     schedule_from_row,
 )
-from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, UPGRADABLE_VERSION, Tables
+from .schema import ARBITERS, INDEXES, SCHEMA_VERSION, STATISTICS, UPGRADABLE_VERSIONS, Tables
 
 DEFAULT_PREFIX = "tinyjobs"
 DEFAULT_MIN_CONNECTIONS = 1
@@ -349,6 +356,7 @@ class PostgresBackend(BaseBackend):
         result_ttl=True,
         loop_bound=True,
         limits=True,
+        after=True,
     )
 
     def __init__(
@@ -413,6 +421,8 @@ class PostgresBackend(BaseBackend):
         self._identity: tuple[Any, ...] | None = None
         self._compiling = False
         self._channel: str | None = None
+        self._releasing = False
+        self._beside = False
         self._statement_timeout = statement_timeout
         self._pool_timeout = pool_timeout
         self._opening: asyncio.Future[None] | None = None
@@ -493,7 +503,7 @@ class PostgresBackend(BaseBackend):
             complete = (
                 placed.tables == len(TABLE_KINDS)
                 and stored == SCHEMA_VERSION
-                and not await self._misplaced(connection, placed)
+                and (self._beside or not await self._misplaced(connection, placed))
             )
         if not complete:
             for attempt in range(SETUP_ATTEMPTS):
@@ -788,7 +798,8 @@ class PostgresBackend(BaseBackend):
             )
         cursor = await connection.execute(
             f"SELECT pg_catalog.string_agg(id, ', ' ORDER BY id) AS ids FROM {jobs} "
-            "WHERE dedup_digest IS NOT NULL AND status IN ('queued', 'held', 'running') "
+            "WHERE dedup_digest IS NOT NULL "
+            "AND status IN ('queued', 'held', 'waiting', 'running') "
             "GROUP BY dedup_digest HAVING pg_catalog.count(*) > 1 LIMIT 5",
             {},
         )
@@ -819,6 +830,8 @@ class PostgresBackend(BaseBackend):
             await self._lock_for_setup(connection)
             placed = await self._placed(connection)
             stored = await self._stored_version(connection, placed) if placed.meta else None
+            if stored is None and placed.tables:
+                stored = UPGRADABLE_VERSIONS[0]
             if stored is not None and stored > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"postgres schema version {stored} is newer than this tinyjobs "
@@ -826,7 +839,7 @@ class PostgresBackend(BaseBackend):
                 )
             if stored == SCHEMA_VERSION:
                 return
-            if stored == UPGRADABLE_VERSION:
+            if stored in UPGRADABLE_VERSIONS:
                 await connection.execute(UNTIMED_UPGRADE)
             for statement in placed.within.ddl(schema_missing=placed.schema_missing):
                 await connection.execute(statement, {})
@@ -836,7 +849,7 @@ class PostgresBackend(BaseBackend):
                     f"the tinyjobs tables for prefix {self._tables.prefix!r} changed while "
                     "setup created them; run setup again"
                 )
-            if stored == UPGRADABLE_VERSION:
+            if stored in UPGRADABLE_VERSIONS:
                 checks = await _fetch(
                     connection,
                     self._unplaced.status_checks,
@@ -1029,6 +1042,7 @@ class PostgresBackend(BaseBackend):
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         if not jobs:
             return []
+        refuse_parents_among(jobs)
         now = await self._now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
@@ -1048,7 +1062,33 @@ class PostgresBackend(BaseBackend):
                     raise
                 logger.warning("retrying a postgres enqueue after %s", error)
         await self._wake(due)
+        await self._settle_sent(stored, now)
         return _in_order(places, copies, len(jobs), stored)
+
+    async def _settle_sent(self, jobs: Sequence[Job], now: float) -> None:
+        waiting = {job.id: job for job in jobs if job.status is JobStatus.WAITING}
+        if not waiting:
+            return
+        try:
+            settled = await self._rows(
+                self._queries.settle_sent, self._at(now, ids=list(waiting))
+            )
+            if not settled[0]["settled"]:
+                return
+            await self._wake(set(json.loads(settled[0]["woken"])))
+            for row in await self._rows(self._queries.by_ids, {"ids": list(waiting)}):
+                placed = job_from_row(row)
+                job = waiting[placed.id]
+                job.status, job.run_at = placed.status, placed.run_at
+                job.finished_at, job.last_error = placed.finished_at, placed.last_error
+        except AppClosedError:
+            raise
+        except Exception as error:
+            logger.debug(
+                "could not look again at the jobs just sent after another (%s); "
+                "the reaper pass settles them",
+                str(error) or type(error).__name__,
+            )
 
     async def claim(
         self,
@@ -1372,10 +1412,33 @@ class PostgresBackend(BaseBackend):
         return [row["id"] for row in rows]
 
     async def complete(self, job: Job, result: bytes | None) -> bool:
-        return await self._outcome(
-            self._queries.complete,
-            await self._finishing(job, ExecutionStatus.SUCCESS, None, result=result),
+        answer: dict[str, Any] = {}
+        finishing = await self._finishing(
+            job, ExecutionStatus.SUCCESS, None, result=result, answer=answer
         )
+        if self._releasing:
+            changed = await self._outcome(self._queries.complete_releasing, finishing)
+        else:
+            changed = await self._outcome(self._queries.complete, finishing)
+            if answer.get("following") == "1":
+                self._releasing = True
+                if changed:
+                    answer = await self._release_children(job, finishing["now"])
+        await self._wake(set(json.loads(answer.get("woken", "[]"))))
+        return changed
+
+    async def _release_children(self, job: Job, now: float) -> dict[str, Any]:
+        try:
+            rows = await self._retrying(self._queries.release_children, self._at(now, id=job.id))
+        except Exception as error:
+            logger.warning(
+                "the jobs waiting on %s were not queued with it (%s); the next reaper pass "
+                "queues them",
+                job.id,
+                str(error) or type(error).__name__,
+            )
+            return {}
+        return rows[0]
 
     async def fail(
         self,
@@ -1421,6 +1484,7 @@ class PostgresBackend(BaseBackend):
 
     def _answered_by(self, entry: Entry, answer: Any) -> Any:
         if not isinstance(answer, BaseException):
+            _note_answer(entry.payload[1], answer[0])
             return int(answer[0]["changed"]) == 1
         if isinstance(answer, RETRIED_ERRORS) and entry.attempts < RETRIES:
             logger.warning("retrying a postgres statement after %s", answer)
@@ -1537,6 +1601,7 @@ class PostgresBackend(BaseBackend):
             self._queries.reap, self._at(now, message=LEASE_EXPIRED_MESSAGE)
         )
         await self._wake(set(rows[0]["queues"]))
+        await self._settle_waiting(now)
         if await self._rows(
             self._queries.claim_recount,
             {
@@ -1549,6 +1614,20 @@ class PostgresBackend(BaseBackend):
                 (self._queries.lock_limits,), self._queries.recount_limits, {}
             )
         return rows[0]["reaped"]
+
+    async def _settle_waiting(self, now: float) -> None:
+        try:
+            settled = await self._retrying(self._queries.settle_waiting, self._at(now))
+        except AppClosedError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "the jobs waiting on jobs that ended were not settled in this pass (%s); "
+                "the next one tries again",
+                str(error) or type(error).__name__,
+            )
+            return
+        await self._wake(set(json.loads(settled[0]["woken"])))
 
     async def _recounted(
         self, locks: tuple[str, ...], recount: str, parameters: dict[str, Any]
@@ -1814,6 +1893,7 @@ class PostgresBackend(BaseBackend):
                 raise _Elsewhere(identity)
             self._joined[connection] = True
             guards = uncompiled
+        refuse_parents_among(jobs)
         now = self._clock.now()
         due: set[str] = set()
         ordered, places, copies = _lock_order(jobs)
@@ -1907,8 +1987,14 @@ class PostgresBackend(BaseBackend):
         for _ in range(INSERT_ROUNDS):
             batch = [job for _, job in pending]
             parameters = dict(zip(JOB_COLUMNS, job_arrays(batch)))
-            rows = yield (queries.insert, self._at(now, **parameters), *guards)
+            following = any(job.after is not None for job in batch)
+            insert = queries.insert_after if following else queries.insert
+            if following:
+                parameters["flag"] = FOLLOWING + batch[0].id
+            rows = yield (insert, self._at(now, **parameters), *guards)
             guards = uncompiled
+            if following:
+                _place(batch, rows)
             inserted = {row["id"] for row in rows}
             due.update(row["queue"] for row in rows if row["due"])
             missing = [(index, job) for index, job in pending if job.id not in inserted]
@@ -1980,6 +2066,7 @@ class PostgresBackend(BaseBackend):
 
     async def _changed(self, query: str, parameters: dict[str, Any]) -> bool:
         rows = await self._retrying(query, parameters)
+        _note_answer(parameters, rows[0])
         return rows[0]["changed"] == 1
 
     async def _retrying(
@@ -2241,7 +2328,13 @@ class PostgresBackend(BaseBackend):
         self, connection: psycopg.AsyncConnection, placed: "_Placement"
     ) -> int | None:
         rows = await _fetch(connection, placed.queries.schema_version, {})
-        return int(rows[0]["value"]) if rows else None
+        if not rows:
+            return None
+        stored, since = int(rows[0]["value"]), rows[0]["compatible_since"]
+        self._beside = (
+            stored > SCHEMA_VERSION and since is not None and int(since) <= SCHEMA_VERSION
+        )
+        return SCHEMA_VERSION if self._beside else stored
 
     async def _now(self) -> float:
         clock = self._clock
@@ -2473,6 +2566,25 @@ def _started(transaction: psycopg.AsyncTransaction) -> bool:
     if status is None:
         return transaction._entered and not transaction._exited
     return status is type(transaction).Status.ACTIVE
+
+
+def _place(jobs: Sequence[Job], rows: Sequence[Mapping[str, Any]]) -> None:
+    for row in rows:
+        if row["orphan"] is not None:
+            raise JobNotFoundError(PARENT_MISSING_MESSAGE.format(after=row["orphan"]))
+    stored = {row["id"]: row for row in rows}
+    for job in jobs:
+        row = stored.get(job.id)
+        if row is not None and job.after is not None:
+            job.status = JobStatus(row["status"])
+            job.finished_at = row["finished_at"]
+            job.last_error = row["last_error"]
+
+
+def _note_answer(parameters: Mapping[str, Any], row: Mapping[str, Any]) -> None:
+    answer = parameters.get("answer")
+    if answer is not None:
+        answer.update(row)
 
 
 def _split(jobs: Sequence[Job]) -> bool:
