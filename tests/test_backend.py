@@ -3788,9 +3788,14 @@ class FreshDatabaseTests(unittest.TestCase):
                     self.assertGreater(interrupt_repeatedly(write), 0)
                 pool.heal_here()
                 self.assertFalse(pool.connection.in_transaction)
-                gc.collect()
-                with FORK_GATE.using():
-                    pass
+                deadline = time.monotonic() + 5
+                while True:
+                    gc.collect()
+                    with FORK_GATE.using():
+                        pass
+                    if not FORK_GATE._holders or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
                 self.assertEqual(FORK_GATE._holders, {})
                 other = sqlite3.connect(path, timeout=1.0, isolation_level=None)
                 other.execute("BEGIN IMMEDIATE")

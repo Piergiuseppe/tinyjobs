@@ -1247,10 +1247,13 @@ class EagerDatabaseTests(DjangoTestCase):
 
 class CommandTests(DjangoTestCase):
     def call(self, *arguments: str) -> str:
+        from unittest import mock
+
         from django.core.management import call_command
 
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        on_any_disk = mock.patch("tinyjobs.backends.sqlite.audit._mounts", return_value=[])
+        with contextlib.redirect_stdout(buffer), on_any_disk:
             call_command("tinyjobs", *arguments)
         return buffer.getvalue()
 
