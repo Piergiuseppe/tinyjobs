@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tinyjobs import TinyJobs
 from tinyjobs.exceptions import ConfigurationError
@@ -159,6 +160,31 @@ class FailureTests(IsolatedTestCase):
         job = await self.send(isolated.segfault)
         await self.settle(self.make_worker(), [job])
         self.assertIs(await self.status_of(job), JobStatus.FAILED)
+        self.assertIn("SIGSEGV", (await self.app.aget(job.id)).last_error)
+
+    async def test_a_signal_is_still_named_when_the_exit_status_arrives_late(self):
+        from tinyjobs.executors import process
+
+        real = process._Child._poll
+        held: dict[object, tuple[float, int]] = {}
+
+        def late(child) -> int | None:
+            popen = child._process._popen
+            if child not in held:
+                code = real(child)
+                if code is None:
+                    return None
+                held[child] = (time.monotonic() + 0.3, code)
+                popen.returncode = None
+            shown, code = held[child]
+            if time.monotonic() < shown:
+                return None
+            popen.returncode = code
+            return code
+
+        with mock.patch.object(process._Child, "_poll", late):
+            job = await self.send(isolated.segfault)
+            await self.settle(self.make_worker(), [job])
         self.assertIn("SIGSEGV", (await self.app.aget(job.id)).last_error)
 
     async def test_a_crash_is_retried_like_any_failure(self):
