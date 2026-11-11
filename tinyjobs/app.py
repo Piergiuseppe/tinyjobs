@@ -318,7 +318,11 @@ class TinyJobs:
                     if current is not None and not current[0].done():
                         current[0].set_result(None)
                     return attempt
-            await self._outcome(current[0])
+            try:
+                await self._outcome(current[0])
+            except AppClosedError:
+                if self._closed:
+                    raise
 
     async def _connect_on_own_loop(
         self, raw: Backend, attempt: concurrent.futures.Future
