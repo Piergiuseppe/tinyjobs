@@ -9,7 +9,7 @@ job = generate_pdf.enqueue(123)
 print(job.id)          # 01a061bf-c08a-738d-...
 
 job.refresh()          # updates this instance in place, and returns it
-job.status             # queued -> running -> success, or held while a limit stops it
+job.status             # queued -> running -> success; held by a limit, waiting on another job
 job.attempts           # 3, if it took three tries
 job.last_error         # 'ConnectionError: refused', when it failed
 
@@ -55,7 +55,7 @@ job, so `jobs show` still tells what happened. A result over the cap fails the j
 `ResultTooLarge` and is not retried, since the function ran and would produce the same result
 again; put the file in object storage and return its key.
 
-## Waiting
+## Waiting for a job
 
 If you want to block until a job is finished, `wait` polls for you:
 
@@ -74,6 +74,59 @@ The async twin is called `awaited` and not `await` for the boring reason that `a
 
 Waiting on a job from the request that created it means you did not need a background job. It is meant
 for scripts, tests and glue code.
+
+## One job after another
+
+A job can be told to run only once another has succeeded:
+
+```python
+report = build_report.enqueue(42)
+email_report.with_options(after=report).enqueue(42)
+```
+
+The second job is stored as `waiting`, where no worker can take it. When the first succeeds the
+store queues the second as it records the success. When the first fails for good or is cancelled,
+the store cancels the second and every job waiting behind it, and their `last_error` says so. On
+Postgres a job sent inside a transaction that was still open when the first one ended misses that
+step, as a few in a thousand do when both happen in the same instant, and the next reaper pass,
+`--reap-interval` apart, settles it instead. An attempt that failed and will be retried changes nothing: the jobs behind keep waiting
+for the last one.
+
+`after` takes the `Job` or its id, works on `app.send` and as `tinyjobs send --after` too, and
+combines with the other options. A
+`delay` still counts from when the job was sent, so a job whose time has passed runs as soon as the
+one before it is done. Any number of jobs can wait on the same job, and each can have jobs waiting
+on it, so a line or a tree is a few `enqueue` calls. A job waits on one job only: there is no
+"after all of these", and nothing to declare up front.
+
+The job before it has to be in the store already, or `enqueue` raises
+`tinyjobs.JobNotFoundError`. If it has succeeded by then, the new job is queued at once, and if it
+has failed or been cancelled the new job is stored as cancelled, so a job sent after a fast one is
+never lost to the race. The reaper pass that settles the Postgres case above is a worker's: where
+only `app.drain()` runs, such a job waits until a worker does.
+
+The second job gets nothing from the first. Send both what they need, or send the first one's id
+and read its result:
+
+```python
+@app.task(store_result=True)
+def build_report(account_id: int) -> str: ...
+
+
+@app.task
+def email_report(report_job: str) -> None:
+    path = app.get(report_job).result()
+
+
+report = build_report.enqueue(42)
+email_report.with_options(after=report).enqueue(report.id)
+```
+
+`jobs retry` puts a job back by the state of the job before it: queued if that one succeeded or is
+no longer in the store, waiting if it is in flight again, and refused while it is still failed or
+cancelled. So after a failure, retry the job that failed and then the ones behind it; retrying the
+first does not bring the others back by itself. `jobs cancel` on any job of the line cancels what
+waits behind it.
 
 ## Running a worker
 

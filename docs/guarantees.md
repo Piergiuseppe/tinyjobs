@@ -3,7 +3,9 @@
 What tinyjobs promises, on every backend, and how to see that it holds on yours.
 
 - A job that `enqueue` acknowledged runs until it succeeds or uses its attempts: a worker killed
-  outright leaves it to its lease, and the reaper returns it to the queue.
+  outright leaves it to its lease, and the reaper returns it to the queue. A job sent to run
+  [after another](jobs.md#one-job-after-another) is promised the same from the moment that one
+  succeeds, and is otherwise cancelled, on the record, with the reason.
 - A job finishing while its worker dies may run again, never be lost. The second run shows as a
   second execution, so an idempotent task makes the whole thing effectively once.
 - Cron fires once per due time from any number of workers, a deduplication key refuses a second

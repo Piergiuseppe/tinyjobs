@@ -18,5 +18,12 @@ A backend that enforces [limits](limits.md) declares `limits` in its capabilitie
 on `claim`, and implements `release_held(tasks=, queues=)`, which returns the held jobs of the tasks
 named, in the queues named or in every queue, to the queue; the contract tests for
 them are skipped without the capability, and a worker or a drain whose app registers a limited task
-refuses such a backend at start. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130
+refuses such a backend at start. A backend that keeps [a job waiting on another](jobs.md#one-job-after-another)
+declares `after`: it places a job whose `after` names a parent by that parent's status when it is
+inserted, raising `JobNotFoundError` for a parent it does not hold; it queues the waiting children
+of a job as it completes it and cancels every waiting descendant of a job that fails
+for good or is cancelled; `requeue` asks the parent again; and a waiting job holds its dedup key, which a job placed
+cancelled does not, and stays out of the queued figures of `stats`. Without the capability `after=`
+raises at enqueue and those contract tests are skipped; one of them cancels a job with 4,000 jobs
+waiting on it within `wide_cancel_seconds`, one second unless the test class sets another. `tests/test_async_backend.py` implements a minimal in-memory backend in about 130
 lines if you want a template.

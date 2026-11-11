@@ -35,8 +35,8 @@ started the last job of a rate-limited task claims again when its interval ends,
 that registers such a task polls at least as often as the shortest interval among its tasks, so a
 backlog drains at the rate asked for.
 
-Held jobs are waiting jobs: `tinyjobs stats`, the dashboard overview, the metrics and
-`tinyjobs check --max-wait` count them with the queued ones, so a backlog stuck behind a saturated
+Held jobs count as queued: the oldest due job in `tinyjobs stats`, the per-task figures of the
+dashboard and the metrics, and `tinyjobs check --max-wait` count them with the queued ones, so a backlog stuck behind a saturated
 task is reported like any other.
 
 ## What the limits mean exactly

@@ -17,7 +17,7 @@ tinyjobs purge --app tasks:app --before 30d --dry-run
 
 Every worker checks whether a sweep is due, and exactly one of them wins, because claiming the sweep
 is a single conditional `UPDATE` on a marker row. So running forty workers still means one sweep per
-interval, with no leader to elect. Queued, held and running jobs are never touched at any horizon, and each
+interval, with no leader to elect. Queued, held, waiting and running jobs are never touched at any horizon, and each
 sweep deletes in small batches, so it never holds the write lock long enough to stall a claim. A
 sweep that reaches its cap of 50,000 jobs goes straight on with another, so pruning keeps up with
 any rate a queue finishes jobs at.
