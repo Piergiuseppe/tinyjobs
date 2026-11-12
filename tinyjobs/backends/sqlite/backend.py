@@ -27,6 +27,7 @@ from ...exceptions import (
     AppClosedError,
     ConfigurationError,
     JobNotFoundError,
+    NewerStoreError,
     UnsupportedCapabilityError,
 )
 from ...following import (
@@ -529,7 +530,7 @@ class SQLiteBackend(BaseBackend):
 
     def _refuse_newer(self, connection: Any, stored: int) -> None:
         if not self._works_on(connection, stored):
-            raise RuntimeError(
+            raise NewerStoreError(
                 f"database schema version {stored} is newer than this tinyjobs "
                 f"build understands ({SCHEMA_VERSION}); upgrade the package"
             )

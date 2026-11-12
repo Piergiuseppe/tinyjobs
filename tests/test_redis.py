@@ -14,7 +14,7 @@ from unittest import mock
 
 import tinyjobs.clock
 from tinyjobs import JobStatus, TinyJobs
-from tinyjobs.exceptions import AppClosedError, ConfigurationError
+from tinyjobs.exceptions import AppClosedError, ConfigurationError, NewerStoreError
 from tinyjobs.limits import Limit
 from tinyjobs.runtime import run_on
 from tinyjobs.status import ExecutionStatus
@@ -225,10 +225,10 @@ class RedisContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         since = self.backend._keys("compatible_since")
         await self.backend._client.set(version, SCHEMA_VERSION + 1)
         await self.backend._client.set(since, SCHEMA_VERSION + 1)
-        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+        with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
             await self.backend.setup()
         await self.backend._client.delete(since)
-        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+        with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
             await self.backend.setup()
         self.assertEqual(
             int(await self.backend._client.get(version)), SCHEMA_VERSION + 1

@@ -49,6 +49,10 @@ class UnsupportedCapabilityError(TinyJobsError):
     pass
 
 
+class NewerStoreError(TinyJobsError, RuntimeError):
+    pass
+
+
 class JobNotFoundError(TinyJobsError):
     pass
 

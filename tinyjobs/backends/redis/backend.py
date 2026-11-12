@@ -23,7 +23,12 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...clock import Clock, FollowingClock, elapsed
-from ...exceptions import AppClosedError, ConfigurationError, JobNotFoundError
+from ...exceptions import (
+    AppClosedError,
+    ConfigurationError,
+    JobNotFoundError,
+    NewerStoreError,
+)
 from ...following import PARENT_MISSING_MESSAGE, refuse_parents_among
 from ...limits import Limit
 from ...models import (
@@ -155,7 +160,7 @@ class RedisBackend(BaseBackend):
     async def setup(self) -> None:
         stored, since = map(int, await self._run("schema", SCHEMA_VERSION, COMPATIBLE_SINCE))
         if stored > SCHEMA_VERSION and since > SCHEMA_VERSION:
-            raise RuntimeError(
+            raise NewerStoreError(
                 f"redis schema version {stored} is newer than this tinyjobs "
                 f"build understands ({SCHEMA_VERSION}); upgrade the package"
             )
