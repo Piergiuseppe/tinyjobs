@@ -61,7 +61,7 @@ number, so a loss cannot hide behind a send that failed after the store had take
 enqueued twice is caught. `--duration`, `--rate`, `--workers`, `--slots`, `--kill-every`,
 `--lease` and `--settle` set the load, with `--settle` above `--lease` plus the 1 s reap interval
 since a killed job comes back when its lease ends, and sized to twice the lease when only
-`--lease` is raised, `--prefix` the namespace on Redis and Postgres, and `--keep` leaves the
+`--lease` is raised, `--prefix` the namespace in the store, and `--keep` leaves the
 finished jobs in the store for `tinyjobs jobs` and the dashboard instead of purging them. It
 refuses an in-memory store, since the workers could not share it, and a store that holds other
 jobs, and purges its own at the end, leaving only the store's schema rows behind, unless other

@@ -74,8 +74,10 @@ tinyjobs_jobs_total{task="tasks.generate_pdf",outcome="success"} 1842
 tinyjobs_job_duration_seconds_bucket{task="tasks.generate_pdf",le="0.5"} 1790
 tinyjobs_jobs_running{task="tasks.generate_pdf"} 2
 tinyjobs_store_jobs{queue="default",status="queued"} 14
+tinyjobs_store_queued_jobs{task="tasks.generate_pdf"} 14
 tinyjobs_store_oldest_due_seconds{queue="default"} 0.8
 tinyjobs_store_expired_leases 0
+tinyjobs_info{version="0.18.0"} 1
 ```
 
 The counters, the duration histogram and the running gauge are this process's, fed by the job

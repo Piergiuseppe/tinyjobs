@@ -24,3 +24,19 @@ export TINYJOBS_REDIS_URL=redis://localhost:6379/0
 export TINYJOBS_POSTGRES_URL=postgresql://postgres:tinyjobs@localhost:5432/postgres
 python -m unittest discover -s tests -t .
 ```
+
+One test needs another release. `tests/test_upgrade.py` lets the previous release create a store and
+fill it, opens it with this one, and then has both send, run and read each other's jobs, four
+processes draining at once at the end, on SQLite and on whichever of Postgres and Redis is set.
+Where this release says the previous one cannot work beside it, the test expects the older process
+to be refused and the jobs it left to run. It skips unless it is told where the previous release is,
+the newest one below the version in `tinyjobs/__init__.py`, `<0.18` here:
+
+```bash
+python -m venv .venv-previous
+.venv-previous/bin/pip install 'tinyjobs[redis,postgres]<0.18'
+TINYJOBS_PREVIOUS_PYTHON=$PWD/.venv-previous/bin/python python -m unittest tests.test_upgrade
+```
+
+The workflow runs it on every pull request, push to main and release tag, against the release before
+the one in the tree.

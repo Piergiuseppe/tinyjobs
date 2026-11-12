@@ -42,7 +42,7 @@ task is reported like any other.
 ## What the limits mean exactly
 
 - The running count is the jobs of the task in the `running` status, so a job whose worker died
-  counts until its lease expires and the reaper returns it to the queue, within `--lease-seconds`.
+  counts until its lease expires and the reaper returns it to the queue, within `--lease`.
   The other way round, a synchronous job that outlives its `timeout=` is recorded as failed while
   its thread runs on, and the room it took is free again; a task that must never run past its cap
   wants `isolated=True` or an async body, which a timeout does stop.

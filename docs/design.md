@@ -527,11 +527,11 @@ exhausted, this job is dead. That distinction is why a separate `RETRYING` job s
 query today; retrofitting it means migrating a live table later. Semantics: cancelling a `QUEUED` job
 prevents it from ever being claimed. Cancelling a `RUNNING` job sets the flag and stops future
 retries. The in-flight attempt is *not* killed, because Python cannot safely interrupt arbitrary
-code. Async tasks may cooperate by checking `job.is_cancelled()`.
+code. An attempt that finishes after the cancellation cannot report: the store refuses its outcome.
 
 ### Execution status
 
-`RUNNING → SUCCESS | FAILED | TIMEOUT | LOST`
+`RUNNING → SUCCESS | FAILED | TIMEOUT | LOST | CANCELLED`
 
 `LOST` is what the reaper writes when a lease expires: we know the attempt started, we will never
 know how it ended. Keeping it distinct from `FAILED` matters: a spike in `LOST` means workers are
@@ -613,16 +613,16 @@ Plain JSON is too thin: no `datetime`, no `Decimal`, no `UUID`. So the default c
 tagged-value convention, roughly 60 lines of standard library:
 
 ```python
-{"$t": "datetime", "v": "2026-08-31T17:34:00+02:00"}
-{"$t": "decimal",  "v": "19.99"}
-{"$t": "uuid",     "v": "..."}
-{"$t": "set",      "v": [1, 2, 3]}
-{"$t": "bytes",    "v": "<base64>"}
+{"$t": "datetime", "$v": "2026-08-31T17:34:00+02:00"}
+{"$t": "decimal",  "$v": "19.99"}
+{"$t": "uuid",     "$v": "..."}
+{"$t": "set",      "$v": [1, 2, 3]}
+{"$t": "bytes",    "$v": "<base64>"}
 ```
 
 Covered out of the box: `str`, `int`, `float`, `bool`, `None`, `list`, `dict`, `tuple`, `set`,
-`frozenset`, `bytes`, `datetime`, `date`, `time`, `timedelta`, `Decimal`, `UUID`, `Path`, `Enum`, and
-`Path`. Anything whose reconstruction needs a class (a `@dataclass`, an `Enum`, a domain object)
+`frozenset`, `bytes`, `datetime`, `date`, `time`, `timedelta`, `Decimal`, `UUID` and `Path`.
+Anything whose reconstruction needs a class (a `@dataclass`, an `Enum`, a domain object)
 must be **registered**, and this is a deliberate refusal rather than a gap:
 
 ```python
@@ -690,15 +690,14 @@ class Backend(Protocol):
     async def claim(self, *, worker_id: str, queues: Sequence[str],
                     limit: int, lease_seconds: float,
                     limits: Mapping[str, Limit] | None = None) -> list[Job]: ...
-    async def claim_job(self, job_id: str, *, worker_id: str,
-                        lease_seconds: float) -> Job | None: ...
     async def heartbeat(
         self, job_ids: Sequence[str], lease_seconds: float, worker_id: str | None = None
-    ) -> None: ...
+    ) -> Collection[str] | None: ...             # the ids whose lease it renewed
     async def complete(self, job: Job, result: bytes | None) -> bool: ...
     async def fail(self, job: Job, error: ExecutionError, retry_at: float | None,
                    execution_status: ExecutionStatus = ExecutionStatus.FAILED) -> bool: ...
     async def release(self, job: Job, delay: float = 0.0) -> bool: ...
+    async def release_many(self, jobs: Sequence[Job]) -> int: ...
     async def hand_back(self, job: Job, delay: float = 0.0) -> bool: ...
     async def release_held(self, tasks: Collection[str],
                            queues: Sequence[str] | None = None) -> int: ...
@@ -722,15 +721,41 @@ class Backend(Protocol):
     # --- housekeeping -----------------------------------------------------
     async def reap_expired(self) -> int: ...
     async def purge(self, policy: RetentionPolicy, now: float) -> int | None: ...
+    async def expire_results(self, task: str, ttl: float, now: float,
+                             batch: int = 500, since: float = 0.0) -> int: ...
 ```
+
+`BaseBackend` gives defaults for `setup`, `close`, `enqueue_many`, `hand_back`, `release_many`,
+`release_held`, `purge`, `expire_results` and the three schedule methods, so a store writes the
+other fourteen. It also defines `follow_clock`, which a store that reads its own server's time
+overrides. Beside the protocol the core looks for a few names a store may leave out, and does
+without them:
+
+- `claim_job(job_id, *, worker_id, lease_seconds)`, which lets an eager call run the one job it
+  sent;
+- `wait_for_jobs`, which lets a worker sleep until a job arrives instead of polling;
+- `transient_errors`, a tuple of the store's own exceptions that mean an outage, through which a
+  worker keeps retrying a job's outcome instead of losing it;
+- `reserve`, which tells a pooled store how many jobs a worker runs and returns, as a whole number
+  of at least 1, how many rounds of hand-backs the worker should allow for when it stops, and
+  `spare`, which has the store size its pool to what was reserved;
+- `audit()`, which answers `tinyjobs check`;
+- `refuse_held_transaction`, with which SQLite refuses a write made while the caller holds a
+  transaction on the same file;
+- for a store that declares `transactional_enqueue`, `enqueue_in(tx, jobs)` and
+  `aenqueue_in(tx, jobs)`.
+
+These are found by name, not declared, and they are the part of this seam most likely to change
+before 1.0 (see [Compatibility](compatibility.md)).
 
 `enqueue_many` earns its place as a distinct method rather than a loop in the core, because **the
 transaction boundary is the optimization**. A thousand separate `enqueue` calls on SQLite means a
-thousand fsyncs; the same thousand inside one transaction means one, which is two orders of magnitude.
-Redis backends will want pipelining, Postgres a multi-row `INSERT`. None of that is reachable if the
-core does the looping. And since the protocol freezes at v1.0, a seam that is not there at v1.0 cannot
-be added later, so it goes in now, with a default implementation in `BaseBackend` (a loop over
-`enqueue()`) so that simple backends get the correct behaviour for free.
+thousand fsyncs; the same thousand inside one transaction means one, which is two orders of
+magnitude. Redis backends will want pipelining, Postgres a multi-row `INSERT`. None of that is
+reachable if the core does the looping. After v1.0 a new method could only arrive with a default, so
+it goes in now, with a default implementation in `BaseBackend` (a loop over `enqueue()`), so that
+simple backends get the correct behaviour for free and the bundled stores override it from the
+start.
 
 `claim_job` claims one job by its id, only while it is queued and due, which is how an eager call
 runs the job it sent and no other (see [Testing](#testing)). It is optional: without it an eager
@@ -798,19 +823,23 @@ Not every store can do everything. A Redis list has no cheap priority ordering, 
 Backends declare what they support so the core can degrade predictably instead of failing at runtime:
 
 ```python
-class Capabilities(NamedTuple):
-    priority: bool
-    delayed: bool
-    dedup: bool
-    transactional_enqueue: bool
-    retention: bool
-    schedules: bool
-    max_payload_bytes: int | None
-    loop_bound: bool
-    result_ttl: bool
-    limits: bool
-    after: bool
+@dataclass(frozen=True, slots=True)
+class Capabilities:
+    priority: bool = True
+    delayed: bool = True
+    dedup: bool = False
+    transactional_enqueue: bool = False
+    retention: bool = False
+    schedules: bool = False
+    max_payload_bytes: int | None = None
+    loop_bound: bool = False
+    result_ttl: bool = False
+    limits: bool = False
+    after: bool = False
 ```
+
+A store names only what differs from the defaults, so a capability added later leaves it as it was.
+`max_payload_bytes` is declared and not yet enforced by the core.
 
 Requesting an unsupported feature raises at *enqueue* time with a clear message, not silently later.
 `limits` says the store enforces a task's `concurrency=` and `rate=` at the claim, which then takes
@@ -830,8 +859,12 @@ dependency-free:
 ```toml
 # in tinyjobs-redis's pyproject.toml
 [project.entry-points."tinyjobs.backends"]
-redis = "tinyjobs_redis:RedisBackend"
+redis = "tinyjobs_redis:RedisBackend.from_url"
 ```
+
+The entry point names a factory, which the app calls as `factory(url, clock=clock, **options)`:
+the URL it was given, the app's clock, which the store reads instead of `time.time()`, and the
+keyword options passed to `TinyJobs`.
 
 The user's side of the swap, in full:
 
@@ -840,10 +873,13 @@ app = TinyJobs("sqlite:///jobs.db")     # before
 app = TinyJobs("redis://localhost/0")   # after
 ```
 
-The URL scheme selects the backend. The core package never imports, references or knows the names of
-optional backends; it looks up the scheme in the entry point group and raises a helpful error
-if nothing is registered for it. Bundled: `sqlite://`, `memory://`, `redis://` behind the `redis`
-extra and `postgres://` behind the `postgres` extra, each client imported only when its URL is used.
+The URL scheme selects the backend. A scheme the package does not bundle is looked up in the entry
+point group, with a helpful error if nothing is registered for it. A few answers still come from the
+bundled schemes only, such as which stores Django can join a transaction on, which are shared
+between processes, and which get a connection pool of their own in `worker.run()` and may run more
+than one loop; a plugin cannot give them yet. Bundled: `sqlite://`, `memory://`, `redis://` behind
+the `redis` extra and `postgres://` behind the `postgres` extra, each client imported only when its
+URL is used.
 
 ---
 
@@ -1063,29 +1099,29 @@ are the reason the backend seam exists.
 
 ## The Redis backend
 
-Bundled rather than a separate `tinyjobs-redis` package: until the protocol freezes at v1.0, a change
-to it would otherwise need two releases in lockstep. It depends on nothing but the public protocol, so
-it can move out later without touching a line. The client library is an extra, `tinyjobs[redis]`, and
-is imported only when a `redis://` URL is used, so the core stays dependency-free. A url redis-py
-cannot read raises `ConfigurationError`, without its reason once the url holds a password, since
-that reason may quote part of it. So does a connection option the client does not take, named
-unless the url holds a password, before the host or as a `password=` option: a raw `?` in the
-password made the rest of the url such an option, which redis-py raised at the first command as a
-`TypeError` quoting the password, and a raw `&` in a `password=` value made the part after it one.
-A `unix://` url whose socket path holds an `@` behind a password is refused too, since redis-py
-took the rest of the password for the path and quoted it when the connection failed. So are
-`decode_responses`, which broke every call, and a `timeout=` that is not a number, which redis-py
-5.0 kept as text and failed every call with; one that is a number is read as one. So are the
-client's own retries (`retry` with any retries, `retry_on_timeout`, `retry_on_error`), on the url
-or as keywords. A client handed in, redis-py 8's default included, gives tinyjobs its settings,
-not its connections: tinyjobs opens its own pool from them with no retries and leaves the client as
-it was, since redis-py keeps the retry on each connection and pinning a shared pool would take the
-retries from other code using it. A call sent again after its answer was lost runs its script twice,
-so one enqueue counted two `queued` jobs and the `complete`
+Bundled rather than a separate `tinyjobs-redis` package: until the protocol stops changing
+incompatibly at v1.0, a change to it would otherwise need two releases in lockstep. It depends on
+nothing but the public protocol, so it can move out later without touching a line. The client
+library is an extra, `tinyjobs[redis]`, and is imported only when a `redis://` URL is used, so the
+core stays dependency-free. A url redis-py cannot read raises `ConfigurationError`, without its
+reason once the url holds a password, since that reason may quote part of it. So does a connection
+option the client does not take, named unless the url holds a password, before the host or as a
+`password=` option: a raw `?` in the password made the rest of the url such an option, which
+redis-py raised at the first command as a `TypeError` quoting the password, and a raw `&` in a
+`password=` value made the part after it one. A `unix://` url whose socket path holds an `@` behind
+a password is refused too, since redis-py took the rest of the password for the path and quoted it
+when the connection failed. So are `decode_responses`, which broke every call, and a `timeout=` that
+is not a number, which redis-py 5.0 kept as text and failed every call with; one that is a number is
+read as one. So are the client's own retries (`retry` with any retries, `retry_on_timeout`,
+`retry_on_error`), on the url or as keywords. A client handed in, redis-py 8's default included,
+gives tinyjobs its settings, not its connections: tinyjobs opens its own pool from them with no
+retries and leaves the client as it was, since redis-py keeps the retry on each connection and
+pinning a shared pool would take the retries from other code using it. A call sent again after its
+answer was lost runs its script twice, so one enqueue counted two `queued` jobs and the `complete`
 sent again found the job no longer running, returned false and left the counts at one `queued` and
 one `success`. Refusing them is simpler than making every script safe to run twice, and tinyjobs
-already recovers a lost answer itself: outcomes are written again only after checking the claim,
-and a lost claim is handed back by its token.
+already recovers a lost answer itself: outcomes are written again only after checking the claim, and
+a lost claim is handed back by its token.
 
 On Python 3.12 a command written to a connection the server had reset raised asyncio's
 `TypeError: 'NoneType' object is not callable`, a bug fixed in 3.13, so a job whose outcome met it
@@ -3445,28 +3481,30 @@ should be benchmarked honestly before anyone opens a `.c` file.
 
 **v0.1, the core loop**
 Task registry, `task.enqueue()` with signature validation, `app.send()` by name, SQLite backend with
-the atomic partial-index claim, single worker, sync and async executors, retries with backoff, JSON
-codec, `tinyjobs worker`, `tinyjobs jobs`.
+the atomic partial-index claim, leases and the reaper, a worker with sync and async executors and a
+graceful shutdown, retries with backoff, queues, priorities, delayed jobs and deduplication keys,
+the JSON codec, `tinyjobs worker`, `tinyjobs jobs`, and the backend plugin seam.
 
-**v0.2, time**
-Cron schedules, `run_at` / delayed jobs, the embedded leader-free scheduler, misfire and overlap
-policies, timezone and DST handling.
+**v0.1.1 and v0.2, results**
+`Job.refresh()`, `Job.result()` and `Job.wait()`.
 
-**v0.3, production shape**
-Leases and the reaper, graceful shutdown, multi-queue routing, priorities, deduplication keys,
-lifecycle hooks, retention and automatic purge.
+**v0.3, retention**
+Finished jobs pruned automatically, and `tinyjobs purge`.
 
-**v0.4, comfort**
-Result storage, `memory://` backend and the conformance suite, eager and drain test modes,
+**v0.4, time and comfort**
+Cron schedules with the embedded leader-free scheduler, misfire and overlap policies, timezone and
+DST handling; lifecycle hooks; the `memory://` backend, eager and drain test modes;
 `tinyjobs stats` / `check`.
 
-**v0.5 to v0.6, integrations**
-FastAPI and Starlette lifespans with an embedded worker, the `django.tasks` backend and
-`manage.py tinyjobs`, the backend plugin seam and its contract suite.
+**v0.5, Redis**
+A Redis backend on Lua scripts, and the contract suite every backend runs.
 
-**v0.7, Redis**
-A Redis backend on Lua scripts, with per-claim tokens, batched outcomes, scripts reloaded when the
-server loses them, and the server's clock followed instead of the worker's.
+**v0.6, FastAPI**
+FastAPI and Starlette lifespans with an embedded worker.
+
+**v0.7, Django**
+The `django.tasks` backend and `manage.py tinyjobs`. On Redis, the server's clock followed instead
+of each machine's.
 
 **v0.8, Postgres**
 A Postgres backend with `LISTEN`/`NOTIFY` wake-ups, enqueue inside the caller's transaction, also
@@ -3513,11 +3551,20 @@ the backend in the job process.
 **v0.17, one job after another**
 `after=job`: a job waits, in a status of its own, until another has succeeded, and is cancelled
 with everything behind it when that one fails. The store settles it in the step that ends the
-parent. With it, `compatible_since`, so that later upgrades need no stop.
+parent. With it, `compatible_since`, so that later upgrades between neighbouring minors need no
+stop.
+
+**v0.18, settling**
+No feature. A changelog and a [compatibility page](compatibility.md) that says what is public and
+what a release may change; the exceptions and return types a caller meets exported from the
+package; `NewerStoreError` for a store too new; the in-memory template backend made to pass the
+contract; and a release check that upgrades a store of the release before and shares it between
+the two versions.
 
 **v1.0, commitment**
-Frozen backend protocol, documented plugin API, migration tooling, full documentation. After this the
-protocol is a compatibility promise.
+A backend protocol that changes only compatibly, a documented plugin API, full documentation. After
+this the protocol is a compatibility promise. [Compatibility](compatibility.md) lists what has to be
+true of the protocol and of the public surface first.
 
 **Beyond**
 Joining a SQLAlchemy session's transaction, designed against a real application rather than against a

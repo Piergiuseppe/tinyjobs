@@ -84,5 +84,8 @@ Upgrading from 0.6: stop every 0.6 worker before starting 0.7. The first 0.7 pro
 store, and from then on a 0.6 process refuses to start against it. 0.7 also needs Python 3.12 or
 newer.
 
+[Compatibility](compatibility.md) says what a release may change, and the
+[changelog](https://github.com/Piergiuseppe/tinyjobs/blob/main/CHANGELOG.md) what each one did.
+
 The [design notes](design.md) explain the design and why it looks like this, including the parts not
 built yet.

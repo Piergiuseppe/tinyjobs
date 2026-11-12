@@ -40,6 +40,7 @@ Homepage = "https://github.com/Piergiuseppe/tinyjobs"
 Documentation = "https://tinyjobs.readthedocs.io/"
 Repository = "https://github.com/Piergiuseppe/tinyjobs"
 Issues = "https://github.com/Piergiuseppe/tinyjobs/issues"
+Changelog = "https://github.com/Piergiuseppe/tinyjobs/blob/main/CHANGELOG.md"
 
 [project.scripts]
 tinyjobs = "tinyjobs.cli:run"

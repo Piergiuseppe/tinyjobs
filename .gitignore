@@ -6,6 +6,7 @@ dist/
 uv.lock
 
 .venv/
+.venv-previous/
 venv/
 
 *.db

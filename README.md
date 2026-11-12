@@ -201,6 +201,8 @@ Everything else is at https://tinyjobs.readthedocs.io/:
   [How it works](https://tinyjobs.readthedocs.io/en/latest/how-it-works/),
   [Measured](https://tinyjobs.readthedocs.io/en/latest/measured/),
   [Status](https://tinyjobs.readthedocs.io/en/latest/status/),
+  [Compatibility](https://tinyjobs.readthedocs.io/en/latest/compatibility/),
+  [Changelog](https://github.com/Piergiuseppe/tinyjobs/blob/main/CHANGELOG.md),
   [Design notes](https://tinyjobs.readthedocs.io/en/latest/design/)
 
 Young, working and measured: [Status](https://tinyjobs.readthedocs.io/en/latest/status/) lists
