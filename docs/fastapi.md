@@ -28,19 +28,20 @@ async def lifespan(api: FastAPI):
         yield
 ```
 
-The process exits within `shutdown_timeout` (30 s), or 1.25 s when that is shorter, so that releasing
-still has its second: a last moment, half a second at most, is kept for closing connections, and of
-the rest running jobs and a claim still in flight get the first three quarters and releasing what is
-still running the last, one second at least; a second Ctrl-C under a server does not cut it short.
-Under `tinyjobs worker` it does: running jobs are cancelled and go back to the queue at once, even
-when one blocks the event loop; a job that swallows every interrupt makes the process exit a second
-later with status 130, leaving its job to the reaper. A `def` job whose
+The process exits within `shutdown_timeout` (30 s), or 1.25 s when that is shorter, so that
+releasing still has its second: a last moment, half a second at most, is kept for closing
+connections, and of the rest running jobs and a claim still in flight get the first three quarters
+and releasing what is still running the last, one second at least; a second Ctrl-C under a server
+does not cut it short. Under `tinyjobs worker` it does: running jobs are cancelled and go back to
+the queue at once, even when one blocks the event loop; a job that swallows every interrupt makes
+the process exit a second later with status 130, leaving its job to the reaper. A `def` job whose
 thread is still running is not released; the worker waits for it and records its outcome within a
 quarter of the timeout, one second at least, after the thread returns. Keep it under your
-orchestrator's grace period: `docker stop` allows 10 s, and past it the process is killed and its jobs
-wait out their leases instead of going straight back to the queue. A worker that cannot reach its
-backend when it starts, or whose setup fails, exits with status 1 as RQ does, so let the orchestrator
-restart it.
+orchestrator's grace period: `docker stop` allows 10 s, and past it the process is killed and its
+jobs wait out their leases instead of going straight back to the queue. Under `tinyjobs worker`, a
+worker that cannot reach its backend when it starts, or whose setup fails, exits with a status other
+than 0, so let the orchestrator restart it: 2 for an error tinyjobs raises itself, such as a
+configuration or a store it refuses, and 1 for any other.
 
 Starlette takes the same `lifespan`. Leave out `worker=True` and the server only enqueues, with
 `tinyjobs worker --app tasks:app` running the jobs elsewhere.

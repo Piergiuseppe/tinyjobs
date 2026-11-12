@@ -41,6 +41,7 @@ nav:
       - How it works: how-it-works.md
       - Measured: measured.md
       - Status: status.md
+      - Compatibility: compatibility.md
   - Project:
       - Working on it: working-on-it.md
       - Tests: tests.md
