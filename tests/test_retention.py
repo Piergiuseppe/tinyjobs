@@ -5,7 +5,7 @@ import shutil
 import unittest
 
 from tinyjobs import TinyJobs
-from tinyjobs.exceptions import ConfigurationError
+from tinyjobs.exceptions import ConfigurationError, NewerStoreError
 from tinyjobs.retention import KEEP_EVERYTHING, RetentionPolicy
 from tinyjobs.status import JobStatus
 
@@ -516,7 +516,7 @@ class MigrationTests(unittest.TestCase):
             finally:
                 await app.aclose()
 
-        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+        with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
             asyncio.run(open_it())
         handle = sqlite3.connect(path)
         tables = [row[0] for row in handle.execute("SELECT name FROM sqlite_master")]

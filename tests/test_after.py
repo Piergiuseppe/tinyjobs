@@ -15,7 +15,12 @@ from tinyjobs.backends.base import Capabilities
 from tinyjobs.backends.sqlite.schema import COMPATIBLE_SINCE, SCHEMA_VERSION
 from tinyjobs.cli import main
 from tinyjobs.dashboard.core import Dashboard, Request
-from tinyjobs.exceptions import JobNotFoundError, UnsupportedCapabilityError, WaitTimeout
+from tinyjobs.exceptions import (
+    JobNotFoundError,
+    NewerStoreError,
+    UnsupportedCapabilityError,
+    WaitTimeout,
+)
 from tinyjobs.metrics import _store_lines
 from tinyjobs.following import AFTER_MESSAGE, PARENT_ENDED_MESSAGE, parent_id
 from tinyjobs.testing.contract import make_job
@@ -455,9 +460,24 @@ class StoreVersionTests(unittest.TestCase):
             prepare()
             app = TinyJobs(f"sqlite:///{self.database}")
             self.addCleanup(app.close)
-            with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+            with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
                 app.start()
         self.assertEqual(self.meta(), {"schema_version": newer})
+
+    def test_a_command_on_a_newer_file_says_so_and_leaves_with_a_usage_status(self):
+        self.opened().close()
+        self.sql(
+            "UPDATE tinyjobs_meta SET value = ? "
+            "WHERE key IN ('schema_version', 'compatible_since')",
+            str(SCHEMA_VERSION + 1),
+        )
+        app = TinyJobs(f"sqlite:///{self.database}")
+        self.addCleanup(app.close)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(main(["stats"], app=app), 2)
+        self.assertRegex(errors.getvalue(), r"^error: database schema version \d+ is newer")
+        self.assertNotIn("Traceback", errors.getvalue())
 
 
 if __name__ == "__main__":

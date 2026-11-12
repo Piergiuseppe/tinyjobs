@@ -21,7 +21,7 @@ import tinyjobs.clock
 from tinyjobs import deadlines
 from tinyjobs.services import lifecycle
 from tinyjobs import JobStatus, TinyJobs
-from tinyjobs.exceptions import ConfigurationError, UnsupportedCapabilityError
+from tinyjobs.exceptions import ConfigurationError, NewerStoreError, UnsupportedCapabilityError
 from tinyjobs.following import PARENT_ENDED_MESSAGE, PARENT_GONE_MESSAGE
 from tinyjobs.limits import Limit
 from tinyjobs.runtime import run_on
@@ -356,10 +356,10 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
             "WHERE key IN ('schema_version', 'compatible_since')",
             {"v": newer},
         )
-        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+        with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
             await self.backend.setup()
         await sql(f"DELETE FROM \"{self.prefix}_meta\" WHERE key = 'compatible_since'")
-        with self.assertRaisesRegex(RuntimeError, "newer than this tinyjobs"):
+        with self.assertRaisesRegex(NewerStoreError, "newer than this tinyjobs"):
             await self.backend.setup()
         stored = await sql(
             f"SELECT value FROM \"{self.prefix}_meta\" WHERE key = 'schema_version'"

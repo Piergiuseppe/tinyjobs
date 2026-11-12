@@ -56,6 +56,7 @@ from ...exceptions import (
     AppClosedError,
     ConfigurationError,
     JobNotFoundError,
+    NewerStoreError,
     UnsupportedCapabilityError,
 )
 from ...following import PARENT_MISSING_MESSAGE, refuse_parents_among
@@ -833,7 +834,7 @@ class PostgresBackend(BaseBackend):
             if stored is None and placed.tables:
                 stored = UPGRADABLE_VERSIONS[0]
             if stored is not None and stored > SCHEMA_VERSION:
-                raise RuntimeError(
+                raise NewerStoreError(
                     f"postgres schema version {stored} is newer than this tinyjobs "
                     f"build understands ({SCHEMA_VERSION}); upgrade the package"
                 )

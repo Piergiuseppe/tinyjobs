@@ -456,6 +456,33 @@ class ConcurrentInitialisationTests(BackendTestCase):
         self.assertEqual(self.fresh.counts()["queued"], 8)
 
 
+class PublicNamesTests(unittest.TestCase):
+    def test_every_exception_a_caller_can_meet_is_importable_from_the_package(self):
+        import tinyjobs
+        from tinyjobs import exceptions
+
+        defined = {
+            name
+            for name, value in vars(exceptions).items()
+            if isinstance(value, type)
+            and issubclass(value, BaseException)
+            and value.__module__ == exceptions.__name__
+        }
+        self.assertEqual(defined - set(tinyjobs.__all__), set())
+
+    def test_every_exported_name_exists_once(self):
+        import tinyjobs
+
+        self.assertEqual(len(tinyjobs.__all__), len(set(tinyjobs.__all__)))
+        self.assertEqual([name for name in tinyjobs.__all__ if not hasattr(tinyjobs, name)], [])
+
+    def test_the_error_for_a_newer_store_is_still_a_runtime_error(self):
+        import tinyjobs
+
+        self.assertTrue(issubclass(tinyjobs.NewerStoreError, tinyjobs.TinyJobsError))
+        self.assertTrue(issubclass(tinyjobs.NewerStoreError, RuntimeError))
+
+
 class FailedConnectionTests(BackendTestCase):
     def test_an_option_sqlite_does_not_take_is_refused_before_connecting(self):
         for url in ("sqlite://", f"sqlite:///{self.database}", "memory://"):
