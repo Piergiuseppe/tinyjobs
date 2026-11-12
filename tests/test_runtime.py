@@ -17,6 +17,7 @@ from unittest import mock
 from tinyjobs import deadlines, runtime
 from tinyjobs.flag import Flag
 from tinyjobs.runtime import FORK_PAUSE_SECONDS, LoopRunner
+from tests.support import freed
 
 
 def loop_threads() -> list[threading.Thread]:
@@ -245,8 +246,7 @@ class ForkPauseTests(unittest.TestCase):
         let_go = weakref.ref(self.loop)
         self.runner.close()
         del self.loop
-        gc.collect()
-        self.assertIsNone(let_go())
+        self.assertTrue(freed(let_go))
 
     def test_a_child_refuses_a_call_to_a_loop_paused_in_its_parent(self):
         import os
@@ -2125,8 +2125,7 @@ class SharedBoundTimerTests(unittest.TestCase):
         gone = weakref.ref(loop)
         with self.assertLogs("asyncio", "ERROR"):
             del loop, task
-            gc.collect()
-        self.assertIsNone(gone())
+            self.assertTrue(freed(gone))
 
     def test_many_open_bounds_share_one_timer(self):
         async def main():

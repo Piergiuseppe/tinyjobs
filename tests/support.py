@@ -35,6 +35,14 @@ class Injected(BaseException):
     pass
 
 
+def freed(reference, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while reference() is not None and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.05)
+    return reference() is None
+
+
 def flush_control(seconds: float = 5) -> None:
     from tinyjobs import runtime
 
