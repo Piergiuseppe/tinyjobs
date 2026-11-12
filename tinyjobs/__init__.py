@@ -14,7 +14,7 @@ if sys.version_info < MINIMUM_PYTHON:
         )
     )
 
-__version__ = "0.17.0"
+__version__ = "0.18.0.dev0"
 
 from .app import TinyJobs
 from .clock import Clock, FrozenClock

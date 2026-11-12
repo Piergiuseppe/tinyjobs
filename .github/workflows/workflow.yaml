@@ -60,7 +60,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install the redis and postgres extras, fastapi and django
-        run: python -m pip install "redis>=5.0.1" "psycopg[binary]>=3.2" "psycopg-pool>=3.2" fastapi httpx "django>=6.0; python_version >= '3.12'"
+        run: python -m pip install "redis>=5.0.1,<9" "psycopg[binary]>=3.2,<3.4" "psycopg-pool>=3.2,<3.4" fastapi httpx "django>=6.0; python_version >= '3.12'"
 
       - name: Run the test suite
         run: python -m unittest discover -s tests -t . --verbose
@@ -102,15 +102,66 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpq5
 
       - name: Install redis without hiredis, psycopg without its binary wheel, fastapi and django
-        run: python -m pip install "redis>=5.0.1" "psycopg>=3.2" "psycopg-pool>=3.2" fastapi httpx "django>=6.0"
+        run: python -m pip install "redis>=5.0.1,<9" "psycopg>=3.2,<3.4" "psycopg-pool>=3.2,<3.4" fastapi httpx "django>=6.0"
 
       - name: Run the test suite with the GIL off
         run: |
           python -c "import sys; assert not sys._is_gil_enabled()"
           python -m unittest discover -s tests -t . --verbose
 
+  upgrade:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        postgres: ["14", "18"]
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_PASSWORD: tinyjobs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      TINYJOBS_REDIS_URL: redis://localhost:6379/0
+      TINYJOBS_POSTGRES_URL: postgresql://postgres:tinyjobs@localhost:5432/postgres
+      TINYJOBS_PREVIOUS_PYTHON: /tmp/previous/bin/python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the redis and postgres extras
+        run: python -m pip install "redis>=5.0.1,<9" "psycopg[binary]>=3.2,<3.4" "psycopg-pool>=3.2,<3.4"
+
+      - name: Install the release before this one in an environment of its own
+        run: |
+          version=$(python -c "import re; print(re.search(r'^__version__ = \"(.+)\"$', open('tinyjobs/__init__.py').read(), re.M)[1])")
+          python -m venv /tmp/previous
+          /tmp/previous/bin/pip install --quiet "tinyjobs[redis,postgres]<$version"
+          /tmp/previous/bin/python -I -c "import tinyjobs; print('previous release:', tinyjobs.__version__)"
+
+      - name: Upgrade a store of the previous release and share it with this one
+        run: python -m unittest tests.test_upgrade --verbose
+
   build:
-    needs: [test, test-free-threaded]
+    needs: [test, test-free-threaded, upgrade]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
