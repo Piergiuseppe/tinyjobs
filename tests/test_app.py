@@ -39,6 +39,7 @@ from tests.support import (
     disarm_alarm,
     flush_control,
     fork_without_warning,
+    freed,
     interrupt_repeatedly,
     race_open_and_close,
     sweep_interrupts,
@@ -956,9 +957,8 @@ class ClosedAppTests(BackendTestCase):
         loop_thread = app._runner._thread
         collected = weakref.ref(app)
         del app, handler
-        gc.collect()
+        self.assertTrue(freed(collected))
         loop_thread.join(5)
-        self.assertIsNone(collected())
         self.assertFalse(loop_thread.is_alive())
 
     def test_a_child_connects_although_a_parent_thread_held_the_app_lock(self):
