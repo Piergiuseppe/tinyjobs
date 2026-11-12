@@ -75,6 +75,13 @@ class BackendContract:
         if not getattr(self.backend.capabilities, capability):
             raise unittest.SkipTest(f"the backend does not declare {capability}")
 
+    def claims_by_id(self) -> bool:
+        return hasattr(self.backend, "claim_job")
+
+    def requires_claim_by_id(self) -> None:
+        if not self.claims_by_id():
+            raise unittest.SkipTest("the backend cannot claim a job by its id")
+
     async def enqueue(self, **overrides) -> Job:
         return await self.backend.enqueue(make_job(**overrides))
 
@@ -99,8 +106,13 @@ class BackendContract:
         first = await self.enqueue(payload=payload, task="tests.a=b,c", dedup_key="k=1,2\n3")
         second = await self.enqueue(payload=payload, task="tests.a=b,c", dedup_key="k=4,5\n6")
         [claimed] = await self.claim(limit=1)
-        by_id = await self.backend.claim_job(second.id, worker_id="worker-b", lease_seconds=60.0)
-        for job, expected in ((claimed, first), (by_id, second)):
+        if self.claims_by_id():
+            other = await self.backend.claim_job(
+                second.id, worker_id="worker-b", lease_seconds=60.0
+            )
+        else:
+            [other] = await self.claim(limit=1, worker="worker-b")
+        for job, expected in ((claimed, first), (other, second)):
             self.assertEqual(job.id, expected.id)
             self.assertEqual(job.payload, payload)
             self.assertEqual(job.task, "tests.a=b,c")
@@ -328,8 +340,7 @@ class BackendContract:
         self.assertEqual(await self.backend.release_many([]), 0)
 
     async def test_a_job_claimed_by_id_is_leased_once_and_only_when_due(self):
-        if not hasattr(self.backend, "claim_job"):
-            raise unittest.SkipTest("the backend cannot claim a job by its id")
+        self.requires_claim_by_id()
         first = await self.enqueue(run_at=START - 2)
         wanted = await self.enqueue(run_at=START - 1)
         later = await self.enqueue(run_at=START + 5)
@@ -955,6 +966,7 @@ class BackendContract:
 
     async def test_a_claim_by_id_takes_room_from_the_task(self):
         self.requires("limits")
+        self.requires_claim_by_id()
         limits = {"tests.noop": Limit(concurrency=1)}
         first = await self.enqueue()
         second = await self.enqueue(run_at=1.0)
@@ -1141,9 +1153,12 @@ class BackendContract:
         self.assertEqual((stored.status, stored.after), (JobStatus.WAITING, parent.id))
         self.assertEqual([job.id for job in await self.claim()], [parent.id])
         self.assertEqual(await self.claim(), [])
-        self.assertIsNone(
-            await self.backend.claim_job(child.id, worker_id="worker-b", lease_seconds=60.0)
-        )
+        if self.claims_by_id():
+            self.assertIsNone(
+                await self.backend.claim_job(
+                    child.id, worker_id="worker-b", lease_seconds=60.0
+                )
+            )
         self.assertEqual((await self.backend.counts_by_status())["waiting"], 1)
         listed = await self.backend.list(status=JobStatus.WAITING)
         self.assertEqual([job.id for job in listed.items], [child.id])
