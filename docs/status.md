@@ -1,6 +1,6 @@
 # Status
 
-v0.16.0. Working and measured, but young. What's in:
+v0.17.0. Working and measured, but young. What's in:
 
 - task registry, `enqueue`, `app.send`
 - SQLite backend, atomic claim, leases, reaper
