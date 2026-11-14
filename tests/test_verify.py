@@ -170,6 +170,32 @@ class VerificationTests(ScratchCase):
         self.assertIn("did not stop cleanly on SIGTERM", report.lines()[-1])
         self.assertEqual(sum(self.counts(url).values()), 0)
 
+    def test_the_store_is_not_settled_while_a_job_moved_between_two_reads_by_status(self):
+        class Moving:
+            def __init__(self):
+                self.later = [JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.SUCCESS]
+                self.cursors = []
+
+            def jobs(self, *, queue, limit, status=None, cursor=None):
+                if status is not None:
+                    return Page([], None)
+                self.cursors.append(cursor)
+                found = JobStatus.SUCCESS if cursor is None else self.later.pop(0)
+                return Page([Job(id="r", task=verify.TASK, payload=b"", codec="json",
+                                 queue=queue, status=found)], None if cursor else "later")
+
+            def sweep(self):
+                pass
+
+        moving = Moving()
+        settings = Settings("sqlite:///jobs.db", **QUICK)
+        report = Report(settings)
+        with mock.patch("tinyjobs.verifying.SETTLE_POLL", 0.01):
+            Verification(settings)._settle(moving, moving, report)
+        self.assertTrue(report.settled)
+        self.assertEqual(moving.later, [])
+        self.assertEqual(moving.cursors, [None, "later"] * 3)
+
     def test_the_load_keeps_the_rate_and_skips_the_kills_it_missed(self):
         class Fake:
             def __init__(self):

@@ -29,6 +29,11 @@ versions are the `SCHEMA_VERSION` of each backend.
 - `from tinyjobs import *` brings in the names listed under Added, among them `Page`, `Clock`,
   `Stats` and `Finding`, which can shadow a name of your own imported before it.
 
+### Fixed
+- `tinyjobs verify` no longer reports jobs as unfinished when a killed worker's jobs went back to
+  the queue between two of its reads: it confirms the store is settled with one listing of the
+  queue.
+
 ### Upgrading
 - No schema change and no stop needed: 0.17 and 0.18 processes work on the same store, which every
   release now checks on SQLite, Postgres and Redis. From 0.16 or earlier, follow the 0.17 note
