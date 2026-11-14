@@ -33,7 +33,6 @@ from tinyjobs.verifying import (
     _pid_of,
     _Workers,
     in_memory,
-    masked,
 )
 
 REDIS_URL = os.environ.get("TINYJOBS_REDIS_URL")
@@ -103,7 +102,8 @@ class VerificationTests(ScratchCase):
     def test_a_store_that_cannot_be_reached_is_a_configuration_error(self):
         with self.assertRaises(ConfigurationError) as caught:
             Verification(Settings("redis://127.0.0.1:1/0", **QUICK)).run()
-        self.assertIn("cannot use the store at redis://127.0.0.1:1/0", str(caught.exception))
+        self.assertIn("cannot use the store (redis): ", str(caught.exception))
+        self.assertNotIn("redis://", str(caught.exception))
 
     def test_keep_leaves_the_jobs_in_the_store(self):
         url = self.scratch_url()
@@ -508,9 +508,7 @@ class VerificationTests(ScratchCase):
         self.assertEqual(code, 2)
         printed = out.getvalue() + err.getvalue()
         self.assertNotIn("hunter2", printed)
-        self.assertIn("postgresql://u:***@127.0.0.1:1/db", printed)
-        self.assertEqual(masked("redis://:secret@[::1]:6379/0"), "redis://:***@[::1]:6379/0")
-        self.assertEqual(masked("sqlite:///jobs.db"), "sqlite:///jobs.db")
+        self.assertIn("on the store (postgresql)", printed)
         self.assertEqual(settled(None, 5.0), 60.0)
         self.assertEqual(settled(None, 60.0), 121.0)
         self.assertEqual(settled(7.0, 60.0), 7.0)

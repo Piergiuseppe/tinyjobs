@@ -14,9 +14,8 @@ from functools import partial
 from pathlib import Path
 from threading import Event
 from typing import IO, Any, Callable, Mapping, Sequence
-from urllib.parse import urlsplit
 
-from .backends.loader import in_memory
+from .backends.loader import in_memory, named
 from .duration import is_finite_seconds
 from .exceptions import ConfigurationError
 from .retention import RetentionPolicy
@@ -63,6 +62,8 @@ PENDING = (JobStatus.QUEUED, JobStatus.HELD, JobStatus.WAITING, JobStatus.RUNNIN
 
 QUEUE_PREFIX = "tinyjobs-verify-"
 
+STORE = "the store"
+
 TERM = "term"
 KILL = "kill"
 FORCED = "forced"
@@ -70,7 +71,7 @@ FORCED = "forced"
 POSIX_MESSAGE = "tinyjobs verify needs a POSIX platform: it stops workers with signals"
 
 IN_MEMORY_MESSAGE = (
-    "tinyjobs verify needs a store its workers can share, and {url} is in memory: "
+    "tinyjobs verify needs a store its workers can share, and {store} is in memory: "
     "give it a file, a Redis database or a Postgres database"
 )
 
@@ -276,7 +277,9 @@ class Verification:
         if os.name != "posix":
             raise ConfigurationError(POSIX_MESSAGE)
         if in_memory(settings.url):
-            raise ConfigurationError(IN_MEMORY_MESSAGE.format(url=settings.url))
+            raise ConfigurationError(
+                IN_MEMORY_MESSAGE.format(store=named(STORE, settings.url))
+            )
         self._settings = settings
         self._stopped = stopped or Event()
         self._command = list(command) if command else self._worker_command()
@@ -345,7 +348,7 @@ class Verification:
             held = sum(app.counts().values())
         except Exception as error:
             raise ConfigurationError(
-                f"cannot use the store at {masked(self._settings.url)}: {_described(error)}"
+                f"cannot use {named(STORE, self._settings.url)}: {_described(error)}"
             ) from error
         if held:
             raise ConfigurationError(OCCUPIED_MESSAGE.format(count=held))
@@ -598,17 +601,6 @@ class _Workers:
         except OSError:
             return []
         return text.splitlines()[-LOG_TAIL:]
-
-
-def masked(url: str) -> str:
-    parts = urlsplit(url)
-    if parts.password is None:
-        return url
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    netloc = f"{parts.username or ''}:***@{host}" + (f":{parts.port}" if parts.port else "")
-    return parts._replace(netloc=netloc).geturl()
 
 
 def _ready(ledger: str) -> set[str]:
