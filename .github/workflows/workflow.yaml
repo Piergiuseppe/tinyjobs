@@ -1,17 +1,24 @@
-name: release
+name: ci
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+      - "mkdocs.yml"
+      - ".readthedocs.yaml"
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
@@ -46,9 +53,9 @@ jobs:
       TINYJOBS_REDIS_URL: redis://localhost:6379/0
       TINYJOBS_POSTGRES_URL: postgresql://postgres:tinyjobs@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -85,9 +92,9 @@ jobs:
       TINYJOBS_REDIS_URL: redis://localhost:6379/0
       TINYJOBS_POSTGRES_URL: postgresql://postgres:tinyjobs@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.14t"
 
@@ -106,14 +113,14 @@ jobs:
     needs: [test, test-free-threaded]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
       - name: Check the tag matches tinyjobs.__version__
-        if: github.event_name == 'push'
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -152,14 +159,25 @@ jobs:
           test "$imported" = "$expected"
           test "$reported" = "tinyjobs $expected"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distribution
           path: dist/
           if-no-files-found: error
 
+  ci-passed:
+    if: always()
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless the tests and the build succeeded
+        env:
+          BUILD: ${{ needs.build.result }}
+        run: test "$BUILD" = success
+
   publish:
     needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: tinyjobs
@@ -167,9 +185,46 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: distribution
           path: dist/
 
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Take this version's section of the changelog as the release notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'NOTES'
+          import os
+          import pathlib
+          import re
+
+          version = re.escape(os.environ["TAG"].removeprefix("v"))
+          changelog = pathlib.Path("CHANGELOG.md")
+          text = changelog.read_text() if changelog.exists() else ""
+          section = re.search(rf"^## {version}(?=\s).*?\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+          notes = re.sub(r"\n[ \t]+(?=[^\s*+-])", " ", section[1]).strip() if section else ""
+          pathlib.Path("notes.md").write_text(notes)
+          print(notes or "no section for this version in CHANGELOG.md")
+          NOTES
+
+      - name: Publish the GitHub release, with notes generated from the merged pull requests when the changelog has none
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -s notes.md ]; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --notes-file notes.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          fi
