@@ -38,5 +38,5 @@ python -m venv .venv-previous
 TINYJOBS_PREVIOUS_PYTHON=$PWD/.venv-previous/bin/python python -m unittest tests.test_upgrade
 ```
 
-The workflow runs it on every pull request, push to main and release tag, against the release before
-the one in the tree.
+The workflow runs it on every pull request and release tag, against the release before the one in
+the tree.
