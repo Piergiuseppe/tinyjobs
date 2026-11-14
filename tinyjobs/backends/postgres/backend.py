@@ -1561,6 +1561,9 @@ class PostgresBackend(BaseBackend):
         await self._wake({row["queue"] for row in rows if row["due"]})
         return bool(rows)
 
+    async def delete(self, job_id: str) -> bool:
+        return await self._changed(self._queries.delete, {"id": job_id})
+
     async def get(self, job_id: str) -> Job | None:
         rows = await self._lookup(self._queries.get, {"id": job_id})
         return job_from_row(rows[0]) if rows else None

@@ -12,7 +12,7 @@ from ..exceptions import JobNotFoundError
 from ..following import PARENT_ENDED_MESSAGE
 from ..ids import new_job_id
 from ..limits import Limit
-from ..models import NEVER, ExecutionError, Job, ScheduleState
+from ..models import NEVER, ExecutionError, Job, Page, ScheduleState
 from ..retention import KEEP_EVERYTHING, RetentionPolicy
 from ..status import ExecutionStatus, JobStatus
 
@@ -488,6 +488,105 @@ class BackendContract:
         self.assertFalse(await self.backend.cancel(claimed.id))
         self.assertFalse(await self.backend.cancel(new_job_id()))
 
+    async def test_delete_removes_a_queued_job_and_one_scheduled_for_later_with_their_history(self):
+        retried = await self.claimed_one(max_attempts=2)
+        self.assertTrue(await self.backend.fail(retried, ERROR, retry_at=START + 600))
+        queued = await self.enqueue()
+        later = await self.enqueue(run_at=START + 3600)
+        for job in (retried, queued, later):
+            self.assertTrue(await self.backend.delete(job.id))
+            self.assertIsNone(await self.stored(job))
+            self.assertEqual(await self.backend.executions(job.id), [])
+        self.assertEqual(await self.backend.counts_by_status(), {})
+        self.assertEqual((await self.backend.list(limit=10)).items, [])
+        stats = await self.backend.stats(self.clock.now())
+        self.assertEqual((stats.queues, stats.queued_tasks), ([], {}))
+        self.clock.advance(3600)
+        self.assertEqual(await self.claim(), [])
+        self.assertFalse(await self.backend.delete(queued.id))
+
+    async def test_a_deleted_id_can_be_enqueued_again_as_a_fresh_job(self):
+        job = await self.enqueue()
+        self.assertTrue(await self.backend.delete(job.id))
+        again = await self.backend.enqueue(make_job(id=job.id, queue="other"))
+        self.assertEqual((again.id, again.queue, again.status), (job.id, "other", JobStatus.QUEUED))
+        self.assertEqual((await self.stored(job)).queue, "other")
+        self.assertEqual([found.id for found in await self.claim(queues=("other",))], [job.id])
+
+    async def test_delete_frees_the_dedup_key_the_job_held(self):
+        self.requires("dedup")
+        deleted = await self.enqueue(dedup_key="invoice:1")
+        self.assertTrue(await self.backend.delete(deleted.id))
+        fresh = await self.enqueue(dedup_key="invoice:1")
+        self.assertNotEqual(fresh.id, deleted.id)
+        self.assertEqual((await self.enqueue(dedup_key="invoice:1")).id, fresh.id)
+        self.assertEqual(await self.backend.counts_by_status(), {"queued": 1})
+
+    async def test_delete_refuses_a_running_job_and_leaves_it_running(self):
+        claimed = await self.claimed_one()
+        self.assertFalse(await self.backend.delete(claimed.id))
+        stored = await self.stored(claimed)
+        self.assertEqual((stored.status, stored.worker_id), (JobStatus.RUNNING, "worker-a"))
+        self.assertEqual(len(await self.backend.executions(claimed.id)), 1)
+        self.assertTrue(await self.backend.complete(claimed, None))
+        self.assertIs((await self.stored(claimed)).status, JobStatus.SUCCESS)
+
+    async def test_delete_refuses_an_ended_job_and_leaves_it(self):
+        done = await self.claimed_one()
+        await self.backend.complete(done, None)
+        failed = await self.claimed_one()
+        await self.backend.fail(failed, ERROR, None)
+        cancelled = await self.enqueue()
+        await self.backend.cancel(cancelled.id)
+        before = await self.backend.counts_by_status()
+        ended = (
+            (done, JobStatus.SUCCESS),
+            (failed, JobStatus.FAILED),
+            (cancelled, JobStatus.CANCELLED),
+        )
+        for job, status in ended:
+            self.assertFalse(await self.backend.delete(job.id))
+            self.assertIs((await self.stored(job)).status, status)
+        self.assertEqual(len(await self.backend.executions(done.id)), 1)
+        self.assertEqual(await self.backend.counts_by_status(), before)
+
+    async def test_delete_leaves_alone_a_job_that_was_to_run_after_it_and_has_ended(self):
+        self.requires("after")
+        parent = await self.enqueue(run_at=START + 3600)
+        child = await self.child_of(parent)
+        self.assertTrue(await self.backend.cancel(child.id))
+        ended = await self.stored(child)
+        self.assertTrue(await self.backend.delete(parent.id))
+        self.assertIsNone(await self.backend.get(parent.id))
+        self.assertEqual(await self.stored(child), ended)
+        self.assertEqual((ended.status, ended.after), (JobStatus.CANCELLED, parent.id))
+        self.assertEqual(await self.backend.counts_by_status(), {"cancelled": 1})
+
+    async def test_delete_of_an_unknown_id_is_false(self):
+        self.assertFalse(await self.backend.delete(new_job_id()))
+        self.assertEqual(await self.backend.counts_by_status(), {})
+
+    async def test_enqueueing_an_id_already_stored_returns_the_stored_job_and_changes_nothing(self):
+        running = await self.claimed_one()
+        done = await self.claimed_one()
+        await self.backend.complete(done, None)
+        queued = await self.enqueue(run_at=START + 3600)
+        before = await self.backend.counts_by_status()
+        jobs = (queued, running, done)
+        stored = [await self.stored(job) for job in jobs]
+        for job, expected in zip(jobs, stored):
+            again = await self.backend.enqueue(make_job(id=job.id, queue="other", priority=9))
+            self.assertEqual(again, expected)
+        fresh = make_job(queue="other")
+        many = await self.backend.enqueue_many(
+            [make_job(id=job.id, queue="other", priority=9) for job in jobs] + [fresh]
+        )
+        self.assertEqual(many, [*stored, fresh])
+        self.assertEqual([await self.stored(job) for job in jobs], stored)
+        self.assertEqual(await self.backend.counts_by_status(), {**before, "queued": 2})
+        self.assertEqual([job.id for job in await self.claim(queues=("other",))], [fresh.id])
+        self.assertTrue(await self.backend.complete(running, None))
+
     async def test_requeue_resets_a_failed_job(self):
         claimed = await self.claimed_one()
         await self.backend.hand_back(claimed)
@@ -919,6 +1018,27 @@ class BackendContract:
         await self.backend.complete(running, None)
         self.assertEqual(await self.limited(**limits), [])
 
+    async def test_delete_removes_a_held_job_with_its_dedup_key_and_its_place_in_line(self):
+        self.requires("limits")
+        self.requires("dedup")
+        limits = {"tests.noop": Limit(concurrency=1)}
+        await self.enqueue()
+        held = await self.enqueue(run_at=1.0, dedup_key="invoice:1")
+        [running] = await self.limited(**limits)
+        self.assertEqual(await self.statuses(held), [JobStatus.HELD])
+        self.assertTrue(await self.backend.delete(held.id))
+        self.assertIsNone(await self.stored(held))
+        self.assertEqual(await self.backend.counts_by_status(), {"running": 1})
+        stats = await self.backend.stats(self.clock.now())
+        self.assertEqual((stats.queues[0].oldest_due_at, stats.queued_tasks), (None, {}))
+        self.assertEqual(await self.backend.list(status=JobStatus.HELD, limit=10), Page([], None))
+        self.assertTrue(await self.backend.complete(running, None))
+        self.assertEqual(await self.backend.release_held({"tests.noop"}), 0)
+        self.assertEqual(await self.limited(**limits), [])
+        fresh = await self.enqueue(dedup_key="invoice:1")
+        self.assertNotEqual(fresh.id, held.id)
+        self.assertEqual([job.id for job in await self.limited(**limits)], [fresh.id])
+
     async def test_every_way_out_of_running_frees_the_room_of_a_task(self):
         self.requires("limits")
         limits = {"tests.noop": Limit(concurrency=1)}
@@ -1287,6 +1407,31 @@ class BackendContract:
         self.assertIn("no-such-job", str(raised.exception))
         self.assertEqual(await self.backend.counts_by_status(), before)
 
+    async def test_an_id_already_stored_is_returned_after_a_parent_and_refused_after_none(self):
+        self.requires("after")
+        parent = await self.enqueue()
+        child = await self.child_of(parent)
+        stored = await self.stored(child)
+        before = await self.backend.counts_by_status()
+        again = await self.backend.enqueue(make_job(id=child.id, after=parent.id, priority=9))
+        self.assertEqual(again, stored)
+        with self.assertRaises(JobNotFoundError):
+            await self.backend.enqueue(make_job(id=child.id, after="no-such-job"))
+        self.assertEqual(await self.stored(child), stored)
+        self.assertEqual(await self.backend.counts_by_status(), before)
+
+    async def test_an_id_already_stored_is_returned_whatever_key_the_new_one_carries(self):
+        self.requires("dedup")
+        holder = await self.enqueue(dedup_key="invoice:1")
+        plain = await self.enqueue()
+        stored = await self.stored(plain)
+        before = await self.backend.counts_by_status()
+        again = await self.backend.enqueue(make_job(id=plain.id, dedup_key="invoice:1"))
+        self.assertEqual(again, stored)
+        keyed = await self.backend.enqueue(make_job(dedup_key="invoice:1"))
+        self.assertEqual(keyed.id, holder.id)
+        self.assertEqual(await self.backend.counts_by_status(), before)
+
     async def test_a_parent_sent_in_the_same_call_is_not_yet_in_the_store(self):
         self.requires("after")
         parent = make_job()
@@ -1416,3 +1561,57 @@ class BackendContract:
         self.assertTrue(await self.backend.cancel(parent.id))
         self.assertEqual(await self.backend.counts_by_status(), {"cancelled": 301})
         self.assertEqual(await self.statuses(descendants[-1]), [JobStatus.CANCELLED])
+
+    async def test_delete_removes_a_waiting_job_that_nothing_waits_behind(self):
+        self.requires("after")
+        self.requires("dedup")
+        parent = await self.enqueue()
+        child = await self.child_of(parent, dedup_key="report:1")
+        self.assertTrue(await self.backend.delete(child.id))
+        self.assertIsNone(await self.stored(child))
+        self.assertEqual(await self.backend.counts_by_status(), {"queued": 1})
+        self.assertEqual(await self.backend.list(status=JobStatus.WAITING), Page([], None))
+        fresh = await self.enqueue(dedup_key="report:1")
+        self.assertNotEqual(fresh.id, child.id)
+
+    async def test_delete_refuses_a_job_another_waits_behind_and_cancels_nothing(self):
+        self.requires("after")
+        parent, child, grandchild = await self.chain(2)
+        self.assertFalse(await self.backend.delete(parent.id))
+        self.assertFalse(await self.backend.delete(child.id))
+        self.assertEqual(
+            await self.statuses(parent, child, grandchild),
+            [JobStatus.QUEUED, JobStatus.WAITING, JobStatus.WAITING],
+        )
+        self.assertTrue(await self.backend.delete(grandchild.id))
+        self.assertFalse(await self.backend.delete(parent.id))
+        self.assertTrue(await self.backend.delete(child.id))
+        self.assertTrue(await self.backend.delete(parent.id))
+        self.assertEqual(await self.backend.counts_by_status(), {})
+
+    async def test_a_deleted_waiting_job_leaves_no_trace_when_the_job_before_it_ends(self):
+        self.requires("after")
+        for ending in ("success", "cancel"):
+            with self.subTest(ending=ending):
+                parent = await self.enqueue(queue=ending)
+                deleted = await self.child_of(parent, queue=ending)
+                kept = await self.child_of(parent, queue=ending)
+                self.assertTrue(await self.backend.delete(deleted.id))
+                if ending == "success":
+                    [claimed] = await self.claim(queues=(ending,))
+                    self.assertTrue(await self.backend.complete(claimed, None))
+                    expected = JobStatus.QUEUED
+                else:
+                    self.assertTrue(await self.backend.cancel(parent.id))
+                    expected = JobStatus.CANCELLED
+                self.assertEqual(await self.statuses(kept), [expected])
+                self.assertIsNone(await self.stored(deleted))
+                self.assertEqual(await self.backend.executions(deleted.id), [])
+                listed = await self.backend.list(queue=ending, limit=10)
+                self.assertEqual({job.id for job in listed.items}, {parent.id, kept.id})
+        self.assertEqual(
+            await self.backend.counts_by_status(),
+            {"success": 1, "queued": 1, "cancelled": 2},
+        )
+        self.assertEqual(await self.reap_after_the_lease(), 0)
+        self.assertEqual(len(await self.claim(queues=("success",))), 1)

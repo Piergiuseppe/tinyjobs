@@ -20,6 +20,7 @@ NAMES = (
     "release_held",
     "cancel",
     "requeue",
+    "delete",
     "heartbeat",
     "reap",
     "claim_sweep",

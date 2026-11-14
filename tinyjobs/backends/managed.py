@@ -300,6 +300,9 @@ class ManagedBackend:
     async def requeue(self, job_id: str) -> bool:
         return await self._forward(self._inner.requeue, job_id)
 
+    async def delete(self, job_id: str) -> bool:
+        return await self._forward(self._inner.delete, job_id)
+
     async def get(self, job_id: str) -> Job | None:
         return await self._forward(self._inner.get, job_id)
 

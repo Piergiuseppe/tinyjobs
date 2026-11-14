@@ -911,6 +911,19 @@ class Queries:
             SELECT count(*) AS changed FROM changed
         """
 
+        self.delete = f"""
+            WITH gone AS (
+                DELETE FROM {jobs}
+                 WHERE id = %(id)s AND status IN ('queued', 'held', 'waiting')
+                   AND NOT EXISTS (
+                       SELECT FROM {jobs} AS child
+                        WHERE child.waiting_on = {jobs}.id AND child.status = 'waiting'
+                   )
+                RETURNING id
+            )
+            SELECT count(*) AS changed FROM gone
+        """
+
         def releasing(within: str) -> str:
             return f"""
             WITH batch AS (

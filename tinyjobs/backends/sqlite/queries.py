@@ -19,13 +19,17 @@ CHILD_VALUES = ", ".join(
 )
 
 TEMPLATES = {
-    "insert_job": f"INSERT INTO {{jobs}} ({JOB_COLUMN_LIST}) VALUES ({JOB_PLACEHOLDERS})",
+    "insert_job": (
+        f"INSERT INTO {{jobs}} ({JOB_COLUMN_LIST}) VALUES ({JOB_PLACEHOLDERS}) "
+        "ON CONFLICT (id) DO NOTHING"
+    ),
     "insert_child": f"""
         INSERT INTO {{jobs}} ({JOB_COLUMN_LIST}, waiting_on)
         SELECT {CHILD_VALUES},
                CASE WHEN parent.status IN ('success', 'failed', 'cancelled') THEN NULL
                     ELSE :runs_after END
           FROM {{jobs}} AS parent WHERE parent.id = :runs_after
+        ON CONFLICT (id) DO NOTHING
     """,
     "select_job": f"SELECT {JOB_COLUMN_LIST} FROM {{jobs}} WHERE id = ?",
     "select_active_by_dedup": f"""
@@ -167,6 +171,14 @@ TEMPLATES = {
            SET status = 'cancelled', finished_at = ?, lease_expires_at = NULL,
                hand_backs = 0, waiting_on = NULL
          WHERE id = ? AND status IN ('queued', 'held', 'waiting', 'running')
+    """,
+    "delete_job": """
+        DELETE FROM {jobs}
+         WHERE id = ? AND status IN ('queued', 'held', 'waiting')
+           AND NOT EXISTS (
+               SELECT 1 FROM {jobs} AS child
+                WHERE child.waiting_on = {jobs}.id AND child.status = 'waiting'
+           )
     """,
     "requeue_job": """
         UPDATE {jobs}

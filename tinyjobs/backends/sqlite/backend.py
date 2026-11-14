@@ -335,6 +335,9 @@ class SQLiteBackend(BaseBackend):
     async def requeue(self, job_id: str) -> bool:
         return await self._call(self._requeue_sync, job_id)
 
+    async def delete(self, job_id: str) -> bool:
+        return await self._call(self._delete_sync, job_id)
+
     async def get(self, job_id: str) -> Job | None:
         return await self._call(self._get_sync, job_id)
 
@@ -649,14 +652,19 @@ class SQLiteBackend(BaseBackend):
         refuse_parents_among(jobs)
         if any(job.dedup_key is not None or job.after is not None for job in jobs):
             return [self._insert(connection, job) for job in jobs]
-        connection.executemany(self._queries.insert_job, [job_to_row(job) for job in jobs])
-        return list(jobs)
+        cursor = connection.executemany(
+            self._queries.insert_job, [job_to_row(job) for job in jobs]
+        )
+        if cursor.rowcount == len(jobs):
+            return list(jobs)
+        return [self._stored(connection, job.id) for job in jobs]
 
     def _insert(self, connection: Any, job: Job) -> Job:
         try:
             if job.after is not None:
                 return self._insert_child(connection, job)
-            connection.execute(self._queries.insert_job, job_to_row(job))
+            if connection.execute(self._queries.insert_job, job_to_row(job)).rowcount == 1:
+                return job
         except sqlite3.IntegrityError:
             if job.dedup_key is None:
                 raise
@@ -664,14 +672,15 @@ class SQLiteBackend(BaseBackend):
             if existing is None:
                 raise
             return existing
-        return job
+        return self._stored(connection, job.id)
 
     def _insert_child(self, connection: Any, job: Job) -> Job:
         values = dict(zip(JOB_COLUMNS, job_to_row(job)))
         values.update(now=self._clock.now(), ended=PARENT_ENDED_MESSAGE)
-        if connection.execute(self._queries.insert_child, values).rowcount != 1:
+        placed = connection.execute(self._queries.insert_child, values).rowcount == 1
+        if not placed and self._stored(connection, job.after) is None:
             raise JobNotFoundError(PARENT_MISSING_MESSAGE.format(after=job.after))
-        return job_from_row(connection.execute(self._queries.select_job, (job.id,)).fetchone())
+        return self._stored(connection, job.id)
 
     def _release_children(self, connection: Any, job_id: str, now: float) -> None:
         connection.execute(self._queries.release_children, (now, job_id))
@@ -680,6 +689,10 @@ class SQLiteBackend(BaseBackend):
         connection.execute(
             self._queries.cancel_descendants, (job_id, now, PARENT_ENDED_MESSAGE)
         )
+
+    def _stored(self, connection: Any, job_id: str) -> Job | None:
+        row = connection.execute(self._queries.select_job, (job_id,)).fetchone()
+        return job_from_row(row) if row else None
 
     def _active_duplicate(self, connection: Any, dedup_key: str) -> Job | None:
         row = connection.execute(self._queries.select_active_by_dedup, (dedup_key,)).fetchone()
@@ -860,6 +873,11 @@ class SQLiteBackend(BaseBackend):
             cursor = connection.execute(
                 self._queries.requeue_job, (status, status, self._clock.now(), job_id)
             )
+        return cursor.rowcount == 1
+
+    def _delete_sync(self, job_id: str) -> bool:
+        with self._connections.write() as connection:
+            cursor = connection.execute(self._queries.delete_job, (job_id,))
         return cursor.rowcount == 1
 
     def _get_sync(self, job_id: str) -> Job | None:
