@@ -7,6 +7,7 @@ import gc
 import importlib.util
 import os
 import signal
+import sqlite3
 import threading
 import time
 import traceback
@@ -1857,6 +1858,17 @@ class InterruptSweepTests(BackendTestCase):
             pass
         self.assertEqual(FORK_GATE._holders, {}, point)
 
+    def write_lock_is_held(self) -> bool:
+        probe = sqlite3.connect(self.database, timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN IMMEDIATE")
+            probe.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            return True
+        finally:
+            probe.close()
+        return False
+
     def sweep(self, action, check=None) -> int:
         def full_check(point: int) -> None:
             self.settled(point)
@@ -1930,10 +1942,10 @@ class InterruptSweepTests(BackendTestCase):
                 )
 
         def check(point: int) -> None:
-            started = time.monotonic()
+            self.assertFalse(self.write_lock_is_held(), point)
             self.assertIsNotNone(self.app.send("noted"))
-            self.assertLess(time.monotonic() - started, 1.0, point)
             self.assertFalse(inner._connections.connection.in_transaction, point)
+            self.assertFalse(self.write_lock_is_held(), point)
 
         self.app.counts()
         self.sweep(write, check)
