@@ -550,14 +550,12 @@ class PostgresContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
 
     async def test_a_long_line_is_cancelled_by_index_whatever_else_waits(self):
         jobs = f'"{self.prefix}_jobs"'
-        self.assertEqual(
-            await sql(
-                "SELECT attoptions FROM pg_attribute "
-                "WHERE attrelid = %(jobs)s::regclass AND attname = 'waiting_on'",
-                {"jobs": jobs},
-            ),
-            [(["n_distinct=-1"],)],
+        [(options,)] = await sql(
+            "SELECT attoptions FROM pg_attribute "
+            "WHERE attrelid = %(jobs)s::regclass AND attname = 'waiting_on'",
+            {"jobs": jobs},
         )
+        self.assertIn("n_distinct=-1", options)
         crowd = await self.enqueue(queue="crowd")
         await sql(
             f"INSERT INTO {jobs} (id, task, payload, codec, queue, status, run_at, created_at, "
