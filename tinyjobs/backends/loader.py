@@ -74,6 +74,11 @@ def load_backend(url: str, **options: Any) -> Any:
     return factory(url, **options)
 
 
+def named(role: str, url: str) -> str:
+    scheme = _scheme(url)
+    return f"{role} ({scheme})" if scheme in available_schemes() else role
+
+
 def available_schemes() -> list[str]:
     plugins = {point.name for point in _plugin_entry_points()}
     return sorted(set(_BUILTIN_FACTORIES) | plugins)

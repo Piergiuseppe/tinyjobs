@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
-from typing import Sequence
+from typing import NoReturn, Sequence
 
 from .. import __version__
 from ..app import TinyJobs
@@ -18,6 +19,8 @@ LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 LOG_FORMATS = tuple(LOG_FORMATTERS)
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_LOG_FORMAT = "text"
+HIDDEN_ADDRESS = "<an address>"
+ADDRESS = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://.*", re.DOTALL)
 
 
 def build_global_options() -> argparse.ArgumentParser:
@@ -38,10 +41,15 @@ def build_global_options() -> argparse.ArgumentParser:
     return shared
 
 
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        super().error(ADDRESS.sub(HIDDEN_ADDRESS, message))
+
+
 def build_parser() -> argparse.ArgumentParser:
     shared = build_global_options()
     app_options = build_app_options()
-    parser = argparse.ArgumentParser(
+    parser = Parser(
         prog="tinyjobs",
         description="background jobs and cron, without a broker",
         parents=[shared],

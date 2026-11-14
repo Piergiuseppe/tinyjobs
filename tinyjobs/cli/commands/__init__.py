@@ -2,6 +2,7 @@ from .base import Command
 from .dashboard import DashboardCommand
 from .health import CheckCommand, StatsCommand
 from .jobs import JobsCommand
+from .move import MoveCommand
 from .purge import PurgeCommand
 from .schedules import SchedulerCommand, SchedulesCommand
 from .send import SendCommand
@@ -17,6 +18,7 @@ COMMANDS: tuple[Command, ...] = (
     CheckCommand(),
     SendCommand(),
     PurgeCommand(),
+    MoveCommand(),
     DashboardCommand(),
     VerifyCommand(),
 )
@@ -27,6 +29,7 @@ __all__ = [
     "Command",
     "DashboardCommand",
     "JobsCommand",
+    "MoveCommand",
     "PurgeCommand",
     "SchedulerCommand",
     "SchedulesCommand",

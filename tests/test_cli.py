@@ -296,7 +296,8 @@ class ParserTests(unittest.TestCase):
     def test_every_command_is_reachable(self):
         parser = build_parser()
         for command in (
-            "worker", "scheduler", "jobs", "schedules", "stats", "check", "send", "purge"
+            "worker", "scheduler", "jobs", "schedules", "stats", "check", "send", "purge",
+            "move",
         ):
             self.assertIn(command, parser.format_help())
 

@@ -4,7 +4,8 @@ import argparse
 from threading import Event
 
 from ...exiting import stop_on_signals
-from ...verifying import REAP_INTERVAL, Settings, Verification, masked
+from ...backends.loader import named
+from ...verifying import REAP_INTERVAL, STORE, Settings, Verification
 from ..duration import parse_duration
 from .base import Command
 
@@ -82,7 +83,7 @@ class VerifyCommand(Command):
         print(
             f"{settings.workers} workers of {settings.slots} slots, {settings.rate:g} jobs/s "
             f"for {settings.duration:g}s, a SIGTERM or SIGKILL every {settings.kill_every:g}s, "
-            f"on {masked(args.url)}",
+            f"on {named(STORE, args.url)}",
             flush=True,
         )
         stopped = Event()
