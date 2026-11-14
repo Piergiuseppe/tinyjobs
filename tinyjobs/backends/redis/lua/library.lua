@@ -192,6 +192,15 @@ local function leave(job)
   end
 end
 
+local function forget(job)
+  leave(job)
+  release_dedup(job)
+  redis.call('ZREM', key('index', 'all'), job.id)
+  redis.call('ZREM', key('index', 'queue', job.queue), job.id)
+  redis.call('ZREM', key('results', job.task), job.id)
+  redis.call('DEL', job_key(job.id), key('executions', job.id))
+end
+
 local function shift(job, status, changes, removals)
   if job.status == 'running' and job.claim_token then
     removals = removals or {}
@@ -263,6 +272,10 @@ local function orphan(jobs)
 end
 
 local function insert(job)
+  if redis.call('EXISTS', job_key(job.id)) == 1 then
+    job.status = 'existing'
+    return job.id
+  end
   if job.after then
     job.status = placed_after(parent_status(job))
     if job.status == 'cancelled' then

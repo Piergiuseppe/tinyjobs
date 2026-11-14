@@ -84,6 +84,8 @@ class Backend(Protocol):
 
     async def requeue(self, job_id: str) -> bool: ...
 
+    async def delete(self, job_id: str) -> bool: ...
+
     async def get(self, job_id: str) -> Job | None: ...
 
     async def list(
@@ -139,6 +141,9 @@ class BaseBackend(ABC):
 
     @abstractmethod
     async def enqueue(self, job: Job) -> Job: ...
+
+    @abstractmethod
+    async def delete(self, job_id: str) -> bool: ...
 
     async def enqueue_many(self, jobs: Sequence[Job]) -> list[Job]:
         return [await self.enqueue(job) for job in jobs]

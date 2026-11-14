@@ -70,6 +70,7 @@ SPARE_CONNECTIONS = 2
 SETTLE_BATCH = 100
 RELEASE_BATCH = 100
 CLOSED_MESSAGE = "the redis backend was closed"
+EXISTING = "existing"
 CLOSE_SECONDS = 0.5
 GHOST_SWEEP_SECONDS = 1.0
 REPLAY_MESSAGE = (
@@ -397,6 +398,9 @@ class RedisBackend(BaseBackend):
     async def requeue(self, job_id: str) -> bool:
         return bool(await self._run("requeue", job_id))
 
+    async def delete(self, job_id: str) -> bool:
+        return bool(await self._run("delete", job_id))
+
     async def get(self, job_id: str) -> Job | None:
         return (await self._load([job_id.encode()]))[0]
 
@@ -715,7 +719,7 @@ class RedisBackend(BaseBackend):
         read = []
         for index, (job, stored) in enumerate(zip(jobs, ids)):
             status = placed[index].decode() if placed else str(job.status)
-            if stored.decode() != job.id or status == JobStatus.CANCELLED:
+            if stored.decode() != job.id or status in (JobStatus.CANCELLED, EXISTING):
                 read.append(stored)
             else:
                 job.status = JobStatus(status)

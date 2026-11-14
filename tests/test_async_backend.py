@@ -51,6 +51,8 @@ class RamBackend(BaseBackend):
 
     @locked
     async def enqueue(self, job: Job) -> Job:
+        if job.id in self._jobs:
+            return replace(self._jobs[job.id])
         self._jobs[job.id] = replace(job)
         self._order[job.id] = next(self._sent)
         self._runs[job.id] = []
@@ -190,6 +192,21 @@ class RamBackend(BaseBackend):
             worker_id=None,
             lease_expires_at=None,
         )
+        return True
+
+    @locked
+    async def delete(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        if job is None or job.status not in (
+            JobStatus.QUEUED, JobStatus.HELD, JobStatus.WAITING
+        ):
+            return False
+        if any(
+            other.after == job_id and other.status is JobStatus.WAITING
+            for other in self._jobs.values()
+        ):
+            return False
+        del self._jobs[job_id], self._runs[job_id], self._order[job_id]
         return True
 
     @locked
