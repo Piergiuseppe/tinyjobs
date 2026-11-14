@@ -140,6 +140,7 @@ finish before it exits. Leave out `worker=True` to run the workers elsewhere.
 | Testing | `memory://`, `eager=True`, `app.drain()` and a frozen clock |
 | Free-threaded Python | the GIL stays off on 3.14t, and `--loops N` runs several event loops in one process |
 | Backends | SQLite, Postgres and Redis behind one API, and a plugin seam with a contract suite |
+| Changing store | `tinyjobs move` carries the jobs still to run to another store, with no stop for the new ones |
 
 Delivery is at-least-once: a worker can finish a job and die before recording it, so write tasks
 that are safe to run twice.
@@ -196,7 +197,8 @@ Everything else is at https://tinyjobs.readthedocs.io/:
 - Backends: [SQLite](https://tinyjobs.readthedocs.io/en/latest/sqlite/),
   [Redis](https://tinyjobs.readthedocs.io/en/latest/redis/),
   [Postgres](https://tinyjobs.readthedocs.io/en/latest/postgres/),
-  [Other backends](https://tinyjobs.readthedocs.io/en/latest/other-backends/)
+  [Other backends](https://tinyjobs.readthedocs.io/en/latest/other-backends/),
+  [Moving to another store](https://tinyjobs.readthedocs.io/en/latest/moving-to-another-store/)
 - About: [How it compares](https://tinyjobs.readthedocs.io/en/latest/how-it-compares/),
   [How it works](https://tinyjobs.readthedocs.io/en/latest/how-it-works/),
   [Measured](https://tinyjobs.readthedocs.io/en/latest/measured/),

@@ -36,6 +36,7 @@ nav:
       - Redis: redis.md
       - Postgres: postgres.md
       - Other backends: other-backends.md
+      - Moving to another store: moving-to-another-store.md
   - About:
       - How it compares: how-it-compares.md
       - How it works: how-it-works.md

@@ -12,6 +12,9 @@ except on a SQLite file that 0.14 created, where an older worker would start a q
 [SQLite](sqlite.md) has the 0.14 steps and what a process left running does; the upgrade order
 that pausing needs is under [Cron](cron.md).
 
+**Change store.** [Moving to another store](moving-to-another-store.md) is two steps, a deploy
+and `tinyjobs move`, and no stop for the jobs sent meanwhile.
+
 **Stop.** `SIGTERM` stops claiming and exits within `--shutdown-timeout` (30 s): running jobs get
 most of it, and the async and isolated ones still running at the end are handed back so another
 worker takes them at once; what a second Ctrl-C does and why the timeout must stay under the

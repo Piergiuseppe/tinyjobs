@@ -237,7 +237,8 @@ someone else could have done, and nothing was left in the store;
 otherwise the failing reasons are the verdict and the exit status is 1, with the tail of the
 workers' log when one died or refused to stop, while a store refused, unreachable or settings
 that make no sense are a configuration error and exit 2 before anything runs. The header and
-the errors show the URL with its password masked. Afterwards the queued jobs of a cut-short run are
+the errors name the store by its kind, `the store (redis)`, and print nothing of its address,
+which can carry a password in more places than one rule finds. Afterwards the queued jobs of a cut-short run are
 cancelled, in every case, since nothing would ever consume a queue named after the run, and
 the run's finished jobs purged, unless `--keep` leaves them in the store, for `tinyjobs jobs`
 and the dashboard, or other jobs appeared during the run, of another task or of another run on
@@ -705,6 +706,7 @@ class Backend(Protocol):
     # --- control ---------------------------------------------------------
     async def cancel(self, job_id: str) -> bool: ...
     async def requeue(self, job_id: str) -> bool: ...
+    async def delete(self, job_id: str) -> bool: ...
     async def get(self, job_id: str) -> Job | None: ...
     async def list(self, *, status: JobStatus | None = None, queue: str | None = None,
                    limit: int = 100, cursor: str | None = None) -> Page: ...
@@ -1133,7 +1135,7 @@ Postgres never meets it.
 ### Atomicity
 
 Every state change is one Lua script: enqueue, claim, complete, fail, release, hand back, cancel, requeue,
-heartbeat, reap, a purge batch, a cron firing. Redis runs a script without interleaving any other
+delete, heartbeat, reap, a purge batch, a cron firing. Redis runs a script without interleaving any other
 command, which gives each transition the guarantee SQLite gets from `BEGIN IMMEDIATE`. The scripts
 share one library, and in it a single pair of functions, `leave` and `enter`, knows which indexes
 each status lives in. A transition is `leave(old)`, write the hash, `enter(new)`, so no script can
@@ -3440,6 +3442,65 @@ becomes a no-op, and a refused 0.6 start cannot stop a running 0.7 worker from r
 
 ---
 
+### Moving between stores
+
+`tinyjobs move` is written against the backend protocol and nothing else: `list`, `get`,
+`enqueue`, `delete`, `reap_expired` and `counts_by_status`, each called on the app that owns the
+store, so it works between any two stores that pass the contract.
+
+The order is copy, then delete. The copy in the new store, under the same id, is the whole record
+of the move: a run that dies leaves both stores holding the job, and the next run sends it again,
+which a store answers with the job it already holds, and deletes the original. Nothing else is
+written down, and nothing is inferred from what a job looks like.
+
+The first version took a job out of the old store with `cancel`, the only verb the protocol
+had, and four rounds of review each found a way it lost or doubled a job. They had two causes.
+`cancel` leaves a cancelled row under a live id, which a later run cannot tell from a job a
+person cancelled: a move back found those rows, took them for copies, and cancelled the jobs in
+the store it was leaving too. And `cancel` reaches further than the job it names: it cancels
+every job waiting behind it, so a job sent behind a moving one was cancelled without ever being
+copied, and it stops a job that a worker had just started. Each fix was another rule for reading
+what had happened from the state of two stores, and each rule had its own counter-example in
+retention, a retry, or a move in the other direction.
+
+So the protocol has `delete`, which the move needed and any store was able to do: it removes a
+job that has not started and that nothing waits behind, with its attempts and its deduplication
+key, and does nothing else. It returns False for a running job, an ended job, and a job with
+another waiting behind it, and touches none of them. With it a moved job leaves no row, a move
+back is a move like any other, and the cases that needed a rule are a False return: a worker
+claimed the job, which goes on running and is reported; or a job arrived behind it, and the two
+wait for the next run. One of those is not airtight on Postgres, where a child is placed by
+reading its parent without locking it, as it always was against a parent ending at the same
+moment: the store's sweep cancels such a child as one whose parent is gone.
+
+`enqueue` of an id a store already holds returns the job it holds, on every store, once the
+parent it names, if any, is found there. They used to disagree: Postgres did that, SQLite raised, and Redis wrote the new fields over the old ones and
+counted the job twice.
+
+The plan groups the jobs to move into families, a job with everything that waits for it,
+directly or not, built from the `after` links whatever order the ids come in, because `enqueue`
+refuses a parent the store does not hold and `delete` refuses a job with another behind it: a
+family is copied parents first and deleted children first. A family whose root is still
+`waiting` is left for the next run, since the job it waits for is not in the plan. A root that
+is queued while its `after` names a job moves with the link cleared: its parent succeeded, and
+the new store has no such job to point at. A job that finds its deduplication key held in the
+new store is not sent, and a child of it is sent `after` the holder instead.
+
+Two addresses can name one store, and a move from a store to itself would send each job, be
+answered with the job itself, and delete it. So before it changes anything else the command
+writes one job of its own to the new store, looks for it in the old one, and deletes it: found
+means one store. A store in memory is refused at either end for a plainer reason: it is created
+empty by the command and gone when the command ends, so a move to one would delete every job
+from the only store that held them. The other mistake an address invites is a store that is not the one meant, and opening a
+store that does not exist creates it on all three; a store that holds no job of any status is
+refused, which is the one thing true of every store made a moment ago.
+
+Addresses are not printed. An earlier version hid the password, and each review found a form of
+address in which one of the drivers reads a password where the rule did not look: an option of
+the query, a password holding `?` or `/`, a second `@` further on. A rule that agrees with
+urllib, libpq and SQLite at once does not exist, so the commands print the kind of store, which
+is a word from a fixed list, and nothing after the scheme.
+
 ## Testing
 
 Testing background jobs is normally miserable, so it is a design constraint rather than an afterthought.
@@ -3592,6 +3653,11 @@ what a release may change; the exceptions and return types a caller meets export
 package; `NewerStoreError` for a store too new; the in-memory template backend made to pass the
 contract; and a release check that upgrades a store of the release before and shares it between
 the two versions.
+
+**v0.19, moving**
+`tinyjobs move`, which carries the jobs still to run from one store to another, so changing
+store is a deploy and a command instead of a stop, and `delete` in the backend protocol, the
+verb it needed.
 
 **v1.0, commitment**
 A backend protocol that changes only compatibly, a documented plugin API, full documentation. After
