@@ -27,10 +27,14 @@ class MySQLContractTests(BackendContract, unittest.IsolatedAsyncioTestCase):
         return MySQLBackend.from_url(URL, clock=clock)
 ```
 
-Subclassing `tinyjobs.backends.BaseBackend` leaves fourteen methods to write: `enqueue`, `claim`,
-`heartbeat`, `complete`, `fail`, `release`, `cancel`, `requeue`, `get`, `list`, `executions`,
-`reap_expired`, `counts_by_status` and `stats`. `heartbeat` takes `worker_id=` and returns the ids
-whose lease it renewed. `claim_job` is optional, and the contract tests that claim by id are skipped
+Subclassing `tinyjobs.backends.BaseBackend` leaves fifteen methods to write: `enqueue`, `claim`,
+`heartbeat`, `complete`, `fail`, `release`, `cancel`, `requeue`, `delete`, `get`, `list`,
+`executions`, `reap_expired`, `counts_by_status` and `stats`. `heartbeat` takes `worker_id=` and
+returns the ids whose lease it renewed. `delete`, new in 0.19, removes a job that has not started
+and that nothing waits behind, with its attempts and its deduplication key, and returns False
+for any other job without touching it; and `enqueue` of an id the store already holds writes
+nothing and returns the job it holds, unless the job names a parent the store does not hold,
+which is refused first. `claim_job` is optional, and the contract tests that claim by id are skipped
 without it, or run without that step. Without it, an eager call drains every due job, as earlier
 releases did, and waits for a job it inserted. A store that does not declare `loop_bound` is called
 from more than one thread: claims, and the hand-backs of a claim given up, run on the app's own

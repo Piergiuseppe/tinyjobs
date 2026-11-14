@@ -7,6 +7,26 @@ versions are the `SCHEMA_VERSION` of each backend.
 
 ## 0.19.0 - unreleased
 
+### Added
+- `tinyjobs move --from URL --to URL` (or `--app`): the jobs still to run in one store are copied
+  to another and deleted from the first, chains sent with `after=` whole, with their ids, times
+  to run, attempts and keys. A run that stops halfway is finished by the next, and a move back
+  is a move like any other. It works between SQLite, Postgres and Redis in any direction; the
+  [page](https://tinyjobs.readthedocs.io/en/latest/moving-to-another-store/) has the steps and
+  what stays behind.
+
+### Changed
+- For backend authors: the protocol has a new method, `delete(job_id)`, which removes a job that
+  has not started and that nothing waits behind, with its attempts and its deduplication key,
+  and returns False for any other job without touching it. It is abstract on `BaseBackend`, so
+  a store without it no longer instantiates, and the contract tests it.
+- For backend authors: `enqueue` of an id the store already holds writes nothing and returns
+  the job it holds, once the parent it names is found, which the contract now tests. SQLite
+  used to raise `sqlite3.IntegrityError`.
+- `tinyjobs verify` names the store by its kind, `the store (redis)`, where it printed the
+  address with the password masked.
+- An argument error no longer echoes an argument that is an address.
+
 ### Fixed
 - A `Ctrl-C` or `SIGTERM` delivered to a thread other than the main one while a job blocked
   the loop is acted on at once, so a second one forces the stop. It used to wait for the job to
@@ -14,6 +34,10 @@ versions are the `SCHEMA_VERSION` of each backend.
   `SIGURG` for a stop signal its loop leaves unread for a tenth of a second, unless `SIGURG`
   has a handler already or the loop is not asyncio's own, as with uvloop; a job blocked in C
   code that retries its own interrupted calls still holds the worker until it returns.
+- On Redis, enqueueing a job whose id is already stored leaves the stored job as it is. It used
+  to write the new fields over it and count it twice.
+- `tinyjobs verify` printed a password given as an option of the address, such as
+  `?password=`.
 
 ### Upgrading
 - No schema change and no stop needed.

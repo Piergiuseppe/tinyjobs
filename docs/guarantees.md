@@ -68,5 +68,5 @@ jobs, and purges its own at the end, leaving only the store's schema rows behind
 jobs appeared during the run, in which case it purges nothing and says so. A verifier killed
 outright leaves its workers to stop themselves, and its temporary directory and its jobs in the
 store behind, which a new file, a flushed Redis database or dropped Postgres tables clear. The
-URL is printed with its password masked. What it does not do, stopping the store or skewing
+address is never printed, only the kind of store. What it does not do, stopping the store or skewing
 clocks, is in [Measured](measured.md).

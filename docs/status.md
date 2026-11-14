@@ -13,7 +13,7 @@ v0.18.0. Working and measured, but young. What's in:
 - lifecycle hooks for metrics and alerting
 - `memory://`, eager mode and `app.drain()` for testing
 - cron schedules, fired leader-free from every worker, with timezones, misfire and overlap policies
-- `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge`
+- `tinyjobs worker` / `scheduler` / `schedules` / `jobs` / `stats` / `check` / `send` / `purge` / `move`
 - a Redis backend, `pip install 'tinyjobs[redis]'`
 - a Postgres backend, `pip install 'tinyjobs[postgres]'`, with `LISTEN`/`NOTIFY` wake-ups
 - transactional enqueue on Postgres and SQLite, also through Django's `transaction.atomic()`
@@ -39,6 +39,7 @@ v0.18.0. Working and measured, but young. What's in:
   `@task`, or by import path in the settings
 - jobs that run after another: `after=job`, with a `waiting` status, on every store and on
   `django.tasks`
+- `tinyjobs move`, which carries the jobs still to run from one store to another
 
 Upgrading to 0.17 adds the `waiting` status and a column (a field, on Redis) to every store. Stop
 every tinyjobs process on a store before starting the first 0.17 one: it upgrades the store on its
