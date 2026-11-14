@@ -396,13 +396,25 @@ class Verification:
         deadline = time.monotonic() + self._settings.settle
         while not self._stopped.is_set():
             workers.sweep()
-            if not any(self._pending(app, status) for status in PENDING):
+            if not self._unsettled(app):
                 return
             if time.monotonic() >= deadline:
                 report.settled = False
                 return
             self._stopped.wait(SETTLE_POLL)
         report.interrupted = True
+
+    def _unsettled(self, app: Any) -> bool:
+        if any(self._pending(app, status) for status in PENDING):
+            return True
+        cursor = None
+        while True:
+            page = app.jobs(queue=self._queue, limit=PAGE, cursor=cursor)
+            if any(job.status in PENDING for job in page.items):
+                return True
+            cursor = page.cursor
+            if not cursor or not page.items:
+                return False
 
     def _pending(self, app: Any, status: JobStatus) -> bool:
         return bool(app.jobs(queue=self._queue, status=status, limit=1).items)
