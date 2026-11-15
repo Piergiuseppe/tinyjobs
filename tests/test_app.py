@@ -1854,9 +1854,14 @@ class InterruptSweepTests(BackendTestCase):
                 break
             time.sleep(0.002)
         self.assertEqual(held, [], point)
-        with FORK_GATE.using():
-            pass
-        self.assertEqual(FORK_GATE._holders, {}, point)
+        while True:
+            with FORK_GATE.using():
+                pass
+            left = dict(FORK_GATE._holders)
+            if not left or time.monotonic() >= deadline:
+                break
+            time.sleep(0.002)
+        self.assertEqual(left, {}, point)
 
     def write_lock_is_held(self) -> bool:
         probe = sqlite3.connect(self.database, timeout=0, isolation_level=None)
