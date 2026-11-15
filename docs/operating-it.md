@@ -15,8 +15,13 @@ that pausing needs is under [Cron](cron.md).
 **Stop.** `SIGTERM` stops claiming and exits within `--shutdown-timeout` (30 s): running jobs get
 most of it, and the async and isolated ones still running at the end are handed back so another
 worker takes them at once; what a second Ctrl-C does and why the timeout must stay under the
-orchestrator's grace period are in [FastAPI](fastapi.md). A worker killed outright leaves its jobs to
-their leases, 60 s by default (`--lease`), before the reaper returns them to the queue.
+orchestrator's grace period are in [FastAPI](fastapi.md). A stop signal that
+reaches another thread while a job blocks the worker's loop is passed on to the main thread with
+a `SIGURG`, unless `SIGURG` has a handler already or the loop is not asyncio's own, as with
+uvloop, so that a second signal forces the stop wherever it lands; a job blocked in C code that
+retries its own interrupted calls still holds the worker until it returns. A worker killed
+outright leaves its jobs to their leases, 60 s by default (`--lease`), before the reaper returns
+them to the queue.
 
 **Watch.** Alert on `tinyjobs check` exiting 1, which a store configured against the
 [guarantees](guarantees.md) does too, with `--store-warnings` where a development store is
