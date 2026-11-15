@@ -5,7 +5,7 @@ Changelog](https://keepachangelog.com/en/1.1.0/). What a release is allowed to c
 [compatibility page](https://tinyjobs.readthedocs.io/en/latest/compatibility/). Store schema
 versions are the `SCHEMA_VERSION` of each backend.
 
-## 0.19.0 - unreleased
+## 0.19.0 - 2026-11-15
 
 ### Added
 - `tinyjobs move --from URL --to URL` (or `--app`): the jobs still to run in one store are copied
