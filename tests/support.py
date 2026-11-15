@@ -625,8 +625,11 @@ class LoopBoundAppCases:
         )
 
     def test_a_stopped_worker_waits_for_a_def_job_on_an_extra_loop(self):
+        began: list[bool] = []
+
         @self.app.task(name="slow")
         def slow():
+            began.append(True)
             time.sleep(1.5)
 
         observer = self.make_app()
@@ -639,7 +642,7 @@ class LoopBoundAppCases:
         worker = self.app.worker(
             concurrency=2, loops=2, scheduler=False, handle_signals=False, shutdown_timeout=0.3
         )
-        self.run_worker(worker, until=lambda: self.app.counts().get("running", 0) >= 2)
+        self.run_worker(worker, until=lambda: len(began) >= 2)
         self.assertEqual(self.app.counts(), {"success": 2})
 
     def test_a_stop_reaches_a_worker_still_connecting(self):
