@@ -14,7 +14,7 @@ from tinyjobs import Abandon, Retry, TinyJobs
 from tinyjobs.exceptions import ConfigurationError, UnknownTaskError
 from tinyjobs.services.execution import current_job
 from tinyjobs.status import ExecutionStatus, JobStatus
-from tests.support import seconds_to_exit
+from tests.support import PROCESS_EXIT_SECONDS, seconds_to_exit
 
 SETTLE_TIMEOUT = 15.0
 
@@ -1984,7 +1984,7 @@ class SQLiteExitTests(unittest.TestCase):
                 task="lingering",
                 errors=errors,
             )
-        self.assertLess(took, 1.25 + 0.3)
+        self.assertLess(took, 1.25 + PROCESS_EXIT_SECONDS)
         self.assertEqual(errors, [""], errors)
 
     def test_a_second_run_does_not_inherit_the_jobs_the_first_left_behind(self):
@@ -2086,7 +2086,7 @@ class SQLiteExitTests(unittest.TestCase):
                     worker.kill()
                     worker.wait(10)
         self.assertEqual(worker.returncode, 0, errors[-2000:])
-        self.assertLess(took, 0.5 + 1.25 + 0.3)
+        self.assertLess(took, 0.5 + 1.25 + PROCESS_EXIT_SECONDS)
     def test_the_cli_exits_within_the_shutdown_timeout_with_its_writes_stuck_on_a_lock(self):
         import sqlite3
 
@@ -2106,7 +2106,7 @@ class SQLiteExitTests(unittest.TestCase):
             took = seconds_to_exit(
                 f"sqlite:///{path}", seconds=0.6, count=4, timeout=2.0, lock=locked, settle=0.8
             )
-        self.assertLess(took, 2.0 + 0.15)
+        self.assertLess(took, 2.0 + PROCESS_EXIT_SECONDS)
 
     def test_the_cli_exit_is_not_held_by_a_heartbeat_waiting_on_a_lock(self):
         import sqlite3
@@ -2132,7 +2132,7 @@ class SQLiteExitTests(unittest.TestCase):
                 lock=locked,
                 options=("--lease", "1.5"),
             )
-        self.assertLess(took, 1.5 + 1.25 + 0.3)
+        self.assertLess(took, 1.5 + 1.25 + PROCESS_EXIT_SECONDS)
 
     def test_the_cli_exits_within_its_shutdown_timeout_while_a_job_ignores_cancellation(self):
         errors: list[str] = []
@@ -2147,7 +2147,7 @@ class SQLiteExitTests(unittest.TestCase):
                 task="stubborn",
                 errors=errors,
             )
-        self.assertLess(took, 2.0 + 0.15)
+        self.assertLess(took, 2.0 + PROCESS_EXIT_SECONDS)
         self.assertEqual(errors, [""], errors)
 
     def test_a_zero_shutdown_timeout_still_releases_async_jobs(self):
@@ -2158,7 +2158,7 @@ class SQLiteExitTests(unittest.TestCase):
             )
             with TinyJobs(url) as app:
                 statuses = [job.status for job in app.jobs().items]
-        self.assertLess(took, 1.25 + 0.15)
+        self.assertLess(took, 1.25 + PROCESS_EXIT_SECONDS)
         self.assertEqual(statuses, [JobStatus.QUEUED] * 3)
 
     def test_a_zero_shutdown_timeout_records_def_jobs_whose_threads_end(self):
@@ -2169,7 +2169,7 @@ class SQLiteExitTests(unittest.TestCase):
             )
             with TinyJobs(url) as app:
                 statuses = [job.status for job in app.jobs().items]
-        self.assertLess(took, 0.5 + 1.25 + 0.15)
+        self.assertLess(took, 0.5 + 1.25 + PROCESS_EXIT_SECONDS)
         self.assertEqual(statuses, [JobStatus.SUCCESS] * 3)
 
 
