@@ -5,6 +5,19 @@ Changelog](https://keepachangelog.com/en/1.1.0/). What a release is allowed to c
 [compatibility page](https://tinyjobs.readthedocs.io/en/latest/compatibility/). Store schema
 versions are the `SCHEMA_VERSION` of each backend.
 
+## 0.19.0 - unreleased
+
+### Fixed
+- A `Ctrl-C` or `SIGTERM` delivered to a thread other than the main one while a job blocked
+  the loop is acted on at once, so a second one forces the stop. It used to wait for the job to
+  return, and two that waited together counted as one. A worker now sends its main thread
+  `SIGURG` for a stop signal its loop leaves unread for a tenth of a second, unless `SIGURG`
+  has a handler already or the loop is not asyncio's own, as with uvloop; a job blocked in C
+  code that retries its own interrupted calls still holds the worker until it returns.
+
+### Upgrading
+- No schema change and no stop needed.
+
 ## 0.18.0 - 2026-11-14
 
 ### Added

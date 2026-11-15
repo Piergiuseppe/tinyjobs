@@ -45,7 +45,7 @@ from ..polling import AdaptiveInterval
 from ..services.execution import current_runner
 from ..services.lifecycle import VERIFY_SECONDS
 from .lanes import Lanes, shares
-from .signals import RunInterrupts, ShutdownWatcher
+from .signals import RunInterrupts, ShutdownWatcher, loop_ended
 
 if TYPE_CHECKING:
     from ..app import TinyJobs
@@ -286,6 +286,7 @@ class Worker:
                 raise
             finally:
                 self._hosting = None
+                loop_ended(loop)
                 interrupts.restore(exiting=clean and self._handle_signals)
                 asyncio.set_event_loop(None)
                 loop.close()

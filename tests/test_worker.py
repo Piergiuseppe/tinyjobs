@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import importlib.util
 import os
+import signal as signal_module
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -878,7 +880,8 @@ class SignalHandlerTests(WorkerTestCase):
         with mock.patch("signal.signal", recorded):
             await self.run_briefly(self.make_worker(), 0.2)
         defaults = (signal.SIG_DFL, signal.default_int_handler)
-        self.assertEqual([entry for entry in installed if entry[1] in defaults], [])
+        passed = [entry for entry in installed if entry[0] in numbers and entry[1] in defaults]
+        self.assertEqual(passed, [])
         self.assertEqual([signal.getsignal(number) for number in numbers], [mine, mine])
 
     async def wait_until(self, condition, timeout: float = 5.0) -> None:
@@ -1525,6 +1528,65 @@ app.worker(shutdown_timeout=1.0, scheduler=False).run()
 """
 
 
+NUDGED_WORKER = """
+import signal
+import sys
+import threading
+import time
+
+from tinyjobs import TinyJobs, runtime
+
+order, handling = sys.argv[2:4]
+number = signal.SIGINT if handling == "raise" else signal.SIGTERM
+if handling == "bare":
+    import asyncio
+
+    class Loop(asyncio.SelectorEventLoop):
+        def add_signal_handler(self, *args):
+            raise NotImplementedError
+
+    class Policy(asyncio.DefaultEventLoopPolicy):
+        def new_event_loop(self):
+            return Loop()
+
+    asyncio.set_event_loop_policy(Policy())
+app = TinyJobs(sys.argv[1])
+
+
+@app.task(name="blocking", max_attempts=1)
+async def blocking():
+    def press():
+        time.sleep(0.5)
+        main, other = threading.main_thread().ident, runtime._control_ident
+        targets = {
+            "main": (main, main),
+            "second": (main, other),
+            "first": (other, main),
+            "neither": (other, other),
+        }
+        for target in targets[order]:
+            signal.pthread_kill(target, number)
+            time.sleep(0.3)
+
+    threading.Thread(target=press, daemon=True).start()
+    time.sleep(20)
+
+
+blocking.enqueue()
+began = time.monotonic()
+try:
+    app.worker(handle_signals=handling != "raise", shutdown_timeout=1.0, scheduler=False).run()
+except KeyboardInterrupt:
+    pass
+print(
+    time.monotonic() - began,
+    signal.getsignal(signal.SIGURG) is signal.SIG_DFL,
+    signal.set_wakeup_fd(-1),
+    flush=True,
+)
+"""
+
+
 class SQLiteBusyTests(unittest.TestCase):
     def test_an_outcome_written_while_another_process_holds_the_lock_is_recorded(self):
         import sqlite3
@@ -1614,6 +1676,292 @@ class PressTests(unittest.TestCase):
         interrupts.restore()
         time.sleep(0.4)
         self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+
+
+@unittest.skipUnless(
+    hasattr(signal_module, "SIGURG") and hasattr(signal_module, "pthread_kill"),
+    "needs SIGURG and pthread_kill",
+)
+class NudgeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from tinyjobs.worker import signals
+
+        self.signals = signals
+        for thread in self.nudge_threads():
+            thread.join(5)
+        self.loop = asyncio.new_event_loop()
+        self.loop.set_debug(False)
+        self.addCleanup(self.loop.close)
+        self.addCleanup(signal_module.signal, signal_module.SIGURG, signal_module.SIG_DFL)
+        self.addCleanup(signals._nudges.forget, self.loop)
+        self.seen: list[int] = []
+        nudged = mock.patch.object(signals, "_nudged", lambda number, frame: self.seen.append(number))
+        nudged.start()
+        self.addCleanup(nudged.stop)
+
+    def presses(self):
+        default = signal_module.default_int_handler
+        before = signal_module.signal(signal_module.SIGINT, default)
+        self.addCleanup(signal_module.signal, signal_module.SIGINT, before)
+        made = self.signals.RunInterrupts(self.loop, lambda: None, lambda: None, lambda: None)
+        self.addCleanup(made.restore)
+        return made
+
+    def wakeup(self) -> int:
+        woken = signal_module.set_wakeup_fd(-1)
+        signal_module.set_wakeup_fd(woken)
+        return woken
+
+    def arrive(self, *numbers: int) -> None:
+        self.loop._csock.send(bytes(numbers))
+
+    def wait(self, seconds: float) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            time.sleep(0.005)
+
+    def nudge_threads(self) -> list[threading.Thread]:
+        return [t for t in threading.enumerate() if t.name == self.signals.NUDGE_THREAD]
+
+    def nudge_signal(self):
+        return signal_module.getsignal(signal_module.SIGURG)
+
+    def worker_took(self, order: str, handling: str = "own") -> float:
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as directory:
+            ran = subprocess.run(
+                [sys.executable, "-c", NUDGED_WORKER,
+                 f"sqlite:///{Path(directory) / 'jobs.db'}", order, handling],
+                capture_output=True, text=True, timeout=60,
+            )
+        self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
+        took, restored, wakeup = ran.stdout.split()
+        self.assertEqual((restored, wakeup), ("True", "-1"))
+        return float(took)
+
+    def test_two_stop_signals_force_the_stop_whichever_thread_received_each(self):
+        for order in ("main", "second", "first", "neither"):
+            with self.subTest(order=order):
+                self.assertLess(self.worker_took(order), 8.0)
+
+    def test_two_ctrl_c_end_a_run_that_leaves_signals_alone_whichever_thread_received_each(self):
+        for order in ("second", "first", "neither"):
+            with self.subTest(order=order):
+                self.assertLess(self.worker_took(order, "raise"), 8.0)
+
+    def test_two_stop_signals_force_the_stop_on_a_loop_that_takes_no_signal_handlers(self):
+        for order in ("second", "first", "neither"):
+            with self.subTest(order=order):
+                self.assertLess(self.worker_took(order, "bare"), 8.0)
+
+    def test_a_watcher_on_a_loop_that_takes_no_signal_handlers_has_the_loop_woken(self):
+        async def installed():
+            watcher = self.signals.ShutdownWatcher(lambda: None, lambda: None)
+            watcher.install()
+            try:
+                return self.wakeup(), self.nudge_signal()
+            finally:
+                watcher.uninstall()
+
+        for number in (signal_module.SIGINT, signal_module.SIGTERM):
+            self.addCleanup(signal_module.signal, number, signal_module.getsignal(number))
+        refusing = mock.patch.object(
+            self.loop, "add_signal_handler", side_effect=NotImplementedError
+        )
+        with refusing:
+            woken, handler = self.loop.run_until_complete(installed())
+        self.assertEqual(woken, self.loop._csock.fileno())
+        self.assertIs(handler, self.signals._nudged)
+        self.assertEqual(self.wakeup(), -1)
+        self.assertIs(self.nudge_signal(), signal_module.SIG_DFL)
+
+    def test_a_stop_signal_a_blocked_loop_did_not_read_nudges_the_main_thread_once(self):
+        self.signals._nudges.watch(self.loop, self)
+        self.assertIs(self.nudge_signal(), self.signals._nudged)
+        self.arrive(signal_module.SIGTERM)
+        self.wait(0.6)
+        self.assertEqual(self.seen, [signal_module.SIGURG])
+        self.arrive(signal_module.SIGINT)
+        self.wait(0.6)
+        self.assertEqual(self.seen, [signal_module.SIGURG] * 2)
+
+    def test_a_stop_signal_the_loop_reads_in_time_nudges_nothing(self):
+        with mock.patch.object(self.signals, "NUDGE_GRACE_SECONDS", 0.5):
+            self.signals._nudges.watch(self.loop, self)
+            self.arrive(signal_module.SIGTERM)
+            self.loop.run_until_complete(asyncio.sleep(1.0))
+        self.assertEqual(self.seen, [])
+
+    def test_what_is_not_a_stop_signal_nudges_nothing(self):
+        self.signals._nudges.watch(self.loop, self)
+        self.arrive(0, signal_module.SIGURG, signal_module.SIGCHLD)
+        self.wait(0.4)
+        self.assertEqual(self.seen, [])
+
+    def test_the_nudges_end_when_the_last_watcher_of_a_loop_leaves(self):
+        first, second = object(), object()
+        self.signals._nudges.watch(self.loop, first)
+        self.signals._nudges.watch(self.loop, second)
+        self.assertEqual(len(self.nudge_threads()), 1)
+        self.signals._nudges.unwatch(self.loop, first)
+        self.assertIs(self.nudge_signal(), self.signals._nudged)
+        self.signals._nudges.unwatch(self.loop, second)
+        self.assertIs(self.nudge_signal(), signal_module.SIG_DFL)
+        self.arrive(signal_module.SIGTERM)
+        self.wait(0.4)
+        self.assertEqual(self.seen, [])
+        for thread in self.nudge_threads():
+            thread.join(5)
+        self.assertEqual(self.nudge_threads(), [])
+
+    def test_a_loop_that_ended_is_watched_no_more(self):
+        self.signals._nudges.watch(self.loop, self)
+        self.signals.loop_ended(self.loop)
+        self.assertIs(self.nudge_signal(), signal_module.SIG_DFL)
+        self.assertEqual(len(self.signals._nudges._watched), 0)
+
+    def test_a_loop_closed_while_watched_is_forgotten_at_the_next_watch(self):
+        closed = asyncio.new_event_loop()
+        self.signals._nudges.watch(closed, self, waking=True)
+        self.assertEqual(self.wakeup(), closed._csock.fileno())
+        closed.close()
+        self.signals._nudges.watch(self.loop, self)
+        self.assertEqual(list(self.signals._nudges._watched), [self.loop])
+        self.assertEqual(self.wakeup(), -1)
+
+    def test_the_thread_of_a_loop_closed_under_it_ends(self):
+        with mock.patch.object(self.signals, "NUDGE_IDLE_SECONDS", 0.05):
+            self.signals._nudges.watch(self.loop, self)
+            self.loop.close()
+            for thread in self.nudge_threads():
+                thread.join(5)
+        self.assertEqual(self.nudge_threads(), [])
+
+    def test_a_run_watches_its_loop_and_takes_the_wakeup_channel_until_it_is_restored(self):
+        presses = self.presses()
+        self.assertIs(self.nudge_signal(), self.signals._nudged)
+        self.assertEqual(self.wakeup(), self.loop._csock.fileno())
+        presses.restore()
+        self.assertIs(self.nudge_signal(), signal_module.SIG_DFL)
+        self.assertEqual(signal_module.set_wakeup_fd(-1), -1)
+
+    def test_a_run_leaves_a_wakeup_channel_that_is_not_its_own_alone(self):
+        import socket
+
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        ours.setblocking(False)
+        signal_module.set_wakeup_fd(ours.fileno())
+        self.addCleanup(signal_module.set_wakeup_fd, -1)
+        self.presses().restore()
+        self.assertEqual(signal_module.set_wakeup_fd(-1), ours.fileno())
+
+    def test_a_run_keeps_the_wakeup_channel_when_the_loop_hands_its_signals_back(self):
+        self.presses()
+        stack = self.signals._LoopStack(self.loop)
+        self.signals._loop_stacks.setdefault(self.loop, {})[signal_module.SIGTERM] = stack
+        self.addCleanup(self.signals._loop_stacks.pop, self.loop, None)
+        self.addCleanup(signal_module.signal, signal_module.SIGTERM, signal_module.SIG_DFL)
+        stack.take(signal_module.SIGTERM)
+        stack.leave(signal_module.SIGTERM)
+        self.assertEqual(self.wakeup(), self.loop._csock.fileno())
+
+    def test_a_run_takes_no_wakeup_channel_when_the_nudge_signal_is_handled(self):
+        signal_module.signal(signal_module.SIGURG, lambda number, frame: None)
+        self.presses()
+        self.assertEqual(self.wakeup(), -1)
+
+    def test_a_handler_the_application_set_for_the_nudge_signal_is_left_alone(self):
+        own_seen = []
+
+        def own(number, frame) -> None:
+            own_seen.append(number)
+
+        signal_module.signal(signal_module.SIGURG, own)
+        self.signals._nudges.watch(self.loop, self)
+        self.arrive(signal_module.SIGTERM)
+        self.wait(0.4)
+        self.assertEqual((own_seen, self.seen, self.nudge_threads()), ([], [], []))
+        self.signals._nudges.unwatch(self.loop, self)
+        self.assertIs(self.nudge_signal(), own)
+
+    def test_a_handler_the_application_sets_while_watched_is_sent_nothing(self):
+        own_seen = []
+        self.signals._nudges.watch(self.loop, self)
+        signal_module.signal(signal_module.SIGURG, lambda number, frame: own_seen.append(number))
+        own = self.nudge_signal()
+        self.arrive(signal_module.SIGTERM)
+        self.wait(0.4)
+        self.signals._nudges.unwatch(self.loop, self)
+        self.assertEqual((own_seen, self.seen), ([], []))
+        self.assertIs(self.nudge_signal(), own)
+
+    def outside_handler(self):
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.signal.restype = ctypes.c_void_p
+        libc.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        self.addCleanup(
+            self.signals._set_raw_action,
+            signal_module.SIGURG,
+            self.signals._raw_action(signal_module.SIGURG),
+        )
+        return lambda: libc.signal(
+            signal_module.SIGURG, ctypes.cast(libc.abs, ctypes.c_void_p).value
+        )
+
+    def raw_handler(self) -> bytes:
+        return self.signals._pointer(self.signals._raw_action(signal_module.SIGURG))
+
+    @unittest.skipUnless(os.name == "posix", "needs sigaction")
+    def test_a_handler_set_outside_python_for_the_nudge_signal_is_left_alone(self):
+        self.outside_handler()()
+        outside = self.raw_handler()
+        self.signals._nudges.watch(self.loop, self)
+        self.assertEqual(self.nudge_threads(), [])
+        self.assertEqual(self.raw_handler(), outside)
+        self.signals._nudges.unwatch(self.loop, self)
+        self.assertEqual(self.raw_handler(), outside)
+
+    @unittest.skipUnless(os.name == "posix", "needs sigaction")
+    def test_a_handler_set_outside_python_while_watched_is_left_alone(self):
+        install = self.outside_handler()
+        default = self.raw_handler()
+        self.signals._nudges.watch(self.loop, self)
+        self.assertNotEqual(self.raw_handler(), default)
+        install()
+        outside = self.raw_handler()
+        self.signals._nudges.unwatch(self.loop, self)
+        self.assertEqual(self.raw_handler(), outside)
+
+    def test_a_watch_off_the_main_thread_starts_nothing(self):
+        thread = threading.Thread(target=self.signals._nudges.watch, args=(self.loop, self))
+        thread.start()
+        thread.join(5)
+        self.assertEqual(self.nudge_threads(), [])
+        self.assertIs(self.nudge_signal(), signal_module.SIG_DFL)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs os.fork")
+    def test_a_child_forked_while_a_loop_is_watched_starts_from_nothing(self):
+        self.presses()
+        child = os.fork()
+        if child == 0:
+            code = 1
+            try:
+                nudges = self.signals._nudges
+                clean = len(nudges._watched) == 0 and nudges._previous is None
+                default = self.nudge_signal() is signal_module.SIG_DFL
+                code = 0 if clean and default and self.wakeup() == -1 else 2
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(child, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertIs(self.nudge_signal(), self.signals._nudged)
+        self.assertEqual(self.wakeup(), self.loop._csock.fileno())
 
 
 @unittest.skipUnless(os.name == "posix", "needs sigaction")

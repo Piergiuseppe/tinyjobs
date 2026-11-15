@@ -6,11 +6,14 @@ import contextvars
 import ctypes
 import logging
 import os
+import selectors
 import signal
+import socket
+import sys
 import threading
 import time
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import cache, partial
 from typing import Any, Callable, Iterable, Iterator
 
@@ -28,6 +31,18 @@ UNANSWERED_EXIT_SECONDS = 1.0
 UNANSWERED_EXIT_STATUS = 130
 
 POKE_SECONDS = 0.05
+
+NUDGE_GRACE_SECONDS = 0.05
+
+NUDGE_IDLE_SECONDS = 1.0
+
+NUDGE_PEEK_BYTES = 65536
+
+NUDGE_SIGNAL = getattr(signal, "SIGURG", None)
+
+NUDGING = NUDGE_SIGNAL is not None and hasattr(signal, "pthread_kill")
+
+NUDGE_THREAD = "tinyjobs-nudge"
 
 logger = logging.getLogger("tinyjobs.signals")
 
@@ -135,6 +150,166 @@ class _Presses:
             self._watch()
 
 
+class _Nudges:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._watched: dict[asyncio.AbstractEventLoop, tuple[set[Any], threading.Event]] = {}
+        self._previous: tuple[Any, bytes | None] | None = None
+        self._installed: bytes | None = None
+        self._woken: tuple[asyncio.AbstractEventLoop, int] | None = None
+
+    def watch(self, loop: asyncio.AbstractEventLoop, owner: Any, waking: bool = False) -> None:
+        reader = getattr(loop, "_ssock", None)
+        if not NUDGING or reader is None:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+        with self._lock:
+            for closed in [known for known in self._watched if known.is_closed()]:
+                self.forget(closed)
+            watched = self._watched.get(loop)
+            if watched is None:
+                if not self._take():
+                    return
+                watched = (set(), threading.Event())
+                try:
+                    threading.Thread(
+                        target=_nudge,
+                        args=(reader, threading.main_thread().ident, watched[1]),
+                        name=NUDGE_THREAD,
+                        daemon=True,
+                    ).start()
+                except RuntimeError:
+                    if not self._watched:
+                        self._give_back()
+                    return
+                self._watched[loop] = watched
+            watched[0].add(owner)
+            if waking and self._woken is None:
+                self._wake(loop)
+
+    def unwatch(self, loop: asyncio.AbstractEventLoop, owner: Any) -> None:
+        with self._lock:
+            watched = self._watched.get(loop)
+            if watched is None:
+                return
+            watched[0].discard(owner)
+            if not watched[0]:
+                self.forget(loop)
+
+    def forget(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._lock:
+            watched = self._watched.pop(loop, None)
+            if watched is not None:
+                watched[1].set()
+            if self._woken is not None and self._woken[0] is loop:
+                self._sleep()
+            if not self._watched:
+                self._give_back()
+
+    def forked(self) -> None:
+        self._lock = threading.RLock()
+        self._watched = {}
+        self._sleep()
+        self._give_back()
+
+    def woken_again(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._woken is not None and self._woken[0] is loop:
+            signal.set_wakeup_fd(self._woken[1], warn_on_full_buffer=False)
+
+    def _wake(self, loop: asyncio.AbstractEventLoop) -> None:
+        writer = getattr(loop, "_csock", None)
+        if writer is None:
+            return
+        before = signal.set_wakeup_fd(writer.fileno(), warn_on_full_buffer=False)
+        if before == -1:
+            self._woken = loop, writer.fileno()
+        else:
+            _wake_as_before(before)
+
+    def _sleep(self) -> None:
+        if self._woken is None or threading.current_thread() is not threading.main_thread():
+            return
+        (_, woken), self._woken = self._woken, None
+        before = signal.set_wakeup_fd(-1)
+        if before not in (-1, woken):
+            _wake_as_before(before)
+
+    def _take(self) -> bool:
+        if self._previous is not None:
+            return True
+        handler, raw = _snapshot(NUDGE_SIGNAL)
+        if handler not in (signal.SIG_DFL, signal.SIG_IGN) or not _unhandled(raw):
+            return False
+        self._previous = handler, raw
+        signal.signal(NUDGE_SIGNAL, _nudged)
+        self._installed = _pointer(_raw_action(NUDGE_SIGNAL))
+        return True
+
+    def _give_back(self) -> None:
+        if self._previous is None or threading.current_thread() is not threading.main_thread():
+            return
+        (handler, raw), self._previous = self._previous, None
+        ours = _pointer(_raw_action(NUDGE_SIGNAL)) == self._installed
+        if ours and signal.getsignal(NUDGE_SIGNAL) is _nudged:
+            signal.signal(NUDGE_SIGNAL, handler)
+            if raw is not None:
+                _set_raw_action(NUDGE_SIGNAL, raw)
+
+
+def _wake_as_before(before: int) -> None:
+    with suppress(OSError, ValueError):
+        signal.set_wakeup_fd(before)
+
+
+def _nudge(reader: socket.socket, main: int, ended: threading.Event) -> None:
+    with suppress(OSError, ValueError), selectors.DefaultSelector() as waiting:
+        waiting.register(reader, selectors.EVENT_READ)
+        _nudge_while(waiting, reader, main, ended)
+
+
+def _nudge_while(
+    waiting: selectors.BaseSelector, reader: socket.socket, main: int, ended: threading.Event
+) -> None:
+    stops = bytes(STOP_SIGNALS)
+    seen = sent = 0
+    while True:
+        readable = waiting.select(NUDGE_IDLE_SECONDS)
+        if ended.is_set() or reader.fileno() < 0:
+            return
+        if readable and ended.wait(NUDGE_GRACE_SECONDS):
+            return
+        try:
+            unread = reader.recv(NUDGE_PEEK_BYTES, socket.MSG_PEEK) if readable else b""
+        except BlockingIOError:
+            unread = b""
+        unhandled = sum(unread.count(stop) for stop in stops)
+        if unhandled and unhandled == seen != sent and signal.getsignal(NUDGE_SIGNAL) is _nudged:
+            signal.pthread_kill(main, NUDGE_SIGNAL)
+            sent = unhandled
+        if unhandled != seen:
+            sent = 0
+        seen = unhandled
+
+
+def _nudged(number: int, frame: Any) -> None:
+    return None
+
+
+def _unhandled(raw: bytes | None) -> bool:
+    return raw is None or int.from_bytes(_pointer(raw) or b"", sys.byteorder) in (0, 1)
+
+
+_nudges = _Nudges()
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=lambda: _nudges.forked())
+
+
+def loop_ended(loop: asyncio.AbstractEventLoop) -> None:
+    _nudges.forget(loop)
+
+
 class RunInterrupts(_Presses):
     __slots__ = (
         "count",
@@ -174,6 +349,8 @@ class RunInterrupts(_Presses):
             if signal.getsignal(number) is default:
                 self._handled[number] = _snapshot(number)
                 signal.signal(number, self._interrupted)
+        if self._handled:
+            _nudges.watch(loop, self, waking=True)
 
     def _interrupted(self, number: int, frame: Any) -> None:
         self.count += 1
@@ -217,6 +394,7 @@ class RunInterrupts(_Presses):
 
     def restore(self, exiting: bool = False) -> None:
         self.close()
+        _nudges.unwatch(self._loop, self)
         for number, (handler, raw) in self._handled.items():
             if signal.getsignal(number) != self._interrupted:
                 continue
@@ -308,6 +486,7 @@ class _LoopStack(_Stack):
         )
         self.previous = _snapshot(number)
         self.loop.add_signal_handler(number, self.dispatch)
+        _nudges.watch(self.loop, self)
         signal.signal(number, self._escalate)
         self.mark(number)
 
@@ -317,6 +496,7 @@ class _LoopStack(_Stack):
 
     def leave(self, number: int) -> None:
         self.close()
+        _nudges.unwatch(self.loop, self)
         stacks = _loop_stacks.get(self.loop, {})
         if stacks.get(number) is not self:
             return
@@ -338,6 +518,7 @@ class _LoopStack(_Stack):
         self.loop._signal_handlers.pop(number, None)
         if not self.loop._signal_handlers:
             signal.set_wakeup_fd(-1)
+            _nudges.woken_again(self.loop)
 
 
 class _SignalStack(_Stack):
@@ -398,10 +579,13 @@ class ShutdownWatcher:
             )
             if stack is None:
                 stack = self._join_signal(number)
+                _nudges.watch(loop, self, waking=True)
             stack.watchers.append(self)
             self._installed.append((number, stack))
 
     def uninstall(self) -> None:
+        if self._loop is not None:
+            _nudges.unwatch(self._loop, self)
         while self._installed:
             number, stack = self._installed.pop()
             if self in stack.watchers:

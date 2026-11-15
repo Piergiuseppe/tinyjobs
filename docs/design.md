@@ -2100,7 +2100,39 @@ included, and hands each handler back without passing through the default, so a 
 while it tears down counts as a press where it killed the process with status 143. A handler set
 outside Python, by `faulthandler.register`, a C extension or the program embedding the interpreter,
 is put back as it was, and an unanswered press only re-sends a signal whose handler is the
-worker's own, so a SIGINT handler the program kept never sees a Ctrl-C nobody pressed. When a run of
+worker's own, so a SIGINT handler the program kept never sees a Ctrl-C nobody pressed.
+
+A signal sent to a process is delivered to one thread of it, any that does not block it, and
+Python runs its handler only on the main thread, at the next instruction that thread runs. A main
+thread that a job holds in a blocking call runs none, and a signal that another thread received
+does not interrupt the call. So a press that landed on the control thread, the app's loop thread or a pool thread, while a job
+blocked the loop, waited for the job to return, and two presses of one signal that waited
+together were handled as one: seen once in 1,200 forced stops on Linux, and once on the release
+runners, where the worker had not left after 15 seconds. Blocking the stop signals in the threads
+tinyjobs starts would send them to the main thread, and was tried twice: a blocked mask is
+inherited by every thread and every process started from the thread that has it, and each attempt
+found another place where code that is not tinyjobs' runs on such a thread, an async job under
+`app.drain()`, a coroutine given to `run_sync`, a dashboard request, whose child processes then
+ignored `terminate()`. What ships instead leaves every mask alone and forwards the press. Python
+writes the number of each signal the process receives, on whichever thread, to the loop's wakeup
+channel, which the loop reads at its next turn. While a run's handlers are in place a thread
+watches that channel without reading it: a stop signal it finds unread twice, a twentieth of a
+second apart, means the loop is blocked, and the thread then sends the main thread `SIGURG`,
+once for each such signal. `SIGURG` does nothing by itself and its handler is empty; the Go runtime
+uses it to the same end. But it interrupts the system call the main thread is in, and Python then
+runs every handler that is due, the stop signal's among them, which is what happens when the
+kernel picks the main thread in the first place. A loop that reads its signals in time is never
+nudged, and nothing is sent that a stop signal did not cause. A run started without
+`handle_signals` still takes a Ctrl-C the program left at its default, and gives Python its
+loop's wakeup channel for as long as it lasts, if none is set, so that the same thread sees it;
+so does a worker on a loop that takes no signal handlers of its own, which a signal on another
+thread used to leave asleep until its next timer.
+None of this happens when `SIGURG` has a handler already, the program's own or one a library set
+outside Python, or on a loop that is not asyncio's own; the disposition and the wakeup channel
+are put back as they were found, in a process forked meanwhile too, unless something else took
+them in between. Two presses of one signal less than a tenth of a second apart, the first on
+another thread, can still count as one, and a main thread that blocks the stop signals around a
+call is interrupted by the `SIGURG` all the same. When a run of
 `tinyjobs worker`, or of `manage.py tinyjobs worker` run with the process's own arguments, ends cleanly, its
 handlers become ones that exit with status 0: they give stdout and stderr half a second to flush,
 and a second signal during that flush exits at once. So a press that lands after the run, while the
