@@ -1197,6 +1197,9 @@ async def stubborn(seconds, marker):
 """
 
 
+PROCESS_EXIT_SECONDS = 0.6
+
+
 def seconds_to_exit(
     url: str,
     *,

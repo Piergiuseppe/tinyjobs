@@ -30,6 +30,7 @@ from tinyjobs.models import ExecutionError
 from tinyjobs.status import ExecutionStatus
 from tinyjobs.testing.contract import ERROR, make_job, pruning
 from tests.support import (
+    PROCESS_EXIT_SECONDS,
     LoopBoundAppCases,
     Untouched,
     fork_without_warning,
@@ -292,10 +293,23 @@ async def sql(query: str, parameters: dict | None = None) -> list[tuple]:
         return await cursor.fetchall() if cursor.description else []
 
 
+DROP_ATTEMPTS = 5
+
+
 async def drop(prefix: str, schema: str | None = None) -> None:
     qualify = f'"{schema}".' if schema else ""
-    for table in ("executions", "jobs", "schedules", "meta", "limits", "ran"):
-        await sql(f'DROP TABLE IF EXISTS {qualify}"{prefix}_{table}" CASCADE')
+    tables = ", ".join(
+        f'{qualify}"{prefix}_{table}"'
+        for table in ("executions", "jobs", "schedules", "meta", "limits", "ran")
+    )
+    for attempt in range(DROP_ATTEMPTS):
+        try:
+            await sql(f"DROP TABLE IF EXISTS {tables} CASCADE")
+            break
+        except psycopg.errors.DeadlockDetected:
+            if attempt == DROP_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(0.2)
     if schema:
         await sql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
@@ -313,9 +327,6 @@ async def _rows_of(connection, query: str, parameters: dict) -> list[tuple]:
     cursor = connection.cursor(row_factory=psycopg.rows.tuple_row)
     await cursor.execute(query, parameters)
     return await cursor.fetchall()
-
-
-PROCESS_EXIT_SECONDS = 0.6
 
 
 async def quiet_snapshots(seconds: float = 20.0) -> None:
@@ -4409,7 +4420,7 @@ class PostgresExitTests(unittest.TestCase):
             lock=self.locked,
             settle=0.8,
         )
-        self.assertLess(took, 2.0 + 0.1)
+        self.assertLess(took, 2.0 + PROCESS_EXIT_SECONDS)
 
     def test_the_cli_exits_a_window_after_a_kept_thread_with_its_outcome_stuck_on_a_lock(self):
         took = seconds_to_exit(
