@@ -81,6 +81,14 @@ class RunsElsewhereTests(IsolatedTestCase):
         await self.settle(self.make_worker(), [job])
         self.assertEqual(await self.result_of(job), [job.id, 2, isolated.current_attempts.name])
 
+    async def test_the_job_inside_the_job_process_talks_to_the_app_of_that_process(self):
+        job = await self.send(isolated.asks_its_own_app)
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(
+            await self.result_of(job),
+            "asked the app of the job process, whose memory store has no such job",
+        )
+
     async def test_a_task_with_a_locator_is_found_through_it(self):
         job = await self.send(isolated.LOCATED["found"])
         await self.settle(self.make_worker(), [job])

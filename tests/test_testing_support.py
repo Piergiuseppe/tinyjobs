@@ -4,7 +4,7 @@ import asyncio
 import os
 import unittest
 
-from tinyjobs import FrozenClock, JobStatus, TinyJobs, UnknownTaskError
+from tinyjobs import FrozenClock, JobStatus, TinyJobs, UnknownTaskError, current_job
 
 START = 1_791_633_600.0
 
@@ -28,6 +28,19 @@ class EagerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.app.close()
+
+    def test_an_eager_task_sees_the_job_it_runs_as(self):
+        @self.app.task
+        def threaded():
+            self.calls.append(current_job.get().id)
+
+        @self.app.task
+        async def on_the_loop():
+            self.calls.append(current_job.get().id)
+
+        sent = [threaded.enqueue().id, on_the_loop.enqueue().id]
+        self.assertEqual(self.calls, sent)
+        self.assertIsNone(current_job.get(None))
 
     def test_a_job_that_sends_its_own_dedup_key_gets_itself_back_at_once(self):
         import threading
@@ -438,6 +451,19 @@ class DrainTests(unittest.TestCase):
         self.assertEqual(self.app.drain(), 1)
         self.assertEqual(self.calls, ["a"])
         self.assertEqual(self.app.drain(), 0)
+
+    def test_a_drained_task_sees_the_job_it_runs_as(self):
+        @self.app.task
+        def threaded():
+            self.calls.append(current_job.get().id)
+
+        @self.app.task
+        async def on_the_loop():
+            self.calls.append(current_job.get().id)
+
+        sent = [threaded.enqueue().id, on_the_loop.enqueue().id]
+        self.assertEqual(self.app.drain(), 2)
+        self.assertEqual(sorted(self.calls), sorted(sent))
 
     def test_jobs_run_by_priority_across_queues(self):
         self.record.enqueue("low")

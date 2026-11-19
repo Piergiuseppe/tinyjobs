@@ -209,12 +209,23 @@ def was_prepared() -> bool:
 
 @app.task(isolated=True, store_result=True, max_attempts=2, retry_base=0, retry_jitter=False)
 def current_attempts() -> list:
-    from tinyjobs.current import current_job
+    from tinyjobs import current_job
 
     job = current_job.get()
     if job.attempts == 1:
         raise ValueError("once more")
     return [job.id, job.attempts, job.task]
+
+
+@app.task(isolated=True, store_result=True)
+def asks_its_own_app() -> str:
+    from tinyjobs import JobNotFoundError, current_job
+
+    try:
+        current_job.get().refresh()
+    except JobNotFoundError:
+        return "asked the app of the job process, whose memory store has no such job"
+    return "found"
 
 
 def _kept_out_of_sight() -> int:
@@ -247,6 +258,7 @@ def locate(key: str):
 
 TASKS = [
     current_attempts,
+    asks_its_own_app,
     *LOCATED.values(),
     hang_with_subprocess,
     registered_pid,
