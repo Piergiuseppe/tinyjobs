@@ -40,6 +40,7 @@ v0.19.0. Working and measured, but young. What's in:
 - jobs that run after another: `after=job`, with a `waiting` status, on every store and on
   `django.tasks`
 - `tinyjobs move`, which carries the jobs still to run from one store to another
+- `current_job`, the job a task is running as, with the id that stays the same on every attempt
 
 Upgrading to 0.17 adds the `waiting` status and a column (a field, on Redis) to every store. Stop
 every tinyjobs process on a store before starting the first 0.17 one: it upgrades the store on its

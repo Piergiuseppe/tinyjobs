@@ -128,6 +128,40 @@ cancelled. So after a failure, retry the job that failed and then the ones behin
 first does not bring the others back by itself. `jobs cancel` on any job of the line cancels what
 waits behind it.
 
+## The job a task runs as
+
+A task can ask which job it is running as:
+
+```python
+from tinyjobs import current_job
+
+
+@app.task(max_attempts=5)
+async def send_welcome(email: str) -> None:
+    job = current_job.get()
+    await provider.send(to=email, template="welcome", idempotency_key=f"welcome:{job.id}")
+```
+
+`current_job.get()` returns the `Job` as the worker claimed it. Its `id` is the one `enqueue`
+returned, and it is the same on every attempt: a retry runs the same job again, and so does the run
+that follows a worker's death. That makes it the idempotency key to hand a provider when the
+arguments carry no natural one, so that a job that runs twice applies its effect once for as
+long as the provider remembers the key, which is what [at-least-once](guarantees.md) asks of a
+task. `job.attempts` is 1 on the first run and grows with each retry and with the run that follows
+a worker's death; a run handed back at a shutdown is not counted, so the next one sees the same
+number. `queue`, `dedup_key`, `max_attempts` and the other fields are there too.
+
+It works in an `async def` task, in a `def` task on its thread and in an
+[isolated](isolated-tasks.md) one in its job process, under `eager=True` and `app.drain()`, and in
+the `asyncio` tasks and `asyncio.to_thread` calls the job starts. It is a
+[context variable](https://docs.python.org/3/library/contextvars.html), so outside a job
+`current_job.get()` raises `LookupError` and `current_job.get(None)` returns `None`. The job is the
+task's own copy of the row as it was claimed: `job.refresh()`, or `await job.arefresh()` in an
+async task, reads it again, and nothing the task changes on it reaches the worker. An isolated task
+reads through the app its job process imported, which on `memory://` is a store of its own with no
+such job. A `django.tasks` task has the same through `takes_context=True`, as
+`context.task_result.id` and `context.attempt`.
+
 ## Running a worker
 
 ```bash

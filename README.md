@@ -131,6 +131,7 @@ finish before it exits. Leave out `worker=True` to run the workers elsewhere.
 | One job after another | `after=job` keeps a job waiting until another has succeeded, and cancels it if that one fails |
 | Limits | `concurrency=2` caps a task at two running jobs across every worker, `rate="10/m"` spaces its starts, both kept in the store |
 | Crash recovery | leases and heartbeats, so a killed worker's jobs come back |
+| Idempotency | `current_job.get()` gives a task the job it runs as, with an id that is the same on every attempt |
 | Transactional enqueue | on SQLite and Postgres, a job sent with your connection as `tx` commits or rolls back with your own transaction |
 | Attempt history | every attempt is a row, with its traceback and timings |
 | Retention | old jobs are pruned, so the database plateaus instead of growing |

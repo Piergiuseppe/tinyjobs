@@ -3161,6 +3161,27 @@ because they would end the transaction early, and a transaction SQLite ends by i
 `INSERT OR ROLLBACK` does, makes the block raise when it exits, since every statement after that
 point committed on its own.
 
+### The job inside its task
+
+A task sometimes needs to know which job it is: for a log line, or for the idempotency key it
+hands a provider so that a second run applies nothing new. The public form is the variable the
+[Django backend](#django-tasks) already reads, exported as `tinyjobs.current_job`.
+
+**Why a context variable and not an argument.** Celery's `bind=True` gives the function a `self`
+first parameter, so the function the author wrote no longer has the signature its callers use, the
+one `enqueue` validates here. A context variable leaves the function alone and follows the job
+into the `asyncio` tasks and `to_thread` calls it starts.
+
+**Why the variable itself and not a function around it.** `current_job.get()` and
+`current_job.get(None)` already say what a helper would have to: the job, or `LookupError`, or a
+default. Whoever knows `contextvars` knows it, and it stays the object the Django backend reads.
+
+**Why a copy.** The worker ends a job with the holder and the claim number it read at the claim,
+the check that makes a late answer harmless. A task that refreshed the worker's own object after
+its lease was lost would give it the next holder's identity, and its late answer would be taken,
+so the task gets a copy. The copy is bound to an app, in a job process to the one that process
+imported, so that `refresh()` asks the store the task itself would ask.
+
 ### Task discovery
 
 Workers must import task modules to populate the registry. A job row stores a task *name*, and a
@@ -3658,6 +3679,10 @@ the two versions.
 `tinyjobs move`, which carries the jobs still to run from one store to another, so changing
 store is a deploy and a command instead of a stop, and `delete` in the backend protocol, the
 verb it needed.
+
+**v0.20, the job inside its task**
+`current_job` made public: the variable the worker already set for `takes_context` is exported
+and documented, so a task can read the id of the job it runs as and use it as an idempotency key.
 
 **v1.0, commitment**
 A backend protocol that changes only compatibly, a documented plugin API, full documentation. After
