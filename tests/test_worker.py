@@ -12,9 +12,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tinyjobs import Abandon, Retry, TinyJobs
+from tinyjobs import Abandon, Retry, TinyJobs, current_job
 from tinyjobs.exceptions import ConfigurationError, UnknownTaskError
-from tinyjobs.services.execution import current_job
 from tinyjobs.status import ExecutionStatus, JobStatus
 from tests.support import PROCESS_EXIT_SECONDS, seconds_to_exit
 
@@ -208,6 +207,92 @@ class CurrentJobTests(WorkerTestCase):
         await handler.aenqueue()
         await self.app.adrain()
         self.assertIsNone(current_job.get(None))
+
+    async def test_what_a_task_does_to_the_job_it_sees_does_not_reach_the_worker(self):
+        @self.app.task
+        def threaded():
+            job = current_job.get()
+            job.worker_id, job.claims, job.attempts = "another", job.claims + 1, 9
+
+        @self.app.task
+        async def on_the_loop():
+            job = current_job.get()
+            job.worker_id, job.claims, job.attempts = "another", job.claims + 1, 9
+
+        jobs = [await threaded.aenqueue(), await on_the_loop.aenqueue()]
+        await self.settle(self.make_worker(), jobs)
+        for job in jobs:
+            with self.subTest(task=job.task):
+                fresh = await self.app.aget(job.id)
+                self.assertEqual((fresh.status, fresh.attempts), (JobStatus.SUCCESS, 1))
+
+    async def test_a_task_can_refresh_the_job_it_sees(self):
+        @self.app.task
+        async def handler():
+            job = await current_job.get().arefresh()
+            self.calls.append(str(job.status))
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(self.calls, [str(JobStatus.RUNNING)])
+
+    async def test_outside_a_job_asking_for_it_raises_a_lookup_error(self):
+        with self.assertRaises(LookupError):
+            current_job.get()
+
+    async def test_every_attempt_sees_the_same_id_and_its_own_number(self):
+        seen: list[tuple[str, str, int]] = []
+
+        @self.app.task(max_attempts=3, retry_base=0.01, retry_jitter=False)
+        def threaded():
+            job = current_job.get()
+            seen.append(("threaded", job.id, job.attempts))
+            if job.attempts < 3:
+                raise ConnectionError("again")
+
+        @self.app.task(max_attempts=3, retry_base=0.01, retry_jitter=False)
+        async def on_the_loop():
+            job = current_job.get()
+            seen.append(("on_the_loop", job.id, job.attempts))
+            if job.attempts < 3:
+                raise ConnectionError("again")
+
+        jobs = {"threaded": await threaded.aenqueue(), "on_the_loop": await on_the_loop.aenqueue()}
+        await self.settle(self.make_worker(), list(jobs.values()))
+        for name, job in jobs.items():
+            with self.subTest(task=name):
+                self.assertEqual(
+                    [entry for entry in seen if entry[0] == name],
+                    [(name, job.id, attempt) for attempt in (1, 2, 3)],
+                )
+
+    async def test_a_task_and_a_thread_the_job_starts_see_the_job(self):
+        async def asked() -> str:
+            return current_job.get().id
+
+        @self.app.task
+        async def handler():
+            self.calls.append(await asyncio.create_task(asked()))
+            self.calls.append(await asyncio.to_thread(lambda: current_job.get().id))
+
+        job = await handler.aenqueue()
+        await self.settle(self.make_worker(), [job])
+        self.assertEqual(self.calls, [job.id, job.id])
+
+    async def test_the_job_a_task_sees_is_the_claimed_one_with_its_key_and_queue(self):
+        seen: list = []
+
+        @self.app.task(queue="mail")
+        def handler():
+            seen.append(current_job.get())
+
+        job = await handler.with_options(key="welcome:7").aenqueue()
+        await self.settle(self.make_worker(queues=["mail"]), [job])
+        [running] = seen
+        self.assertEqual(
+            (running.id, running.task, running.queue, running.dedup_key, running.status),
+            (job.id, handler.name, "mail", "welcome:7", JobStatus.RUNNING),
+        )
 
 
 class FailureTests(WorkerTestCase):

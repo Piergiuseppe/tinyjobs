@@ -7,7 +7,9 @@ What tinyjobs promises, on every backend, and how to see that it holds on yours.
   [after another](jobs.md#one-job-after-another) is promised the same from the moment that one
   succeeds, and is otherwise cancelled, on the record, with the reason.
 - A job finishing while its worker dies may run again, never be lost. The second run shows as a
-  second execution, so an idempotent task makes the whole thing effectively once.
+  second execution, so an idempotent task makes the whole thing effectively once. Both runs see
+  the same job id, which a task reads from [`current_job`](jobs.md#the-job-a-task-runs-as) and
+  can pass on as an idempotency key.
 - Cron fires once per due time from any number of workers, a deduplication key refuses a second
   job while one is pending or running, and on Postgres and SQLite a job enqueued in a transaction
   that rolls back never exists.

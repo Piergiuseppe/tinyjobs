@@ -5,6 +5,22 @@ Changelog](https://keepachangelog.com/en/1.1.0/). What a release is allowed to c
 [compatibility page](https://tinyjobs.readthedocs.io/en/latest/compatibility/). Store schema
 versions are the `SCHEMA_VERSION` of each backend.
 
+## 0.20.0 - unreleased
+
+### Added
+- `from tinyjobs import current_job`: inside a task, `current_job.get()` is the job it runs as,
+  with the id that `enqueue` returned and that stays the same on every attempt, so a task can
+  hand it to a provider as an idempotency key. It works in async, threaded and isolated tasks,
+  in eager mode and under `app.drain()`. The variable was already set by the worker, at
+  `tinyjobs.current.current_job`, which keeps working; it is now public and
+  [documented](https://tinyjobs.readthedocs.io/en/latest/jobs/#the-job-a-task-runs-as).
+
+### Fixed
+- The job a task reads from `current_job` is a copy of its own. It was the object the worker
+  ends the job with, so a task that changed it or refreshed it after losing its lease could
+  leave the job running, or have a late answer accepted. In a job process the copy is bound to
+  the app of that process, where it had none.
+
 ## 0.19.0 - 2026-11-15
 
 ### Added

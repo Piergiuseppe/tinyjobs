@@ -18,6 +18,7 @@ __version__ = "0.19.0"
 
 from .app import TinyJobs
 from .clock import Clock, FrozenClock
+from .current import current_job
 from .limits import Limit
 from .exceptions import (
     Abandon,
@@ -115,4 +116,5 @@ __all__ = [
     "WaitTimeout",
     "Worker",
     "__version__",
+    "current_job",
 ]

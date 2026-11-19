@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable
 
 from ..clock import Clock
@@ -51,7 +51,7 @@ class ExecutionService:
         settling: Callable[[], None] | None = None,
         settled: Callable[[], None] | None = None,
     ) -> Attempt:
-        token = current_job.set(job)
+        token = current_job.set(replace(job))
         try:
             return await self._attempt(job, task, executors, held_until, settling, settled)
         finally:

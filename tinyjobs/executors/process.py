@@ -748,7 +748,11 @@ def _run(conn: Any, request: tuple, state: _State) -> None:
         _reply(conn, _failure(error))
         return
     conn.send(("started",))
-    token = None if job is None else current_job.set(replace(job, payload=encoded))
+    token = (
+        None
+        if job is None
+        else current_job.set(replace(job, payload=encoded).bound_to(task.app))
+    )
     try:
         result = task.function(*raw["args"], **raw["kwargs"])
     except Retry as error:

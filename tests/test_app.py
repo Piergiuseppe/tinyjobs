@@ -472,6 +472,13 @@ class PublicNamesTests(unittest.TestCase):
         }
         self.assertEqual(defined - set(tinyjobs.__all__), set())
 
+    def test_the_running_job_is_exported_as_the_variable_the_worker_sets(self):
+        import tinyjobs
+        from tinyjobs.current import current_job
+
+        self.assertIs(tinyjobs.current_job, current_job)
+        self.assertIn("current_job", tinyjobs.__all__)
+
     def test_every_exported_name_exists_once(self):
         import tinyjobs
 
